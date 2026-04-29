@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RequestHandlerHelper.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">KafkaApis fuzz coverage</a> &gt; <a href="index.source.html" class="el_package">kafka.server</a> &gt; <span class="el_source">RequestHandlerHelper.scala</span></div><h1>RequestHandlerHelper.scala</h1><pre class="source lang-java linenums">/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package kafka.server
+
+import kafka.cluster.Partition
+import kafka.coordinator.transaction.TransactionCoordinator
+import kafka.network.RequestChannel
+import kafka.server.QuotaFactory.QuotaManagers
+import org.apache.kafka.common.errors.ClusterAuthorizationException
+import org.apache.kafka.common.internals.Topic
+import org.apache.kafka.common.network.Send
+import org.apache.kafka.common.requests.{AbstractRequest, AbstractResponse}
+import org.apache.kafka.common.utils.Time
+import org.apache.kafka.coordinator.group.GroupCoordinator
+
+import java.util.OptionalInt
+
+<span class="nc" id="L33">object RequestHandlerHelper {</span>
+
+  def onLeadershipChange(groupCoordinator: GroupCoordinator,
+                         txnCoordinator: TransactionCoordinator,
+                         updatedLeaders: Iterable[Partition],
+                         updatedFollowers: Iterable[Partition]): Unit = {
+    // for each new leader or follower, call coordinator to handle consumer group migration.
+    // this callback is invoked under the replica state change lock to ensure proper order of
+    // leadership changes
+<span class="nc" id="L42">    updatedLeaders.foreach { partition =&gt;</span>
+<span class="nc bnc" id="L43" title="All 4 branches missed.">      if (partition.topic == Topic.GROUP_METADATA_TOPIC_NAME)</span>
+<span class="nc" id="L44">        groupCoordinator.onElection(partition.partitionId, partition.getLeaderEpoch)</span>
+<span class="nc bnc" id="L45" title="All 4 branches missed.">      else if (partition.topic == Topic.TRANSACTION_STATE_TOPIC_NAME)</span>
+<span class="nc" id="L46">        txnCoordinator.onElection(partition.partitionId, partition.getLeaderEpoch)</span>
+    }
+
+<span class="nc" id="L49">    updatedFollowers.foreach { partition =&gt;</span>
+<span class="nc bnc" id="L50" title="All 4 branches missed.">      if (partition.topic == Topic.GROUP_METADATA_TOPIC_NAME)</span>
+<span class="nc" id="L51">        groupCoordinator.onResignation(partition.partitionId, OptionalInt.of(partition.getLeaderEpoch))</span>
+<span class="nc bnc" id="L52" title="All 4 branches missed.">      else if (partition.topic == Topic.TRANSACTION_STATE_TOPIC_NAME)</span>
+<span class="nc" id="L53">        txnCoordinator.onResignation(partition.partitionId, Some(partition.getLeaderEpoch))</span>
+    }
+  }
+
+}
+
+<span class="fc" id="L59">class RequestHandlerHelper(</span>
+<span class="fc" id="L60">  requestChannel: RequestChannel,</span>
+<span class="fc" id="L61">  quotas: QuotaManagers,</span>
+<span class="fc" id="L62">  time: Time</span>
+) {
+
+  def throttle(
+    quotaManager: ClientQuotaManager,
+<span class="fc" id="L67">    request: RequestChannel.Request,</span>
+    throttleTimeMs: Int
+  ): Unit = {
+<span class="pc bpc" id="L70" title="1 of 2 branches missed.">    val callback = new ThrottleCallback {</span>
+<span class="nc" id="L71">      override def startThrottling(): Unit = requestChannel.startThrottling(request)</span>
+<span class="nc" id="L72">      override def endThrottling(): Unit = requestChannel.endThrottling(request)</span>
+    }
+<span class="fc" id="L74">    quotaManager.throttle(request, callback, throttleTimeMs)</span>
+  }
+
+  def handleError(request: RequestChannel.Request, e: Throwable): Unit = {
+<span class="nc bnc" id="L78" title="All 4 branches missed.">    val mayThrottle = e.isInstanceOf[ClusterAuthorizationException] || !request.header.apiKey.clusterAction</span>
+<span class="nc bnc" id="L79" title="All 2 branches missed.">    if (mayThrottle)</span>
+<span class="nc" id="L80">      sendErrorResponseMaybeThrottle(request, e)</span>
+    else
+<span class="nc" id="L82">      sendErrorResponseExemptThrottle(request, e)</span>
+  }
+
+  private def sendErrorOrCloseConnection(
+    request: RequestChannel.Request,
+    error: Throwable,
+    throttleMs: Int
+  ): Unit = {
+<span class="fc" id="L90">    val requestBody = request.body[AbstractRequest]</span>
+<span class="fc" id="L91">    val response = requestBody.getErrorResponse(throttleMs, error)</span>
+<span class="fc bfc" id="L92" title="All 2 branches covered.">    if (response == null)</span>
+<span class="fc" id="L93">      requestChannel.closeConnection(request, requestBody.errorCounts(error))</span>
+    else
+<span class="fc" id="L95">      requestChannel.sendResponse(request, response, None)</span>
+  }
+
+  def sendForwardedResponse(request: RequestChannel.Request,
+                            response: AbstractResponse): Unit = {
+    // For requests forwarded to the controller, we take the maximum of the local
+    // request throttle and the throttle sent by the controller in the response.
+<span class="nc" id="L102">    val controllerThrottleTimeMs = response.throttleTimeMs()</span>
+<span class="nc" id="L103">    val requestThrottleTimeMs = maybeRecordAndGetThrottleTimeMs(request)</span>
+<span class="nc" id="L104">    val appliedThrottleTimeMs = math.max(controllerThrottleTimeMs, requestThrottleTimeMs)</span>
+<span class="nc" id="L105">    throttle(quotas.request, request, appliedThrottleTimeMs)</span>
+<span class="nc" id="L106">    response.maybeSetThrottleTimeMs(appliedThrottleTimeMs)</span>
+<span class="nc" id="L107">    requestChannel.sendResponse(request, response, None)</span>
+  }
+
+  // Throttle the channel if the request quota is enabled but has been violated. Regardless of throttling, send the
+  // response immediately.
+  def sendMaybeThrottle(
+    request: RequestChannel.Request,
+    response: AbstractResponse
+  ): Unit = {
+<span class="fc" id="L116">    val throttleTimeMs = maybeRecordAndGetThrottleTimeMs(request)</span>
+    // Only throttle non-forwarded requests
+<span class="fc bfc" id="L118" title="All 2 branches covered.">    if (!request.isForwarded)</span>
+<span class="fc" id="L119">      throttle(quotas.request, request, throttleTimeMs)</span>
+<span class="fc" id="L120">    response.maybeSetThrottleTimeMs(throttleTimeMs)</span>
+<span class="fc" id="L121">    requestChannel.sendResponse(request, response, None)</span>
+  }
+
+  def sendResponseMaybeThrottle(request: RequestChannel.Request,
+                                createResponse: Int =&gt; AbstractResponse): Unit = {
+<span class="nc" id="L126">    val throttleTimeMs = maybeRecordAndGetThrottleTimeMs(request)</span>
+    // Only throttle non-forwarded requests
+<span class="nc bnc" id="L128" title="All 2 branches missed.">    if (!request.isForwarded)</span>
+<span class="nc" id="L129">      throttle(quotas.request, request, throttleTimeMs)</span>
+<span class="nc" id="L130">    requestChannel.sendResponse(request, createResponse(throttleTimeMs), None)</span>
+  }
+
+  def sendErrorResponseMaybeThrottle(request: RequestChannel.Request, error: Throwable): Unit = {
+<span class="fc" id="L134">    val throttleTimeMs = maybeRecordAndGetThrottleTimeMs(request)</span>
+    // Only throttle non-forwarded requests or cluster authorization failures
+<span class="pc bpc" id="L136" title="2 of 4 branches missed.">    if (error.isInstanceOf[ClusterAuthorizationException] || !request.isForwarded)</span>
+<span class="fc" id="L137">      throttle(quotas.request, request, throttleTimeMs)</span>
+<span class="fc" id="L138">    sendErrorOrCloseConnection(request, error, throttleTimeMs)</span>
+  }
+
+  def maybeRecordAndGetThrottleTimeMs(request: RequestChannel.Request): Int = {
+<span class="fc" id="L142">    val throttleTimeMs = quotas.request.maybeRecordAndGetThrottleTimeMs(request, time.milliseconds())</span>
+<span class="fc" id="L143">    request.apiThrottleTimeMs = throttleTimeMs</span>
+<span class="fc" id="L144">    throttleTimeMs</span>
+  }
+
+  /**
+   * Throttle the channel if the controller mutations quota or the request quota have been violated.
+   * Regardless of throttling, send the response immediately.
+   */
+  def sendResponseMaybeThrottleWithControllerQuota(
+    controllerMutationQuota: ControllerMutationQuota,
+    request: RequestChannel.Request,
+    response: AbstractResponse
+  ): Unit = {
+<span class="nc" id="L156">    val timeMs = time.milliseconds</span>
+<span class="nc" id="L157">    val controllerThrottleTimeMs = controllerMutationQuota.throttleTime</span>
+<span class="nc" id="L158">    val requestThrottleTimeMs = quotas.request.maybeRecordAndGetThrottleTimeMs(request, timeMs)</span>
+<span class="nc" id="L159">    val maxThrottleTimeMs = Math.max(controllerThrottleTimeMs, requestThrottleTimeMs)</span>
+    // Only throttle non-forwarded requests
+<span class="nc bnc" id="L161" title="All 4 branches missed.">    if (maxThrottleTimeMs &gt; 0 &amp;&amp; !request.isForwarded) {</span>
+<span class="nc" id="L162">      request.apiThrottleTimeMs = maxThrottleTimeMs</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">      if (controllerThrottleTimeMs &gt; requestThrottleTimeMs) {</span>
+<span class="nc" id="L164">        throttle(quotas.controllerMutation, request, controllerThrottleTimeMs)</span>
+      } else {
+<span class="nc" id="L166">        throttle(quotas.request, request, requestThrottleTimeMs)</span>
+      }
+    }
+
+<span class="nc" id="L170">    response.maybeSetThrottleTimeMs(maxThrottleTimeMs)</span>
+<span class="nc" id="L171">    requestChannel.sendResponse(request, response, None)</span>
+  }
+
+  def sendResponseExemptThrottle(request: RequestChannel.Request,
+                                 response: AbstractResponse,
+<span class="nc" id="L176">                                 onComplete: Option[Send =&gt; Unit] = None): Unit = {</span>
+<span class="fc" id="L177">    quotas.request.maybeRecordExempt(request)</span>
+<span class="fc" id="L178">    requestChannel.sendResponse(request, response, onComplete)</span>
+  }
+
+  private def sendErrorResponseExemptThrottle(request: RequestChannel.Request, error: Throwable): Unit = {
+<span class="nc" id="L182">    quotas.request.maybeRecordExempt(request)</span>
+<span class="nc" id="L183">    sendErrorOrCloseConnection(request, error, 0)</span>
+  }
+
+  def sendNoOpResponseExemptThrottle(request: RequestChannel.Request): Unit = {
+<span class="fc" id="L187">    quotas.request.maybeRecordExempt(request)</span>
+<span class="fc" id="L188">    requestChannel.sendNoOpResponse(request)</span>
+  }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

@@ -32,6 +32,32 @@ Three coverage-improvement tests added on top (`maxDuration = "20s"` each):
   `acks == 1` and `requestThrottle > bandwidthThrottle`, so the
   request-throttle sub-branch (line 696) is taken.
 
+### `KafkaApisDescribeTopicPartitionsFuzzTest` (target: `handleDescribeTopicPartitionsRequest`, ZK arm)
+
+Three `@FuzzTest` cases (`maxDuration = "20s"` each) live in
+`core/src/test/scala/unit/kafka/server/KafkaApisDescribeTopicPartitionsFuzzTest.scala`.
+Only the ZooKeeper arm of `handleDescribeTopicPartitionsRequest` is in
+scope (the KRaft `Some(handler)` arm is unreachable from a
+`ZkMetadataCache` so it is left to the dedicated
+`DescribeTopicPartitionsRequestHandlerTest`):
+
+* `fuzzTestZkUnsupportedVersion` &mdash; default no-throttle path:
+  fuzzer-generated topic list + version, request quota mock returns 0.
+* `fuzzTestZkUnsupportedVersionThrottled` &mdash; same shape but the
+  request quota returns a positive throttle so
+  `RequestHandlerHelper.throttle(...)` actually mutes the channel before
+  the response is sent.
+* `fuzzTestZkUnsupportedVersionForwarded` &mdash; wraps the request in
+  an envelope so `request.isForwarded == true`, covering the else-arm
+  of the `if (!request.isForwarded)` branch on
+  `RequestHandlerHelper.scala:118`.
+
+Together these drive `handleDescribeTopicPartitionsRequest`'s ZK arm
+to 100% line/branch coverage, the loop in
+`DescribeTopicPartitionsRequest.getErrorResponse`, and bring
+`RequestHandlerHelper.sendMaybeThrottle` to 100% line / 100% branch
+coverage.
+
 ### `KafkaApisFetchFuzzTest` (target: `handleFetchRequest`)
 
 Five `@FuzzTest` cases (`maxDuration = "20s"` each) live in
@@ -174,6 +200,26 @@ Jazzer-discovered crashes after extracting the NPE finding into
 | Source lines          | 177 / 187       | 94.7%  |
 | Bytecode instructions | 1109 / 1352     | 82.0%  |
 | Branches              | 69 / 94         | 73.4%  |
+
+### `handleDescribeTopicPartitionsRequest` (KafkaApis.scala lines 1445&ndash;1461, ZK arm only)
+
+The KRaft `Some(handler)` arm (lines 1448-1454) is intentionally out of
+scope. The reachable ZK arm is fully covered:
+
+| Metric                                | Covered / Total | %       |
+| ------------------------------------- | --------------- | ------- |
+| Source lines (full method)            | 4 / 10          | 40.0%   |
+| Source lines (ZK arm only)            | 4 / 4           | 100.0%  |
+| Branches (full method)                | 2 / 4           | 50.0%   |
+| Branches (ZK arm only)                | 2 / 2           | 100.0%  |
+
+### `RequestHandlerHelper.sendMaybeThrottle` (RequestHandlerHelper.scala 112&ndash;122)
+
+| Metric                | Covered / Total | %       |
+| --------------------- | --------------- | ------- |
+| Source lines          | 5 / 5           | 100.0%  |
+| Bytecode instructions | 24 / 24         | 100.0%  |
+| Branches              | 2 / 2           | 100.0%  |
 
 The remaining uncovered lines in both methods are documented per-line in
 [`coverage_results/coverage_summary.txt`](./coverage_results/coverage_summary.txt).

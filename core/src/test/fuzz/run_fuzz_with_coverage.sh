@@ -71,6 +71,14 @@ FETCH_TESTS=(
     fuzzTestFetchDownConversion
 )
 
+# handleDescribeTopicPartitionsRequest fuzz targets (ZK arm only;
+# KafkaApisDescribeTopicPartitionsFuzzTest, maxDuration = 20s each)
+DESCRIBE_TP_TESTS=(
+    fuzzTestZkUnsupportedVersion
+    fuzzTestZkUnsupportedVersionThrottled
+    fuzzTestZkUnsupportedVersionForwarded
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -90,6 +98,9 @@ for t in "${PRODUCE_TESTS[@]}"; do
 done
 for t in "${FETCH_TESTS[@]}"; do
     run_one "unit.kafka.server.KafkaApisFetchFuzzTest" "$t"
+done
+for t in "${DESCRIBE_TP_TESTS[@]}"; do
+    run_one "unit.kafka.server.KafkaApisDescribeTopicPartitionsFuzzTest" "$t"
 done
 
 # 4. Generate HTML/XML/CSV reports against the freshly compiled core classes.
@@ -112,24 +123,27 @@ python3 - "$REPORT_DIR/coverage.xml" <<'PY'
 import sys, xml.etree.ElementTree as ET
 
 TARGETS = [
-    ("handleProduceRequest", 606, 752),
-    ("handleFetchRequest",   757, 1077),
+    ("KafkaApis.scala",          "handleProduceRequest",                  606, 752),
+    ("KafkaApis.scala",          "handleFetchRequest",                    757, 1077),
+    ("KafkaApis.scala",          "handleDescribeTopicPartitionsRequest", 1445, 1461),
+    ("RequestHandlerHelper.scala", "sendMaybeThrottle",                   112,  122),
 ]
 
 tree = ET.parse(sys.argv[1])
 root = tree.getroot()
 
-src = None
-for pkg in root.findall('package'):
-    if pkg.get('name') == 'kafka/server':
-        for sf in pkg.findall('sourcefile'):
-            if sf.get('name') == 'KafkaApis.scala':
-                src = sf
-if src is None:
-    print("KafkaApis.scala source coverage not found in report")
-    sys.exit(1)
+def find_src(filename):
+    for pkg in root.findall('package'):
+        if pkg.get('name') == 'kafka/server':
+            for sf in pkg.findall('sourcefile'):
+                if sf.get('name') == filename:
+                    return sf
+    return None
 
-for name, start, end in TARGETS:
+for filename, name, start, end in TARGETS:
+    src = find_src(filename)
+    if src is None:
+        print("%s: source not found in report" % filename); continue
     lines_in = [l for l in src.findall('line') if start <= int(l.get('nr')) <= end]
     mi = ci = mb = cb = 0
     covered, missed = [], []
@@ -144,14 +158,15 @@ for name, start, end in TARGETS:
     total_instr = mi + ci
     total_br = mb + cb
     print()
-    print("%s (KafkaApis.scala lines %d-%d):" % (name, start, end))
-    print("  Source lines  : %d / %d  (%.1f%%)" % (
-        len(covered), total_lines,
-        100.0*len(covered)/max(total_lines, 1)))
-    print("  Instructions  : %d / %d  (%.1f%%)" % (
-        ci, total_instr, 100.0*ci/max(total_instr, 1)))
+    print("%s (%s lines %d-%d):" % (name, filename, start, end))
+    if total_lines:
+        print("  Source lines  : %d / %d  (%.1f%%)" % (
+            len(covered), total_lines, 100.0*len(covered)/total_lines))
+    if total_instr:
+        print("  Instructions  : %d / %d  (%.1f%%)" % (
+            ci, total_instr, 100.0*ci/total_instr))
     if total_br:
         print("  Branches      : %d / %d  (%.1f%%)" % (
-            cb, total_br, 100.0*cb/max(total_br, 1)))
+            cb, total_br, 100.0*cb/total_br))
     print("  Missed lines  : %s" % missed)
 PY

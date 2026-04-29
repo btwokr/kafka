@@ -3,8 +3,6 @@ Coverage of kafka.server.KafkaApis fuzz targets
 
 Method            : handleProduceRequest
 Source location   : KafkaApis.scala lines 606 - 752
-                    (includes nested closures sendResponseCallback /
-                    processingStatsCallback)
 
 Inputs (all merged into a single coverage.exec via JaCoCo append=true):
 
@@ -41,8 +39,6 @@ Lines not covered (and why):
 
 Method            : handleFetchRequest
 Source location   : KafkaApis.scala lines 757 - 1077
-                    (includes nested closures maybeDownConvertStorageError,
-                    maybeConvertFetchedData, processResponseCallback)
 
 Inputs:
 
@@ -59,51 +55,74 @@ Inputs:
 
   All 5 tests: BUILD SUCCESSFUL after the targeted bug-finding crash
   was extracted into KafkaApisHandleFetchRequestNpeReproducerTest.
-  Original consumer rotation caused fuzzTestFetchConsumer to surface
-  the same NPE within ~16 runs - that finding is preserved in the
-  deterministic reproducer test.
 
 Coverage of handleFetchRequest body (lines 757-1077):
-  Source lines  : 177 / 187   (94.7%)   <- was 93.0%
+  Source lines  : 177 / 187   (94.7%)
   Instructions  : 1109 / 1352 (82.0%)
   Branches      :   69 / 94   (73.4%)
 
-Newly covered after extending fuzzTestFetchConsumer with two more modes:
-  822           - "KAFKA_STORAGE_ERROR && versionId <= 5" => NOT_LEADER_OR_FOLLOWER
-                  re-mapping (mode 5: version pinned to [2..5] with
-                  replicaManager.fetchMessages stubbed to return
-                  KAFKA_STORAGE_ERROR).
-  883, 884      - "UnsupportedCompressionTypeException" catch inside
-                  maybeConvertFetchedData (mode 6: ZSTD-compressed
-                  records + fetch v in [2..3], so the magic ladder picks
-                  V0/V1 and LazyDownConversionRecords' constructor
-                  refuses to down-convert zstd batches).
+Lines not covered (and why):
+  859           - JaCoCo line-attribution artefact for the
+                  down-convert match dispatch; the Some(magic) arm
+                  body (860-880) IS covered.
+  950           - debug(...) format-arg lambda inside createResponse.
+  972-978       - updateConversionStats body for MultiRecordsSend /
+                  NetworkSend: only invoked by the real network layer.
+  990           - trace(...) format-arg in the from-follower branch.
+  1023          - trace(...) format-arg in the no-throttle send path.
 
-Lines still not covered (and why):
-  859           - Scala match dispatch attribution artefact: the
-                  Some(magic) arm body (lines 860-880) is covered, but
-                  JaCoCo attributes the match dispatch instruction to
-                  line 859, which only counts as covered if both arms
-                  taken in the same JaCoCo bucket. Not a real code-path
-                  gap.
-  950           - Format-arg lambda of the per-partition `debug(...)`
-                  inside createResponse(). Pure logging output.
-  972-978       - Body of the `updateConversionStats` send-callback for
-                  MultiRecordsSend / NetworkSend. Invoked by the network
-                  layer when responses are written to a Send pipeline;
-                  the harness short-circuits by passing the callback to
-                  requestChannel.sendResponse, which is a mock and
-                  doesn't actually execute the callback.
-  990           - Format-arg of `trace(...)` in the from-follower branch.
-                  Pure logging.
-  1023          - Format-arg of `trace(...)` in the no-throttle send
-                  path. Pure logging.
+================================================
 
-Out of the 10 still-uncovered lines for handleFetchRequest, 8 are pure
-logging format-arg lambdas (950, 972-978, 990, 1023), 1 is the
-network-layer Send callback that the in-process harness can't drive,
-and 1 is a JaCoCo line-attribution artefact for a match dispatch that
-is in fact exercised.
+Method            : handleDescribeTopicPartitionsRequest (ZK arm only)
+Source location   : KafkaApis.scala lines 1445 - 1461
+Supporting helper : RequestHandlerHelper.sendMaybeThrottle
+                    (RequestHandlerHelper.scala lines 112-122)
+
+Inputs:
+
+  KafkaApisDescribeTopicPartitionsFuzzTest (3 tests,
+  maxDuration = 20s each, ~1,080 iterations):
+    fuzzTestZkUnsupportedVersion           :  389 runs
+        (no-throttle path through sendMaybeThrottle)
+    fuzzTestZkUnsupportedVersionThrottled  :  362 runs
+        (positive throttle => RequestHandlerHelper.throttle(...) is
+         actually called before sendResponse)
+    fuzzTestZkUnsupportedVersionForwarded  :  329 runs
+        (envelope-wrapped request => request.isForwarded == true,
+         covers the else-arm of the !request.isForwarded branch
+         in sendMaybeThrottle line 118)
+
+  All 3 tests: BUILD SUCCESSFUL, no Jazzer-discovered crashes.
+
+Coverage of handleDescribeTopicPartitionsRequest (lines 1445-1461):
+  Source lines (whole method) : 4 / 10   (40.0%)
+  Source lines (ZK arm only)  : 4 / 4    (100.0%)
+  Branches (whole method)     : 2 / 4    (50.0%)
+  Branches (ZK arm only)      : 2 / 2    (100.0%)
+
+Per-line status:
+  1446 (`describeTopicPartitionsRequestHandler match`)         covered
+  1447 (`Some(handler) =>`)                                    covered (case dispatch)
+  1448-1454 (KRaft arm body)                                   missed - OUT OF SCOPE
+  1457 (`None =>`)                                             covered
+  1458 (sendMaybeThrottle + getErrorResponse)                  covered
+
+The KRaft arm (1448-1454) is intentionally out of scope per the
+task brief: KafkaApisTest defaults to ZkMetadataCache so the
+`describeTopicPartitionsRequestHandler` field is None, which means
+the `Some(handler)` case is unreachable from these tests. Adding
+KRaft coverage would require swapping in a KRaftMetadataCache
+which is what `DescribeTopicPartitionsRequestHandlerTest` already
+covers.
+
+Coverage of RequestHandlerHelper.sendMaybeThrottle (lines 112-122):
+  Source lines  : 5 / 5    (100.0%)
+  Instructions  : 24 / 24  (100.0%)
+  Branches      : 2 / 2    (100.0%)
+
+The forwarded variant (`fuzzTestZkUnsupportedVersionForwarded`) is
+what closes the last branch (the `if (!request.isForwarded)` else-arm
+on line 118).
 
 ================================================
 
@@ -129,9 +148,7 @@ Crash findings
        name is null (the conventional encoding for an unresolved topic
        id in a fetch session), AND
     2. The FetchRequest version is <= 12 (versions for which the
-       FetchResponse schema still carries the topic name on the wire;
-       see FetchableTopicResponse.addSize line 755 of the generated
-       FetchResponseData.java).
+       FetchResponse schema still carries the topic name on the wire).
 
   A deterministic mock-driven repro is committed as
   core/src/test/scala/unit/kafka/server/KafkaApisHandleFetchRequestNpeReproducerTest.scala
