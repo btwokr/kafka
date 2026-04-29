@@ -38,8 +38,11 @@ Five `@FuzzTest` cases (`maxDuration = "20s"` each) live in
 `core/src/test/scala/unit/kafka/server/KafkaApisFetchFuzzTest.scala`:
 
 * `fuzzTestFetchConsumer` — fans out via a `mode` int over the
-  consumer-path branches (happy path, deny-auth, absent-topic,
-  not-leader-on-v16+, ZSTD-on-old-version log config).
+  consumer-path branches: happy path, deny-auth, absent-topic,
+  not-leader-on-v16+, ZSTD-on-old-version log config,
+  `KAFKA_STORAGE_ERROR` on v&le;5 (covers line 822), and
+  `UnsupportedCompressionTypeException` from down-converting
+  ZSTD-compressed records on v&le;3 (covers lines 883-884).
 * `fuzzTestFetchFollower` — follower path with the `CLUSTER_ACTION`
   authorizer either allowing or denying, plus null/absent topic
   sub-modes; covers the from-follower send branch.
@@ -168,9 +171,9 @@ Jazzer-discovered crashes after extracting the NPE finding into
 
 | Metric                | Covered / Total | %      |
 | --------------------- | --------------- | ------ |
-| Source lines          | 174 / 187       | 93.0%  |
-| Bytecode instructions | 1094 / 1352     | 80.9%  |
-| Branches              | 67 / 94         | 71.3%  |
+| Source lines          | 177 / 187       | 94.7%  |
+| Bytecode instructions | 1109 / 1352     | 82.0%  |
+| Branches              | 69 / 94         | 73.4%  |
 
 The remaining uncovered lines in both methods are documented per-line in
 [`coverage_results/coverage_summary.txt`](./coverage_results/coverage_summary.txt).

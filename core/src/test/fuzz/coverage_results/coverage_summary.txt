@@ -46,8 +46,12 @@ Source location   : KafkaApis.scala lines 757 - 1077
 
 Inputs:
 
-  KafkaApisFetchFuzzTest (5 tests, maxDuration = 20s each, 3,333 iterations):
-    fuzzTestFetchConsumer        :  781 runs
+  KafkaApisFetchFuzzTest (5 tests, maxDuration = 20s each, ~4,100
+  iterations after extending fuzzTestFetchConsumer's mode rotation):
+    fuzzTestFetchConsumer        :  784 runs (extended rotation incl.
+                                              KAFKA_STORAGE_ERROR mode 5
+                                              and UnsupportedCompressionType
+                                              mode 6)
     fuzzTestFetchFollower        :  760 runs
     fuzzTestFetchThrottling      :  554 runs
     fuzzTestFetchEmptyInteresting:  527 runs
@@ -55,31 +59,33 @@ Inputs:
 
   All 5 tests: BUILD SUCCESSFUL after the targeted bug-finding crash
   was extracted into KafkaApisHandleFetchRequestNpeReproducerTest.
-  Original consumer rotation (now removed) caused
-  fuzzTestFetchConsumer to surface the same NPE within ~16 runs - that
-  finding is preserved in the deterministic reproducer test.
+  Original consumer rotation caused fuzzTestFetchConsumer to surface
+  the same NPE within ~16 runs - that finding is preserved in the
+  deterministic reproducer test.
 
 Coverage of handleFetchRequest body (lines 757-1077):
-  Source lines  : 174 / 187   (93.0%)
-  Instructions  : 1094 / 1352 (80.9%)
-  Branches      :   67 / 94   (71.3%)
+  Source lines  : 177 / 187   (94.7%)   <- was 93.0%
+  Instructions  : 1109 / 1352 (82.0%)
+  Branches      :   69 / 94   (73.4%)
 
-Lines not covered (and why):
-  822           - KAFKA_STORAGE_ERROR + versionId <= 5 sub-branch in
-                  maybeDownConvertStorageError. Niche legacy error path;
-                  the fuzz harness doesn't produce KAFKA_STORAGE_ERROR
-                  responses from replicaManager.fetchMessages.
-  859           - The Some(magic) arm of the down-convert match. The
-                  current down-conversion fuzz test sometimes constructs
-                  empty records (LazyDownConversionRecords on empty
-                  MemoryRecords) so the Some path isn't reliably hit;
-                  reachable in principle with a more targeted fuzz seed.
-  883, 884      - The UnsupportedCompressionTypeException catch in
-                  maybeConvertFetchedData. Would require building a
-                  record batch whose compression codec actually fails
-                  during lazy down-conversion. Reachable in principle
-                  but out of scope for the current FuzzedDataProvider
-                  harness.
+Newly covered after extending fuzzTestFetchConsumer with two more modes:
+  822           - "KAFKA_STORAGE_ERROR && versionId <= 5" => NOT_LEADER_OR_FOLLOWER
+                  re-mapping (mode 5: version pinned to [2..5] with
+                  replicaManager.fetchMessages stubbed to return
+                  KAFKA_STORAGE_ERROR).
+  883, 884      - "UnsupportedCompressionTypeException" catch inside
+                  maybeConvertFetchedData (mode 6: ZSTD-compressed
+                  records + fetch v in [2..3], so the magic ladder picks
+                  V0/V1 and LazyDownConversionRecords' constructor
+                  refuses to down-convert zstd batches).
+
+Lines still not covered (and why):
+  859           - Scala match dispatch attribution artefact: the
+                  Some(magic) arm body (lines 860-880) is covered, but
+                  JaCoCo attributes the match dispatch instruction to
+                  line 859, which only counts as covered if both arms
+                  taken in the same JaCoCo bucket. Not a real code-path
+                  gap.
   950           - Format-arg lambda of the per-partition `debug(...)`
                   inside createResponse(). Pure logging output.
   972-978       - Body of the `updateConversionStats` send-callback for
@@ -93,11 +99,11 @@ Lines not covered (and why):
   1023          - Format-arg of `trace(...)` in the no-throttle send
                   path. Pure logging.
 
-Out of the 13 uncovered lines for handleFetchRequest, 6 are logging
-format-arg lambdas (950, 972-978, 990, 1023) and 1 is a niche legacy
-error-mapping branch (822). The remaining 4 (859, 883, 884) are all
-reachable in principle with more targeted record/compression input
-generation.
+Out of the 10 still-uncovered lines for handleFetchRequest, 8 are pure
+logging format-arg lambdas (950, 972-978, 990, 1023), 1 is the
+network-layer Send callback that the in-process harness can't drive,
+and 1 is a JaCoCo line-attribution artefact for a match dispatch that
+is in fact exercised.
 
 ================================================
 
