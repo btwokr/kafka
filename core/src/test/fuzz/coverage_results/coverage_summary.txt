@@ -1,0 +1,131 @@
+Coverage of kafka.server.KafkaApis fuzz targets
+================================================
+
+Method            : handleProduceRequest
+Source location   : KafkaApis.scala lines 606 - 752
+                    (includes nested closures sendResponseCallback /
+                    processingStatsCallback)
+
+Inputs (all merged into a single coverage.exec via JaCoCo append=true):
+
+  KafkaApisFuzzTest (8 tests, 11,743 fuzz iterations total):
+
+    Original 5 tests (maxDuration = 100s each, 10,009 iterations):
+      fuzzTestProduceResponseContainsNewLeaderOnNotLeaderOrFollower : 2080 runs
+      fuzzTestTransactionalParametersSetCorrectly                   : 1973 runs
+      fuzzTestNullableTransactionalId                               : 1925 runs
+      fuzzTestNoAuthorizedTransactionalRequest                      : 1849 runs
+      fuzzTestNoAuthorized                                          : 2182 runs
+
+    Coverage-improvement tests (maxDuration = 20s each, 1,734 iterations):
+      fuzzTestUnknownTopicOrPartition                               :  596 runs
+      fuzzTestThrottlingAndAckZeroNoOp                              :  521 runs
+      fuzzTestRequestThrottleDominates                              :  620 runs
+
+  All 8 tests: BUILD SUCCESSFUL, no Jazzer-discovered crashes.
+
+Coverage of handleProduceRequest body (lines 606-752):
+  Source lines  : 75 / 84    (89.3%)
+  Instructions  : 505 / 626  (80.7%)
+  Branches      :  36 / 42   (85.7%)
+
+Lines not covered (and why):
+  642           - "ApiException" catch in record validation: would
+                  require a hand-crafted invalid record batch.
+  660-663       - Format-arg lambda of debug(...): logging only.
+  710, 712      - Format-arg lambda of info(...): logging only.
+  726, 727      - processingStatsCallback body: invoked by the real
+                  replicaManager.handleProduceAppend, mocked away.
+
+================================================
+
+Method            : handleFetchRequest
+Source location   : KafkaApis.scala lines 757 - 1077
+                    (includes nested closures maybeDownConvertStorageError,
+                    maybeConvertFetchedData, processResponseCallback)
+
+Inputs:
+
+  KafkaApisFetchFuzzTest (5 tests, maxDuration = 20s each, 3,333 iterations):
+    fuzzTestFetchConsumer        :  781 runs
+    fuzzTestFetchFollower        :  760 runs
+    fuzzTestFetchThrottling      :  554 runs
+    fuzzTestFetchEmptyInteresting:  527 runs
+    fuzzTestFetchDownConversion  :  711 runs
+
+  All 5 tests: BUILD SUCCESSFUL after the targeted bug-finding crash
+  was extracted into KafkaApisHandleFetchRequestNpeReproducerTest.
+  Original consumer rotation (now removed) caused
+  fuzzTestFetchConsumer to surface the same NPE within ~16 runs - that
+  finding is preserved in the deterministic reproducer test.
+
+Coverage of handleFetchRequest body (lines 757-1077):
+  Source lines  : 174 / 187   (93.0%)
+  Instructions  : 1094 / 1352 (80.9%)
+  Branches      :   67 / 94   (71.3%)
+
+Lines not covered (and why):
+  822           - KAFKA_STORAGE_ERROR + versionId <= 5 sub-branch in
+                  maybeDownConvertStorageError. Niche legacy error path;
+                  the fuzz harness doesn't produce KAFKA_STORAGE_ERROR
+                  responses from replicaManager.fetchMessages.
+  859           - The Some(magic) arm of the down-convert match. The
+                  current down-conversion fuzz test sometimes constructs
+                  empty records (LazyDownConversionRecords on empty
+                  MemoryRecords) so the Some path isn't reliably hit;
+                  reachable in principle with a more targeted fuzz seed.
+  883, 884      - The UnsupportedCompressionTypeException catch in
+                  maybeConvertFetchedData. Would require building a
+                  record batch whose compression codec actually fails
+                  during lazy down-conversion. Reachable in principle
+                  but out of scope for the current FuzzedDataProvider
+                  harness.
+  950           - Format-arg lambda of the per-partition `debug(...)`
+                  inside createResponse(). Pure logging output.
+  972-978       - Body of the `updateConversionStats` send-callback for
+                  MultiRecordsSend / NetworkSend. Invoked by the network
+                  layer when responses are written to a Send pipeline;
+                  the harness short-circuits by passing the callback to
+                  requestChannel.sendResponse, which is a mock and
+                  doesn't actually execute the callback.
+  990           - Format-arg of `trace(...)` in the from-follower branch.
+                  Pure logging.
+  1023          - Format-arg of `trace(...)` in the no-throttle send
+                  path. Pure logging.
+
+Out of the 13 uncovered lines for handleFetchRequest, 6 are logging
+format-arg lambdas (950, 972-978, 990, 1023) and 1 is a niche legacy
+error-mapping branch (822). The remaining 4 (859, 883, 884) are all
+reachable in principle with more targeted record/compression input
+generation.
+
+================================================
+
+Crash findings
+==============
+
+  fuzzTestFetchConsumer surfaced a reproducible NullPointerException
+  in handleFetchRequest within ~16 fuzz iterations:
+
+    java.lang.NullPointerException: Cannot invoke
+      "String.getBytes(java.nio.charset.Charset)" because
+      "this.topic" is null
+      at FetchResponseData$FetchableTopicResponse.addSize(...)
+      at FetchResponseData.addSize(...)
+      at Message.size(...)
+      at FetchResponse.sizeOf(...)
+      at FullFetchContext.getResponseSize(FetchSession.scala:430)
+      at KafkaApis.processResponseCallback$1(KafkaApis.scala:1000)
+      at KafkaApis.handleFetchRequest(KafkaApis.scala:1033)
+
+  Trigger:
+    1. FetchManager#newContext returns a TopicIdPartition whose topic
+       name is null (the conventional encoding for an unresolved topic
+       id in a fetch session), AND
+    2. The FetchRequest version is <= 12 (versions for which the
+       FetchResponse schema still carries the topic name on the wire;
+       see FetchableTopicResponse.addSize line 755 of the generated
+       FetchResponseData.java).
+
+  A deterministic mock-driven repro is committed as
+  core/src/test/scala/unit/kafka/server/KafkaApisHandleFetchRequestNpeReproducerTest.scala

@@ -48,7 +48,8 @@ export JAZZER_FUZZ=1
 
 # 3. Run each fuzz test in its own JVM (Jazzer fuzzes only the first
 #    @FuzzTest per JVM lifetime).
-TESTS=(
+# handleProduceRequest fuzz targets (KafkaApisFuzzTest)
+PRODUCE_TESTS=(
     # Original tests (maxDuration = 100s each)
     fuzzTestProduceResponseContainsNewLeaderOnNotLeaderOrFollower
     fuzzTestTransactionalParametersSetCorrectly
@@ -61,15 +62,34 @@ TESTS=(
     fuzzTestRequestThrottleDominates
 )
 
+# handleFetchRequest fuzz targets (KafkaApisFetchFuzzTest, maxDuration = 20s each)
+FETCH_TESTS=(
+    fuzzTestFetchConsumer
+    fuzzTestFetchFollower
+    fuzzTestFetchThrottling
+    fuzzTestFetchEmptyInteresting
+    fuzzTestFetchDownConversion
+)
+
 mkdir -p "$JACOCO_DIR"
-for t in "${TESTS[@]}"; do
+
+run_one() {
+    local fqcn="$1"
+    local t="$2"
     echo "=========================================="
-    echo "[fuzz] running $t"
+    echo "[fuzz] running ${fqcn}.${t}"
     echo "=========================================="
     ./gradlew :core:test --no-daemon --rerun-tasks \
-        --tests "unit.kafka.server.KafkaApisFuzzTest.${t}" \
+        --tests "${fqcn}.${t}" \
         -i 2>&1 | tee "$JACOCO_DIR/run_${t}.log" | \
-        grep -E "(Fuzzing|fuzzTest.*PASSED|fuzzTest.*FAILED|Done [0-9]+ runs|<empty input>|exec/s: [0-9]+ |BUILD |^FAILURE)" || true
+        grep -E "(Fuzzing|fuzzTest.*PASSED|fuzzTest.*FAILED|Done [0-9]+ runs|<empty input>|exec/s: [0-9]+ |BUILD |^FAILURE|crash-)" || true
+}
+
+for t in "${PRODUCE_TESTS[@]}"; do
+    run_one "unit.kafka.server.KafkaApisFuzzTest" "$t"
+done
+for t in "${FETCH_TESTS[@]}"; do
+    run_one "unit.kafka.server.KafkaApisFetchFuzzTest" "$t"
 done
 
 # 4. Generate HTML/XML/CSV reports against the freshly compiled core classes.
@@ -87,11 +107,14 @@ echo "[fuzz] HTML report : $REPORT_DIR/html/index.html"
 echo "[fuzz] XML  report : $REPORT_DIR/coverage.xml"
 echo "[fuzz] exec data   : $EXEC"
 
-# 5. Print a focused summary of handleProduceRequest coverage.
+# 5. Print a focused summary of both fuzz targets' coverage.
 python3 - "$REPORT_DIR/coverage.xml" <<'PY'
 import sys, xml.etree.ElementTree as ET
 
-START_LINE, END_LINE = 606, 752  # body of handleProduceRequest in KafkaApis.scala
+TARGETS = [
+    ("handleProduceRequest", 606, 752),
+    ("handleFetchRequest",   757, 1077),
+]
 
 tree = ET.parse(sys.argv[1])
 root = tree.getroot()
@@ -106,27 +129,29 @@ if src is None:
     print("KafkaApis.scala source coverage not found in report")
     sys.exit(1)
 
-lines_in = [l for l in src.findall('line') if START_LINE <= int(l.get('nr')) <= END_LINE]
-mi = ci = mb = cb = 0
-covered, missed = [], []
-for l in lines_in:
-    mi_l = int(l.get('mi')); ci_l = int(l.get('ci'))
-    mb_l = int(l.get('mb')); cb_l = int(l.get('cb'))
-    mi += mi_l; ci += ci_l; mb += mb_l; cb += cb_l
-    nr = int(l.get('nr'))
-    if ci_l > 0:        covered.append(nr)
-    elif mi_l > 0:      missed.append(nr)
-
-total_lines = len(covered) + len(missed)
-total_instr = mi + ci
-total_br = mb + cb
-
-print()
-print("handleProduceRequest (KafkaApis.scala lines %d-%d):" % (START_LINE, END_LINE))
-print("  Source lines covered     : %d / %d  (%.1f%%)" % (len(covered), total_lines, 100.0*len(covered)/max(total_lines,1)))
-print("  Bytecode instructions    : %d / %d  (%.1f%%)" % (ci, total_instr, 100.0*ci/max(total_instr,1)))
-if total_br:
-    print("  Branches                 : %d / %d  (%.1f%%)" % (cb, total_br, 100.0*cb/max(total_br,1)))
-print()
-print("  Missed source lines      : %s" % missed)
+for name, start, end in TARGETS:
+    lines_in = [l for l in src.findall('line') if start <= int(l.get('nr')) <= end]
+    mi = ci = mb = cb = 0
+    covered, missed = [], []
+    for l in lines_in:
+        mi_l = int(l.get('mi')); ci_l = int(l.get('ci'))
+        mb_l = int(l.get('mb')); cb_l = int(l.get('cb'))
+        mi += mi_l; ci += ci_l; mb += mb_l; cb += cb_l
+        nr = int(l.get('nr'))
+        if ci_l > 0:    covered.append(nr)
+        elif mi_l > 0:  missed.append(nr)
+    total_lines = len(covered) + len(missed)
+    total_instr = mi + ci
+    total_br = mb + cb
+    print()
+    print("%s (KafkaApis.scala lines %d-%d):" % (name, start, end))
+    print("  Source lines  : %d / %d  (%.1f%%)" % (
+        len(covered), total_lines,
+        100.0*len(covered)/max(total_lines, 1)))
+    print("  Instructions  : %d / %d  (%.1f%%)" % (
+        ci, total_instr, 100.0*ci/max(total_instr, 1)))
+    if total_br:
+        print("  Branches      : %d / %d  (%.1f%%)" % (
+            cb, total_br, 100.0*cb/max(total_br, 1)))
+    print("  Missed lines  : %s" % missed)
 PY
