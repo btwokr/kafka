@@ -82,6 +82,45 @@ class KafkaApisDescribeTopicPartitionsFuzzTest extends KafkaApisTest {
   }
 
   /**
+   * Drives the `request.isForwarded == true` branch of
+   * `RequestHandlerHelper.sendMaybeThrottle` (line 118). Wraps the
+   * DescribeTopicPartitionsRequest in an envelope so the resulting
+   * RequestChannel.Request reports isForwarded == true; in that case
+   * sendMaybeThrottle skips the local throttle() call and goes
+   * straight to maybeSetThrottleTimeMs + sendResponse.
+   */
+  @FuzzTest(maxDuration = "20s")
+  def fuzzTestZkUnsupportedVersionForwarded(data: FuzzedDataProvider): Unit = {
+    val version = data.consumeInt(
+      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.oldestVersion().toInt,
+      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.latestVersion().toInt).toShort
+    val numTopics = data.consumeInt(0, 16)
+    val nameLen = data.consumeInt(0, 64)
+    val throttleMs = data.consumeInt(0, 100)
+
+    val requestData = new DescribeTopicPartitionsRequestData()
+    var i = 0
+    while (i < numTopics) {
+      val rawName = new String(data.consumeBytes(nameLen))
+      val safeName = if (rawName.isEmpty) s"fuzz-fwd-topic-$i" else rawName
+      requestData.topics().add(
+        new DescribeTopicPartitionsRequestData.TopicRequest().setName(safeName))
+      i += 1
+    }
+
+    val req = new DescribeTopicPartitionsRequest.Builder(requestData).build(version)
+    val request = buildForwardedRequest(req)
+
+    reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyLong)).thenReturn(throttleMs)
+
+    val kafkaApis = createKafkaApis()
+    try kafkaApis.handleDescribeTopicPartitionsRequest(request)
+    finally kafkaApis.close()
+  }
+
+  /**
    * Same as `fuzzTestZkUnsupportedVersion` but pins the request quota to
    * a positive throttle value so `RequestHandlerHelper.throttle(...)`
    * actually mutes the channel before the response is sent.
