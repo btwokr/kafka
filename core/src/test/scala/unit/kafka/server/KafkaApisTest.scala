@@ -131,7 +131,9 @@ class KafkaApisTest extends Logging {
   private val replicaQuotaManager: ReplicationQuotaManager = mock(classOf[ReplicationQuotaManager])
   private val quotas = QuotaManagers(clientQuotaManager, clientQuotaManager, clientRequestQuotaManager,
     clientControllerQuotaManager, replicaQuotaManager, replicaQuotaManager, replicaQuotaManager, None)
-  private val fetchManager: FetchManager = mock(classOf[FetchManager])
+  // Exposed (non-private) so that fuzz tests in `unit.kafka.server` can stub
+  // it directly. See KafkaApisFetchFuzzTest.
+  val fetchManager: FetchManager = mock(classOf[FetchManager])
   private val clientMetricsManager: ClientMetricsManager = mock(classOf[ClientMetricsManager])
   private val brokerTopicStats = new BrokerTopicStats
   private val clusterId = "clusterId"
