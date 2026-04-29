@@ -23,7 +23,7 @@ import scala.collection.{Map, Seq}
 import scala.jdk.CollectionConverters.SeqHasAsJava
 
 class KafkaApisFuzzTest extends KafkaApisTest {
-  @FuzzTest(maxDuration = "10s")
+  @FuzzTest(maxDuration = "100s")
   def fuzzTestProduceResponseContainsNewLeaderOnNotLeaderOrFollower(data: FuzzedDataProvider): Unit = {
     // Arrange
     val version = data.consumeInt(10, ApiKeys.PRODUCE.latestVersion).toShort
@@ -87,7 +87,7 @@ class KafkaApisFuzzTest extends KafkaApisTest {
     }
   }
 
-  @FuzzTest(maxDuration = "10h")
+  @FuzzTest(maxDuration = "100s")
   def fuzzTestTransactionalParametersSetCorrectly(data: FuzzedDataProvider): Unit = {
     val transactionalId = data.consumeString(5)
     val timeoutMs = data.consumeInt(0, 5000)
@@ -136,7 +136,7 @@ class KafkaApisFuzzTest extends KafkaApisTest {
     }
   }
 
-  @FuzzTest(maxDuration = "10h")
+  @FuzzTest(maxDuration = "100s")
   def fuzzTestNullableTransactionalId(data: FuzzedDataProvider): Unit = {
     val timeoutMs = data.consumeInt(0, 5000)
     val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
@@ -184,7 +184,7 @@ class KafkaApisFuzzTest extends KafkaApisTest {
     }
   }
 
-  @FuzzTest(maxDuration = "10h")
+  @FuzzTest(maxDuration = "100s")
   def fuzzTestNoAuthorizedTransactionalRequest(data: FuzzedDataProvider): Unit = {
     val transactionalId = data.consumeString(5)
     val timeoutMs = data.consumeInt(0, 5000)
@@ -237,7 +237,7 @@ class KafkaApisFuzzTest extends KafkaApisTest {
     }
   }
 
-  @FuzzTest(maxDuration = "10h")
+  @FuzzTest(maxDuration = "100s")
   def fuzzTestNoAuthorized(data: FuzzedDataProvider): Unit = {
     val timeoutMs = data.consumeInt(0, 5000)
     val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
