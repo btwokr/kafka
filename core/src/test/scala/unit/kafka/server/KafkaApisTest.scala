@@ -131,7 +131,9 @@ class KafkaApisTest extends Logging {
   private val replicaQuotaManager: ReplicationQuotaManager = mock(classOf[ReplicationQuotaManager])
   private val quotas = QuotaManagers(clientQuotaManager, clientQuotaManager, clientRequestQuotaManager,
     clientControllerQuotaManager, replicaQuotaManager, replicaQuotaManager, replicaQuotaManager, None)
-  private val fetchManager: FetchManager = mock(classOf[FetchManager])
+  // Exposed (non-private) so that fuzz tests in `unit.kafka.server` can stub
+  // it directly. See KafkaApisFetchFuzzTest.
+  val fetchManager: FetchManager = mock(classOf[FetchManager])
   private val clientMetricsManager: ClientMetricsManager = mock(classOf[ClientMetricsManager])
   private val brokerTopicStats = new BrokerTopicStats
   private val clusterId = "clusterId"
@@ -6387,6 +6389,38 @@ class KafkaApisTest extends Logging {
       ClientInformation.EMPTY, fromPrivilegedListener, Optional.of(kafkaPrincipalSerde))
     new RequestChannel.Request(processor = 1, context = context, startTimeNanos = 0, MemoryPool.NONE, buffer,
       requestMetrics, envelope = None)
+  }
+
+  /**
+   * Build a forwarded request: the resulting `RequestChannel.Request` has
+   * `envelope = Some(...)` so `request.isForwarded` returns true. Useful
+   * for fuzz tests that want to drive the `request.isForwarded == true`
+   * branches in `RequestHandlerHelper.sendMaybeThrottle` and friends.
+   */
+  def buildForwardedRequest(
+      request: AbstractRequest,
+      listenerName: ListenerName = ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT),
+      requestMetrics: RequestChannel.Metrics = requestChannelMetrics): RequestChannel.Request = {
+    val envelope = TestUtils.buildEnvelopeRequest(
+      request,
+      kafkaPrincipalSerde,
+      requestMetrics,
+      startTimeNanos = 0
+    )
+    val innerHeader = new RequestHeader(request.apiKey, request.version, clientId, 0)
+    val innerBuffer = request.serializeWithHeader(innerHeader)
+    RequestHeader.parse(innerBuffer)
+    val innerContext = new RequestContext(innerHeader, "1", InetAddress.getLocalHost, Optional.empty(),
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice"), listenerName, SecurityProtocol.SSL,
+      ClientInformation.EMPTY, /* fromPrivilegedListener = */ true, Optional.of(kafkaPrincipalSerde))
+    new RequestChannel.Request(
+      processor = envelope.processor,
+      context = innerContext,
+      startTimeNanos = envelope.startTimeNanos,
+      memoryPool = MemoryPool.NONE,
+      buffer = innerBuffer,
+      metrics = requestMetrics,
+      envelope = Some(envelope))
   }
 
   private def verifyNoThrottling[T <: AbstractResponse](

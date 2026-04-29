@@ -1,0 +1,154 @@
+Coverage of kafka.server.KafkaApis fuzz targets
+================================================
+
+Method            : handleProduceRequest
+Source location   : KafkaApis.scala lines 606 - 752
+
+Inputs (all merged into a single coverage.exec via JaCoCo append=true):
+
+  KafkaApisFuzzTest (8 tests, 11,743 fuzz iterations total):
+
+    Original 5 tests (maxDuration = 100s each, 10,009 iterations):
+      fuzzTestProduceResponseContainsNewLeaderOnNotLeaderOrFollower : 2080 runs
+      fuzzTestTransactionalParametersSetCorrectly                   : 1973 runs
+      fuzzTestNullableTransactionalId                               : 1925 runs
+      fuzzTestNoAuthorizedTransactionalRequest                      : 1849 runs
+      fuzzTestNoAuthorized                                          : 2182 runs
+
+    Coverage-improvement tests (maxDuration = 20s each, 1,734 iterations):
+      fuzzTestUnknownTopicOrPartition                               :  596 runs
+      fuzzTestThrottlingAndAckZeroNoOp                              :  521 runs
+      fuzzTestRequestThrottleDominates                              :  620 runs
+
+  All 8 tests: BUILD SUCCESSFUL, no Jazzer-discovered crashes.
+
+Coverage of handleProduceRequest body (lines 606-752):
+  Source lines  : 75 / 84    (89.3%)
+  Instructions  : 505 / 626  (80.7%)
+  Branches      :  36 / 42   (85.7%)
+
+Lines not covered (and why):
+  642           - "ApiException" catch in record validation: would
+                  require a hand-crafted invalid record batch.
+  660-663       - Format-arg lambda of debug(...): logging only.
+  710, 712      - Format-arg lambda of info(...): logging only.
+  726, 727      - processingStatsCallback body: invoked by the real
+                  replicaManager.handleProduceAppend, mocked away.
+
+================================================
+
+Method            : handleFetchRequest
+Source location   : KafkaApis.scala lines 757 - 1077
+
+Inputs:
+
+  KafkaApisFetchFuzzTest (5 tests, maxDuration = 20s each, ~4,100
+  iterations after extending fuzzTestFetchConsumer's mode rotation):
+    fuzzTestFetchConsumer        :  784 runs (extended rotation incl.
+                                              KAFKA_STORAGE_ERROR mode 5
+                                              and UnsupportedCompressionType
+                                              mode 6)
+    fuzzTestFetchFollower        :  760 runs
+    fuzzTestFetchThrottling      :  554 runs
+    fuzzTestFetchEmptyInteresting:  527 runs
+    fuzzTestFetchDownConversion  :  711 runs
+
+  All 5 tests: BUILD SUCCESSFUL after the targeted bug-finding crash
+  was extracted into KafkaApisHandleFetchRequestNpeReproducerTest.
+
+Coverage of handleFetchRequest body (lines 757-1077):
+  Source lines  : 177 / 187   (94.7%)
+  Instructions  : 1109 / 1352 (82.0%)
+  Branches      :   69 / 94   (73.4%)
+
+Lines not covered (and why):
+  859           - JaCoCo line-attribution artefact for the
+                  down-convert match dispatch; the Some(magic) arm
+                  body (860-880) IS covered.
+  950           - debug(...) format-arg lambda inside createResponse.
+  972-978       - updateConversionStats body for MultiRecordsSend /
+                  NetworkSend: only invoked by the real network layer.
+  990           - trace(...) format-arg in the from-follower branch.
+  1023          - trace(...) format-arg in the no-throttle send path.
+
+================================================
+
+Method            : handleDescribeTopicPartitionsRequest (ZK arm only)
+Source location   : KafkaApis.scala lines 1445 - 1461
+Supporting helper : RequestHandlerHelper.sendMaybeThrottle
+                    (RequestHandlerHelper.scala lines 112-122)
+
+Inputs:
+
+  KafkaApisDescribeTopicPartitionsFuzzTest (3 tests,
+  maxDuration = 20s each, ~1,080 iterations):
+    fuzzTestZkUnsupportedVersion           :  389 runs
+        (no-throttle path through sendMaybeThrottle)
+    fuzzTestZkUnsupportedVersionThrottled  :  362 runs
+        (positive throttle => RequestHandlerHelper.throttle(...) is
+         actually called before sendResponse)
+    fuzzTestZkUnsupportedVersionForwarded  :  329 runs
+        (envelope-wrapped request => request.isForwarded == true,
+         covers the else-arm of the !request.isForwarded branch
+         in sendMaybeThrottle line 118)
+
+  All 3 tests: BUILD SUCCESSFUL, no Jazzer-discovered crashes.
+
+Coverage of handleDescribeTopicPartitionsRequest (lines 1445-1461):
+  Source lines (whole method) : 4 / 10   (40.0%)
+  Source lines (ZK arm only)  : 4 / 4    (100.0%)
+  Branches (whole method)     : 2 / 4    (50.0%)
+  Branches (ZK arm only)      : 2 / 2    (100.0%)
+
+Per-line status:
+  1446 (`describeTopicPartitionsRequestHandler match`)         covered
+  1447 (`Some(handler) =>`)                                    covered (case dispatch)
+  1448-1454 (KRaft arm body)                                   missed - OUT OF SCOPE
+  1457 (`None =>`)                                             covered
+  1458 (sendMaybeThrottle + getErrorResponse)                  covered
+
+The KRaft arm (1448-1454) is intentionally out of scope per the
+task brief: KafkaApisTest defaults to ZkMetadataCache so the
+`describeTopicPartitionsRequestHandler` field is None, which means
+the `Some(handler)` case is unreachable from these tests. Adding
+KRaft coverage would require swapping in a KRaftMetadataCache
+which is what `DescribeTopicPartitionsRequestHandlerTest` already
+covers.
+
+Coverage of RequestHandlerHelper.sendMaybeThrottle (lines 112-122):
+  Source lines  : 5 / 5    (100.0%)
+  Instructions  : 24 / 24  (100.0%)
+  Branches      : 2 / 2    (100.0%)
+
+The forwarded variant (`fuzzTestZkUnsupportedVersionForwarded`) is
+what closes the last branch (the `if (!request.isForwarded)` else-arm
+on line 118).
+
+================================================
+
+Crash findings
+==============
+
+  fuzzTestFetchConsumer surfaced a reproducible NullPointerException
+  in handleFetchRequest within ~16 fuzz iterations:
+
+    java.lang.NullPointerException: Cannot invoke
+      "String.getBytes(java.nio.charset.Charset)" because
+      "this.topic" is null
+      at FetchResponseData$FetchableTopicResponse.addSize(...)
+      at FetchResponseData.addSize(...)
+      at Message.size(...)
+      at FetchResponse.sizeOf(...)
+      at FullFetchContext.getResponseSize(FetchSession.scala:430)
+      at KafkaApis.processResponseCallback$1(KafkaApis.scala:1000)
+      at KafkaApis.handleFetchRequest(KafkaApis.scala:1033)
+
+  Trigger:
+    1. FetchManager#newContext returns a TopicIdPartition whose topic
+       name is null (the conventional encoding for an unresolved topic
+       id in a fetch session), AND
+    2. The FetchRequest version is <= 12 (versions for which the
+       FetchResponse schema still carries the topic name on the wire).
+
+  A deterministic mock-driven repro is committed as
+  core/src/test/scala/unit/kafka/server/KafkaApisHandleFetchRequestNpeReproducerTest.scala
