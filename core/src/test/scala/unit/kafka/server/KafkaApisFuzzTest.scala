@@ -287,6 +287,206 @@ class KafkaApisFuzzTest extends KafkaApisTest {
     }
   }
 
+  // ------------------------------------------------------------------------
+  // Additional fuzz tests targeting branches that the original 5 tests did
+  // not cover in handleProduceRequest. See core/src/test/fuzz/README.md.
+  // ------------------------------------------------------------------------
+
+  /**
+   * Targets line 635: topic is authorized but NOT present in the metadata
+   * cache => UNKNOWN_TOPIC_OR_PARTITION branch.
+   *
+   * Compared with the existing fuzz tests, this one deliberately does NOT
+   * call addTopicToMetadataCache(topic, ...).
+   */
+  @FuzzTest(maxDuration = "20s")
+  def fuzzTestUnknownTopicOrPartition(data: FuzzedDataProvider): Unit = {
+    val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
+    val acks = data.consumeInt(0, 1).toShort
+    val timeoutMs = data.consumeInt(0, 5000)
+    val compression = buildCompression(data.consumeInt(0, 4), version)
+    val splitSize = data.consumeInt(10, 4096)
+    val (topic, record) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
+
+    reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
+
+    val tp = new TopicPartition(topic, 0)
+
+    val produceRequest = ProduceRequest.forCurrentMagic(new ProduceRequestData()
+        .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+          Collections.singletonList(new ProduceRequestData.TopicProduceData()
+              .setName(tp.topic).setPartitionData(Collections.singletonList(
+                new ProduceRequestData.PartitionProduceData()
+                  .setIndex(tp.partition)
+                  .setRecords(MemoryRecords.withRecords(compression, new SimpleRecord(record))))))
+            .iterator))
+        .setAcks(acks)
+        .setTimeoutMs(timeoutMs))
+      .build(version)
+    val request = buildRequest(produceRequest)
+
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](),
+      any[Long])).thenReturn(0)
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
+
+    val kafkaApis = createKafkaApis()
+    try {
+      kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+    } finally {
+      kafkaApis.close()
+    }
+  }
+
+  /**
+   * Targets lines 691-697: throttling branch in sendResponseCallback.
+   * Drives both the bandwidth-throttle (line 694) and request-throttle
+   * (line 696) sub-branches by varying which mocked quota manager
+   * returns the larger value.
+   *
+   * Also exercises line 718 (sendNoOpResponseExemptThrottle) by routing
+   * a non-error PartitionResponse back through the response callback
+   * with acks == 0.
+   */
+  @FuzzTest(maxDuration = "20s")
+  def fuzzTestThrottlingAndAckZeroNoOp(data: FuzzedDataProvider): Unit = {
+    val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
+    val compression = buildCompression(data.consumeInt(0, 4), version)
+    val splitSize = data.consumeInt(10, 4096)
+    val timeoutMs = data.consumeInt(0, 5000)
+    // Always acks == 0 so we can also exercise line 718 (sendNoOpResponseExemptThrottle).
+    val acks: Short = 0
+    // We want maxThrottleTimeMs > 0 (line 691) deterministically so line
+    // 692 and the `bandwidthThrottle > requestThrottle` branch (line 694)
+    // are exercised on every iteration. With acks == 0 the request quota
+    // is forced to 0 by line 688, so we just need bandwidth >= 1.
+    val bandwidthThrottle = data.consumeInt(1, 100)
+    val requestThrottle   = data.consumeInt(0, 100)
+
+    val (topic, record) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
+    addTopicToMetadataCache(topic, numPartitions = 2)
+
+    reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
+
+    val tp = new TopicPartition(topic, 0)
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+
+    val produceRequest = ProduceRequest.forCurrentMagic(new ProduceRequestData()
+        .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+          Collections.singletonList(new ProduceRequestData.TopicProduceData()
+              .setName(tp.topic).setPartitionData(Collections.singletonList(
+                new ProduceRequestData.PartitionProduceData()
+                  .setIndex(tp.partition)
+                  .setRecords(MemoryRecords.withRecords(compression, new SimpleRecord(record))))))
+            .iterator))
+        .setAcks(acks)
+        .setTimeoutMs(timeoutMs))
+      .build(version)
+    val request = buildRequest(produceRequest)
+
+    // Reply to handleProduceAppend with a successful (no-error) response so
+    // errorInResponse stays false and line 718 (sendNoOpResponseExemptThrottle)
+    // is reached.
+    when(replicaManager.handleProduceAppend(anyLong,
+      anyShort,
+      ArgumentMatchers.eq(false),
+      any(),
+      any(),
+      responseCallback.capture(),
+      any(),
+      any(),
+      any(),
+      any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(Map(tp -> new PartitionResponse(Errors.NONE))))
+
+    // Non-zero throttle returns => maxThrottleTimeMs > 0 (line 691).
+    // Note: when acks == 0 the request quota is forced to 0 by line 688,
+    // so to exercise line 696 we run a sibling test invocation below
+    // (acks == 1) - controlled by the next test.
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(bandwidthThrottle)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(requestThrottle)
+
+    val kafkaApis = createKafkaApis()
+    try {
+      kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+    } finally {
+      kafkaApis.close()
+    }
+  }
+
+  /**
+   * Targets line 696 specifically: requestThrottle > bandwidthThrottle, so
+   * sendResponseCallback takes the else branch of `if (bandwidthThrottle...
+   * > requestThrottle...)`.
+   *
+   * Uses acks == 1 so the request quota is actually consulted (see the
+   * branch on line 688) and the non-acks==0 send path on line 721 is also
+   * exercised. Throttle values are derived deterministically from the
+   * fuzz input so every iteration triggers line 696 regardless of the
+   * input length.
+   */
+  @FuzzTest(maxDuration = "20s")
+  def fuzzTestRequestThrottleDominates(data: FuzzedDataProvider): Unit = {
+    val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
+    val compression = buildCompression(data.consumeInt(0, 4), version)
+    val splitSize = data.consumeInt(10, 4096)
+    val timeoutMs = data.consumeInt(0, 5000)
+    val acks: Short = 1
+    // Fix bandwidth low and pick request strictly higher so the
+    // `requestThrottle > bandwidthThrottle` branch always wins.
+    val bandwidthThrottle = 1
+    val requestThrottle   = data.consumeInt(2, 100)
+
+    val (topic, record) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
+    addTopicToMetadataCache(topic, numPartitions = 2)
+
+    reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
+
+    val tp = new TopicPartition(topic, 0)
+    val responseCallback: ArgumentCaptor[Map[TopicPartition, PartitionResponse] => Unit] =
+      ArgumentCaptor.forClass(classOf[Map[TopicPartition, PartitionResponse] => Unit])
+
+    val produceRequest = ProduceRequest.forCurrentMagic(new ProduceRequestData()
+        .setTopicData(new ProduceRequestData.TopicProduceDataCollection(
+          Collections.singletonList(new ProduceRequestData.TopicProduceData()
+              .setName(tp.topic).setPartitionData(Collections.singletonList(
+                new ProduceRequestData.PartitionProduceData()
+                  .setIndex(tp.partition)
+                  .setRecords(MemoryRecords.withRecords(compression, new SimpleRecord(record))))))
+            .iterator))
+        .setAcks(acks)
+        .setTimeoutMs(timeoutMs))
+      .build(version)
+    val request = buildRequest(produceRequest)
+
+    when(replicaManager.handleProduceAppend(anyLong,
+      anyShort,
+      ArgumentMatchers.eq(false),
+      any(),
+      any(),
+      responseCallback.capture(),
+      any(),
+      any(),
+      any(),
+      any())
+    ).thenAnswer(_ => responseCallback.getValue.apply(Map(tp -> new PartitionResponse(Errors.NONE))))
+
+    when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(bandwidthThrottle)
+    when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
+      any[RequestChannel.Request](), any[Long])).thenReturn(requestThrottle)
+
+    val kafkaApis = createKafkaApis()
+    try {
+      kafkaApis.handleProduceRequest(request, RequestLocal.withThreadConfinedCaching)
+    } finally {
+      kafkaApis.close()
+    }
+  }
+
   def helperSplitByteArray(byteArray: Array[Byte], splitSize: Int): (String, Array[Byte]) = {
     // Ensure the split size is valid
     require(splitSize >= 0, "Split size must be non-negative")
