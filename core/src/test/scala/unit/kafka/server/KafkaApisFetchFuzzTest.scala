@@ -154,7 +154,12 @@ class KafkaApisFetchFuzzTest extends KafkaApisTest {
    *   - the maybeConvertFetchedData magic ladder (lines 850-857) by
    *     varying the FetchRequest version,
    *   - the ZSTD-on-old-version branch (line 833) when log config has
-   *     ZSTD compression.
+   *     ZSTD compression,
+   *   - line 822 (KAFKA_STORAGE_ERROR -> NOT_LEADER_OR_FOLLOWER) when
+   *     replicaManager returns KAFKA_STORAGE_ERROR for a v<=5 fetch,
+   *   - lines 883-884 (UnsupportedCompressionTypeException catch in
+   *     maybeConvertFetchedData) when ZSTD-compressed records are
+   *     down-converted to magic v0/v1 for a v<=3 fetch.
    *
    * The "null topic in fetch context => UNKNOWN_TOPIC_ID" sub-branch
    * (lines 800-801) is exercised by `fuzzTestFetchEmptyInteresting` so
@@ -166,8 +171,16 @@ class KafkaApisFetchFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = "20s")
   def fuzzTestFetchConsumer(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(2, ApiKeys.FETCH.latestVersion).toShort
-    val mode = data.consumeInt(0, 4)
+    val mode = data.consumeInt(0, 6)
+    // For modes 5 (KAFKA_STORAGE_ERROR + v<=5 mapping) and 6
+    // (UnsupportedCompressionTypeException + v<=3 down-conversion) we pin
+    // the FetchRequest version low so the targeted branches are reached
+    // on every iteration; otherwise we let the fuzzer pick.
+    val version: Short = mode match {
+      case 5 => data.consumeInt(2, 5).toShort
+      case 6 => data.consumeInt(2, 3).toShort
+      case _ => data.consumeInt(2, ApiKeys.FETCH.latestVersion).toShort
+    }
     val maxBytes = data.consumeInt(1, 1024 * 1024)
     val minBytes = data.consumeInt(0, 1024)
     val maxWait = data.consumeInt(0, 5000)
@@ -188,11 +201,16 @@ class KafkaApisFetchFuzzTest extends KafkaApisTest {
     //   2 -> topic NOT in metadata cache => UNKNOWN_TOPIC_OR_PARTITION
     //   3 -> happy path with NOT_LEADER_OR_FOLLOWER on v16+
     //   4 -> happy path with ZSTD log config
-    val isDenyAuth  = mode == 1
-    val isAbsent    = mode == 2
-    val notLeader   = mode == 3
-    val zstdConfig  = mode == 4
-    val isNullTopic = false
+    //   5 -> KAFKA_STORAGE_ERROR on v<=5 (covers line 822)
+    //   6 -> ZSTD-compressed records down-converted on v<=3
+    //        => UnsupportedCompressionTypeException catch (lines 883-884)
+    val isDenyAuth     = mode == 1
+    val isAbsent       = mode == 2
+    val notLeader      = mode == 3
+    val zstdConfig     = mode == 4
+    val storageError   = mode == 5
+    val zstdRecords    = mode == 6
+    val isNullTopic    = false
 
     if (!isAbsent) {
       addTopicToMetadataCache(topic, numPartitions = 2, numBrokers = 3, topicId = topicId)
@@ -202,7 +220,12 @@ class KafkaApisFetchFuzzTest extends KafkaApisTest {
       topic, topicId, partition, isFollower = false, withNullTopicName = isNullTopic)
     stubFetchManager(ctx)
 
-    // LogConfig: pick something sensible per mode.
+    // LogConfig: pick something sensible per mode. For mode 6 we want the
+    // on-disk message format to be magic >= V2 so the down-convert ladder
+    // (lines 850-857) returns Some(MAGIC_VALUE_V0) for fetch v<=1 (or
+    // MAGIC_VALUE_V1 for v<=3), forcing maybeConvertFetchedData into the
+    // try block at line 866 where the LazyDownConversionRecords
+    // constructor will throw for ZSTD-compressed records.
     val logConfigProps = new Properties()
     if (zstdConfig) logConfigProps.put("compression.type", BrokerCompressionType.ZSTD.name)
     val logConfig = LogConfig.fromProps(Collections.emptyMap(), logConfigProps)
@@ -213,11 +236,22 @@ class KafkaApisFetchFuzzTest extends KafkaApisTest {
     when(mockedPartition.leaderReplicaIdOpt).thenReturn(Some(2))
     when(mockedPartition.getLeaderEpoch).thenReturn(5)
 
-    // Stub fetchMessages to return the chosen error.
-    val records = if (recordBytes.isEmpty) MemoryRecords.EMPTY
-      else MemoryRecords.withRecords(Compression.NONE, new SimpleRecord(recordBytes))
+    // Build records. Mode 6 needs ZSTD-compressed records so the
+    // LazyDownConversionRecords constructor throws
+    // UnsupportedCompressionTypeException (RecordsUtil.downConvert refuses
+    // to down-convert zstd batches to magic v0/v1).
+    val recordCompression =
+      if (zstdRecords) Compression.zstd().build()
+      else Compression.NONE
+    val payload =
+      if (zstdRecords && recordBytes.isEmpty) "fuzz-record-payload".getBytes
+      else recordBytes
+    val records = if (payload.isEmpty) MemoryRecords.EMPTY
+      else MemoryRecords.withRecords(recordCompression, new SimpleRecord(payload))
+
     val err =
-      if (notLeader && version >= 16) Errors.NOT_LEADER_OR_FOLLOWER
+      if (storageError) Errors.KAFKA_STORAGE_ERROR
+      else if (notLeader && version >= 16) Errors.NOT_LEADER_OR_FOLLOWER
       else Errors.NONE
     stubFetchMessages(tipInContext, err, records, hw = 3L, logStartOffset = 0L,
       isReassignmentFetch = false)
