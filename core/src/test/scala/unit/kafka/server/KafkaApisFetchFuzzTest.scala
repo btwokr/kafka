@@ -145,7 +145,6 @@ class KafkaApisFetchFuzzTest extends KafkaApisTest {
   /**
    * Consumer fetch path (non-follower). Drives:
    *   - the !isFromFollower partition-collection block (lines 798-813),
-   *   - line 800-801 (null topic in fetch context => UNKNOWN_TOPIC_ID),
    *   - line 808 (TOPIC_AUTHORIZATION_FAILED) when the authorizer denies,
    *   - line 810 (UNKNOWN_TOPIC_OR_PARTITION) when the topic is absent
    *     from the metadata cache,
@@ -156,11 +155,19 @@ class KafkaApisFetchFuzzTest extends KafkaApisTest {
    *     varying the FetchRequest version,
    *   - the ZSTD-on-old-version branch (line 833) when log config has
    *     ZSTD compression.
+   *
+   * The "null topic in fetch context => UNKNOWN_TOPIC_ID" sub-branch
+   * (lines 800-801) is exercised by `fuzzTestFetchEmptyInteresting` so
+   * that this test can stay focused on the regular consumer paths.
+   * Putting that branch in the per-iteration `mode` rotation here causes
+   * Jazzer to surface a known NPE in handleFetchRequest within ~10 runs
+   * (see `KafkaApisHandleFetchRequestNpeReproducerTest`), which would
+   * stop the rest of this test from being explored.
    */
   @FuzzTest(maxDuration = "20s")
   def fuzzTestFetchConsumer(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(2, ApiKeys.FETCH.latestVersion).toShort
-    val mode = data.consumeInt(0, 5)
+    val mode = data.consumeInt(0, 4)
     val maxBytes = data.consumeInt(1, 1024 * 1024)
     val minBytes = data.consumeInt(0, 1024)
     val maxWait = data.consumeInt(0, 5000)
@@ -177,16 +184,15 @@ class KafkaApisFetchFuzzTest extends KafkaApisTest {
 
     // Decide which sub-branch to drive based on `mode`.
     //   0 -> happy path (topic in cache, no authorizer, NONE)
-    //   1 -> null topic in fetch context => UNKNOWN_TOPIC_ID
-    //   2 -> deny authorizer => TOPIC_AUTHORIZATION_FAILED
-    //   3 -> topic NOT in metadata cache => UNKNOWN_TOPIC_OR_PARTITION
-    //   4 -> happy path with NOT_LEADER_OR_FOLLOWER on v16+
-    //   5 -> happy path with ZSTD log config
-    val isNullTopic = mode == 1
-    val isDenyAuth  = mode == 2
-    val isAbsent    = mode == 3
-    val notLeader   = mode == 4
-    val zstdConfig  = mode == 5
+    //   1 -> deny authorizer => TOPIC_AUTHORIZATION_FAILED
+    //   2 -> topic NOT in metadata cache => UNKNOWN_TOPIC_OR_PARTITION
+    //   3 -> happy path with NOT_LEADER_OR_FOLLOWER on v16+
+    //   4 -> happy path with ZSTD log config
+    val isDenyAuth  = mode == 1
+    val isAbsent    = mode == 2
+    val notLeader   = mode == 3
+    val zstdConfig  = mode == 4
+    val isNullTopic = false
 
     if (!isAbsent) {
       addTopicToMetadataCache(topic, numPartitions = 2, numBrokers = 3, topicId = topicId)
@@ -382,14 +388,15 @@ class KafkaApisFetchFuzzTest extends KafkaApisTest {
 
     val request = buildFetchRequestPayload(tip, version,
       replicaId = -1, maxBytes, minBytes, maxWait)
-    // Note: when the fetch context contains ONLY null-topic-name partitions,
-    // the resulting unconverted FetchResponse may include a topic with a
-    // null name, which fails the protocol-level size computation
-    // (FetchResponseData$FetchableTopicResponse.addSize NPE). That isn't
-    // a fuzzer-found bug per se - it requires the fetch session to lie
-    // about a topic - but it shouldn't stop us from exploring the rest of
-    // the input space here. We swallow the protocol-encode NPE and re-throw
-    // anything else so that Jazzer can still surface real crashes.
+    // Known finding: when the fetch context contains ONLY null-topic-name
+    // partitions AND the FetchRequest version is <= 12, the resulting
+    // unconverted FetchResponse fails the protocol-level size computation
+    // (FetchResponseData$FetchableTopicResponse.addSize NPE) inside
+    // handleFetchRequest. The deterministic reproducer for this bug is
+    // `KafkaApisHandleFetchRequestNpeReproducerTest`. Until the bug is
+    // fixed in handleFetchRequest, we swallow the topic-related NPE here
+    // so Jazzer can keep exploring the rest of the input space and
+    // surface other crashes. Any other Throwable is allowed to propagate.
     withKafkaApis() { k =>
       try {
         k.handleFetchRequest(request)
