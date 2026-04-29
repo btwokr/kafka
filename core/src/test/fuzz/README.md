@@ -5,13 +5,28 @@ This directory documents how to run the Jazzer fuzz tests in
 collect line/branch coverage of the fuzz target
 (`kafka.server.KafkaApis#handleProduceRequest`) with JaCoCo.
 
-There are five `@FuzzTest`-annotated cases in `KafkaApisFuzzTest`:
+There are eight `@FuzzTest`-annotated cases in `KafkaApisFuzzTest`:
+
+The five original tests (`maxDuration = "100s"` each):
 
 * `fuzzTestProduceResponseContainsNewLeaderOnNotLeaderOrFollower`
 * `fuzzTestTransactionalParametersSetCorrectly`
 * `fuzzTestNullableTransactionalId`
 * `fuzzTestNoAuthorizedTransactionalRequest`
 * `fuzzTestNoAuthorized`
+
+Three coverage-improvement tests added on top (`maxDuration = "20s"` each):
+
+* `fuzzTestUnknownTopicOrPartition` — drives the `UNKNOWN_TOPIC_OR_PARTITION`
+  branch (line 635) by NOT pre-registering the produced topic in the
+  metadata cache.
+* `fuzzTestThrottlingAndAckZeroNoOp` — stubs the quota mocks to return
+  non-zero throttle times so the throttling block (lines 692-694) runs,
+  and uses `acks == 0` with a no-error response so
+  `sendNoOpResponseExemptThrottle` (line 718) is exercised.
+* `fuzzTestRequestThrottleDominates` — like the previous one but with
+  `acks == 1` and `requestThrottle > bandwidthThrottle`, so the
+  request-throttle sub-branch (line 696) is taken.
 
 Each one feeds a `FuzzedDataProvider` into `kafkaApis.handleProduceRequest`
 through a fully-mocked `KafkaApisTest` harness.
@@ -66,9 +81,12 @@ What the script does (≈ 25-30 minutes wall time on a developer machine):
 2. Sets `JAVA_TOOL_OPTIONS` to attach `jacocoagent.jar` (writing to
    `/tmp/jacoco/coverage.exec`, `append=true`).
 3. Sets `JAZZER_FUZZ=1` so `jazzer-junit` actually fuzzes.
-4. Loops over the 5 fuzz tests and runs each in its **own**
+4. Loops over the 8 fuzz tests and runs each in its **own**
    `./gradlew :core:test --no-daemon --rerun-tasks --tests ...` invocation,
    so every test reaches Jazzer's fuzzing mode (one fuzz target per JVM).
+   Each test runs for the duration declared in its `@FuzzTest` annotation
+   (100 s for the five original tests, 20 s for the three
+   coverage-improvement tests).
 5. Generates HTML / XML / CSV reports with `jacococli.jar report ...`
    into `/tmp/jacoco/report/`.
 6. Prints a focused summary of `KafkaApis.scala` lines 606-752
@@ -87,21 +105,30 @@ same method).
 
 ## Last recorded result
 
-With `maxDuration = "100s"` per test (10,009 total fuzz iterations, no
-crashes), JaCoCo reports the following coverage of
-`KafkaApis#handleProduceRequest` (lines 606-752, including its closures):
+After running all 8 fuzz tests (10,009 + 1,734 = 11,743 total fuzz
+iterations, no Jazzer-discovered crashes), JaCoCo reports the following
+coverage of `KafkaApis#handleProduceRequest` (lines 606-752, including
+its closures):
 
-| Metric                | Covered / Total | %      |
-| --------------------- | --------------- | ------ |
-| Source lines          | 69 / 84         | 82.1%  |
-| Bytecode instructions | 461 / 626       | 73.6%  |
-| Branches              | 30 / 42         | 71.4%  |
+| Metric                | 5-test baseline | After +3 tests |
+| --------------------- | --------------- | -------------- |
+| Source lines          | 69 / 84 (82.1%) | 75 / 84 (89.3%) |
+| Bytecode instructions | 461 / 626 (73.6%) | 505 / 626 (80.7%) |
+| Branches              | 30 / 42 (71.4%) | 36 / 42 (85.7%) |
 
-The 15 missed lines are documented in
-[`coverage_results/handleProduceRequest_coverage_summary.txt`](./coverage_results/handleProduceRequest_coverage_summary.txt)
-and stem from either lazy log-message lambdas or paths that require
-non-mocked behaviour from `replicaManager` (real append, non-zero
-throttle return, real record processing stats).
+Lines newly covered by the three added tests: 635
+(`UNKNOWN_TOPIC_OR_PARTITION`), 692-694 (bandwidth-throttle branch),
+696 (request-throttle branch), and 718 (acks==0 no-error no-op send).
+
+The 9 lines that remain uncovered are documented per-line in
+[`coverage_results/handleProduceRequest_coverage_summary.txt`](./coverage_results/handleProduceRequest_coverage_summary.txt).
+They consist of (a) the format-arg lambdas of two log statements (lines
+660-663 and 710-712) — pure logging output with no behaviour to verify,
+(b) line 642 (`ApiException` catch in record validation) — would require
+a hand-crafted invalid record batch which is not produced by
+`MemoryRecords.withRecords` from `FuzzedDataProvider` bytes, and
+(c) lines 726-727 (`processingStatsCallback`) — the harness mocks
+`replicaManager.handleProduceAppend`, so the callback is never invoked.
 
 ## In-tree coverage artefacts
 

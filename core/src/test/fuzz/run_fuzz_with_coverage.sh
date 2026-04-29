@@ -49,11 +49,16 @@ export JAZZER_FUZZ=1
 # 3. Run each fuzz test in its own JVM (Jazzer fuzzes only the first
 #    @FuzzTest per JVM lifetime).
 TESTS=(
+    # Original tests (maxDuration = 100s each)
     fuzzTestProduceResponseContainsNewLeaderOnNotLeaderOrFollower
     fuzzTestTransactionalParametersSetCorrectly
     fuzzTestNullableTransactionalId
     fuzzTestNoAuthorizedTransactionalRequest
     fuzzTestNoAuthorized
+    # Coverage-improvement tests (maxDuration = 20s each)
+    fuzzTestUnknownTopicOrPartition
+    fuzzTestThrottlingAndAckZeroNoOp
+    fuzzTestRequestThrottleDominates
 )
 
 mkdir -p "$JACOCO_DIR"
