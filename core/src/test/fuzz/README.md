@@ -6,10 +6,10 @@ fuzz targets with JaCoCo.
 
 ## Test classes
 
-### `KafkaApisFuzzTest` (target: `handleProduceRequest`)
+### `HandleProduceRequestFuzzTest` (target: `handleProduceRequest`)
 
 Eight `@FuzzTest`-annotated cases live in
-`core/src/test/scala/unit/kafka/server/KafkaApisFuzzTest.scala`.
+`core/src/test/scala/unit/kafka/server/fuzz/HandleProduceRequestFuzzTest.scala`.
 
 Five original tests (`maxDuration = "100s"` each):
 
@@ -32,10 +32,10 @@ Three coverage-improvement tests added on top (`maxDuration = "20s"` each):
   `acks == 1` and `requestThrottle > bandwidthThrottle`, so the
   request-throttle sub-branch (line 696) is taken.
 
-### `KafkaApisDescribeTopicPartitionsFuzzTest` (target: `handleDescribeTopicPartitionsRequest`, ZK arm)
+### `HandleDescribeTopicPartitionsRequestFuzzTest` (target: `handleDescribeTopicPartitionsRequest`, ZK arm)
 
 Three `@FuzzTest` cases (`maxDuration = "20s"` each) live in
-`core/src/test/scala/unit/kafka/server/KafkaApisDescribeTopicPartitionsFuzzTest.scala`.
+`core/src/test/scala/unit/kafka/server/fuzz/HandleDescribeTopicPartitionsRequestFuzzTest.scala`.
 Only the ZooKeeper arm of `handleDescribeTopicPartitionsRequest` is in
 scope (the KRaft `Some(handler)` arm is unreachable from a
 `ZkMetadataCache` so it is left to the dedicated
@@ -58,10 +58,10 @@ to 100% line/branch coverage, the loop in
 `RequestHandlerHelper.sendMaybeThrottle` to 100% line / 100% branch
 coverage.
 
-### `KafkaApisFetchFuzzTest` (target: `handleFetchRequest`)
+### `HandleFetchRequestFuzzTest` (target: `handleFetchRequest`)
 
 Five `@FuzzTest` cases (`maxDuration = "20s"` each) live in
-`core/src/test/scala/unit/kafka/server/KafkaApisFetchFuzzTest.scala`:
+`core/src/test/scala/unit/kafka/server/fuzz/HandleFetchRequestFuzzTest.scala`:
 
 * `fuzzTestFetchConsumer` — fans out via a `mode` int over the
   consumer-path branches: happy path, deny-auth, absent-topic,
@@ -90,7 +90,7 @@ to surface specific branches).
 
 ## Bug findings
 
-`KafkaApisFetchFuzzTest.fuzzTestFetchConsumer` originally surfaced a
+`HandleFetchRequestFuzzTest.fuzzTestFetchConsumer` originally surfaced a
 reproducible `NullPointerException` thrown from inside
 `handleFetchRequest` &mdash; specifically, when a `FetchManager` session
 returns a `TopicIdPartition` with a null topic name (the conventional
@@ -157,9 +157,9 @@ What the script does (≈ 50-55 minutes wall time on a developer machine):
 2. Sets `JAVA_TOOL_OPTIONS` to attach `jacocoagent.jar` (writing to
    `/tmp/jacoco/coverage.exec`, `append=true`).
 3. Sets `JAZZER_FUZZ=1` so `jazzer-junit` actually fuzzes.
-4. Loops over the 16 fuzz tests (8 in `KafkaApisFuzzTest`, 5 in
-   `KafkaApisFetchFuzzTest`, and 3 in
-   `KafkaApisDescribeTopicPartitionsFuzzTest`) and runs each in its
+4. Loops over the 16 fuzz tests (8 in `HandleProduceRequestFuzzTest`, 5 in
+   `HandleFetchRequestFuzzTest`, and 3 in
+   `HandleDescribeTopicPartitionsRequestFuzzTest`) and runs each in its
    **own** `./gradlew :core:test --no-daemon --rerun-tasks --tests ...`
    invocation, so every test reaches Jazzer's fuzzing mode (one fuzz
    target per JVM). Each test runs for the duration declared in its

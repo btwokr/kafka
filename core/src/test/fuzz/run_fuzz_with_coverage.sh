@@ -86,7 +86,7 @@ export JAZZER_FUZZ=1
 
 # 3. Run each fuzz test in its own JVM (Jazzer fuzzes only the first
 #    @FuzzTest per JVM lifetime).
-# handleProduceRequest fuzz targets (KafkaApisFuzzTest)
+# handleProduceRequest fuzz targets (HandleProduceRequestFuzzTest)
 PRODUCE_TESTS=(
     # Original tests (maxDuration = 100s each)
     fuzzTestProduceResponseContainsNewLeaderOnNotLeaderOrFollower
@@ -100,7 +100,7 @@ PRODUCE_TESTS=(
     fuzzTestRequestThrottleDominates
 )
 
-# handleFetchRequest fuzz targets (KafkaApisFetchFuzzTest, maxDuration = 20s each)
+# handleFetchRequest fuzz targets (HandleFetchRequestFuzzTest, maxDuration = 20s each)
 FETCH_TESTS=(
     fuzzTestFetchConsumer
     fuzzTestFetchFollower
@@ -110,7 +110,7 @@ FETCH_TESTS=(
 )
 
 # handleDescribeTopicPartitionsRequest fuzz targets (ZK arm only;
-# KafkaApisDescribeTopicPartitionsFuzzTest, maxDuration = 20s each)
+# HandleDescribeTopicPartitionsRequestFuzzTest, maxDuration = 20s each)
 DESCRIBE_TP_TESTS=(
     fuzzTestZkUnsupportedVersion
     fuzzTestZkUnsupportedVersionThrottled
@@ -132,13 +132,13 @@ run_one() {
 }
 
 for t in "${PRODUCE_TESTS[@]}"; do
-    run_one "unit.kafka.server.KafkaApisFuzzTest" "$t"
+    run_one "unit.kafka.server.fuzz.HandleProduceRequestFuzzTest" "$t"
 done
 for t in "${FETCH_TESTS[@]}"; do
-    run_one "unit.kafka.server.KafkaApisFetchFuzzTest" "$t"
+    run_one "unit.kafka.server.fuzz.HandleFetchRequestFuzzTest" "$t"
 done
 for t in "${DESCRIBE_TP_TESTS[@]}"; do
-    run_one "unit.kafka.server.KafkaApisDescribeTopicPartitionsFuzzTest" "$t"
+    run_one "unit.kafka.server.fuzz.HandleDescribeTopicPartitionsRequestFuzzTest" "$t"
 done
 
 # 4. Generate HTML/XML/CSV reports against the freshly compiled core classes.
@@ -149,7 +149,7 @@ java -jar "$CLI" report "$EXEC" \
     --html "$REPORT_DIR/html" \
     --xml  "$REPORT_DIR/coverage.xml" \
     --csv  "$REPORT_DIR/coverage.csv" \
-    --name "KafkaApisFuzzTest fuzz coverage"
+    --name "KafkaApis fuzz coverage (Handle*RequestFuzzTest)"
 
 echo
 echo "[fuzz] HTML report : $REPORT_DIR/html/index.html"
