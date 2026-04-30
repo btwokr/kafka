@@ -1,4 +1,4 @@
-package unit.kafka.server
+package unit.kafka.server.fuzz
 
 import com.code_intelligence.jazzer.api.FuzzedDataProvider
 import com.code_intelligence.jazzer.junit.FuzzTest
@@ -36,7 +36,7 @@ import org.mockito.Mockito.{reset, when}
  * `RequestHandlerHelper.sendMaybeThrottle` / `throttle` /
  * `requestChannel.sendResponse`.
  */
-class KafkaApisDescribeTopicPartitionsFuzzTest extends KafkaApisTest {
+class HandleDescribeTopicPartitionsRequestFuzzTest extends KafkaApisTest {
 
   /**
    * Drives the ZooKeeper-broker arm of `handleDescribeTopicPartitionsRequest`

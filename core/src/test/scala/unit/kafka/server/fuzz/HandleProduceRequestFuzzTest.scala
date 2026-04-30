@@ -1,4 +1,4 @@
-package unit.kafka.server
+package unit.kafka.server.fuzz
 
 import com.code_intelligence.jazzer.api.FuzzedDataProvider
 import com.code_intelligence.jazzer.junit.FuzzTest
@@ -10,19 +10,19 @@ import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.message.ProduceRequestData
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
 import org.apache.kafka.common.record.{MemoryRecords, SimpleRecord}
-import org.apache.kafka.common.requests.{ProduceRequest, RequestContext}
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse
+import org.apache.kafka.common.requests.{ProduceRequest, RequestContext}
 import org.apache.kafka.server.authorizer.{Action, AuthorizationResult, Authorizer}
-import org.mockito.{ArgumentCaptor, ArgumentMatchers}
 import org.mockito.ArgumentMatchers.{any, anyDouble, anyLong, anyShort}
-import org.mockito.Mockito.{mock, never, reset, verify, when}
+import org.mockito.Mockito._
+import org.mockito.{ArgumentCaptor, ArgumentMatchers}
 
 import java.util
 import java.util.Collections
 import scala.collection.{Map, Seq}
 import scala.jdk.CollectionConverters.SeqHasAsJava
 
-class KafkaApisFuzzTest extends KafkaApisTest {
+class HandleProduceRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = "100s")
   def fuzzTestProduceResponseContainsNewLeaderOnNotLeaderOrFollower(data: FuzzedDataProvider): Unit = {
     // Arrange

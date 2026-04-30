@@ -1,16 +1,16 @@
-package unit.kafka.server
+package unit.kafka.server.fuzz
 
 import com.code_intelligence.jazzer.api.FuzzedDataProvider
 import com.code_intelligence.jazzer.junit.FuzzTest
 import kafka.cluster.Partition
 import kafka.network.RequestChannel
 import kafka.server.{FetchSessionCacheShard, FullFetchContext, KafkaApisTest, ReplicaQuota}
-import org.apache.kafka.common.{TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
 import org.apache.kafka.common.record.{MemoryRecords, SimpleRecord}
-import org.apache.kafka.common.requests.{FetchMetadata => JFetchMetadata, FetchRequest}
+import org.apache.kafka.common.requests.{FetchRequest, FetchMetadata => JFetchMetadata}
 import org.apache.kafka.common.utils.Time
+import org.apache.kafka.common.{TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.server.authorizer.{Action, AuthorizationResult, Authorizer}
 import org.apache.kafka.server.record.BrokerCompressionType
 import org.apache.kafka.storage.internals.log.{FetchParams, FetchPartitionData, LogConfig}
@@ -35,7 +35,7 @@ import scala.jdk.CollectionConverters._
  * any reproducible crash; if Jazzer finds one, the test JVM exits with a
  * `crash-...` artefact under `core/`.
  */
-class KafkaApisFetchFuzzTest extends KafkaApisTest {
+class HandleFetchRequestFuzzTest extends KafkaApisTest {
 
   // ------------------------------------------------------------------------
   // Helpers
