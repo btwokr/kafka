@@ -151,32 +151,72 @@ From the repository root:
 ./core/src/test/fuzz/run_fuzz_with_coverage.sh
 ```
 
-What the script does (≈ 25-30 minutes wall time on a developer machine):
+What the script does (≈ 50-55 minutes wall time on a developer machine):
 
 1. Downloads JaCoCo 0.8.12 to `/tmp/jacoco/` if it isn't there yet.
 2. Sets `JAVA_TOOL_OPTIONS` to attach `jacocoagent.jar` (writing to
    `/tmp/jacoco/coverage.exec`, `append=true`).
 3. Sets `JAZZER_FUZZ=1` so `jazzer-junit` actually fuzzes.
-4. Loops over the 13 fuzz tests (8 in `KafkaApisFuzzTest` + 5 in
-   `KafkaApisFetchFuzzTest`) and runs each in its **own**
-   `./gradlew :core:test --no-daemon --rerun-tasks --tests ...` invocation,
-   so every test reaches Jazzer's fuzzing mode (one fuzz target per JVM).
-   Each test runs for the duration declared in its `@FuzzTest` annotation.
+4. Loops over the 16 fuzz tests (8 in `KafkaApisFuzzTest`, 5 in
+   `KafkaApisFetchFuzzTest`, and 3 in
+   `KafkaApisDescribeTopicPartitionsFuzzTest`) and runs each in its
+   **own** `./gradlew :core:test --no-daemon --rerun-tasks --tests ...`
+   invocation, so every test reaches Jazzer's fuzzing mode (one fuzz
+   target per JVM). Each test runs for the duration declared in its
+   `@FuzzTest` annotation.
 5. Generates HTML / XML / CSV reports with `jacococli.jar report ...`
    into `/tmp/jacoco/report/`.
-6. Prints a focused summary of `KafkaApis.scala` for both
-   `handleProduceRequest` (lines 606-752) and `handleFetchRequest`
-   (lines 757-1077).
+6. Prints a focused summary of `KafkaApis.scala` for
+   `handleProduceRequest` (lines 606-752),
+   `handleFetchRequest` (lines 757-1077),
+   `handleDescribeTopicPartitionsRequest` (lines 1445-1461), and
+   `RequestHandlerHelper.sendMaybeThrottle` (lines 112-122).
 
 Open `/tmp/jacoco/report/html/index.html` and navigate to
 `kafka.server → KafkaApis.scala` to see the colour-annotated source for the
 whole class.
 
 The XML report (`/tmp/jacoco/report/coverage.xml`) provides per-method
-counters; the entry of interest is the `<method name="handleProduceRequest">`
-under `class kafka/server/KafkaApis`, plus the
-`$anonfun$handleProduceRequest$N` siblings (Scala-generated closures of the
-same method).
+counters; the entries of interest are
+`<method name="handle{Produce,Fetch,DescribeTopicPartitions}Request">` under
+`class kafka/server/KafkaApis`, plus the `$anonfun$...$N` siblings
+(Scala-generated closures of the same method).
+
+### Persisting `coverage.exec` across VM recycles
+
+The runner script writes its exec file to `/tmp/jacoco/coverage.exec`,
+which lives on the agent VM's `/tmp` and is wiped whenever the VM is
+recycled. To avoid having to re-run the full fuzz suite (≈ 50 minutes)
+every time, the most recent exec file is committed to the repo at
+[`coverage_results/coverage.exec.xz`](./coverage_results/coverage.exec.xz)
+(xz-compressed, ~500 KB; the underlying exec file is mostly zero bytes
+and compresses ≈ 80×).
+
+The runner has three modes, selectable via the `FUZZ_MODE` env var:
+
+| `FUZZ_MODE` | Pre-run                                                 | Post-run                                                                 |
+| ----------- | ------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `fresh` (default) | `rm -f /tmp/jacoco/coverage.exec`                  | nothing                                                                  |
+| `resume`    | `xz -dc coverage_results/coverage.exec.xz > /tmp/jacoco/coverage.exec` | nothing                                          |
+| `snapshot`  | `rm -f /tmp/jacoco/coverage.exec`                       | `xz -9e -c /tmp/jacoco/coverage.exec > coverage_results/coverage.exec.xz` |
+
+Typical workflow:
+
+```bash
+# Fresh full run that also updates the in-tree snapshot for next time.
+FUZZ_MODE=snapshot ./core/src/test/fuzz/run_fuzz_with_coverage.sh
+
+# Later (possibly on a different agent VM): only run the tests you care
+# about and have their coverage append on top of the committed snapshot.
+FUZZ_MODE=resume ./core/src/test/fuzz/run_fuzz_with_coverage.sh
+```
+
+When you want the in-tree snapshot updated again after a `resume` run,
+re-snapshot manually:
+
+```bash
+xz -9e -c /tmp/jacoco/coverage.exec > core/src/test/fuzz/coverage_results/coverage.exec.xz
+```
 
 ## Last recorded result
 

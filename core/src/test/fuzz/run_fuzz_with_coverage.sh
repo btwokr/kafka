@@ -1,9 +1,24 @@
 #!/usr/bin/env bash
-# Run all @FuzzTest cases in KafkaApisFuzzTest.scala with the JaCoCo agent
-# attached, then render an HTML/XML/CSV coverage report.
+# Run all @FuzzTest cases over the KafkaApis fuzz targets with the JaCoCo
+# agent attached, then render an HTML/XML/CSV coverage report.
 #
 # See ./README.md for design notes (why JAVA_TOOL_OPTIONS, why one Gradle
 # invocation per fuzz test, etc.).
+#
+# Modes (selectable via the FUZZ_MODE env var):
+#
+#   fresh     [default] start with an empty coverage.exec and run all
+#             fuzz tests from scratch.
+#   resume    seed coverage.exec from the committed snapshot
+#             ./coverage_results/coverage.exec.xz (xz-compressed,
+#             ~500 KB) and append today's runs on top of it. Useful
+#             when the previous fuzz pass already cost ~50 minutes
+#             and you only want to add incremental coverage.
+#   snapshot  same as fresh, but at the very end re-compresses the
+#             produced coverage.exec back into
+#             ./coverage_results/coverage.exec.xz so the in-tree
+#             snapshot stays in sync. Use this whenever you commit
+#             a new run.
 #
 # Output:
 #   /tmp/jacoco/coverage.exec            JaCoCo execution data (binary)
@@ -11,13 +26,25 @@
 #   /tmp/jacoco/report/coverage.xml      XML coverage report (per-method)
 #   /tmp/jacoco/report/coverage.csv      CSV coverage report (per-class)
 #
-# Wall-clock time: roughly 25-30 minutes for 5 x 100s fuzz tests
-# plus Gradle startup overhead.
+# Wall-clock time: roughly 50-55 minutes for the full 8 produce + 5
+# fetch + 3 describe-topic-partitions fuzz suite plus Gradle startup
+# overhead.
 #
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+COMMITTED_EXEC_XZ="$SCRIPT_DIR/coverage_results/coverage.exec.xz"
 cd "$REPO_ROOT"
+
+FUZZ_MODE="${FUZZ_MODE:-fresh}"
+case "$FUZZ_MODE" in
+    fresh|resume|snapshot) ;;
+    *)
+        echo "[fuzz] unknown FUZZ_MODE=$FUZZ_MODE (expected: fresh|resume|snapshot)" >&2
+        exit 2
+        ;;
+esac
 
 JACOCO_VERSION="${JACOCO_VERSION:-0.8.12}"
 JACOCO_DIR="/tmp/jacoco"
@@ -37,7 +64,18 @@ if [[ ! -f "$AGENT" || ! -f "$CLI" ]]; then
     cd "$REPO_ROOT"
 fi
 
-rm -f "$EXEC"
+# 1b. Either start fresh or seed from the committed snapshot.
+if [[ "$FUZZ_MODE" == "resume" ]]; then
+    if [[ ! -f "$COMMITTED_EXEC_XZ" ]]; then
+        echo "[fuzz] FUZZ_MODE=resume but $COMMITTED_EXEC_XZ does not exist" >&2
+        exit 2
+    fi
+    echo "[fuzz] resuming from $COMMITTED_EXEC_XZ"
+    mkdir -p "$JACOCO_DIR"
+    xz -dc "$COMMITTED_EXEC_XZ" > "$EXEC"
+else
+    rm -f "$EXEC"
+fi
 
 # 2. Attach the JaCoCo agent to every JVM the JDK launches (including
 #    Gradle's forked test JVMs) via JAVA_TOOL_OPTIONS, and tell jazzer-junit
@@ -117,6 +155,18 @@ echo
 echo "[fuzz] HTML report : $REPORT_DIR/html/index.html"
 echo "[fuzz] XML  report : $REPORT_DIR/coverage.xml"
 echo "[fuzz] exec data   : $EXEC"
+
+# 4b. Optionally re-snapshot the freshly produced exec file into the
+#     committed in-tree location so it survives a Cloud Agent VM
+#     recycle and a future `FUZZ_MODE=resume` can pick up where this
+#     run left off. xz -9e gives ~80x compression on the mostly-zero
+#     coverage data (40 MB -> ~500 KB) which is fine to commit.
+if [[ "$FUZZ_MODE" == "snapshot" ]]; then
+    echo "[fuzz] re-snapshotting $EXEC -> $COMMITTED_EXEC_XZ"
+    mkdir -p "$(dirname "$COMMITTED_EXEC_XZ")"
+    xz -9e -f -c "$EXEC" > "$COMMITTED_EXEC_XZ"
+    ls -la "$COMMITTED_EXEC_XZ"
+fi
 
 # 5. Print a focused summary of both fuzz targets' coverage.
 python3 - "$REPORT_DIR/coverage.xml" <<'PY'
