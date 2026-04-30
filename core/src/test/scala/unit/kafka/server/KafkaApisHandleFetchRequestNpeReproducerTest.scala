@@ -48,7 +48,7 @@ import scala.jdk.CollectionConverters._
  *       and hits `String.getBytes(charset)` on the null topic name.
  *
  * == How this was discovered ==
- * Surfaced by Jazzer fuzzing of `KafkaApisFetchFuzzTest` (run #16 of
+ * Surfaced by Jazzer fuzzing of `HandleFetchRequestFuzzTest` (run #16 of
  * `fuzzTestFetchConsumer`, mode == 1). The 2-byte crash input
  * (0x3d 0x0a) selected the "null topic in fetch context" sub-mode of
  * that test.

@@ -498,7 +498,7 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
   }
 
   // ------------------------------------------------------------------------
-  // Locally-scoped helpers (mirror those in KafkaApisFuzzTest)
+  // Locally-scoped helpers (mirror those in HandleProduceRequestFuzzTest)
   // ------------------------------------------------------------------------
 
   private def helperSplitByteArray(byteArray: Array[Byte], splitSize: Int): (String, Array[Byte]) = {
