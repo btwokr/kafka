@@ -11,27 +11,6 @@ fuzz targets with JaCoCo.
 Eight `@FuzzTest`-annotated cases live in
 `core/src/test/scala/unit/kafka/server/fuzz/HandleProduceRequestFuzzTest.scala`.
 
-Five original tests (`maxDuration = "100s"` each):
-
-* `fuzzTestProduceResponseContainsNewLeaderOnNotLeaderOrFollower`
-* `fuzzTestTransactionalParametersSetCorrectly`
-* `fuzzTestNullableTransactionalId`
-* `fuzzTestNoAuthorizedTransactionalRequest`
-* `fuzzTestNoAuthorized`
-
-Three coverage-improvement tests added on top (`maxDuration = "20s"` each):
-
-* `fuzzTestUnknownTopicOrPartition` — drives the
-  `UNKNOWN_TOPIC_OR_PARTITION` branch (line 635) by NOT pre-registering
-  the produced topic in the metadata cache.
-* `fuzzTestThrottlingAndAckZeroNoOp` — stubs the quota mocks to return
-  non-zero throttle times so the throttling block (lines 692-694) runs,
-  and uses `acks == 0` with a no-error response so
-  `sendNoOpResponseExemptThrottle` (line 718) is exercised.
-* `fuzzTestRequestThrottleDominates` — like the previous one but with
-  `acks == 1` and `requestThrottle > bandwidthThrottle`, so the
-  request-throttle sub-branch (line 696) is taken.
-
 ### `HandleDescribeTopicPartitionsRequestFuzzTest` (target: `handleDescribeTopicPartitionsRequest`, ZK arm)
 
 Three `@FuzzTest` cases (`maxDuration = "20s"` each) live in
@@ -41,70 +20,15 @@ scope (the KRaft `Some(handler)` arm is unreachable from a
 `ZkMetadataCache` so it is left to the dedicated
 `DescribeTopicPartitionsRequestHandlerTest`):
 
-* `fuzzTestZkUnsupportedVersion` &mdash; default no-throttle path:
-  fuzzer-generated topic list + version, request quota mock returns 0.
-* `fuzzTestZkUnsupportedVersionThrottled` &mdash; same shape but the
-  request quota returns a positive throttle so
-  `RequestHandlerHelper.throttle(...)` actually mutes the channel before
-  the response is sent.
-* `fuzzTestZkUnsupportedVersionForwarded` &mdash; wraps the request in
-  an envelope so `request.isForwarded == true`, covering the else-arm
-  of the `if (!request.isForwarded)` branch on
-  `RequestHandlerHelper.scala:118`.
-
-Together these drive `handleDescribeTopicPartitionsRequest`'s ZK arm
-to 100% line/branch coverage, the loop in
-`DescribeTopicPartitionsRequest.getErrorResponse`, and bring
-`RequestHandlerHelper.sendMaybeThrottle` to 100% line / 100% branch
-coverage.
-
 ### `HandleFetchRequestFuzzTest` (target: `handleFetchRequest`)
 
 Five `@FuzzTest` cases (`maxDuration = "20s"` each) live in
 `core/src/test/scala/unit/kafka/server/fuzz/HandleFetchRequestFuzzTest.scala`:
 
-* `fuzzTestFetchConsumer` — fans out via a `mode` int over the
-  consumer-path branches: happy path, deny-auth, absent-topic,
-  not-leader-on-v16+, ZSTD-on-old-version log config,
-  `KAFKA_STORAGE_ERROR` on v&le;5 (covers line 822), and
-  `UnsupportedCompressionTypeException` from down-converting
-  ZSTD-compressed records on v&le;3 (covers lines 883-884).
-* `fuzzTestFetchFollower` — follower path with the `CLUSTER_ACTION`
-  authorizer either allowing or denying, plus null/absent topic
-  sub-modes; covers the from-follower send branch.
-* `fuzzTestFetchThrottling` — drives both
-  `bandwidthThrottle > requestThrottle` and `requestThrottle >
-  bandwidthThrottle` orderings in the throttle block.
-* `fuzzTestFetchEmptyInteresting` — exercises the
-  `interesting.isEmpty` branch by stuffing the only partition into
-  the erroneous bucket via a null topic name. (Carries a documented
-  workaround for a known NPE: see "Bug findings" below.)
-* `fuzzTestFetchDownConversion` — fuzzes the FetchRequest version in
-  `[0, 3]` plus the `message.format.version` / `messageDownConversionEnable`
-  combinations to drive the down-conversion magic ladder.
-
 Each test feeds a `FuzzedDataProvider` into
 `kafkaApis.handleFetchRequest` through a fully-mocked `KafkaApisTest`
 harness (with `fetchManager` and `replicaManager.fetchMessages` stubbed
 to surface specific branches).
-
-## Bug findings
-
-`HandleFetchRequestFuzzTest.fuzzTestFetchConsumer` originally surfaced a
-reproducible `NullPointerException` thrown from inside
-`handleFetchRequest` &mdash; specifically, when a `FetchManager` session
-returns a `TopicIdPartition` with a null topic name (the conventional
-encoding for an unresolved topic id) AND the FetchRequest version is
-`<= 12`, response sizing dies in
-`FetchResponseData$FetchableTopicResponse.addSize` because the
-generated message-sizer dereferences `topic.getBytes(charset)` on the
-null name.
-
-The deterministic reproducer is committed at
-[`core/src/test/scala/unit/kafka/server/KafkaApisHandleFetchRequestNpeReproducerTest.scala`](../scala/unit/kafka/server/KafkaApisHandleFetchRequestNpeReproducerTest.scala).
-The NPE-triggering sub-mode of `fuzzTestFetchConsumer` was removed once
-the deterministic reproducer was added so the rest of the consumer-path
-fuzzer can keep exploring.
 
 ## How fuzz mode is enabled
 
