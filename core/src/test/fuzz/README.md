@@ -138,6 +138,10 @@ The runner has three modes, selectable via the `FUZZ_MODE` env var:
 | `resume`    | `xz -dc coverage_results/coverage.exec.xz > /tmp/jacoco/coverage.exec` | nothing                                          |
 | `snapshot`  | `rm -f /tmp/jacoco/coverage.exec`                       | `xz -9e -c /tmp/jacoco/coverage.exec > coverage_results/coverage.exec.xz` |
 
+Optional **`FUZZ_SUITE`** (default `all`): set `FUZZ_SUITE=offset-fetch` to run only
+`HandleOffsetFetchRequestFuzzTest` (four tests). Useful with `FUZZ_MODE=resume` to
+append JaCoCo data for the new targets without re-running produce/fetch/describe.
+
 Typical workflow:
 
 ```bash
