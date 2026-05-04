@@ -32,7 +32,7 @@ to surface specific branches).
 
 ### `HandleOffsetFetchRequestFuzzTest` (target: `handleOffsetFetchRequest`)
 
-Four `@FuzzTest` cases (`maxDuration = "20s"` each) live in
+Five `@FuzzTest` cases (`maxDuration = "20s"` each) live in
 `core/src/test/scala/unit/kafka/server/fuzz/HandleOffsetFetchRequestFuzzTest.scala`.
 They cover OffsetFetch protocol version 0 (ZooKeeper-backed reads with
 `KafkaZkClient.getConsumerOffset` stubbed in tests), single-group
@@ -91,9 +91,9 @@ What the script does (≈ 60-70 minutes wall time on a developer machine):
 2. Sets `JAVA_TOOL_OPTIONS` to attach `jacocoagent.jar` (writing to
    `/tmp/jacoco/coverage.exec`, `append=true`).
 3. Sets `JAZZER_FUZZ=1` so `jazzer-junit` actually fuzzes.
-4. Loops over the 20 fuzz tests (8 in `HandleProduceRequestFuzzTest`, 5 in
+4. Loops over the 21 fuzz tests (8 in `HandleProduceRequestFuzzTest`, 5 in
    `HandleFetchRequestFuzzTest`, 3 in
-   `HandleDescribeTopicPartitionsRequestFuzzTest`, and 4 in
+   `HandleDescribeTopicPartitionsRequestFuzzTest`, and 5 in
    `HandleOffsetFetchRequestFuzzTest`) and runs each in its
    **own** `./gradlew :core:test --no-daemon --rerun-tasks --tests ...`
    invocation, so every test reaches Jazzer's fuzzing mode (one fuzz
@@ -208,9 +208,9 @@ scope. The reachable ZK arm is fully covered:
 
 | Metric                | Covered / Total | %       |
 | --------------------- | --------------- | ------- |
-| Source lines          | 84 / 104        | 80.8%   |
-| Bytecode instructions | 462 / 602       | 76.7%   |
-| Branches              | 21 / 30         | 70.0%   |
+| Source lines          | 93 / 104        | 89.4%   |
+| Bytecode instructions | 489 / 602       | 81.2%   |
+| Branches              | 24 / 30         | 80.0%   |
 
 Per-line gaps are listed in
 [`coverage_results/coverage_summary.txt`](./coverage_results/coverage_summary.txt).

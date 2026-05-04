@@ -374,4 +374,77 @@ class HandleOffsetFetchRequestFuzzTest extends KafkaApisTest {
     val k = createKafkaApis()
     try k.handleOffsetFetchRequest(request) finally k.close()
   }
+
+  /**
+   * Targets JaCoCo lines that are easy to miss in the broader coordinator fuzz:
+   *   - 1530-1532: `GROUP_AUTHORIZATION_FAILED` when DESCRIBE on GROUP is denied.
+   *   - 1566-1568: `fetchAllOffsetsForGroup` `.handle` exception branch (all-partitions path).
+   *   - 1607-1609: `fetchOffsetsForGroup` `.handle` exception branch (partitioned path).
+   *
+   * Runs all three scenarios every iteration (still fuzzes `groupId` from the byte tail)
+   * so a single regression pass and minimal libFuzzer input still hit these branches.
+   * Uses `Errors.*.exception` completions so Jazzer does not flag them as findings.
+   */
+  @FuzzTest(maxDuration = "20s")
+  def fuzzTestOffsetFetchCoordinatorAuthAndHandleExceptions(data: FuzzedDataProvider): Unit = {
+    val splitSize = data.consumeInt(1, 24)
+    val (gidRaw, _) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
+    val groupId = if (gidRaw.isEmpty) "fuzz-deep-g" else gidRaw.take(120)
+    val version = ApiKeys.OFFSET_FETCH.latestVersion
+
+    def stubNoThrottle(): Unit = {
+      when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(any[RequestChannel.Request](), anyLong))
+        .thenReturn(0)
+    }
+
+    // --- 1530-1532: group DESCRIBE denied (coordinator path, v8+) ---
+    reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator, groupCoordinator)
+    stubNoThrottle()
+    val partitions = util.Collections.singletonList(new TopicPartition("fuzz-deep-tp", 0))
+    val reqDenied = new OffsetFetchRequest.Builder(groupId, false, partitions, false).build(version)
+    val requestDenied = buildRequest(reqDenied)
+    val groupAuthorizer = mock(classOf[Authorizer])
+    when(groupAuthorizer.authorize(any[RequestContext], any[util.List[Action]])).thenAnswer { inv =>
+      val actions = inv.getArgument(1, classOf[util.List[Action]])
+      actions.asScala.map { a =>
+        if (a.resourcePattern.resourceType == ResourceType.GROUP &&
+          a.operation == AclOperation.DESCRIBE &&
+          a.resourcePattern.name == groupId)
+          AuthorizationResult.DENIED
+        else
+          AuthorizationResult.ALLOWED
+      }.asJava
+    }
+    val k0 = createKafkaApis(authorizer = Some(groupAuthorizer))
+    try k0.handleOffsetFetchRequest(requestDenied) finally k0.close()
+
+    // --- 1566-1568: fetchAllOffsets future completes exceptionally ---
+    reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator, groupCoordinator)
+    stubNoThrottle()
+    val jmap = new util.HashMap[String, util.List[TopicPartition]]()
+    jmap.put(groupId, null)
+    val reqAll = new OffsetFetchRequest.Builder(jmap, false, false).build(version)
+    val requestAll = buildRequest(reqAll)
+    val futAll = new CompletableFuture[OffsetFetchResponseData.OffsetFetchResponseGroup]()
+    when(groupCoordinator.fetchAllOffsets(any(), any(), anyBoolean())).thenReturn(futAll)
+    futAll.completeExceptionally(Errors.NOT_COORDINATOR.exception)
+    val k1 = createKafkaApis()
+    try k1.handleOffsetFetchRequest(requestAll) finally k1.close()
+
+    // --- 1607-1609: fetchOffsets future completes exceptionally ---
+    reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator, groupCoordinator)
+    stubNoThrottle()
+    val reqPart = new OffsetFetchRequest.Builder(
+      groupId,
+      false,
+      util.Collections.singletonList(new TopicPartition("fuzz-deep-tp2", 0)),
+      false
+    ).build(version)
+    val requestPart = buildRequest(reqPart)
+    val futPart = new CompletableFuture[OffsetFetchResponseData.OffsetFetchResponseGroup]()
+    when(groupCoordinator.fetchOffsets(any(), any(), anyBoolean())).thenReturn(futPart)
+    futPart.completeExceptionally(Errors.UNKNOWN_TOPIC_OR_PARTITION.exception)
+    val k2 = createKafkaApis()
+    try k2.handleOffsetFetchRequest(requestPart) finally k2.close()
+  }
 }

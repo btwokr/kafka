@@ -140,6 +140,7 @@ OFFSET_FETCH_TESTS=(
     fuzzTestOffsetFetchCoordinatorMultiGroup
     fuzzTestOffsetFetchCoordinatorV1To7
     fuzzTestOffsetFetchCoordinatorThrottleAndForwarded
+    fuzzTestOffsetFetchCoordinatorAuthAndHandleExceptions
 )
 
 mkdir -p "$JACOCO_DIR"
