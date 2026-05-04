@@ -193,6 +193,12 @@ echo "[fuzz] HTML report : $REPORT_DIR/html/index.html"
 echo "[fuzz] XML  report : $REPORT_DIR/coverage.xml"
 echo "[fuzz] exec data   : $EXEC"
 
+# 4a. Refresh the trimmed in-tree report under core/src/test/fuzz/coverage_results/
+#     (KafkaApis + RequestHandlerHelper only; see refresh_in_repo_coverage.py).
+if [[ -f "$REPORT_DIR/coverage.xml" ]]; then
+    python3 "$SCRIPT_DIR/refresh_in_repo_coverage.py" || echo "[fuzz] warning: refresh_in_repo_coverage.py failed" >&2
+fi
+
 # 4b. Optionally re-snapshot the freshly produced exec file into the
 #     committed in-tree location so it survives a Cloud Agent VM
 #     recycle and a future `FUZZ_MODE=resume` can pick up where this

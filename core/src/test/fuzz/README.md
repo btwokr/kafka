@@ -206,10 +206,14 @@ scope. The reachable ZK arm is fully covered:
 
 ### `handleOffsetFetchRequest` (KafkaApis.scala lines 1466&ndash;1630)
 
-The four `HandleOffsetFetchRequestFuzzTest` cases were added after the
-last full JaCoCo snapshot; re-run `./core/src/test/fuzz/run_fuzz_with_coverage.sh`
-to populate counters for this span (the script’s summary block already
-includes it).
+| Metric                | Covered / Total | %       |
+| --------------------- | --------------- | ------- |
+| Source lines          | 84 / 104        | 80.8%   |
+| Bytecode instructions | 462 / 602       | 76.7%   |
+| Branches              | 21 / 30         | 70.0%   |
+
+Per-line gaps are listed in
+[`coverage_results/coverage_summary.txt`](./coverage_results/coverage_summary.txt).
 
 The remaining uncovered lines in both methods are documented per-line in
 [`coverage_results/coverage_summary.txt`](./coverage_results/coverage_summary.txt).
@@ -233,15 +237,17 @@ re-running the fuzzer:
 * `coverage_results/html/kafka.server/KafkaApis.html` &mdash; per-method
   counters for `KafkaApis`, including every
   `$anonfun$handleProduceRequest$N`, `$anonfun$handleFetchRequest$N`, and
-  offset-fetch-related closures
-  Scala-generated closure.
+  offset-fetch-related Scala-generated closures.
 * `coverage_results/coverage_KafkaApis.xml` &mdash; subset of the JaCoCo XML
   report scoped to the `kafka/server` package (machine-readable).
-* `coverage_results/coverage.csv` &mdash; full per-class CSV from the run.
+* `coverage_results/coverage.csv` &mdash; CSV rows for `KafkaApis` and
+  `RequestHandlerHelper` only (trimmed from the full report).
 * `coverage_results/coverage_summary.txt` &mdash; human-readable summary
-  including per-line and per-closure breakdown for the produce and fetch
-  fuzz targets,
+  including per-line breakdown for the fuzz targets,
   plus the description of the NPE crash finding.
+* `refresh_in_repo_coverage.py` &mdash; copies the trimmed HTML/XML/CSV slice
+  from `/tmp/jacoco/report/`; invoked automatically at the end of
+  `run_fuzz_with_coverage.sh` after JaCoCo report generation.
 
 The full HTML report (≈ 12 MB across hundreds of classes) is **not**
 committed; rerun `run_fuzz_with_coverage.sh` to regenerate it under
