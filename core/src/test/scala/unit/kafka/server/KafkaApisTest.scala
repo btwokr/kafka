@@ -108,10 +108,11 @@ class KafkaApisTest extends Logging {
   val requestChannel: RequestChannel = mock(classOf[RequestChannel])
   private val requestChannelMetrics: RequestChannel.Metrics = mock(classOf[RequestChannel.Metrics])
   val replicaManager: ReplicaManager = mock(classOf[ReplicaManager])
-  private val groupCoordinator: GroupCoordinator = mock(classOf[GroupCoordinator])
+  // Exposed for fuzz tests in `unit.kafka.server.fuzz` (HandleHeartbeatRequestFuzzTest).
+  val groupCoordinator: GroupCoordinator = mock(classOf[GroupCoordinator])
   private val adminManager: ZkAdminManager = mock(classOf[ZkAdminManager])
   val txnCoordinator: TransactionCoordinator = mock(classOf[TransactionCoordinator])
-  private val controller: KafkaController = mock(classOf[KafkaController])
+  protected val controller: KafkaController = mock(classOf[KafkaController])
   private val forwardingManager: ForwardingManager = mock(classOf[ForwardingManager])
   private val autoTopicCreationManager: AutoTopicCreationManager = mock(classOf[AutoTopicCreationManager])
 
@@ -121,10 +122,12 @@ class KafkaApisTest extends Logging {
   }
   private val zkClient: KafkaZkClient = mock(classOf[KafkaZkClient])
   private val metrics = new Metrics()
-  private val brokerId = 1
-  // KRaft tests should override this with a KRaftMetadataCache
-  private var metadataCache: MetadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.latestTesting())
-  private var brokerEpochManager: ZkBrokerEpochManager = new ZkBrokerEpochManager(metadataCache, controller, None)
+  /** Visible to subclasses (e.g. fuzz tests under `unit.kafka.server.fuzz`). */
+  protected val brokerId = 1
+  // KRaft tests should override this with a KRaftMetadataCache.
+  // Exposed for fuzz tests (e.g. HandleHeartbeatRequestFuzzTest) that pin IBP.
+  var metadataCache: MetadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.latestTesting())
+  var brokerEpochManager: ZkBrokerEpochManager = new ZkBrokerEpochManager(metadataCache, controller, None)
   val clientQuotaManager: ClientQuotaManager = mock(classOf[ClientQuotaManager])
   val clientRequestQuotaManager: ClientRequestQuotaManager = mock(classOf[ClientRequestQuotaManager])
   private val clientControllerQuotaManager: ControllerMutationQuotaManager = mock(classOf[ControllerMutationQuotaManager])

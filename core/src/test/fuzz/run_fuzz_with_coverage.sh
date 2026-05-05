@@ -26,9 +26,9 @@
 #   /tmp/jacoco/report/coverage.xml      XML coverage report (per-method)
 #   /tmp/jacoco/report/coverage.csv      CSV coverage report (per-class)
 #
-# Wall-clock time: roughly 50-55 minutes for the full 8 produce + 5
-# fetch + 3 describe-topic-partitions fuzz suite plus Gradle startup
-# overhead.
+# Wall-clock time: roughly 65-75 minutes for the full 8 produce + 5
+# fetch + 3 describe-topic-partitions + 5 heartbeat fuzz suite plus
+# Gradle startup overhead.
 #
 set -u
 
@@ -117,6 +117,16 @@ DESCRIBE_TP_TESTS=(
     fuzzTestZkUnsupportedVersionForwarded
 )
 
+# handleHeartbeatRequest fuzz targets (HandleHeartbeatRequestFuzzTest,
+# maxDuration = 20s each)
+HEARTBEAT_TESTS=(
+    fuzzTestHeartbeatCoordinatorPath
+    fuzzTestHeartbeatStaticMembershipOldIbp
+    fuzzTestHeartbeatStaticMembershipSupportedIbp
+    fuzzTestHeartbeatAuthorizationDenied
+    fuzzTestHeartbeatThrottled
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -139,6 +149,9 @@ for t in "${FETCH_TESTS[@]}"; do
 done
 for t in "${DESCRIBE_TP_TESTS[@]}"; do
     run_one "unit.kafka.server.fuzz.HandleDescribeTopicPartitionsRequestFuzzTest" "$t"
+done
+for t in "${HEARTBEAT_TESTS[@]}"; do
+    run_one "unit.kafka.server.fuzz.HandleHeartbeatRequestFuzzTest" "$t"
 done
 
 # 4. Generate HTML/XML/CSV reports against the freshly compiled core classes.
@@ -176,6 +189,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleProduceRequest",                  606, 752),
     ("KafkaApis.scala",          "handleFetchRequest",                    757, 1077),
     ("KafkaApis.scala",          "handleDescribeTopicPartitionsRequest", 1445, 1461),
+    ("KafkaApis.scala",          "handleHeartbeatRequest",               1924, 1948),
     ("RequestHandlerHelper.scala", "sendMaybeThrottle",                   112,  122),
 ]
 
