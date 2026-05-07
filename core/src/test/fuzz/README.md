@@ -1,4 +1,4 @@
-# Fuzz testing `KafkaApis` (`handleProduceRequest` + `handleFetchRequest`)
+# Fuzz testing `KafkaApis` (produce, fetch, describe-topic-partitions, offset-fetch)
 
 This directory documents how to run the Jazzer fuzz tests for
 `kafka.server.KafkaApis` and how to collect line/branch coverage of the
@@ -30,18 +30,28 @@ Each test feeds a `FuzzedDataProvider` into
 harness (with `fetchManager` and `replicaManager.fetchMessages` stubbed
 to surface specific branches).
 
+### `HandleOffsetFetchRequestFuzzTest` (target: `handleOffsetFetchRequest`)
+
+Five `@FuzzTest` cases (`maxDuration = "20s"` each) live in
+`core/src/test/scala/unit/kafka/server/fuzz/HandleOffsetFetchRequestFuzzTest.scala`.
+They cover OffsetFetch protocol version 0 (ZooKeeper-backed reads with
+`KafkaZkClient.getConsumerOffset` stubbed in tests), single-group
+coordinator requests for versions 1&ndash;7, batched multi-group
+requests for version 8 and above, and the asynchronous coordinator
+completion path (`sendMaybeThrottle`) including forwarded requests.
+
 ## How fuzz mode is enabled
 
 `jazzer-junit` only fuzzes (rather than running a single regression iteration
 against the corpus) when the env var `JAZZER_FUZZ=1` is set during the test
 JVM's lifetime. Fuzzing duration is controlled by the `maxDuration` argument
 of the `@FuzzTest` annotation; in this branch the produce baseline tests
-run for `100s` each, the produce coverage-improvement tests and all the
-fetch tests run for `20s` each.
+run for `100s` each, the produce coverage-improvement tests, all fetch,
+describe-topic-partitions, and offset-fetch tests run for `20s` each.
 
 > Important: Jazzer only fuzzes the **first** `@FuzzTest` it sees in a JVM;
-> the rest run a single regression pass. To get all five tests to fuzz, each
-> one must be invoked in its own Gradle test JVM, hence the loop in the
+> the rest run a single regression pass. To get every fuzz method to fuzz,
+> each one must be invoked in its own Gradle test JVM, hence the loop in the
 > reproduction script below.
 
 ## Attaching the JaCoCo agent
@@ -75,15 +85,16 @@ From the repository root:
 ./core/src/test/fuzz/run_fuzz_with_coverage.sh
 ```
 
-What the script does (≈ 50-55 minutes wall time on a developer machine):
+What the script does (≈ 60-70 minutes wall time on a developer machine):
 
 1. Downloads JaCoCo 0.8.12 to `/tmp/jacoco/` if it isn't there yet.
 2. Sets `JAVA_TOOL_OPTIONS` to attach `jacocoagent.jar` (writing to
    `/tmp/jacoco/coverage.exec`, `append=true`).
 3. Sets `JAZZER_FUZZ=1` so `jazzer-junit` actually fuzzes.
-4. Loops over the 16 fuzz tests (8 in `HandleProduceRequestFuzzTest`, 5 in
-   `HandleFetchRequestFuzzTest`, and 3 in
-   `HandleDescribeTopicPartitionsRequestFuzzTest`) and runs each in its
+4. Loops over the 21 fuzz tests (8 in `HandleProduceRequestFuzzTest`, 5 in
+   `HandleFetchRequestFuzzTest`, 3 in
+   `HandleDescribeTopicPartitionsRequestFuzzTest`, and 5 in
+   `HandleOffsetFetchRequestFuzzTest`) and runs each in its
    **own** `./gradlew :core:test --no-daemon --rerun-tasks --tests ...`
    invocation, so every test reaches Jazzer's fuzzing mode (one fuzz
    target per JVM). Each test runs for the duration declared in its
@@ -93,7 +104,10 @@ What the script does (≈ 50-55 minutes wall time on a developer machine):
 6. Prints a focused summary of `KafkaApis.scala` for
    `handleProduceRequest` (lines 606-752),
    `handleFetchRequest` (lines 757-1077),
-   `handleDescribeTopicPartitionsRequest` (lines 1445-1461), and
+   `handleDescribeTopicPartitionsRequest` (lines 1445-1461),
+   `handleOffsetFetchRequest` (lines 1466-1630, including private helpers
+   `handleOffsetFetchRequestFromZookeeper` / `handleOffsetFetchRequestFromCoordinator`
+   and related closures in that span), and
    `RequestHandlerHelper.sendMaybeThrottle` (lines 112-122).
 
 Open `/tmp/jacoco/report/html/index.html` and navigate to
@@ -102,7 +116,7 @@ whole class.
 
 The XML report (`/tmp/jacoco/report/coverage.xml`) provides per-method
 counters; the entries of interest are
-`<method name="handle{Produce,Fetch,DescribeTopicPartitions}Request">` under
+`<method name="handle{Produce,Fetch,DescribeTopicPartitions,OffsetFetch}Request">` under
 `class kafka/server/KafkaApis`, plus the `$anonfun$...$N` siblings
 (Scala-generated closures of the same method).
 
@@ -110,7 +124,7 @@ counters; the entries of interest are
 
 The runner script writes its exec file to `/tmp/jacoco/coverage.exec`,
 which lives on the agent VM's `/tmp` and is wiped whenever the VM is
-recycled. To avoid having to re-run the full fuzz suite (≈ 50 minutes)
+recycled. To avoid having to re-run the full fuzz suite (roughly an hour)
 every time, the most recent exec file is committed to the repo at
 [`coverage_results/coverage.exec.xz`](./coverage_results/coverage.exec.xz)
 (xz-compressed, ~500 KB; the underlying exec file is mostly zero bytes
@@ -123,6 +137,10 @@ The runner has three modes, selectable via the `FUZZ_MODE` env var:
 | `fresh` (default) | `rm -f /tmp/jacoco/coverage.exec`                  | nothing                                                                  |
 | `resume`    | `xz -dc coverage_results/coverage.exec.xz > /tmp/jacoco/coverage.exec` | nothing                                          |
 | `snapshot`  | `rm -f /tmp/jacoco/coverage.exec`                       | `xz -9e -c /tmp/jacoco/coverage.exec > coverage_results/coverage.exec.xz` |
+
+Optional **`FUZZ_SUITE`** (default `all`): set `FUZZ_SUITE=offset-fetch` to run only
+`HandleOffsetFetchRequestFuzzTest` (four tests). Useful with `FUZZ_MODE=resume` to
+append JaCoCo data for the new targets without re-running produce/fetch/describe.
 
 Typical workflow:
 
@@ -144,9 +162,10 @@ xz -9e -c /tmp/jacoco/coverage.exec > core/src/test/fuzz/coverage_results/covera
 
 ## Last recorded result
 
-After running all 13 fuzz tests (11,743 produce-method iterations +
-3,333 fetch-method iterations = 15,076 fuzz iterations total, no
-Jazzer-discovered crashes after extracting the NPE finding into
+After running the produce + fetch + describe-topic-partitions fuzz tests
+(11,743 produce-method iterations + 3,333 fetch-method iterations =
+15,076 fuzz iterations for those targets; no Jazzer-discovered crashes
+after extracting the NPE finding into
 `KafkaApisHandleFetchRequestNpeReproducerTest`), JaCoCo reports:
 
 ### `handleProduceRequest` (KafkaApis.scala lines 606&ndash;752)
@@ -185,6 +204,17 @@ scope. The reachable ZK arm is fully covered:
 | Bytecode instructions | 24 / 24         | 100.0%  |
 | Branches              | 2 / 2           | 100.0%  |
 
+### `handleOffsetFetchRequest` (KafkaApis.scala lines 1466&ndash;1630)
+
+| Metric                | Covered / Total | %       |
+| --------------------- | --------------- | ------- |
+| Source lines          | 93 / 104        | 89.4%   |
+| Bytecode instructions | 489 / 602       | 81.2%   |
+| Branches              | 24 / 30         | 80.0%   |
+
+Per-line gaps are listed in
+[`coverage_results/coverage_summary.txt`](./coverage_results/coverage_summary.txt).
+
 The remaining uncovered lines in both methods are documented per-line in
 [`coverage_results/coverage_summary.txt`](./coverage_results/coverage_summary.txt).
 They are predominantly logging format-arg lambdas plus a few branches
@@ -202,18 +232,22 @@ re-running the fuzzer:
   annotated `KafkaApis.scala` source view and the per-method table.
 * `coverage_results/html/kafka.server/KafkaApis.scala.html` &mdash; JaCoCo's
   green/yellow/red annotated `KafkaApis.scala` (scroll to lines
-  606&ndash;752 for `handleProduceRequest` or 757&ndash;1077 for
-  `handleFetchRequest`).
+  606&ndash;752 for `handleProduceRequest`, 757&ndash;1077 for
+  `handleFetchRequest`, or 1466&ndash;1630 for `handleOffsetFetchRequest`).
 * `coverage_results/html/kafka.server/KafkaApis.html` &mdash; per-method
   counters for `KafkaApis`, including every
-  `$anonfun$handleProduceRequest$N` and `$anonfun$handleFetchRequest$N`
-  Scala-generated closure.
+  `$anonfun$handleProduceRequest$N`, `$anonfun$handleFetchRequest$N`, and
+  offset-fetch-related Scala-generated closures.
 * `coverage_results/coverage_KafkaApis.xml` &mdash; subset of the JaCoCo XML
   report scoped to the `kafka/server` package (machine-readable).
-* `coverage_results/coverage.csv` &mdash; full per-class CSV from the run.
+* `coverage_results/coverage.csv` &mdash; CSV rows for `KafkaApis` and
+  `RequestHandlerHelper` only (trimmed from the full report).
 * `coverage_results/coverage_summary.txt` &mdash; human-readable summary
-  including per-line and per-closure breakdown for both fuzz targets,
+  including per-line breakdown for the fuzz targets,
   plus the description of the NPE crash finding.
+* `refresh_in_repo_coverage.py` &mdash; copies the trimmed HTML/XML/CSV slice
+  from `/tmp/jacoco/report/`; invoked automatically at the end of
+  `run_fuzz_with_coverage.sh` after JaCoCo report generation.
 
 The full HTML report (≈ 12 MB across hundreds of classes) is **not**
 committed; rerun `run_fuzz_with_coverage.sh` to regenerate it under
