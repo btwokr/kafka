@@ -299,7 +299,7 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
    * Compared with the existing fuzz tests, this one deliberately does NOT
    * call addTopicToMetadataCache(topic, ...).
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestUnknownTopicOrPartition(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
     val acks = data.consumeInt(0, 1).toShort
@@ -348,7 +348,7 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
    * a non-error PartitionResponse back through the response callback
    * with acks == 0.
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestThrottlingAndAckZeroNoOp(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
     val compression = buildCompression(data.consumeInt(0, 4), version)
@@ -428,7 +428,7 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
    * fuzz input so every iteration triggers line 696 regardless of the
    * input length.
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestRequestThrottleDominates(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
     val compression = buildCompression(data.consumeInt(0, 4), version)

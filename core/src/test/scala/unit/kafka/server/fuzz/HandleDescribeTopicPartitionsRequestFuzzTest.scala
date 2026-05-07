@@ -51,7 +51,7 @@ class HandleDescribeTopicPartitionsRequestFuzzTest extends KafkaApisTest {
    *       response.maybeSetThrottleTimeMs (line 120),
    *       requestChannel.sendResponse (line 121).
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestZkUnsupportedVersion(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(
       ApiKeys.DESCRIBE_TOPIC_PARTITIONS.oldestVersion().toInt,
@@ -89,7 +89,7 @@ class HandleDescribeTopicPartitionsRequestFuzzTest extends KafkaApisTest {
    * sendMaybeThrottle skips the local throttle() call and goes
    * straight to maybeSetThrottleTimeMs + sendResponse.
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestZkUnsupportedVersionForwarded(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(
       ApiKeys.DESCRIBE_TOPIC_PARTITIONS.oldestVersion().toInt,
@@ -125,7 +125,7 @@ class HandleDescribeTopicPartitionsRequestFuzzTest extends KafkaApisTest {
    * a positive throttle value so `RequestHandlerHelper.throttle(...)`
    * actually mutes the channel before the response is sent.
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestZkUnsupportedVersionThrottled(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(
       ApiKeys.DESCRIBE_TOPIC_PARTITIONS.oldestVersion().toInt,

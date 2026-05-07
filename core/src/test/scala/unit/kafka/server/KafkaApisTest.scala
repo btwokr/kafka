@@ -105,6 +105,7 @@ import scala.collection.{Map, Seq, mutable}
 import scala.jdk.CollectionConverters._
 
 class KafkaApisTest extends Logging {
+  final val FUZZ_DURATION = "10s"
   val requestChannel: RequestChannel = mock(classOf[RequestChannel])
   private val requestChannelMetrics: RequestChannel.Metrics = mock(classOf[RequestChannel.Metrics])
   val replicaManager: ReplicaManager = mock(classOf[ReplicaManager])
@@ -113,7 +114,7 @@ class KafkaApisTest extends Logging {
   val txnCoordinator: TransactionCoordinator = mock(classOf[TransactionCoordinator])
   val controller: KafkaController = mock(classOf[KafkaController])
   private val forwardingManager: ForwardingManager = mock(classOf[ForwardingManager])
-  private val autoTopicCreationManager: AutoTopicCreationManager = mock(classOf[AutoTopicCreationManager])
+  val autoTopicCreationManager: AutoTopicCreationManager = mock(classOf[AutoTopicCreationManager])
 
   private val kafkaPrincipalSerde = new KafkaPrincipalSerde {
     override def serialize(principal: KafkaPrincipal): Array[Byte] = Utils.utf8(principal.toString)
@@ -131,8 +132,6 @@ class KafkaApisTest extends Logging {
   private val replicaQuotaManager: ReplicationQuotaManager = mock(classOf[ReplicationQuotaManager])
   private val quotas = QuotaManagers(clientQuotaManager, clientQuotaManager, clientRequestQuotaManager,
     clientControllerQuotaManager, replicaQuotaManager, replicaQuotaManager, replicaQuotaManager, None)
-  // Exposed (non-private) so that fuzz tests in `unit.kafka.server` can stub
-  // it directly. See HandleFetchRequestFuzzTest.
   val fetchManager: FetchManager = mock(classOf[FetchManager])
   private val clientMetricsManager: ClientMetricsManager = mock(classOf[ClientMetricsManager])
   private val brokerTopicStats = new BrokerTopicStats

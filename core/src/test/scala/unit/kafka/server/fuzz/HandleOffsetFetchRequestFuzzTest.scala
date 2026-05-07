@@ -46,7 +46,7 @@ class HandleOffsetFetchRequestFuzzTest extends KafkaApisTest {
    * `RuntimeException` during fuzzing as a security finding even when the
    * production handler catches it inside `handleOffsetFetchRequestFromZookeeper`.
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestOffsetFetchZk(data: FuzzedDataProvider): Unit = {
     val mode = data.consumeInt(0, 4)
     val throttleMs = data.consumeInt(0, 100)
@@ -129,7 +129,7 @@ class HandleOffsetFetchRequestFuzzTest extends KafkaApisTest {
    * exceptional completion so `fetchAllOffsetsForGroup` / `fetchOffsetsForGroup`
    * handle branches run.
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestOffsetFetchCoordinatorMultiGroup(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(8, ApiKeys.OFFSET_FETCH.latestVersion).toShort
     val numGroups = data.consumeInt(1, 4)
@@ -284,7 +284,7 @@ class HandleOffsetFetchRequestFuzzTest extends KafkaApisTest {
   /**
    * Coordinator path for single-group protocol versions 1&ndash;7 (no batching).
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestOffsetFetchCoordinatorV1To7(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(1, 7).toShort
     val requireStable = data.consumeBoolean()
@@ -337,7 +337,7 @@ class HandleOffsetFetchRequestFuzzTest extends KafkaApisTest {
    * `sendMaybeThrottle` on the coordinator completion path with non-zero
    * request quota and a forwarded request (skips local `throttle()`).
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestOffsetFetchCoordinatorThrottleAndForwarded(data: FuzzedDataProvider): Unit = {
     val useForwarded = data.consumeBoolean()
     val throttleMs = data.consumeInt(0, 100)
@@ -385,7 +385,7 @@ class HandleOffsetFetchRequestFuzzTest extends KafkaApisTest {
    * so a single regression pass and minimal libFuzzer input still hit these branches.
    * Uses `Errors.*.exception` completions so Jazzer does not flag them as findings.
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestOffsetFetchCoordinatorAuthAndHandleExceptions(data: FuzzedDataProvider): Unit = {
     val splitSize = data.consumeInt(1, 24)
     val (gidRaw, _) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)

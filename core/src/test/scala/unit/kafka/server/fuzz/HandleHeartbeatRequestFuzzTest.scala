@@ -60,7 +60,7 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
    * Uses current metadata version so static membership is allowed when
    * `groupInstanceId` is non-null.
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestHeartbeatCoordinatorPath(data: FuzzedDataProvider): Unit = {
     resetZkMetadataToLatestTesting()
     val version = data.consumeInt(
@@ -116,7 +116,7 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
    * `groupInstanceId` set on IBP &lt; 2.3 triggers the early
    * `UNSUPPORTED_VERSION` response (no coordinator call).
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestHeartbeatStaticMembershipOldIbp(data: FuzzedDataProvider): Unit = {
     resetZkMetadataToLatestTesting()
     val version = data.consumeInt(
@@ -153,7 +153,7 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
    * Authorized path on IBP &ge; 2.3 with non-null `groupInstanceId` exercises
    * the branch where static membership is supported (coordinator invoked).
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestHeartbeatStaticMembershipSupportedIbp(data: FuzzedDataProvider): Unit = {
     resetZkMetadataToLatestTesting()
     val version = data.consumeInt(
@@ -196,7 +196,7 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
    * Denies READ on the group; expects `GROUP_AUTHORIZATION_FAILED` without
    * calling the coordinator.
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestHeartbeatAuthorizationDenied(data: FuzzedDataProvider): Unit = {
     resetZkMetadataToLatestTesting()
     val version = data.consumeInt(
@@ -233,7 +233,7 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
    * Request-quota throttling on the success path (`sendMaybeThrottle` with
    * non-zero throttle time).
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestHeartbeatThrottled(data: FuzzedDataProvider): Unit = {
     resetZkMetadataToLatestTesting()
     val version = data.consumeInt(

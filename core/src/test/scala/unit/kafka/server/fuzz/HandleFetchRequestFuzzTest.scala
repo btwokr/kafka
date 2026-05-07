@@ -169,7 +169,7 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
    * (see `KafkaApisHandleFetchRequestNpeReproducerTest`), which would
    * stop the rest of this test from being explored.
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestFetchConsumer(data: FuzzedDataProvider): Unit = {
     val mode = data.consumeInt(0, 6)
     // For modes 5 (KAFKA_STORAGE_ERROR + v<=5 mapping) and 6
@@ -280,7 +280,7 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
    *   - the isFromFollower branch with CLUSTER_ACTION denied (lines 791-794),
    *   - the follower send path (lines 985-991).
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestFetchFollower(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(4, ApiKeys.FETCH.latestVersion).toShort
     val mode = data.consumeInt(0, 3)
@@ -347,7 +347,7 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
    * the else branch (line 1014). Uses a non-follower request so the
    * non-follower send path (lines 992-1028) is exercised.
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestFetchThrottling(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(2, ApiKeys.FETCH.latestVersion).toShort
     // 0 -> bandwidth dominates, 1 -> request dominates
@@ -393,7 +393,7 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
    * spend its time exploring the related branches without competing
    * with the other modes.
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestFetchEmptyInteresting(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(2, ApiKeys.FETCH.latestVersion).toShort
     val maxBytes = data.consumeInt(1, 1024 * 1024)
@@ -453,7 +453,7 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
    * disabled => UNSUPPORTED_VERSION) and 866-880 (the actual lazy
    * down-conversion construction).
    */
-  @FuzzTest(maxDuration = "20s")
+  @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestFetchDownConversion(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(0, 3).toShort  // versions where down-conversion may trigger
     val downConversionEnabled = data.consumeBoolean()
