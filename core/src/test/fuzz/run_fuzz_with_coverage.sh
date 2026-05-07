@@ -26,9 +26,9 @@
 #   /tmp/jacoco/report/coverage.xml      XML coverage report (per-method)
 #   /tmp/jacoco/report/coverage.csv      CSV coverage report (per-class)
 #
-# Wall-clock time: roughly 65-75 minutes for the full 8 produce + 5
-# fetch + 3 describe-topic-partitions + 5 heartbeat fuzz suite plus
-# Gradle startup overhead.
+# Optional: `FUZZ_SUITE=all` (default) runs every fuzz target; set
+# `FUZZ_SUITE=offset-fetch` to run only `HandleOffsetFetchRequestFuzzTest`
+# (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
 
@@ -42,6 +42,19 @@ case "$FUZZ_MODE" in
     fresh|resume|snapshot) ;;
     *)
         echo "[fuzz] unknown FUZZ_MODE=$FUZZ_MODE (expected: fresh|resume|snapshot)" >&2
+        exit 2
+        ;;
+esac
+
+# Optional: run a subset of fuzz tests (default: full suite). Use with
+# FUZZ_MODE=resume to append only new targets onto the committed snapshot.
+#   FUZZ_SUITE=all            8 produce + 5 fetch + 3 describe + 4 offset-fetch
+#   FUZZ_SUITE=offset-fetch   4 offset-fetch tests only
+FUZZ_SUITE="${FUZZ_SUITE:-all}"
+case "$FUZZ_SUITE" in
+    all|offset-fetch) ;;
+    *)
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch)" >&2
         exit 2
         ;;
 esac
@@ -127,6 +140,16 @@ HEARTBEAT_TESTS=(
     fuzzTestHeartbeatThrottled
 )
 
+# handleOffsetFetchRequest fuzz targets (HandleOffsetFetchRequestFuzzTest,
+# maxDuration = 20s each)
+OFFSET_FETCH_TESTS=(
+    fuzzTestOffsetFetchZk
+    fuzzTestOffsetFetchCoordinatorMultiGroup
+    fuzzTestOffsetFetchCoordinatorV1To7
+    fuzzTestOffsetFetchCoordinatorThrottleAndForwarded
+    fuzzTestOffsetFetchCoordinatorAuthAndHandleExceptions
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -135,24 +158,37 @@ run_one() {
     echo "=========================================="
     echo "[fuzz] running ${fqcn}.${t}"
     echo "=========================================="
+    set +e
     ./gradlew :core:test --no-daemon --rerun-tasks \
         --tests "${fqcn}.${t}" \
         -i 2>&1 | tee "$JACOCO_DIR/run_${t}.log" | \
         grep -E "(Fuzzing|fuzzTest.*PASSED|fuzzTest.*FAILED|Done [0-9]+ runs|<empty input>|exec/s: [0-9]+ |BUILD |^FAILURE|crash-)" || true
+    local st=${PIPESTATUS[0]}
+    set -e
+    if [[ $st -ne 0 ]]; then
+        echo "[fuzz] ERROR: gradlew exited with status $st for ${fqcn}.${t}" >&2
+        exit $st
+    fi
 }
 
-for t in "${PRODUCE_TESTS[@]}"; do
-    run_one "unit.kafka.server.fuzz.HandleProduceRequestFuzzTest" "$t"
-done
-for t in "${FETCH_TESTS[@]}"; do
-    run_one "unit.kafka.server.fuzz.HandleFetchRequestFuzzTest" "$t"
-done
-for t in "${DESCRIBE_TP_TESTS[@]}"; do
-    run_one "unit.kafka.server.fuzz.HandleDescribeTopicPartitionsRequestFuzzTest" "$t"
-done
-for t in "${HEARTBEAT_TESTS[@]}"; do
-    run_one "unit.kafka.server.fuzz.HandleHeartbeatRequestFuzzTest" "$t"
-done
+if [[ "$FUZZ_SUITE" == "all" ]]; then
+    for t in "${PRODUCE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleProduceRequestFuzzTest" "$t"
+    done
+    for t in "${FETCH_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleFetchRequestFuzzTest" "$t"
+    done
+    for t in "${DESCRIBE_TP_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDescribeTopicPartitionsRequestFuzzTest" "$t"
+    done
+    for t in "${HEARTBEAT_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleHeartbeatRequestFuzzTest" "$t"
+    done
+    for t in "${OFFSET_FETCH_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
+    done
+fi
+
 
 # 4. Generate HTML/XML/CSV reports against the freshly compiled core classes.
 mkdir -p "$REPORT_DIR"
@@ -168,6 +204,12 @@ echo
 echo "[fuzz] HTML report : $REPORT_DIR/html/index.html"
 echo "[fuzz] XML  report : $REPORT_DIR/coverage.xml"
 echo "[fuzz] exec data   : $EXEC"
+
+# 4a. Refresh the trimmed in-tree report under core/src/test/fuzz/coverage_results/
+#     (KafkaApis + RequestHandlerHelper only; see refresh_in_repo_coverage.py).
+if [[ -f "$REPORT_DIR/coverage.xml" ]]; then
+    python3 "$SCRIPT_DIR/refresh_in_repo_coverage.py" || echo "[fuzz] warning: refresh_in_repo_coverage.py failed" >&2
+fi
 
 # 4b. Optionally re-snapshot the freshly produced exec file into the
 #     committed in-tree location so it survives a Cloud Agent VM
@@ -190,6 +232,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleFetchRequest",                    757, 1077),
     ("KafkaApis.scala",          "handleDescribeTopicPartitionsRequest", 1445, 1461),
     ("KafkaApis.scala",          "handleHeartbeatRequest",               1924, 1948),
+    ("KafkaApis.scala",          "handleOffsetFetchRequest",             1466, 1630),
     ("RequestHandlerHelper.scala", "sendMaybeThrottle",                   112,  122),
 ]
 
