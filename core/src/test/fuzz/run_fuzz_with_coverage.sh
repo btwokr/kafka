@@ -30,9 +30,6 @@
 # `FUZZ_SUITE=offset-fetch` to run only `HandleOffsetFetchRequestFuzzTest`
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
-# fetch + 3 describe-topic-partitions + 4 offset-fetch fuzz suite plus
-# Gradle startup overhead.
-#
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
@@ -133,6 +130,16 @@ DESCRIBE_TP_TESTS=(
     fuzzTestZkUnsupportedVersionForwarded
 )
 
+# handleHeartbeatRequest fuzz targets (HandleHeartbeatRequestFuzzTest,
+# maxDuration = 20s each)
+HEARTBEAT_TESTS=(
+    fuzzTestHeartbeatCoordinatorPath
+    fuzzTestHeartbeatStaticMembershipOldIbp
+    fuzzTestHeartbeatStaticMembershipSupportedIbp
+    fuzzTestHeartbeatAuthorizationDenied
+    fuzzTestHeartbeatThrottled
+)
+
 # handleOffsetFetchRequest fuzz targets (HandleOffsetFetchRequestFuzzTest,
 # maxDuration = 20s each)
 OFFSET_FETCH_TESTS=(
@@ -174,10 +181,14 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${DESCRIBE_TP_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDescribeTopicPartitionsRequestFuzzTest" "$t"
     done
+    for t in "${HEARTBEAT_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleHeartbeatRequestFuzzTest" "$t"
+    done
+    for t in "${OFFSET_FETCH_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
+    done
 fi
-for t in "${OFFSET_FETCH_TESTS[@]}"; do
-    run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
-done
+
 
 # 4. Generate HTML/XML/CSV reports against the freshly compiled core classes.
 mkdir -p "$REPORT_DIR"
@@ -220,6 +231,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleProduceRequest",                  606, 752),
     ("KafkaApis.scala",          "handleFetchRequest",                    757, 1077),
     ("KafkaApis.scala",          "handleDescribeTopicPartitionsRequest", 1445, 1461),
+    ("KafkaApis.scala",          "handleHeartbeatRequest",               1924, 1948),
     ("KafkaApis.scala",          "handleOffsetFetchRequest",             1466, 1630),
     ("RequestHandlerHelper.scala", "sendMaybeThrottle",                   112,  122),
 ]
