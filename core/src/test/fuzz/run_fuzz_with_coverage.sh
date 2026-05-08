@@ -161,6 +161,14 @@ SYNC_GROUP_TESTS=(
     fuzzTestSyncGroupThrottledResponse
 )
 
+# handleLeaveGroupRequest fuzz targets (HandleLeaveGroupRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+LEAVE_GROUP_TESTS=(
+    fuzzTestLeaveGroupAuthorizationDenied
+    fuzzTestLeaveGroupCoordinatorFuture
+    fuzzTestLeaveGroupThrottledResponse
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -200,6 +208,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${SYNC_GROUP_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleSyncGroupRequestFuzzTest" "$t"
+    done
+    for t in "${LEAVE_GROUP_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleLeaveGroupRequestFuzzTest" "$t"
     done
 fi
 
