@@ -33,8 +33,11 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val acks = data.consumeInt(0, 1).toShort
     val timeoutMs = data.consumeInt(0, 5000)
-
-    val (topic, record) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
+    val recordSuffixLen = data.consumeInt(0, 8192)
+    val topicPrefixBytes = data.consumeBytes(splitSize)
+    val recordBytes = data.consumeBytes(recordSuffixLen)
+    val topic = new String(topicPrefixBytes)
+    val record = recordBytes
     addTopicToMetadataCache(topic, numPartitions = 2, numBrokers = 3)
 
     reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
@@ -95,7 +98,11 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
     val num = data.consumeInt(0, 1)
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val splitSize = data.consumeInt(10, 4096)
-    val (topic, record) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
+    val recordSuffixLen = data.consumeInt(0, 8192)
+    val topicPrefixBytes = data.consumeBytes(splitSize)
+    val recordBytes = data.consumeBytes(recordSuffixLen)
+    val topic = new String(topicPrefixBytes)
+    val record = recordBytes
 
     addTopicToMetadataCache(topic, numPartitions = 2)
 
@@ -143,7 +150,11 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
     val num = data.consumeInt(0, 1)
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val splitSize = data.consumeInt(10, 4096)
-    val (topic, record) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
+    val recordSuffixLen = data.consumeInt(0, 8192)
+    val topicPrefixBytes = data.consumeBytes(splitSize)
+    val recordBytes = data.consumeBytes(recordSuffixLen)
+    val topic = new String(topicPrefixBytes)
+    val record = recordBytes
 
     addTopicToMetadataCache(topic, numPartitions = 2)
 
@@ -192,7 +203,11 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
     val num = data.consumeInt(0, 1)
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val splitSize = data.consumeInt(10, 4096)
-    val (topic, record) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
+    val recordSuffixLen = data.consumeInt(0, 8192)
+    val topicPrefixBytes = data.consumeBytes(splitSize)
+    val recordBytes = data.consumeBytes(recordSuffixLen)
+    val topic = new String(topicPrefixBytes)
+    val record = recordBytes
 
     addTopicToMetadataCache(topic, numPartitions = 2)
 
@@ -245,7 +260,11 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
     val acks = data.consumeInt(0, 1).toShort
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val splitSize = data.consumeInt(10, 4096)
-    val (topic, record) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
+    val recordSuffixLen = data.consumeInt(0, 8192)
+    val topicPrefixBytes = data.consumeBytes(splitSize)
+    val recordBytes = data.consumeBytes(recordSuffixLen)
+    val topic = new String(topicPrefixBytes)
+    val record = recordBytes
 
     addTopicToMetadataCache(topic, numPartitions = 2)
 
@@ -306,7 +325,11 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
     val timeoutMs = data.consumeInt(0, 5000)
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val splitSize = data.consumeInt(10, 4096)
-    val (topic, record) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
+    val recordSuffixLen = data.consumeInt(0, 8192)
+    val topicPrefixBytes = data.consumeBytes(splitSize)
+    val recordBytes = data.consumeBytes(recordSuffixLen)
+    val topic = new String(topicPrefixBytes)
+    val record = recordBytes
 
     reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
 
@@ -352,7 +375,6 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
   def fuzzTestThrottlingAndAckZeroNoOp(data: FuzzedDataProvider): Unit = {
     val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
     val compression = buildCompression(data.consumeInt(0, 4), version)
-    val splitSize = data.consumeInt(10, 4096)
     val timeoutMs = data.consumeInt(0, 5000)
     // Always acks == 0 so we can also exercise line 718 (sendNoOpResponseExemptThrottle).
     val acks: Short = 0
@@ -361,9 +383,14 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
     // are exercised on every iteration. With acks == 0 the request quota
     // is forced to 0 by line 688, so we just need bandwidth >= 1.
     val bandwidthThrottle = data.consumeInt(1, 100)
-    val requestThrottle   = data.consumeInt(0, 100)
+    val requestThrottle = data.consumeInt(0, 100)
+    val splitSize = data.consumeInt(10, 4096)
+    val recordSuffixLen = data.consumeInt(0, 8192)
+    val topicPrefixBytes = data.consumeBytes(splitSize)
+    val recordBytes = data.consumeBytes(recordSuffixLen)
+    val topic = new String(topicPrefixBytes)
+    val record = recordBytes
 
-    val (topic, record) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
     addTopicToMetadataCache(topic, numPartitions = 2)
 
     reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
@@ -438,9 +465,13 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
     // Fix bandwidth low and pick request strictly higher so the
     // `requestThrottle > bandwidthThrottle` branch always wins.
     val bandwidthThrottle = 1
-    val requestThrottle   = data.consumeInt(2, 100)
+    val requestThrottle = data.consumeInt(2, 100)
+    val recordSuffixLen = data.consumeInt(0, 8192)
+    val topicPrefixBytes = data.consumeBytes(splitSize)
+    val recordBytes = data.consumeBytes(recordSuffixLen)
+    val topic = new String(topicPrefixBytes)
+    val record = recordBytes
 
-    val (topic, record) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
     addTopicToMetadataCache(topic, numPartitions = 2)
 
     reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel, txnCoordinator)
@@ -485,20 +516,6 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
     } finally {
       kafkaApis.close()
     }
-  }
-
-  def helperSplitByteArray(byteArray: Array[Byte], splitSize: Int): (String, Array[Byte]) = {
-    // Ensure the split size is valid
-    require(splitSize >= 0, "Split size must be non-negative")
-
-    // Split the byte array into two parts
-    val (stringBytes, remainingBytes) = byteArray.splitAt(splitSize)
-
-    // Convert the first part to a String
-    val resultString = new String(stringBytes)
-
-    // Return the result as a tuple
-    (resultString, remainingBytes)
   }
 
   def buildCompression(input: Int, version: Int): Compression = {
