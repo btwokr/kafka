@@ -27,7 +27,7 @@ import scala.jdk.CollectionConverters._
  *   - otherwise `groupCoordinator.heartbeat` with success or exception
  *     paths in the completion handler.
  */
-class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
+class HandleHeartbeatRequestFuzzTest extends KafkaApisTest { //TODO
 
   private def resetZkMetadataToLatestTesting(): Unit = {
     metadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.latestTesting())
@@ -48,9 +48,8 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
       any[RequestChannel.Request](), anyLong)).thenReturn(0)
   }
 
-  private def splitBytes(data: FuzzedDataProvider, splitSize: Int): (String, Array[Byte]) = {
-    val bytes = data.consumeRemainingAsBytes()
-    val (prefix, rest) = bytes.splitAt(splitSize)
+  private def splitBytes(byteArray: Array[Byte], splitSize: Int): (String, Array[Byte]) = {
+    val (prefix, rest) = byteArray.splitAt(splitSize)
     (new String(prefix), rest)
   }
 
@@ -63,11 +62,11 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestHeartbeatCoordinatorPath(data: FuzzedDataProvider): Unit = {
     resetZkMetadataToLatestTesting()
-    val version = data.consumeInt(
-      ApiKeys.HEARTBEAT.oldestVersion().toInt,
-      ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.HEARTBEAT.oldestVersion(),
+      ApiKeys.HEARTBEAT.latestVersion())
     val splitSize = data.consumeInt(0, 128)
-    val (groupIdPrefix, tail) = splitBytes(data, splitSize)
+    val (groupIdPrefix, tail) = splitBytes(data.consumeRemainingAsBytes(), splitSize)
     val (memberPrefix, tail2) = {
       val s = data.consumeInt(0, math.min(64, tail.length))
       val (a, b) = tail.splitAt(s)
@@ -123,7 +122,7 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
       ApiKeys.HEARTBEAT.oldestVersion().toInt,
       ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
     val splitSize = data.consumeInt(0, 64)
-    val (gid, rest) = splitBytes(data, splitSize)
+    val (gid, rest) = splitBytes(data.consumeRemainingAsBytes(), splitSize)
     val mid = if (rest.isEmpty) "m" else new String(rest)
     val instanceId = if (gid.isEmpty) "fuzz-static-id" else s"$gid-instance"
 
@@ -160,7 +159,7 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
       ApiKeys.HEARTBEAT.oldestVersion().toInt,
       ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
     val splitSize = data.consumeInt(0, 64)
-    val (gid, rest) = splitBytes(data, splitSize)
+    val (gid, rest) = splitBytes(data.consumeRemainingAsBytes(), splitSize)
     val instanceId = if (rest.isEmpty) "static" else new String(rest)
 
     val requestData = new HeartbeatRequestData()
@@ -203,7 +202,7 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
       ApiKeys.HEARTBEAT.oldestVersion().toInt,
       ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
     val splitSize = data.consumeInt(0, 64)
-    val (gid, rest) = splitBytes(data, splitSize)
+    val (gid, rest) = splitBytes(data.consumeRemainingAsBytes(), splitSize)
     val memberId = if (rest.isEmpty) "m" else new String(rest)
 
     val requestData = new HeartbeatRequestData()
@@ -241,7 +240,7 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
       ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
     val throttleMs = data.consumeInt(1, 500)
     val splitSize = data.consumeInt(0, 64)
-    val (gid, _) = splitBytes(data, splitSize)
+    val (gid, _) = splitBytes(data.consumeRemainingAsBytes(), splitSize)
 
     val requestData = new HeartbeatRequestData()
       .setGroupId(if (gid.isEmpty) "fuzz-throttle-group" else gid)

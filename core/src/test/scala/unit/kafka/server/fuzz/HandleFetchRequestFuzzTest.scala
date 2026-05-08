@@ -288,6 +288,7 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
     val minBytes = data.consumeInt(0, 1024)
     val maxWait = data.consumeInt(0, 5000)
     val splitSize = data.consumeInt(10, 4096)
+    val isReassignmentFetch = data.consumeBoolean()
     val (rawTopic, recordBytes) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
     val topic = if (rawTopic.isEmpty) "fuzz-follower-topic" else rawTopic
     val topicId = Uuid.randomUuid()
@@ -322,8 +323,7 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
 
     val records = if (recordBytes.isEmpty) MemoryRecords.EMPTY
       else MemoryRecords.withRecords(Compression.NONE, new SimpleRecord(recordBytes))
-    stubFetchMessages(tipInContext, Errors.NONE, records, hw = 7L, logStartOffset = 0L,
-      isReassignmentFetch = data.consumeBoolean())
+    stubFetchMessages(tipInContext, Errors.NONE, records, hw = 7L, logStartOffset = 0L, isReassignmentFetch)
 
     stubNoThrottling()
 

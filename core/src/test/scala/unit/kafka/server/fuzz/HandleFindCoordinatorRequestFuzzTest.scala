@@ -102,9 +102,12 @@ class HandleFindCoordinatorRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestFindCoordinatorBeforeV4(data: FuzzedDataProvider): Unit = {
     val mode = data.consumeInt(0, 7)
+    val version1 = data.consumeShort(1, 3)
+    val version2 = data.consumeShort(0, 3)
+    val coordType = data.consumeBoolean()
     val version: Short = mode match {
-      case 1 | 2 => data.consumeInt(1, 3).toShort
-      case _ => data.consumeInt(0, 3).toShort
+      case 1 | 2 => version1
+      case _ => version2
     }
     val key = safeKey(data, "fuzz-old-coordinator")
     reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel,
@@ -121,7 +124,7 @@ class HandleFindCoordinatorRequestFuzzTest extends KafkaApisTest {
         CoordinatorType.SHARE.id -> Some(allowOrDenyAuthorizer(AuthorizationResult.ALLOWED))
       case _ =>
         val coordinatorType =
-          if (data.consumeBoolean()) CoordinatorType.GROUP else CoordinatorType.TRANSACTION
+          if (coordType) CoordinatorType.GROUP else CoordinatorType.TRANSACTION
         coordinatorType.id -> None
     }
     mode match {
@@ -152,15 +155,18 @@ class HandleFindCoordinatorRequestFuzzTest extends KafkaApisTest {
   def fuzzTestFindCoordinatorV4AndAbove(data: FuzzedDataProvider): Unit = {
     val mode = data.consumeInt(0, 8)
     val version: Short =
-      if (mode == 3) data.consumeInt(4, 5).toShort
-      else data.consumeInt(4, ApiKeys.FIND_COORDINATOR.latestVersion).toShort
+      if (mode == 3) data.consumeShort(4, 5)
+      else data.consumeShort(4, ApiKeys.FIND_COORDINATOR.latestVersion)
     val numKeys = data.consumeInt(1, 4)
+    val coordType = data.consumeBoolean()
     val keys = (0 until numKeys).map(i => safeKey(data, s"fuzz-new-coordinator-$i"))
+
     reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel,
       txnCoordinator, autoTopicCreationManager)
     stubNoThrottle()
     when(groupCoordinator.partitionFor(anyString())).thenReturn(0)
     when(txnCoordinator.partitionFor(anyString())).thenReturn(0)
+
     val (keyType, authorizer) = mode match {
       case 0 =>
         CoordinatorType.GROUP.id -> Some(allowOrDenyAuthorizer(AuthorizationResult.DENIED))
@@ -174,7 +180,7 @@ class HandleFindCoordinatorRequestFuzzTest extends KafkaApisTest {
         CoordinatorType.SHARE.id -> Some(allowOrDenyAuthorizer(AuthorizationResult.ALLOWED))
       case _ =>
         val coordinatorType =
-          if (data.consumeBoolean()) CoordinatorType.GROUP else CoordinatorType.TRANSACTION
+          if (coordType) CoordinatorType.GROUP else CoordinatorType.TRANSACTION
         coordinatorType.id -> None
     }
     mode match {

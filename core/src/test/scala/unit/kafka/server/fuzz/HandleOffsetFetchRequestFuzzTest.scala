@@ -134,16 +134,16 @@ class HandleOffsetFetchRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeInt(8, ApiKeys.OFFSET_FETCH.latestVersion).toShort
     val numGroups = data.consumeInt(1, 4)
     val splitSize = data.consumeInt(1, 32)
-    val (prefix, _) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
-    val p = if (prefix.isEmpty) "g" else prefix.replaceAll("[^a-zA-Z0-9._-]", "_").take(32)
-
     val requireStable = data.consumeBoolean()
+    val branch = data.consumeInt(0, 3)
+    val (prefix, _) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)//
+
+    val p = if (prefix.isEmpty) "g" else prefix.replaceAll("[^a-zA-Z0-9._-]", "_").take(32)
 
     case class Spec(gid: String, branch: Int, partitionList: util.List[TopicPartition])
 
     val specs = (0 until numGroups).map { i =>
       val gid = s"$p-$i"
-      val branch = data.consumeInt(0, 3)
       val partitionList: util.List[TopicPartition] = branch match {
         case 0 =>
           util.Arrays.asList(
@@ -290,6 +290,7 @@ class HandleOffsetFetchRequestFuzzTest extends KafkaApisTest {
     val requireStable = data.consumeBoolean()
     val allPartitions = version >= 2 && data.consumeBoolean()
     val splitSize = data.consumeInt(1, 32)
+    val completeExceptionally = data.consumeBoolean()
     val (rawGroup, _) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
     val groupId = if (rawGroup.isEmpty) "fuzz-c-group" else rawGroup.take(200)
 
@@ -309,7 +310,7 @@ class HandleOffsetFetchRequestFuzzTest extends KafkaApisTest {
     when(groupCoordinator.fetchOffsets(any(), any(), anyBoolean())).thenReturn(fut)
     when(groupCoordinator.fetchAllOffsets(any(), any(), anyBoolean())).thenReturn(fut)
 
-    if (data.consumeBoolean())
+    if (completeExceptionally)
       fut.completeExceptionally(Errors.COORDINATOR_LOAD_IN_PROGRESS.exception)
     else
       fut.complete(new OffsetFetchResponseData.OffsetFetchResponseGroup()
