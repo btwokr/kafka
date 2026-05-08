@@ -179,6 +179,15 @@ DESCRIBE_GROUPS_TESTS=(
     fuzzTestDescribeGroupsThrottledResponse
 )
 
+# handleListGroupsRequest fuzz targets (HandleListGroupsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+LIST_GROUPS_TESTS=(
+    fuzzTestListGroupsPassthroughWithoutAuthorizer
+    fuzzTestListGroupsFilteredWhenClusterDescribeDenied
+    fuzzTestListGroupsCoordinatorException
+    fuzzTestListGroupsThrottledResponse
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -224,6 +233,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${DESCRIBE_GROUPS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDescribeGroupsRequestFuzzTest" "$t"
+    done
+    for t in "${LIST_GROUPS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleListGroupsRequestFuzzTest" "$t"
     done
 fi
 
