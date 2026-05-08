@@ -5,6 +5,7 @@ import com.code_intelligence.jazzer.junit.FuzzTest
 import kafka.network.RequestChannel
 import kafka.server.{KafkaApisTest, MetadataCache, ZkBrokerEpochManager}
 import org.apache.kafka.common.message.HeartbeatRequestData
+import org.apache.kafka.common.message.HeartbeatResponseData
 import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.requests.{HeartbeatRequest, RequestContext}
 import org.apache.kafka.server.authorizer.{Action, AuthorizationResult, Authorizer}
@@ -14,8 +15,8 @@ import org.mockito.ArgumentMatchers.{any, anyDouble, anyLong}
 import org.mockito.Mockito.{mock, reset, when}
 
 import java.util
+import java.util.Collections
 import java.util.concurrent.CompletableFuture
-import scala.jdk.CollectionConverters._
 
 /**
  * Jazzer fuzz tests targeting `KafkaApis.handleHeartbeatRequest`.
@@ -27,7 +28,12 @@ import scala.jdk.CollectionConverters._
  *   - otherwise `groupCoordinator.heartbeat` with success or exception
  *     paths in the completion handler.
  */
-class HandleHeartbeatRequestFuzzTest extends KafkaApisTest { //TODO
+class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
+
+  private def safeString(data: FuzzedDataProvider, fallback: String): String = {
+    val value = data.consumeString(128)
+    if (value == null || value.isEmpty) fallback else value
+  }
 
   private def resetZkMetadataToLatestTesting(): Unit = {
     metadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.latestTesting())
@@ -48,11 +54,6 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest { //TODO
       any[RequestChannel.Request](), anyLong)).thenReturn(0)
   }
 
-  private def splitBytes(byteArray: Array[Byte], splitSize: Int): (String, Array[Byte]) = {
-    val (prefix, rest) = byteArray.splitAt(splitSize)
-    (new String(prefix), rest)
-  }
-
   /**
    * Varies API version, group / member / instance id strings, generation id,
    * and whether the coordinator future completes normally or exceptionally.
@@ -62,41 +63,31 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest { //TODO
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestHeartbeatCoordinatorPath(data: FuzzedDataProvider): Unit = {
     resetZkMetadataToLatestTesting()
-    val version = data.consumeShort(
-      ApiKeys.HEARTBEAT.oldestVersion(),
-      ApiKeys.HEARTBEAT.latestVersion())
-    val splitSize = data.consumeInt(0, 128)
-    val (groupIdPrefix, tail) = splitBytes(data.consumeRemainingAsBytes(), splitSize)
-    val (memberPrefix, tail2) = {
-      val s = data.consumeInt(0, math.min(64, tail.length))
-      val (a, b) = tail.splitAt(s)
-      (new String(a), b)
-    }
-    val instanceLen = data.consumeInt(0, math.min(64, tail2.length))
-    val instanceId =
-      if (instanceLen == 0) null
-      else new String(tail2.take(instanceLen))
+    val version = data.consumeInt(
+      ApiKeys.HEARTBEAT.oldestVersion().toInt,
+      ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
+    val groupId = safeString(data, "fuzz-group")
+    val memberId = safeString(data, "fuzz-member")
+    val useInstanceId = data.consumeBoolean()
+    val groupInstanceId = if (useInstanceId) safeString(data, "fuzz-instance") else null
     val generationId = data.consumeInt()
     val completeWithError = data.consumeBoolean()
-
-    val groupId = if (groupIdPrefix.isEmpty) "fuzz-group" else groupIdPrefix
-    val memberId = if (memberPrefix.isEmpty) "fuzz-member" else memberPrefix
 
     val requestData = new HeartbeatRequestData()
       .setGroupId(groupId)
       .setMemberId(memberId)
-      .setGroupInstanceId(instanceId)
+      .setGroupInstanceId(groupInstanceId)
       .setGenerationId(generationId)
 
-    val heartbeatReq = new HeartbeatRequest.Builder(requestData).build(
-      heartbeatVersionAllowingInstanceId(version, instanceId))
+    val builtVersion = heartbeatVersionAllowingInstanceId(version, groupInstanceId)
+    val heartbeatReq = new HeartbeatRequest.Builder(requestData).build(builtVersion)
     val request = buildRequest(heartbeatReq)
 
     reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel,
       txnCoordinator, groupCoordinator)
     stubNoThrottling()
 
-    val future = new CompletableFuture[org.apache.kafka.common.message.HeartbeatResponseData]()
+    val future = new CompletableFuture[HeartbeatResponseData]()
     when(groupCoordinator.heartbeat(any[RequestContext], any())).thenReturn(future)
 
     val kafkaApis = createKafkaApis()
@@ -105,7 +96,7 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest { //TODO
       if (completeWithError)
         future.completeExceptionally(new IllegalStateException("fuzz-coordinator-error"))
       else
-        future.complete(new org.apache.kafka.common.message.HeartbeatResponseData())
+        future.complete(new HeartbeatResponseData())
     } finally {
       kafkaApis.close()
     }
@@ -121,19 +112,19 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest { //TODO
     val version = data.consumeInt(
       ApiKeys.HEARTBEAT.oldestVersion().toInt,
       ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
-    val splitSize = data.consumeInt(0, 64)
-    val (gid, rest) = splitBytes(data.consumeRemainingAsBytes(), splitSize)
-    val mid = if (rest.isEmpty) "m" else new String(rest)
-    val instanceId = if (gid.isEmpty) "fuzz-static-id" else s"$gid-instance"
+    val groupId = safeString(data, "fuzz-g")
+    val memberId = safeString(data, "fuzz-m")
+    val groupInstanceId = safeString(data, "fuzz-static-id")
+    val generationId = data.consumeInt()
 
     val requestData = new HeartbeatRequestData()
-      .setGroupId(if (gid.isEmpty) "g" else gid)
-      .setMemberId(mid)
-      .setGroupInstanceId(instanceId)
-      .setGenerationId(data.consumeInt())
+      .setGroupId(groupId)
+      .setMemberId(memberId)
+      .setGroupInstanceId(groupInstanceId)
+      .setGenerationId(generationId)
 
     val heartbeatReq = new HeartbeatRequest.Builder(requestData).build(
-      heartbeatVersionAllowingInstanceId(version, instanceId))
+      heartbeatVersionAllowingInstanceId(version, groupInstanceId))
     val request = buildRequest(heartbeatReq)
 
     metadataCache = MetadataCache.zkMetadataCache(brokerId, IBP_2_2_IV1)
@@ -158,18 +149,18 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest { //TODO
     val version = data.consumeInt(
       ApiKeys.HEARTBEAT.oldestVersion().toInt,
       ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
-    val splitSize = data.consumeInt(0, 64)
-    val (gid, rest) = splitBytes(data.consumeRemainingAsBytes(), splitSize)
-    val instanceId = if (rest.isEmpty) "static" else new String(rest)
+    val groupId = safeString(data, "fuzz-g")
+    val groupInstanceId = safeString(data, "fuzz-static-inst")
+    val generationId = data.consumeInt(0, Int.MaxValue)
 
     val requestData = new HeartbeatRequestData()
-      .setGroupId(if (gid.isEmpty) "fuzz-g" else gid)
+      .setGroupId(groupId)
       .setMemberId("member")
-      .setGroupInstanceId(instanceId)
-      .setGenerationId(data.consumeInt(0, Int.MaxValue))
+      .setGroupInstanceId(groupInstanceId)
+      .setGenerationId(generationId)
 
     val heartbeatReq = new HeartbeatRequest.Builder(requestData).build(
-      heartbeatVersionAllowingInstanceId(version, instanceId))
+      heartbeatVersionAllowingInstanceId(version, groupInstanceId))
     val request = buildRequest(heartbeatReq)
 
     metadataCache = MetadataCache.zkMetadataCache(brokerId, IBP_2_3_IV0)
@@ -179,13 +170,13 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest { //TODO
       txnCoordinator, groupCoordinator)
     stubNoThrottling()
 
-    val future = new CompletableFuture[org.apache.kafka.common.message.HeartbeatResponseData]()
+    val future = new CompletableFuture[HeartbeatResponseData]()
     when(groupCoordinator.heartbeat(any[RequestContext], any())).thenReturn(future)
 
     val kafkaApis = createKafkaApis(IBP_2_3_IV0)
     try {
       kafkaApis.handleHeartbeatRequest(request)
-      future.complete(new org.apache.kafka.common.message.HeartbeatResponseData())
+      future.complete(new HeartbeatResponseData())
     } finally {
       kafkaApis.close()
     }
@@ -201,23 +192,22 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest { //TODO
     val version = data.consumeInt(
       ApiKeys.HEARTBEAT.oldestVersion().toInt,
       ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
-    val splitSize = data.consumeInt(0, 64)
-    val (gid, rest) = splitBytes(data.consumeRemainingAsBytes(), splitSize)
-    val memberId = if (rest.isEmpty) "m" else new String(rest)
+    val groupId = safeString(data, "fuzz-auth-group")
+    val memberId = safeString(data, "fuzz-auth-member")
+    val generationId = data.consumeInt()
 
     val requestData = new HeartbeatRequestData()
-      .setGroupId(if (gid.isEmpty) "fuzz-auth-group" else gid)
+      .setGroupId(groupId)
       .setMemberId(memberId)
       .setGroupInstanceId(null)
-      .setGenerationId(data.consumeInt())
+      .setGenerationId(generationId)
 
     val heartbeatReq = new HeartbeatRequest.Builder(requestData).build(version)
     val request = buildRequest(heartbeatReq)
 
     val authorizer: Authorizer = mock(classOf[Authorizer])
-    when(authorizer.authorize(any[RequestContext], any[util.List[Action]])).thenAnswer { _ =>
-      Seq(AuthorizationResult.DENIED).asJava
-    }
+    when(authorizer.authorize(any[RequestContext], any[util.List[Action]]))
+      .thenReturn(Collections.singletonList(AuthorizationResult.DENIED))
 
     reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel,
       txnCoordinator, groupCoordinator)
@@ -239,11 +229,10 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest { //TODO
       ApiKeys.HEARTBEAT.oldestVersion().toInt,
       ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
     val throttleMs = data.consumeInt(1, 500)
-    val splitSize = data.consumeInt(0, 64)
-    val (gid, _) = splitBytes(data.consumeRemainingAsBytes(), splitSize)
+    val groupId = safeString(data, "fuzz-throttle-group")
 
     val requestData = new HeartbeatRequestData()
-      .setGroupId(if (gid.isEmpty) "fuzz-throttle-group" else gid)
+      .setGroupId(groupId)
       .setMemberId("m")
       .setGenerationId(0)
 
@@ -257,13 +246,13 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest { //TODO
     when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyLong)).thenReturn(throttleMs)
 
-    val future = new CompletableFuture[org.apache.kafka.common.message.HeartbeatResponseData]()
+    val future = new CompletableFuture[HeartbeatResponseData]()
     when(groupCoordinator.heartbeat(any[RequestContext], any())).thenReturn(future)
 
     val kafkaApis = createKafkaApis()
     try {
       kafkaApis.handleHeartbeatRequest(request)
-      future.complete(new org.apache.kafka.common.message.HeartbeatResponseData())
+      future.complete(new HeartbeatResponseData())
     } finally {
       kafkaApis.close()
     }
