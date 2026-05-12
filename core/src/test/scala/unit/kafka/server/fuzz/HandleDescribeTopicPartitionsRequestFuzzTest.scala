@@ -53,9 +53,9 @@ class HandleDescribeTopicPartitionsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestZkUnsupportedVersion(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.oldestVersion().toInt,
-      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.oldestVersion(),
+      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.latestVersion())
     val numTopics = data.consumeInt(0, 16)
     val nameLen = data.consumeInt(0, 64)
 
@@ -91,9 +91,9 @@ class HandleDescribeTopicPartitionsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestZkUnsupportedVersionForwarded(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.oldestVersion().toInt,
-      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.oldestVersion(),
+      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.latestVersion())
     val numTopics = data.consumeInt(0, 16)
     val nameLen = data.consumeInt(0, 64)
     val throttleMs = data.consumeInt(0, 100)
@@ -127,9 +127,9 @@ class HandleDescribeTopicPartitionsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestZkUnsupportedVersionThrottled(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.oldestVersion().toInt,
-      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.oldestVersion(),
+      ApiKeys.DESCRIBE_TOPIC_PARTITIONS.latestVersion())
     val numTopics = data.consumeInt(0, 16)
     val nameLen = data.consumeInt(0, 64)
     val throttleMs = data.consumeInt(1, 100)

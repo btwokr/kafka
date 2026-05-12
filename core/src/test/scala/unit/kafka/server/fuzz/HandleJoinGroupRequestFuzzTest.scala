@@ -105,8 +105,8 @@ class HandleJoinGroupRequestFuzzTest extends KafkaApisTest {
   def fuzzTestJoinGroupEarlyErrors(data: FuzzedDataProvider): Unit = {
     val staticMembershipUnsupported = data.consumeBoolean()
     val version: Short =
-      if (staticMembershipUnsupported) data.consumeInt(5, ApiKeys.JOIN_GROUP.latestVersion).toShort
-      else data.consumeInt(ApiKeys.JOIN_GROUP.oldestVersion.toInt, ApiKeys.JOIN_GROUP.latestVersion.toInt).toShort
+      if (staticMembershipUnsupported) data.consumeShort(5, ApiKeys.JOIN_GROUP.latestVersion)
+      else data.consumeShort(ApiKeys.JOIN_GROUP.oldestVersion, ApiKeys.JOIN_GROUP.latestVersion)
     val groupInstanceStr = safeString(data, "group-instance")
     val groupInstanceId =
       if (staticMembershipUnsupported) Some(groupInstanceStr) else None
@@ -145,9 +145,9 @@ class HandleJoinGroupRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestJoinGroupCoordinatorFuture(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.JOIN_GROUP.oldestVersion.toInt,
-      ApiKeys.JOIN_GROUP.latestVersion.toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.JOIN_GROUP.oldestVersion,
+      ApiKeys.JOIN_GROUP.latestVersion)
     val useGroupInstance = version >= 5 && data.consumeBoolean()
     val groupInstanceStr = safeString(data, "group-instance")
     val groupInstanceId = if (useGroupInstance) Some(groupInstanceStr) else None
@@ -207,9 +207,9 @@ class HandleJoinGroupRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestJoinGroupThrottledResponse(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.JOIN_GROUP.oldestVersion.toInt,
-      ApiKeys.JOIN_GROUP.latestVersion.toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.JOIN_GROUP.oldestVersion,
+      ApiKeys.JOIN_GROUP.latestVersion)
     val protocolName = safeString(data, "range")
     val protocolBytesLen = data.consumeInt(0, 128)
     val protocolBytes = data.consumeBytes(protocolBytesLen)

@@ -188,6 +188,55 @@ LIST_GROUPS_TESTS=(
     fuzzTestListGroupsThrottledResponse
 )
 
+# handleApiVersionsRequest fuzz targets (HandleApiVersionsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+API_VERSIONS_TESTS=(
+    fuzzTestApiVersionsSuccessPath
+    fuzzTestApiVersionsInvalidClientSoftware
+    fuzzTestApiVersionsUnsupportedWireHeader
+    fuzzTestApiVersionsThrottledResponse
+    fuzzTestApiVersionsForwardedInnerRequest
+)
+
+# handleDeleteRecordsRequest fuzz targets (HandleDeleteRecordsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DELETE_RECORDS_TESTS=(
+    fuzzTestDeleteRecordsUnknownPartitionsOnly
+    fuzzTestDeleteRecordsReplicaManagerCallback
+    fuzzTestDeleteRecordsMixedKnownAndUnknownPartitions
+    fuzzTestDeleteRecordsTopicAuthorizationDenied
+    fuzzTestDeleteRecordsThrottledResponse
+    fuzzTestDeleteRecordsForwardedInnerRequest
+)
+
+# handleInitProducerIdRequest fuzz targets (HandleInitProducerIdRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+INIT_PRODUCER_ID_TESTS=(
+    fuzzTestInitProducerIdTransactionalIdAuthorizationDenied
+    fuzzTestInitProducerIdClusterAuthorizationDeniedNoTransactionalId
+    fuzzTestInitProducerIdClusterDeniedTopicWriteByTypeAllowed
+    fuzzTestInitProducerIdInvalidProducerIdOrEpochCombination
+    fuzzTestInitProducerIdTxnCoordinatorSuccess
+    fuzzTestInitProducerIdProducerFencedVersionRemap
+    fuzzTestInitProducerIdThrottledResponse
+    fuzzTestInitProducerIdForwardedInnerRequest
+)
+
+# handleCreateTopicsRequest fuzz targets (HandleCreateTopicsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+CREATE_TOPICS_TESTS=(
+    fuzzTestCreateTopicsNotController
+    fuzzTestCreateTopicsClusterMetadataTopicRejected
+    fuzzTestCreateTopicsDuplicateNamesInRequest
+    fuzzTestCreateTopicsTopicCreateAuthorizationWithoutCluster
+    fuzzTestCreateTopicsDescribeConfigsAuthorization
+    fuzzTestCreateTopicsAdminManagerSuccess
+    fuzzTestCreateTopicsAdminManagerErrorMerge
+    fuzzTestCreateTopicsAllTopicsUnauthorizedEmptyToCreate
+    fuzzTestCreateTopicsThrottling
+    fuzzTestCreateTopicsForwardedInnerRequest
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -236,6 +285,18 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${LIST_GROUPS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleListGroupsRequestFuzzTest" "$t"
+    done
+    for t in "${API_VERSIONS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleApiVersionsRequestFuzzTest" "$t"
+    done
+    for t in "${DELETE_RECORDS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDeleteRecordsRequestFuzzTest" "$t"
+    done
+    for t in "${INIT_PRODUCER_ID_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleInitProducerIdRequestFuzzTest" "$t"
+    done
+    for t in "${CREATE_TOPICS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleCreateTopicsRequestFuzzTest" "$t"
     done
 fi
 

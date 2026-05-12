@@ -105,9 +105,9 @@ class HandleLeaveGroupRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestLeaveGroupAuthorizationDenied(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.LEAVE_GROUP.oldestVersion().toInt,
-      ApiKeys.LEAVE_GROUP.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.LEAVE_GROUP.oldestVersion(),
+      ApiKeys.LEAVE_GROUP.latestVersion())
     val groupId = safeString(data, "fuzz-leave-auth-g")
     val memberId1 = safeString(data, "fuzz-leave-auth-m1")
     val memberId2 = safeString(data, "fuzz-leave-auth-m2")
@@ -135,9 +135,9 @@ class HandleLeaveGroupRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestLeaveGroupCoordinatorFuture(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.LEAVE_GROUP.oldestVersion().toInt,
-      ApiKeys.LEAVE_GROUP.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.LEAVE_GROUP.oldestVersion(),
+      ApiKeys.LEAVE_GROUP.latestVersion())
     val groupId = safeString(data, "fuzz-leave-g")
     val memberId1 = safeString(data, "fuzz-leave-m1")
     val memberId2 = safeString(data, "fuzz-leave-m2")
@@ -182,9 +182,9 @@ class HandleLeaveGroupRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestLeaveGroupThrottledResponse(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.LEAVE_GROUP.oldestVersion().toInt,
-      ApiKeys.LEAVE_GROUP.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.LEAVE_GROUP.oldestVersion(),
+      ApiKeys.LEAVE_GROUP.latestVersion())
     val throttleMs = data.consumeInt(1, 500)
     val groupId = safeString(data, "fuzz-leave-throttle-g")
     val memberId1 = safeString(data, "fuzz-leave-throttle-m1")

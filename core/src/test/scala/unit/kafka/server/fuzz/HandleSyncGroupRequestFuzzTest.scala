@@ -59,9 +59,9 @@ class HandleSyncGroupRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestSyncGroupStaticMembershipOldIbp(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.SYNC_GROUP.oldestVersion().toInt,
-      ApiKeys.SYNC_GROUP.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.SYNC_GROUP.oldestVersion(),
+      ApiKeys.SYNC_GROUP.latestVersion())
     val groupId = safeString(data, "fuzz-g")
     val memberId = safeString(data, "fuzz-m")
     val generationId = data.consumeInt()
@@ -106,7 +106,7 @@ class HandleSyncGroupRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestSyncGroupInconsistentProtocol(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(5, ApiKeys.SYNC_GROUP.latestVersion().toInt).toShort
+    val version = data.consumeShort(5, ApiKeys.SYNC_GROUP.latestVersion())
     val omitProtocolType = data.consumeBoolean()
     val groupId = safeString(data, "fuzz-g")
     val memberId = safeString(data, "fuzz-m")
@@ -144,9 +144,9 @@ class HandleSyncGroupRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestSyncGroupAuthorizationDenied(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.SYNC_GROUP.oldestVersion().toInt,
-      ApiKeys.SYNC_GROUP.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.SYNC_GROUP.oldestVersion(),
+      ApiKeys.SYNC_GROUP.latestVersion())
     val groupId = safeString(data, "fuzz-auth-g")
     val memberId = safeString(data, "fuzz-auth-m")
     val generationId = data.consumeInt()
@@ -192,9 +192,9 @@ class HandleSyncGroupRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestSyncGroupCoordinatorFuture(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.SYNC_GROUP.oldestVersion().toInt,
-      ApiKeys.SYNC_GROUP.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.SYNC_GROUP.oldestVersion(),
+      ApiKeys.SYNC_GROUP.latestVersion())
     val groupId = safeString(data, "fuzz-coord-g")
     val memberId = safeString(data, "fuzz-coord-m")
     val generationId = data.consumeInt()
@@ -264,9 +264,9 @@ class HandleSyncGroupRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestSyncGroupStaticMembershipSupportedIbp(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.SYNC_GROUP.oldestVersion().toInt,
-      ApiKeys.SYNC_GROUP.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.SYNC_GROUP.oldestVersion(),
+      ApiKeys.SYNC_GROUP.latestVersion())
     val groupId = safeString(data, "fuzz-static-ok-g")
     val memberId = safeString(data, "fuzz-static-ok-m")
     val generationId = data.consumeInt(0, Int.MaxValue)
@@ -326,9 +326,9 @@ class HandleSyncGroupRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestSyncGroupThrottledResponse(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.SYNC_GROUP.oldestVersion().toInt,
-      ApiKeys.SYNC_GROUP.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.SYNC_GROUP.oldestVersion(),
+      ApiKeys.SYNC_GROUP.latestVersion())
     val throttleMs = data.consumeInt(1, 500)
     val groupId = safeString(data, "fuzz-throttle-g")
     val memberId = safeString(data, "fuzz-throttle-m")
