@@ -24,6 +24,7 @@ import kafka.coordinator.transaction.{InitProducerIdResult, TransactionCoordinat
 import kafka.log.UnifiedLog
 import kafka.network.{RequestChannel, RequestMetrics}
 import kafka.server.QuotaFactory.QuotaManagers
+import kafka.server.{ControllerMutationQuota, UnboundedControllerMutationQuota}
 import kafka.server.metadata.{ConfigRepository, KRaftMetadataCache, MockConfigRepository, ZkMetadataCache}
 import kafka.utils.{CoreUtils, Log4jController, Logging, TestUtils}
 import kafka.zk.KafkaZkClient
@@ -148,6 +149,17 @@ class KafkaApisTest extends Logging {
     TestUtils.clearYammerMetrics()
     metrics.close()
   }
+
+  /** Resets the ZK `adminManager` mock for fuzz tests that re-stub `createTopics` across Jazzer iterations. */
+  protected def resetAdminManager(): Unit = reset(adminManager)
+
+  protected def whenCreateTopicsControllerMutationQuotaReturns(quota: ControllerMutationQuota): Unit = {
+    when(clientControllerQuotaManager.newQuotaFor(
+      any[RequestChannel.Request](),
+      ArgumentMatchers.eq(6))).thenReturn(quota)
+  }
+
+  protected def zkAdminManagerMock: ZkAdminManager = adminManager
 
   def createKafkaApis(interBrokerProtocolVersion: MetadataVersion = MetadataVersion.latestTesting,
                       authorizer: Option[Authorizer] = None,

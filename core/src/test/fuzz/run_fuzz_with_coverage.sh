@@ -222,6 +222,21 @@ INIT_PRODUCER_ID_TESTS=(
     fuzzTestInitProducerIdForwardedInnerRequest
 )
 
+# handleCreateTopicsRequest fuzz targets (HandleCreateTopicsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+CREATE_TOPICS_TESTS=(
+    fuzzTestCreateTopicsNotController
+    fuzzTestCreateTopicsClusterMetadataTopicRejected
+    fuzzTestCreateTopicsDuplicateNamesInRequest
+    fuzzTestCreateTopicsTopicCreateAuthorizationWithoutCluster
+    fuzzTestCreateTopicsDescribeConfigsAuthorization
+    fuzzTestCreateTopicsAdminManagerSuccess
+    fuzzTestCreateTopicsAdminManagerErrorMerge
+    fuzzTestCreateTopicsAllTopicsUnauthorizedEmptyToCreate
+    fuzzTestCreateTopicsThrottling
+    fuzzTestCreateTopicsForwardedInnerRequest
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -279,6 +294,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${INIT_PRODUCER_ID_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleInitProducerIdRequestFuzzTest" "$t"
+    done
+    for t in "${CREATE_TOPICS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleCreateTopicsRequestFuzzTest" "$t"
     done
 fi
 
