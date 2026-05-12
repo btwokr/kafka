@@ -188,6 +188,16 @@ LIST_GROUPS_TESTS=(
     fuzzTestListGroupsThrottledResponse
 )
 
+# handleApiVersionsRequest fuzz targets (HandleApiVersionsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+API_VERSIONS_TESTS=(
+    fuzzTestApiVersionsSuccessPath
+    fuzzTestApiVersionsInvalidClientSoftware
+    fuzzTestApiVersionsUnsupportedWireHeader
+    fuzzTestApiVersionsThrottledResponse
+    fuzzTestApiVersionsForwardedInnerRequest
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -236,6 +246,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${LIST_GROUPS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleListGroupsRequestFuzzTest" "$t"
+    done
+    for t in "${API_VERSIONS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleApiVersionsRequestFuzzTest" "$t"
     done
 fi
 
