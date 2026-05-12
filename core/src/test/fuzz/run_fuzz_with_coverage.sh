@@ -198,6 +198,17 @@ API_VERSIONS_TESTS=(
     fuzzTestApiVersionsForwardedInnerRequest
 )
 
+# handleDeleteRecordsRequest fuzz targets (HandleDeleteRecordsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DELETE_RECORDS_TESTS=(
+    fuzzTestDeleteRecordsUnknownPartitionsOnly
+    fuzzTestDeleteRecordsReplicaManagerCallback
+    fuzzTestDeleteRecordsMixedKnownAndUnknownPartitions
+    fuzzTestDeleteRecordsTopicAuthorizationDenied
+    fuzzTestDeleteRecordsThrottledResponse
+    fuzzTestDeleteRecordsForwardedInnerRequest
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -249,6 +260,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${API_VERSIONS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleApiVersionsRequestFuzzTest" "$t"
+    done
+    for t in "${DELETE_RECORDS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDeleteRecordsRequestFuzzTest" "$t"
     done
 fi
 
