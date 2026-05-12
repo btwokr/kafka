@@ -6472,41 +6472,6 @@ class KafkaApisTest extends Logging {
   }
 
   /**
-   * Serialize an [[ApiVersionsRequest]] body with one wire `RequestHeader.apiVersion` and another
-   * schema version for the body bytes. Used to exercise `RequestContext.parseRequest`'s
-   * unsupported-ApiVersions path (`ApiVersionsRequest.hasUnsupportedRequestVersion`) where the
-   * header declares a broker-unknown protocol version while the payload is still readable.
-   */
-  def buildApiVersionsRequestWithMismatchedWireHeader(
-      bodyWireVersion: Short,
-      headerApiVersion: Short,
-      requestData: ApiVersionsRequestData = new ApiVersionsRequestData(),
-      listenerName: ListenerName = ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT),
-      fromPrivilegedListener: Boolean = false,
-      requestMetrics: RequestChannel.Metrics = requestChannelMetrics
-  ): RequestChannel.Request = {
-    val inner = new ApiVersionsRequest.Builder(
-      requestData,
-      ApiKeys.API_VERSIONS.oldestVersion(),
-      ApiKeys.API_VERSIONS.latestVersion()
-    ).build(bodyWireVersion)
-    val wireHeader = new RequestHeader(ApiKeys.API_VERSIONS, headerApiVersion, clientId, 0)
-    val serialized = RequestUtils.serialize(
-      wireHeader.data(),
-      wireHeader.headerVersion(),
-      inner.data(),
-      bodyWireVersion
-    )
-    val buffer = serialized.duplicate()
-    val parsedHeader = RequestHeader.parse(buffer)
-    val context = new RequestContext(parsedHeader, "1", InetAddress.getLocalHost, Optional.empty(),
-      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice"), listenerName, SecurityProtocol.SSL,
-      ClientInformation.EMPTY, fromPrivilegedListener, Optional.of(kafkaPrincipalSerde))
-    new RequestChannel.Request(processor = 1, context = context, startTimeNanos = 0, MemoryPool.NONE, buffer,
-      requestMetrics, envelope = None)
-  }
-
-  /**
    * Build a forwarded request: the resulting `RequestChannel.Request` has
    * `envelope = Some(...)` so `request.isForwarded` returns true. Useful
    * for fuzz tests that want to drive the `request.isForwarded == true`

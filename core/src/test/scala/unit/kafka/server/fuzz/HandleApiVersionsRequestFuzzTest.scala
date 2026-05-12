@@ -21,11 +21,16 @@ import com.code_intelligence.jazzer.api.FuzzedDataProvider
 import com.code_intelligence.jazzer.junit.FuzzTest
 import kafka.network.RequestChannel
 import kafka.server.KafkaApisTest
+import org.apache.kafka.common.memory.MemoryPool
 import org.apache.kafka.common.message.ApiVersionsRequestData
+import org.apache.kafka.common.network.{ClientInformation, ListenerName}
 import org.apache.kafka.common.protocol.ApiKeys
-import org.apache.kafka.common.requests.{ApiVersionsRequest}
+import org.apache.kafka.common.requests.{ApiVersionsRequest, RequestContext, RequestHeader, RequestUtils}
+import org.apache.kafka.common.security.auth.{KafkaPrincipal, SecurityProtocol}
 import org.mockito.ArgumentMatchers.{any, anyDouble, anyLong}
-import org.mockito.Mockito.{reset, when}
+import org.mockito.Mockito.{mock, reset, when}
+
+import java.net.InetAddress
 
 /**
  * Jazzer fuzz tests targeting `KafkaApis.handleApiVersionsRequest`.
@@ -47,6 +52,51 @@ class HandleApiVersionsRequestFuzzTest extends KafkaApisTest {
       any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
     when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyLong)).thenReturn(0)
+  }
+
+  /**
+   * Serialize an [[ApiVersionsRequest]] body with one wire `RequestHeader.apiVersion` and another
+   * schema version for the body bytes, so `RequestContext.parseRequest` yields
+   * `ApiVersionsRequest.hasUnsupportedRequestVersion == true`.
+   */
+  private def buildApiVersionsRequestWithMismatchedWireHeader(
+      bodyWireVersion: Short,
+      headerApiVersion: Short,
+      requestData: ApiVersionsRequestData = new ApiVersionsRequestData()
+  ): RequestChannel.Request = {
+    val inner = new ApiVersionsRequest.Builder(
+      requestData,
+      ApiKeys.API_VERSIONS.oldestVersion(),
+      ApiKeys.API_VERSIONS.latestVersion()
+    ).build(bodyWireVersion)
+    val wireHeader = new RequestHeader(ApiKeys.API_VERSIONS, headerApiVersion, /* clientId */ "", 0)
+    val serialized = RequestUtils.serialize(
+      wireHeader.data(),
+      wireHeader.headerVersion(),
+      inner.data(),
+      bodyWireVersion
+    )
+    val buffer = serialized.duplicate()
+    val parsedHeader = RequestHeader.parse(buffer)
+    val listenerName = ListenerName.forSecurityProtocol(SecurityProtocol.PLAINTEXT)
+    val requestMetrics = mock(classOf[RequestChannel.Metrics])
+    val context = new RequestContext(
+      parsedHeader,
+      "1",
+      InetAddress.getLocalHost,
+      new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "Alice"),
+      listenerName,
+      SecurityProtocol.SSL,
+      ClientInformation.EMPTY,
+      /* fromPrivilegedListener = */ false)
+    new RequestChannel.Request(
+      processor = 1,
+      context = context,
+      startTimeNanos = 0,
+      memoryPool = MemoryPool.NONE,
+      buffer = buffer,
+      metrics = requestMetrics,
+      envelope = None)
   }
 
   /**
