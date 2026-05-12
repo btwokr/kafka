@@ -26,12 +26,12 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = "100s")
   def fuzzTestProduceResponseContainsNewLeaderOnNotLeaderOrFollower(data: FuzzedDataProvider): Unit = {
     // Arrange
-    val version = data.consumeInt(10, ApiKeys.PRODUCE.latestVersion).toShort
+    val version = data.consumeShort(10, ApiKeys.PRODUCE.latestVersion)
     val newLeaderId = data.consumeInt()
     val newLeaderEpoch = data.consumeInt()
     val splitSize = data.consumeInt(10, 4096)
     val compression = buildCompression(data.consumeInt(0, 4), version)
-    val acks = data.consumeInt(0, 1).toShort
+    val acks = data.consumeShort(0, 1)
     val timeoutMs = data.consumeInt(0, 5000)
     val recordSuffixLen = data.consumeInt(0, 8192)
     val topicPrefixBytes = data.consumeBytes(splitSize)
@@ -94,7 +94,7 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
   def fuzzTestTransactionalParametersSetCorrectly(data: FuzzedDataProvider): Unit = {
     val transactionalId = data.consumeString(5)
     val timeoutMs = data.consumeInt(0, 5000)
-    val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
+    val version = data.consumeShort(3, ApiKeys.PRODUCE.latestVersion)
     val num = data.consumeInt(0, 1)
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val splitSize = data.consumeInt(10, 4096)
@@ -146,7 +146,7 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = "100s")
   def fuzzTestNullableTransactionalId(data: FuzzedDataProvider): Unit = {
     val timeoutMs = data.consumeInt(0, 5000)
-    val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
+    val version = data.consumeShort(3, ApiKeys.PRODUCE.latestVersion)
     val num = data.consumeInt(0, 1)
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val splitSize = data.consumeInt(10, 4096)
@@ -199,7 +199,7 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
   def fuzzTestNoAuthorizedTransactionalRequest(data: FuzzedDataProvider): Unit = {
     val transactionalId = data.consumeString(5)
     val timeoutMs = data.consumeInt(0, 5000)
-    val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
+    val version = data.consumeShort(3, ApiKeys.PRODUCE.latestVersion)
     val num = data.consumeInt(0, 1)
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val splitSize = data.consumeInt(10, 4096)
@@ -255,9 +255,9 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = "100s")
   def fuzzTestNoAuthorized(data: FuzzedDataProvider): Unit = {
     val timeoutMs = data.consumeInt(0, 5000)
-    val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
+    val version = data.consumeShort(3, ApiKeys.PRODUCE.latestVersion)
     val num = data.consumeInt(0, 1)
-    val acks = data.consumeInt(0, 1).toShort
+    val acks = data.consumeShort(0, 1)
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val splitSize = data.consumeInt(10, 4096)
     val recordSuffixLen = data.consumeInt(0, 8192)
@@ -320,8 +320,8 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestUnknownTopicOrPartition(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
-    val acks = data.consumeInt(0, 1).toShort
+    val version = data.consumeShort(3, ApiKeys.PRODUCE.latestVersion)
+    val acks = data.consumeShort(0, 1)
     val timeoutMs = data.consumeInt(0, 5000)
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val splitSize = data.consumeInt(10, 4096)
@@ -373,7 +373,7 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestThrottlingAndAckZeroNoOp(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
+    val version = data.consumeShort(3, ApiKeys.PRODUCE.latestVersion)
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val timeoutMs = data.consumeInt(0, 5000)
     // Always acks == 0 so we can also exercise line 718 (sendNoOpResponseExemptThrottle).
@@ -457,7 +457,7 @@ class HandleProduceRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestRequestThrottleDominates(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(3, ApiKeys.PRODUCE.latestVersion).toShort
+    val version = data.consumeShort(3, ApiKeys.PRODUCE.latestVersion)
     val compression = buildCompression(data.consumeInt(0, 4), version)
     val splitSize = data.consumeInt(10, 4096)
     val timeoutMs = data.consumeInt(0, 5000)

@@ -95,9 +95,9 @@ class HandleDeleteRecordsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDeleteRecordsUnknownPartitionsOnly(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DELETE_RECORDS.oldestVersion().toInt,
-      ApiKeys.DELETE_RECORDS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DELETE_RECORDS.oldestVersion(),
+      ApiKeys.DELETE_RECORDS.latestVersion())
     val timeoutMs = data.consumeInt(1000, 120_000)
     val topic = safeString(data, "fuzz-del-unknown")
     val partition = data.consumeInt(0, 7)
@@ -136,9 +136,9 @@ class HandleDeleteRecordsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDeleteRecordsReplicaManagerCallback(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DELETE_RECORDS.oldestVersion().toInt,
-      ApiKeys.DELETE_RECORDS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DELETE_RECORDS.oldestVersion(),
+      ApiKeys.DELETE_RECORDS.latestVersion())
     val timeoutMs = data.consumeInt(1000, 120_000)
     val topic = safeString(data, "fuzz-del-rm")
     val partition = data.consumeInt(0, 4)
@@ -148,7 +148,7 @@ class HandleDeleteRecordsRequestFuzzTest extends KafkaApisTest {
       Errors.NONE.code,
       Errors.OFFSET_OUT_OF_RANGE.code,
       Errors.KAFKA_STORAGE_ERROR.code
-    )(data.consumeInt(0, 2)).toShort
+    )(data.consumeShort(0, 2)).toShort
 
     val tp = new TopicPartition(topic, partition)
 
@@ -197,9 +197,9 @@ class HandleDeleteRecordsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDeleteRecordsMixedKnownAndUnknownPartitions(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DELETE_RECORDS.oldestVersion().toInt,
-      ApiKeys.DELETE_RECORDS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DELETE_RECORDS.oldestVersion(),
+      ApiKeys.DELETE_RECORDS.latestVersion())
     val timeoutMs = data.consumeInt(1000, 120_000)
     val topic = safeString(data, "fuzz-del-mixed")
     val offset0 = data.consumeLong(0L, 1L << 15)
@@ -252,9 +252,9 @@ class HandleDeleteRecordsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDeleteRecordsTopicAuthorizationDenied(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DELETE_RECORDS.oldestVersion().toInt,
-      ApiKeys.DELETE_RECORDS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DELETE_RECORDS.oldestVersion(),
+      ApiKeys.DELETE_RECORDS.latestVersion())
     val timeoutMs = data.consumeInt(1000, 120_000)
     val allowedBase = safeString(data, "fuzz-del-ok")
     val deniedBase = safeString(data, "fuzz-del-deny")
@@ -311,9 +311,9 @@ class HandleDeleteRecordsRequestFuzzTest extends KafkaApisTest {
   /** Request-quota throttle time is applied in `sendResponseMaybeThrottle`. */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDeleteRecordsThrottledResponse(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DELETE_RECORDS.oldestVersion().toInt,
-      ApiKeys.DELETE_RECORDS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DELETE_RECORDS.oldestVersion(),
+      ApiKeys.DELETE_RECORDS.latestVersion())
     val timeoutMs = data.consumeInt(1000, 120_000)
     val throttleMs = data.consumeInt(1, 500)
     val topic = safeString(data, "fuzz-del-throttle")
@@ -369,9 +369,9 @@ class HandleDeleteRecordsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDeleteRecordsForwardedInnerRequest(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DELETE_RECORDS.oldestVersion().toInt,
-      ApiKeys.DELETE_RECORDS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DELETE_RECORDS.oldestVersion(),
+      ApiKeys.DELETE_RECORDS.latestVersion())
     val timeoutMs = data.consumeInt(1000, 120_000)
     val throttleMs = data.consumeInt(0, 200)
     val topic = safeString(data, "fuzz-del-fwd")

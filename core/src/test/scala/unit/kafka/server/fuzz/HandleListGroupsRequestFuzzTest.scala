@@ -105,9 +105,9 @@ class HandleListGroupsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestListGroupsPassthroughWithoutAuthorizer(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.LIST_GROUPS.oldestVersion().toInt,
-      ApiKeys.LIST_GROUPS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.LIST_GROUPS.oldestVersion(),
+      ApiKeys.LIST_GROUPS.latestVersion())
     val numGroups = data.consumeInt(1, 5)
     val groupBase = safeString(data, "fuzz-lg")
     val groupIds = Array.tabulate(numGroups)(i => s"$groupBase-$i")
@@ -147,9 +147,9 @@ class HandleListGroupsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestListGroupsFilteredWhenClusterDescribeDenied(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.LIST_GROUPS.oldestVersion().toInt,
-      ApiKeys.LIST_GROUPS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.LIST_GROUPS.oldestVersion(),
+      ApiKeys.LIST_GROUPS.latestVersion())
     val numGroups = data.consumeInt(2, 5)
     val groupBase = safeString(data, "fuzz-lg-filter")
     val groupIds = Array.tabulate(numGroups)(i => s"$groupBase-$i")
@@ -194,9 +194,9 @@ class HandleListGroupsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestListGroupsCoordinatorException(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.LIST_GROUPS.oldestVersion().toInt,
-      ApiKeys.LIST_GROUPS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.LIST_GROUPS.oldestVersion(),
+      ApiKeys.LIST_GROUPS.latestVersion())
     val stateA = safeString(data, "Stable")
     val stateB = safeString(data, "Empty")
     val typeA = safeString(data, "classic")
@@ -231,9 +231,9 @@ class HandleListGroupsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestListGroupsThrottledResponse(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.LIST_GROUPS.oldestVersion().toInt,
-      ApiKeys.LIST_GROUPS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.LIST_GROUPS.oldestVersion(),
+      ApiKeys.LIST_GROUPS.latestVersion())
     val throttleMs = data.consumeInt(1, 500)
     val numGroups = data.consumeInt(1, 3)
     val groupBase = safeString(data, "fuzz-lg-th")

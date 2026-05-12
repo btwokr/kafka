@@ -105,9 +105,9 @@ class HandleApiVersionsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestApiVersionsSuccessPath(data: FuzzedDataProvider): Unit = {
-    val bodyVersion = data.consumeInt(
-      ApiKeys.API_VERSIONS.oldestVersion().toInt,
-      ApiKeys.API_VERSIONS.latestVersion().toInt).toShort
+    val bodyVersion = data.consumeShort(
+      ApiKeys.API_VERSIONS.oldestVersion(),
+      ApiKeys.API_VERSIONS.latestVersion())
 
     val built = new ApiVersionsRequest.Builder().build(bodyVersion)
     val request = buildRequest(built)
@@ -127,7 +127,7 @@ class HandleApiVersionsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestApiVersionsInvalidClientSoftware(data: FuzzedDataProvider): Unit = {
-    val bodyVersion = data.consumeInt(3, ApiKeys.API_VERSIONS.latestVersion().toInt).toShort
+    val bodyVersion = data.consumeShort(3, ApiKeys.API_VERSIONS.latestVersion())
     val useEmptyName = data.consumeBoolean()
     val useEmptyVersion = data.consumeBoolean()
     val fuzzName = safeString(data, "n")
@@ -165,9 +165,9 @@ class HandleApiVersionsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestApiVersionsUnsupportedWireHeader(data: FuzzedDataProvider): Unit = {
-    val bodyWireVersion = data.consumeInt(
-      ApiKeys.API_VERSIONS.oldestVersion().toInt,
-      ApiKeys.API_VERSIONS.latestVersion().toInt).toShort
+    val bodyWireVersion = data.consumeShort(
+      ApiKeys.API_VERSIONS.oldestVersion(),
+      ApiKeys.API_VERSIONS.latestVersion())
     val headerDelta = data.consumeInt(1, 1000)
     val headerApiVersion = (ApiKeys.API_VERSIONS.latestVersion().toLong + headerDelta).toShort
 
@@ -185,9 +185,9 @@ class HandleApiVersionsRequestFuzzTest extends KafkaApisTest {
   /** Non-zero request-quota throttle time is threaded into the response callback. */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestApiVersionsThrottledResponse(data: FuzzedDataProvider): Unit = {
-    val bodyVersion = data.consumeInt(
-      ApiKeys.API_VERSIONS.oldestVersion().toInt,
-      ApiKeys.API_VERSIONS.latestVersion().toInt).toShort
+    val bodyVersion = data.consumeShort(
+      ApiKeys.API_VERSIONS.oldestVersion(),
+      ApiKeys.API_VERSIONS.latestVersion())
     val throttleMs = data.consumeInt(1, 500)
 
     val built = new ApiVersionsRequest.Builder().build(bodyVersion)
@@ -211,9 +211,9 @@ class HandleApiVersionsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestApiVersionsForwardedInnerRequest(data: FuzzedDataProvider): Unit = {
-    val bodyVersion = data.consumeInt(
-      ApiKeys.API_VERSIONS.oldestVersion().toInt,
-      ApiKeys.API_VERSIONS.latestVersion().toInt).toShort
+    val bodyVersion = data.consumeShort(
+      ApiKeys.API_VERSIONS.oldestVersion(),
+      ApiKeys.API_VERSIONS.latestVersion())
     val throttleMs = data.consumeInt(0, 200)
 
     val built = new ApiVersionsRequest.Builder().build(bodyVersion)

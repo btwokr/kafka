@@ -177,9 +177,9 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
     // the FetchRequest version low so the targeted branches are reached
     // on every iteration; otherwise we let the fuzzer pick.
     val version: Short = mode match {
-      case 5 => data.consumeInt(2, 5).toShort
-      case 6 => data.consumeInt(2, 3).toShort
-      case _ => data.consumeInt(2, ApiKeys.FETCH.latestVersion).toShort
+      case 5 => data.consumeShort(2, 5)
+      case 6 => data.consumeShort(2, 3)
+      case _ => data.consumeShort(2, ApiKeys.FETCH.latestVersion)
     }
     val maxBytes = data.consumeInt(1, 1024 * 1024)
     val minBytes = data.consumeInt(0, 1024)
@@ -282,7 +282,7 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestFetchFollower(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(4, ApiKeys.FETCH.latestVersion).toShort
+    val version = data.consumeShort(4, ApiKeys.FETCH.latestVersion)
     val mode = data.consumeInt(0, 3)
     val maxBytes = data.consumeInt(1, 1024 * 1024)
     val minBytes = data.consumeInt(0, 1024)
@@ -349,7 +349,7 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestFetchThrottling(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(2, ApiKeys.FETCH.latestVersion).toShort
+    val version = data.consumeShort(2, ApiKeys.FETCH.latestVersion)
     // 0 -> bandwidth dominates, 1 -> request dominates
     val dominant = data.consumeInt(0, 1)
     val bandwidthThrottle = if (dominant == 0) data.consumeInt(2, 100) else 1
@@ -395,7 +395,7 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestFetchEmptyInteresting(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(2, ApiKeys.FETCH.latestVersion).toShort
+    val version = data.consumeShort(2, ApiKeys.FETCH.latestVersion)
     val maxBytes = data.consumeInt(1, 1024 * 1024)
     val minBytes = data.consumeInt(0, 1024)
     val maxWait = data.consumeInt(0, 5000)
@@ -455,7 +455,7 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestFetchDownConversion(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(0, 3).toShort  // versions where down-conversion may trigger
+    val version = data.consumeShort(0, 3)  // versions where down-conversion may trigger
     val downConversionEnabled = data.consumeBoolean()
     // Pick on-disk magic via MESSAGE_FORMAT_VERSION_CONFIG. v2 (RecordBatch.MAGIC_VALUE_V2)
     // forces the down-convert path; v0 / v1 take the no-op None branch.

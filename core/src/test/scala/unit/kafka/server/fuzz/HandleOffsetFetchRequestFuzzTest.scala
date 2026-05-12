@@ -131,7 +131,7 @@ class HandleOffsetFetchRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestOffsetFetchCoordinatorMultiGroup(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(8, ApiKeys.OFFSET_FETCH.latestVersion).toShort
+    val version = data.consumeShort(8, ApiKeys.OFFSET_FETCH.latestVersion)
     val numGroups = data.consumeInt(1, 4)
     val splitSize = data.consumeInt(1, 32)
     val requireStable = data.consumeBoolean()
@@ -286,7 +286,7 @@ class HandleOffsetFetchRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestOffsetFetchCoordinatorV1To7(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(1, 7).toShort
+    val version = data.consumeShort(1, 7)
     val requireStable = data.consumeBoolean()
     val allPartitions = version >= 2 && data.consumeBoolean()
     val splitSize = data.consumeInt(1, 32)
@@ -342,7 +342,7 @@ class HandleOffsetFetchRequestFuzzTest extends KafkaApisTest {
   def fuzzTestOffsetFetchCoordinatorThrottleAndForwarded(data: FuzzedDataProvider): Unit = {
     val useForwarded = data.consumeBoolean()
     val throttleMs = data.consumeInt(0, 100)
-    val version = data.consumeInt(3, ApiKeys.OFFSET_FETCH.latestVersion).toShort
+    val version = data.consumeShort(3, ApiKeys.OFFSET_FETCH.latestVersion)
     val splitSize = data.consumeInt(1, 24)
     val (gidRaw, _) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
     val groupId = if (gidRaw.isEmpty) "fuzz-throttle-g" else gidRaw.take(120)

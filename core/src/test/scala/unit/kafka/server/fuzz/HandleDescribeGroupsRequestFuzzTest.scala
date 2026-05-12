@@ -80,9 +80,9 @@ class HandleDescribeGroupsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDescribeGroupsMixedAuthorization(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DESCRIBE_GROUPS.oldestVersion().toInt,
-      ApiKeys.DESCRIBE_GROUPS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DESCRIBE_GROUPS.oldestVersion(),
+      ApiKeys.DESCRIBE_GROUPS.latestVersion())
     val numGroups = data.consumeInt(2, 5)
     val groupBase = safeString(data, "fuzz-dg")
     val groupIds = Array.tabulate(numGroups)(i => s"$groupBase-$i")
@@ -126,9 +126,9 @@ class HandleDescribeGroupsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDescribeGroupsAllGroupsUnauthorized(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DESCRIBE_GROUPS.oldestVersion().toInt,
-      ApiKeys.DESCRIBE_GROUPS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DESCRIBE_GROUPS.oldestVersion(),
+      ApiKeys.DESCRIBE_GROUPS.latestVersion())
     val numGroups = data.consumeInt(1, 4)
     val groupBase = safeString(data, "fuzz-deny-all")
     val groupIds = Array.tabulate(numGroups)(i => s"$groupBase-$i")
@@ -159,9 +159,9 @@ class HandleDescribeGroupsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDescribeGroupsCoordinatorException(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DESCRIBE_GROUPS.oldestVersion().toInt,
-      ApiKeys.DESCRIBE_GROUPS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DESCRIBE_GROUPS.oldestVersion(),
+      ApiKeys.DESCRIBE_GROUPS.latestVersion())
     val numGroups = data.consumeInt(1, 4)
     val groupBase = safeString(data, "fuzz-dg-err")
     val groupIds = Array.tabulate(numGroups)(i => s"$groupBase-$i")
@@ -198,9 +198,9 @@ class HandleDescribeGroupsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDescribeGroupsSuccessWithAuthorizedOperations(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DESCRIBE_GROUPS.oldestVersion().toInt,
-      ApiKeys.DESCRIBE_GROUPS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DESCRIBE_GROUPS.oldestVersion(),
+      ApiKeys.DESCRIBE_GROUPS.latestVersion())
     val numGroups = data.consumeInt(1, 3)
     val groupBase = safeString(data, "fuzz-dg-ok")
     val groupIds = Array.tabulate(numGroups)(i => s"$groupBase-$i")
@@ -243,9 +243,9 @@ class HandleDescribeGroupsRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDescribeGroupsThrottledResponse(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeInt(
-      ApiKeys.DESCRIBE_GROUPS.oldestVersion().toInt,
-      ApiKeys.DESCRIBE_GROUPS.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.DESCRIBE_GROUPS.oldestVersion(),
+      ApiKeys.DESCRIBE_GROUPS.latestVersion())
     val throttleMs = data.consumeInt(1, 500)
     val numGroups = data.consumeInt(1, 3)
     val groupBase = safeString(data, "fuzz-dg-th")

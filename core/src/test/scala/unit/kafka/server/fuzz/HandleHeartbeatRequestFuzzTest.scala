@@ -63,9 +63,9 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestHeartbeatCoordinatorPath(data: FuzzedDataProvider): Unit = {
     resetZkMetadataToLatestTesting()
-    val version = data.consumeInt(
-      ApiKeys.HEARTBEAT.oldestVersion().toInt,
-      ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.HEARTBEAT.oldestVersion(),
+      ApiKeys.HEARTBEAT.latestVersion())
     val groupId = safeString(data, "fuzz-group")
     val memberId = safeString(data, "fuzz-member")
     val useInstanceId = data.consumeBoolean()
@@ -109,9 +109,9 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestHeartbeatStaticMembershipOldIbp(data: FuzzedDataProvider): Unit = {
     resetZkMetadataToLatestTesting()
-    val version = data.consumeInt(
-      ApiKeys.HEARTBEAT.oldestVersion().toInt,
-      ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.HEARTBEAT.oldestVersion(),
+      ApiKeys.HEARTBEAT.latestVersion())
     val groupId = safeString(data, "fuzz-g")
     val memberId = safeString(data, "fuzz-m")
     val groupInstanceId = safeString(data, "fuzz-static-id")
@@ -146,9 +146,9 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestHeartbeatStaticMembershipSupportedIbp(data: FuzzedDataProvider): Unit = {
     resetZkMetadataToLatestTesting()
-    val version = data.consumeInt(
-      ApiKeys.HEARTBEAT.oldestVersion().toInt,
-      ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.HEARTBEAT.oldestVersion(),
+      ApiKeys.HEARTBEAT.latestVersion())
     val groupId = safeString(data, "fuzz-g")
     val groupInstanceId = safeString(data, "fuzz-static-inst")
     val generationId = data.consumeInt(0, Int.MaxValue)
@@ -189,9 +189,9 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestHeartbeatAuthorizationDenied(data: FuzzedDataProvider): Unit = {
     resetZkMetadataToLatestTesting()
-    val version = data.consumeInt(
-      ApiKeys.HEARTBEAT.oldestVersion().toInt,
-      ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.HEARTBEAT.oldestVersion(),
+      ApiKeys.HEARTBEAT.latestVersion())
     val groupId = safeString(data, "fuzz-auth-group")
     val memberId = safeString(data, "fuzz-auth-member")
     val generationId = data.consumeInt()
@@ -225,9 +225,9 @@ class HandleHeartbeatRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestHeartbeatThrottled(data: FuzzedDataProvider): Unit = {
     resetZkMetadataToLatestTesting()
-    val version = data.consumeInt(
-      ApiKeys.HEARTBEAT.oldestVersion().toInt,
-      ApiKeys.HEARTBEAT.latestVersion().toInt).toShort
+    val version = data.consumeShort(
+      ApiKeys.HEARTBEAT.oldestVersion(),
+      ApiKeys.HEARTBEAT.latestVersion())
     val throttleMs = data.consumeInt(1, 500)
     val groupId = safeString(data, "fuzz-throttle-group")
 
