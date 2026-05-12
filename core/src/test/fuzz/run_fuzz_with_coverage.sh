@@ -209,6 +209,19 @@ DELETE_RECORDS_TESTS=(
     fuzzTestDeleteRecordsForwardedInnerRequest
 )
 
+# handleInitProducerIdRequest fuzz targets (HandleInitProducerIdRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+INIT_PRODUCER_ID_TESTS=(
+    fuzzTestInitProducerIdTransactionalIdAuthorizationDenied
+    fuzzTestInitProducerIdClusterAuthorizationDeniedNoTransactionalId
+    fuzzTestInitProducerIdClusterDeniedTopicWriteByTypeAllowed
+    fuzzTestInitProducerIdInvalidProducerIdOrEpochCombination
+    fuzzTestInitProducerIdTxnCoordinatorSuccess
+    fuzzTestInitProducerIdProducerFencedVersionRemap
+    fuzzTestInitProducerIdThrottledResponse
+    fuzzTestInitProducerIdForwardedInnerRequest
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -263,6 +276,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${DELETE_RECORDS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDeleteRecordsRequestFuzzTest" "$t"
+    done
+    for t in "${INIT_PRODUCER_ID_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleInitProducerIdRequestFuzzTest" "$t"
     done
 fi
 
