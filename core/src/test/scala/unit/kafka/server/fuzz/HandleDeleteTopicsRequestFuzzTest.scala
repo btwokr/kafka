@@ -54,17 +54,17 @@ import scala.collection.immutable.Map
 class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
 
   private def safeTopicName(data: FuzzedDataProvider, fallback: String): String = {
-    val s = data.consumeString(48)
-    if (s == null || s.isEmpty) fallback
-    else s
+    val fuzzString = data.consumeString(48)
+    if (fuzzString == null || fuzzString.isEmpty) fallback
+    else fuzzString
   }
 
   private def nonZeroUuid(data: FuzzedDataProvider): Uuid = {
-    val msb = data.consumeLong()
-    var lsb = data.consumeLong()
-    if (msb == 0L && lsb == 0L)
-      lsb = 1L
-    new Uuid(msb, lsb)
+    val uuidMostSignificantBits = data.consumeLong()
+    val rawLeastSignificantBits = data.consumeLong()
+    val uuidLeastSignificantBits =
+      if (uuidMostSignificantBits == 0L && rawLeastSignificantBits == 0L) 1L else rawLeastSignificantBits
+    new Uuid(uuidMostSignificantBits, uuidLeastSignificantBits)
   }
 
   private def resetZkAndCommonMocks(): Unit = {
@@ -106,8 +106,8 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
     describeAllowed: Set[String],
     deleteAllowed: Set[String]
   ): Authorizer = {
-    val a = mock(classOf[Authorizer])
-    when(a.authorize(any(), any[util.List[Action]])).thenAnswer(invocation => {
+    val mockAuthorizer = mock(classOf[Authorizer])
+    when(mockAuthorizer.authorize(any(), any[util.List[Action]])).thenAnswer(invocation => {
       val actions = invocation.getArgument(1, classOf[util.List[Action]])
       val out = new util.ArrayList[AuthorizationResult](actions.size())
       actions.forEach { act =>
@@ -127,34 +127,34 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
       }
       out
     })
-    a
+    mockAuthorizer
   }
 
   private def buildDeleteTopicsRequestLegacy(version: Short, timeoutMs: Int, names: Seq[String]): DeleteTopicsRequest = {
-    val d = new DeleteTopicsRequestData().setTimeoutMs(timeoutMs)
-    names.foreach(n => d.topicNames().add(n))
-    new DeleteTopicsRequest.Builder(d).build(version)
+    val requestData = new DeleteTopicsRequestData().setTimeoutMs(timeoutMs)
+    names.foreach(topicName => requestData.topicNames().add(topicName))
+    new DeleteTopicsRequest.Builder(requestData).build(version)
   }
 
   private def buildDeleteTopicsRequestV6Plus(version: Short, timeoutMs: Int, states: Seq[DeleteTopicState]): DeleteTopicsRequest = {
-    val d = new DeleteTopicsRequestData().setTimeoutMs(timeoutMs)
-    states.foreach(s => d.topics().add(s))
-    new DeleteTopicsRequest.Builder(d).build(version)
+    val requestData = new DeleteTopicsRequestData().setTimeoutMs(timeoutMs)
+    states.foreach(topicState => requestData.topics().add(topicState))
+    new DeleteTopicsRequest.Builder(requestData).build(version)
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDeleteTopicsNotController(data: FuzzedDataProvider): Unit = {
     val version = data.consumeShort(ApiKeys.DELETE_TOPICS.oldestVersion(), ApiKeys.DELETE_TOPICS.latestVersion())
     val timeoutMs = data.consumeInt(0, 120_000)
-    val t1 = safeTopicName(data, "fuzz-dt-nc-a")
-    val t2 = safeTopicName(data, "fuzz-dt-nc-b")
+    val topic1 = safeTopicName(data, "fuzz-dt-nc-a")
+    val topic2 = safeTopicName(data, "fuzz-dt-nc-b")
 
     resetZkAndCommonMocks()
     stubNoThrottle()
     stubDeleteTopicsMutationQuota(UnboundedControllerMutationQuota)
     when(controller.isActive).thenReturn(false)
 
-    val built = buildDeleteTopicsRequestLegacy(version, timeoutMs, Seq(t1, t2))
+    val built = buildDeleteTopicsRequestLegacy(version, timeoutMs, Seq(topic1, topic2))
     val request = buildRequest(built)
 
     val kafkaApis = createKafkaApis()
@@ -166,8 +166,8 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
   def fuzzTestDeleteTopicsDeletionDisabled(data: FuzzedDataProvider): Unit = {
     val version = data.consumeShort(ApiKeys.DELETE_TOPICS.oldestVersion(), ApiKeys.DELETE_TOPICS.latestVersion())
     val timeoutMs = data.consumeInt(0, 120_000)
-    val t1 = safeTopicName(data, "fuzz-dt-dis-a")
-    val t2 = safeTopicName(data, "fuzz-dt-dis-b")
+    val topic1 = safeTopicName(data, "fuzz-dt-dis-a")
+    val topic2 = safeTopicName(data, "fuzz-dt-dis-b")
 
     resetZkAndCommonMocks()
     stubNoThrottle()
@@ -177,11 +177,11 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
     val built =
       if (version >= 6) {
         buildDeleteTopicsRequestV6Plus(version, timeoutMs, Seq(
-          new DeleteTopicState().setName(t1).setTopicId(Uuid.ZERO_UUID),
-          new DeleteTopicState().setName(t2).setTopicId(Uuid.ZERO_UUID)
+          new DeleteTopicState().setName(topic1).setTopicId(Uuid.ZERO_UUID),
+          new DeleteTopicState().setName(topic2).setTopicId(Uuid.ZERO_UUID)
         ))
       } else
-        buildDeleteTopicsRequestLegacy(version, timeoutMs, Seq(t1, t2))
+        buildDeleteTopicsRequestLegacy(version, timeoutMs, Seq(topic1, topic2))
 
     val request = buildRequest(built)
     val kafkaApis = createKafkaApis(overrideProperties = Map(ServerConfigs.DELETE_TOPIC_ENABLE_CONFIG -> "false"))
@@ -252,9 +252,9 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
     when(controller.isActive).thenReturn(true)
 
     val topicId = nonZeroUuid(data)
-    val ctx = mock(classOf[ControllerContext])
-    when(controller.controllerContext).thenReturn(ctx)
-    when(ctx.topicName(topicId)).thenReturn(Some(topic))
+    val mockControllerContext = mock(classOf[ControllerContext])
+    when(controller.controllerContext).thenReturn(mockControllerContext)
+    when(mockControllerContext.topicName(topicId)).thenReturn(Some(topic))
 
     val built = buildDeleteTopicsRequestV6Plus(version, timeoutMs, Seq(
       new DeleteTopicState().setTopicId(topicId)
@@ -308,9 +308,9 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
     stubDeleteTopicsMutationQuota(UnboundedControllerMutationQuota)
     when(controller.isActive).thenReturn(true)
 
-    val ctx = mock(classOf[ControllerContext])
-    when(controller.controllerContext).thenReturn(ctx)
-    when(ctx.topicName(topicId)).thenReturn(None)
+    val mockControllerContext = mock(classOf[ControllerContext])
+    when(controller.controllerContext).thenReturn(mockControllerContext)
+    when(mockControllerContext.topicName(topicId)).thenReturn(None)
 
     val built = buildDeleteTopicsRequestV6Plus(version, timeoutMs, Seq(
       new DeleteTopicState().setTopicId(topicId)
@@ -334,9 +334,9 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
     stubDeleteTopicsMutationQuota(UnboundedControllerMutationQuota)
     when(controller.isActive).thenReturn(true)
 
-    val ctx = mock(classOf[ControllerContext])
-    when(controller.controllerContext).thenReturn(ctx)
-    when(ctx.topicName(topicId)).thenReturn(Some(topic))
+    val mockControllerContext = mock(classOf[ControllerContext])
+    when(controller.controllerContext).thenReturn(mockControllerContext)
+    when(mockControllerContext.topicName(topicId)).thenReturn(Some(topic))
 
     val built = buildDeleteTopicsRequestV6Plus(version, timeoutMs, Seq(
       new DeleteTopicState().setTopicId(topicId)
@@ -354,11 +354,11 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
   def fuzzTestDeleteTopicsAdminManagerSuccess(data: FuzzedDataProvider): Unit = {
     val version = data.consumeShort(ApiKeys.DELETE_TOPICS.oldestVersion(), ApiKeys.DELETE_TOPICS.latestVersion())
     val timeoutMs = data.consumeInt(1, 120_000)
-    val t1 = safeTopicName(data, "fuzz-dt-am-1")
-    val t2 = safeTopicName(data, "fuzz-dt-am-2")
+    val topic1 = safeTopicName(data, "fuzz-dt-am-1")
+    val topic2 = safeTopicName(data, "fuzz-dt-am-2")
 
     resetZkAndCommonMocks()
-    installMetadataCacheContains(Set(t1, t2))
+    installMetadataCacheContains(Set(topic1, topic2))
     stubNoThrottle()
     stubDeleteTopicsMutationQuota(UnboundedControllerMutationQuota)
     when(controller.isActive).thenReturn(true)
@@ -367,10 +367,10 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
     val built =
       if (version >= 6)
         buildDeleteTopicsRequestV6Plus(version, timeoutMs, Seq(
-          new DeleteTopicState().setName(t1).setTopicId(Uuid.ZERO_UUID),
-          new DeleteTopicState().setName(t2).setTopicId(Uuid.ZERO_UUID)))
+          new DeleteTopicState().setName(topic1).setTopicId(Uuid.ZERO_UUID),
+          new DeleteTopicState().setName(topic2).setTopicId(Uuid.ZERO_UUID)))
       else
-        buildDeleteTopicsRequestLegacy(version, timeoutMs, Seq(t1, t2))
+        buildDeleteTopicsRequestLegacy(version, timeoutMs, Seq(topic1, topic2))
 
     val request = buildRequest(built)
     val kafkaApis = createKafkaApis()
@@ -382,26 +382,26 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
   def fuzzTestDeleteTopicsAdminManagerCallbackErrors(data: FuzzedDataProvider): Unit = {
     val version = data.consumeShort(ApiKeys.DELETE_TOPICS.oldestVersion(), ApiKeys.DELETE_TOPICS.latestVersion())
     val timeoutMs = data.consumeInt(1, 120_000)
-    val ok = safeTopicName(data, "fuzz-dt-cb-ok")
-    val bad = safeTopicName(data, "fuzz-dt-cb-bad")
+    val topic1 = safeTopicName(data, "fuzz-dt-cb-ok")
+    val topic2 = safeTopicName(data, "fuzz-dt-cb-bad")
 
     resetZkAndCommonMocks()
-    installMetadataCacheContains(Set(ok, bad))
+    installMetadataCacheContains(Set(topic1, topic2))
     stubNoThrottle()
     stubDeleteTopicsMutationQuota(UnboundedControllerMutationQuota)
     when(controller.isActive).thenReturn(true)
     stubDeleteTopicsCallback(Map(
-      ok -> Errors.NONE,
-      bad -> Errors.REQUEST_TIMED_OUT
+      topic1 -> Errors.NONE,
+      topic2 -> Errors.REQUEST_TIMED_OUT
     ))
 
     val built =
       if (version >= 6)
         buildDeleteTopicsRequestV6Plus(version, timeoutMs, Seq(
-          new DeleteTopicState().setName(ok).setTopicId(Uuid.ZERO_UUID),
-          new DeleteTopicState().setName(bad).setTopicId(Uuid.ZERO_UUID)))
+          new DeleteTopicState().setName(topic1).setTopicId(Uuid.ZERO_UUID),
+          new DeleteTopicState().setName(topic2).setTopicId(Uuid.ZERO_UUID)))
       else
-        buildDeleteTopicsRequestLegacy(version, timeoutMs, Seq(ok, bad))
+        buildDeleteTopicsRequestLegacy(version, timeoutMs, Seq(topic1, topic2))
 
     val request = buildRequest(built)
     val kafkaApis = createKafkaApis()
@@ -413,8 +413,8 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
   def fuzzTestDeleteTopicsEmptyToDeleteImmediateResponse(data: FuzzedDataProvider): Unit = {
     val version = data.consumeShort(ApiKeys.DELETE_TOPICS.oldestVersion(), ApiKeys.DELETE_TOPICS.latestVersion())
     val timeoutMs = data.consumeInt(0, 120_000)
-    val u1 = safeTopicName(data, "fuzz-dt-empty-a")
-    val u2 = safeTopicName(data, "fuzz-dt-empty-b")
+    val topic1 = safeTopicName(data, "fuzz-dt-empty-a")
+    val topic2 = safeTopicName(data, "fuzz-dt-empty-b")
 
     resetZkAndCommonMocks()
     installMetadataCacheContains(Set.empty)
@@ -425,10 +425,10 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
     val built =
       if (version >= 6)
         buildDeleteTopicsRequestV6Plus(version, timeoutMs, Seq(
-          new DeleteTopicState().setName(u1).setTopicId(Uuid.ZERO_UUID),
-          new DeleteTopicState().setName(u2).setTopicId(Uuid.ZERO_UUID)))
+          new DeleteTopicState().setName(topic1).setTopicId(Uuid.ZERO_UUID),
+          new DeleteTopicState().setName(topic2).setTopicId(Uuid.ZERO_UUID)))
       else
-        buildDeleteTopicsRequestLegacy(version, timeoutMs, Seq(u1, u2))
+        buildDeleteTopicsRequestLegacy(version, timeoutMs, Seq(topic1, topic2))
 
     val request = buildRequest(built)
     val kafkaApis = createKafkaApis()

@@ -51,9 +51,9 @@ import scala.jdk.CollectionConverters._
 class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
 
   private def safeTopicName(data: FuzzedDataProvider, fallback: String): String = {
-    val s = data.consumeString(48)
-    if (s == null || s.isEmpty) fallback
-    else s
+    val fuzzString = data.consumeString(48)
+    if (fuzzString == null || fuzzString.isEmpty) fallback
+    else fuzzString
   }
 
   private def resetZkHarness(): Unit = {
@@ -72,36 +72,36 @@ class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
 
   private def stubReplicaManagerEchoSuccess(): Unit = {
     when(replicaManager.lastOffsetForLeaderEpoch(ArgumentMatchers.any())).thenAnswer(invocation => {
-      val topics = invocation.getArgument(0).asInstanceOf[scala.collection.Seq[OffsetForLeaderTopic]]
-        topics.map { ot =>
-          val parts = ot.partitions.asScala.map { p =>
-            new EpochEndOffset()
-              .setPartition(p.partition)
-              .setErrorCode(Errors.NONE.code)
-              .setLeaderEpoch(p.leaderEpoch)
-              .setEndOffset(100L + p.partition)
-          }
-          new OffsetForLeaderTopicResult()
-            .setTopic(ot.topic)
-            .setPartitions(parts.toList.asJava)
+      val requestedTopics = invocation.getArgument(0).asInstanceOf[scala.collection.Seq[OffsetForLeaderTopic]]
+      requestedTopics.map { requestTopic =>
+        val epochEndOffsets = requestTopic.partitions.asScala.map { partitionRequest =>
+          new EpochEndOffset()
+            .setPartition(partitionRequest.partition)
+            .setErrorCode(Errors.NONE.code)
+            .setLeaderEpoch(partitionRequest.leaderEpoch)
+            .setEndOffset(100L + partitionRequest.partition)
         }
-      })
+        new OffsetForLeaderTopicResult()
+          .setTopic(requestTopic.topic)
+          .setPartitions(epochEndOffsets.toList.asJava)
+      }
+    })
   }
 
   private def authorizerClusterActionAllowed(): Authorizer = {
-    val a = mock(classOf[Authorizer])
-    when(a.authorize(any(), any[util.List[Action]])).thenAnswer(invocation => {
+    val mockAuthorizer = mock(classOf[Authorizer])
+    when(mockAuthorizer.authorize(any(), any[util.List[Action]])).thenAnswer(invocation => {
       val actions = invocation.getArgument(1, classOf[util.List[Action]])
       val out = new util.ArrayList[AuthorizationResult](actions.size())
       actions.forEach(_ => out.add(AuthorizationResult.ALLOWED))
       out
     })
-    a
+    mockAuthorizer
   }
 
   private def authorizerClusterDeniedDescribeTopics(describeAllowed: Set[String]): Authorizer = {
-    val a = mock(classOf[Authorizer])
-    when(a.authorize(any(), any[util.List[Action]])).thenAnswer(invocation => {
+    val mockAuthorizer = mock(classOf[Authorizer])
+    when(mockAuthorizer.authorize(any(), any[util.List[Action]])).thenAnswer(invocation => {
       val actions = invocation.getArgument(1, classOf[util.List[Action]])
       val out = new util.ArrayList[AuthorizationResult](actions.size())
       actions.forEach { act =>
@@ -119,46 +119,46 @@ class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
       }
       out
     })
-    a
+    mockAuthorizer
   }
 
   private def buildEpochs(
     topics: Seq[(String, Seq[(Int, Int, Int)])]
   ): OffsetForLeaderTopicCollection = {
-    val c = new OffsetForLeaderTopicCollection()
+    val topicCollection = new OffsetForLeaderTopicCollection()
     topics.foreach { case (topic, partitions) =>
-      val t = new OffsetForLeaderTopic().setTopic(topic)
+      val offsetForLeaderTopic = new OffsetForLeaderTopic().setTopic(topic)
       partitions.foreach { case (partitionIndex, leaderEpoch, currentLeaderEpoch) =>
-        t.partitions().add(new OffsetForLeaderPartition()
+        offsetForLeaderTopic.partitions().add(new OffsetForLeaderPartition()
           .setPartition(partitionIndex)
           .setLeaderEpoch(leaderEpoch)
           .setCurrentLeaderEpoch(currentLeaderEpoch))
       }
-      c.add(t)
+      topicCollection.add(offsetForLeaderTopic)
     }
-    c
+    topicCollection
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestOffsetForLeaderEpochNoAuthorizerClusterPath(data: FuzzedDataProvider): Unit = {
     val version = data.consumeShort(ApiKeys.OFFSET_FOR_LEADER_EPOCH.oldestVersion(), ApiKeys.OFFSET_FOR_LEADER_EPOCH.latestVersion())
     val replicaId = data.consumeInt(0, 10)
-    val t1 = safeTopicName(data, "fuzz-ofle-nc-a")
-    val t2 = safeTopicName(data, "fuzz-ofle-nc-b")
-    val p0 = data.consumeInt(0, 7)
-    val p1 = data.consumeInt(0, 7)
-    val le0 = data.consumeInt(0, 32)
-    val le1 = data.consumeInt(0, 32)
-    val cle0 = data.consumeInt(-1, 32)
-    val cle1 = data.consumeInt(-1, 32)
+    val topic1 = safeTopicName(data, "fuzz-ofle-nc-a")
+    val topic2 = safeTopicName(data, "fuzz-ofle-nc-b")
+    val partitionIndex1 = data.consumeInt(0, 7)
+    val partitionIndex2 = data.consumeInt(0, 7)
+    val leaderEpoch1 = data.consumeInt(0, 32)
+    val leaderEpoch2 = data.consumeInt(0, 32)
+    val currentLeaderEpoch1 = data.consumeInt(-1, 32)
+    val currentLeaderEpoch2 = data.consumeInt(-1, 32)
 
     resetZkHarness()
     stubNoThrottle()
     stubReplicaManagerEchoSuccess()
 
     val epochs = buildEpochs(Seq(
-      (t1, Seq((p0, le0, cle0))),
-      (t2, Seq((p1, le1, cle1)))
+      (topic1, Seq((partitionIndex1, leaderEpoch1, currentLeaderEpoch1))),
+      (topic2, Seq((partitionIndex2, leaderEpoch2, currentLeaderEpoch2)))
     ))
     val built = OffsetsForLeaderEpochRequest.Builder.forFollower(version, epochs, replicaId).build(version)
     val request = buildRequest(built)
@@ -173,15 +173,15 @@ class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeShort(ApiKeys.OFFSET_FOR_LEADER_EPOCH.oldestVersion(), ApiKeys.OFFSET_FOR_LEADER_EPOCH.latestVersion())
     val replicaId = data.consumeInt(0, 10)
     val topic = safeTopicName(data, "fuzz-ofle-cl-ok")
-    val part = data.consumeInt(0, 15)
-    val le = data.consumeInt(0, 64)
-    val cle = data.consumeInt(-1, 64)
+    val partitionIndex = data.consumeInt(0, 15)
+    val leaderEpoch = data.consumeInt(0, 64)
+    val currentLeaderEpoch = data.consumeInt(-1, 64)
 
     resetZkHarness()
     stubNoThrottle()
     stubReplicaManagerEchoSuccess()
 
-    val epochs = buildEpochs(Seq((topic, Seq((part, le, cle)))))
+    val epochs = buildEpochs(Seq((topic, Seq((partitionIndex, leaderEpoch, currentLeaderEpoch)))))
     val built = OffsetsForLeaderEpochRequest.Builder.forFollower(version, epochs, replicaId).build(version)
     val request = buildRequest(built)
 
@@ -196,18 +196,18 @@ class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
     val replicaId = data.consumeInt(0, 10)
     val allowedTopic = safeTopicName(data, "fuzz-ofle-mix-yes")
     val deniedTopic = safeTopicName(data, "fuzz-ofle-mix-no")
-    val pA = data.consumeInt(0, 7)
-    val pB = data.consumeInt(0, 7)
-    val leA = data.consumeInt(0, 32)
-    val leB = data.consumeInt(0, 32)
+    val allowedTopicPartitionIndex = data.consumeInt(0, 7)
+    val deniedTopicPartitionIndex = data.consumeInt(0, 7)
+    val allowedTopicLeaderEpoch = data.consumeInt(0, 32)
+    val deniedTopicLeaderEpoch = data.consumeInt(0, 32)
 
     resetZkHarness()
     stubNoThrottle()
     stubReplicaManagerEchoSuccess()
 
     val epochs = buildEpochs(Seq(
-      (allowedTopic, Seq((pA, leA, RecordBatch.NO_PARTITION_LEADER_EPOCH))),
-      (deniedTopic, Seq((pB, leB, RecordBatch.NO_PARTITION_LEADER_EPOCH)))
+      (allowedTopic, Seq((allowedTopicPartitionIndex, allowedTopicLeaderEpoch, RecordBatch.NO_PARTITION_LEADER_EPOCH))),
+      (deniedTopic, Seq((deniedTopicPartitionIndex, deniedTopicLeaderEpoch, RecordBatch.NO_PARTITION_LEADER_EPOCH)))
     ))
     val built = OffsetsForLeaderEpochRequest.Builder.forFollower(version, epochs, replicaId).build(version)
     val request = buildRequest(built)
@@ -222,18 +222,18 @@ class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
   def fuzzTestOffsetForLeaderEpochClusterDeniedAllTopicsUnauthorized(data: FuzzedDataProvider): Unit = {
     val version = data.consumeShort(ApiKeys.OFFSET_FOR_LEADER_EPOCH.oldestVersion(), ApiKeys.OFFSET_FOR_LEADER_EPOCH.latestVersion())
     val replicaId = data.consumeInt(0, 10)
-    val t1 = safeTopicName(data, "fuzz-ofle-all-a")
-    val t2 = safeTopicName(data, "fuzz-ofle-all-b")
-    val p0 = data.consumeInt(0, 3)
-    val p1 = data.consumeInt(0, 3)
+    val topic1 = safeTopicName(data, "fuzz-ofle-all-a")
+    val topic2 = safeTopicName(data, "fuzz-ofle-all-b")
+    val partitionIndex1 = data.consumeInt(0, 3)
+    val partitionIndex2 = data.consumeInt(0, 3)
 
     resetZkHarness()
     stubNoThrottle()
     stubReplicaManagerEchoSuccess()
 
     val epochs = buildEpochs(Seq(
-      (t1, Seq((p0, 0, RecordBatch.NO_PARTITION_LEADER_EPOCH))),
-      (t2, Seq((p1, 1, RecordBatch.NO_PARTITION_LEADER_EPOCH)))
+      (topic1, Seq((partitionIndex1, 0, RecordBatch.NO_PARTITION_LEADER_EPOCH))),
+      (topic2, Seq((partitionIndex2, 1, RecordBatch.NO_PARTITION_LEADER_EPOCH)))
     ))
     val built = OffsetsForLeaderEpochRequest.Builder.forFollower(version, epochs, replicaId).build(version)
     val request = buildRequest(built)
@@ -266,10 +266,10 @@ class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeShort(ApiKeys.OFFSET_FOR_LEADER_EPOCH.oldestVersion(), ApiKeys.OFFSET_FOR_LEADER_EPOCH.latestVersion())
     val replicaId = data.consumeInt(0, 10)
     val topic = safeTopicName(data, "fuzz-ofle-multi")
-    val p0 = data.consumeInt(0, 5)
-    val p1 = data.consumeInt(0, 5)
-    val le0 = data.consumeInt(0, 20)
-    val le1 = data.consumeInt(0, 20)
+    val partitionIndex1 = data.consumeInt(0, 5)
+    val partitionIndex2 = data.consumeInt(0, 5)
+    val leaderEpoch1 = data.consumeInt(0, 20)
+    val leaderEpoch2 = data.consumeInt(0, 20)
 
     resetZkHarness()
     stubNoThrottle()
@@ -277,8 +277,8 @@ class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
 
     val epochs = buildEpochs(Seq(
       (topic, Seq(
-        (p0, le0, RecordBatch.NO_PARTITION_LEADER_EPOCH),
-        (p1, le1, RecordBatch.NO_PARTITION_LEADER_EPOCH)
+        (partitionIndex1, leaderEpoch1, RecordBatch.NO_PARTITION_LEADER_EPOCH),
+        (partitionIndex2, leaderEpoch2, RecordBatch.NO_PARTITION_LEADER_EPOCH)
       ))
     ))
     val built = OffsetsForLeaderEpochRequest.Builder.forFollower(version, epochs, replicaId).build(version)
@@ -293,15 +293,15 @@ class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
   def fuzzTestOffsetForLeaderEpochConsumerBuilderPath(data: FuzzedDataProvider): Unit = {
     val version = data.consumeShort(3.toShort, ApiKeys.OFFSET_FOR_LEADER_EPOCH.latestVersion())
     val topic = safeTopicName(data, "fuzz-ofle-cons")
-    val part = data.consumeInt(0, 11)
-    val le = data.consumeInt(0, 40)
-    val cle = data.consumeInt(-1, 40)
+    val partitionIndex = data.consumeInt(0, 11)
+    val leaderEpoch = data.consumeInt(0, 40)
+    val currentLeaderEpoch = data.consumeInt(-1, 40)
 
     resetZkHarness()
     stubNoThrottle()
     stubReplicaManagerEchoSuccess()
 
-    val epochs = buildEpochs(Seq((topic, Seq((part, le, cle)))))
+    val epochs = buildEpochs(Seq((topic, Seq((partitionIndex, leaderEpoch, currentLeaderEpoch)))))
     val built = OffsetsForLeaderEpochRequest.Builder.forConsumer(epochs).build(version)
     val request = buildRequest(built)
 
@@ -317,8 +317,8 @@ class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
     val replicaId = data.consumeInt(0, 10)
     val throttleMs = data.consumeInt(1, 250)
     val topic = safeTopicName(data, "fuzz-ofle-thr")
-    val part = data.consumeInt(0, 4)
-    val le = data.consumeInt(0, 16)
+    val partitionIndex = data.consumeInt(0, 4)
+    val leaderEpoch = data.consumeInt(0, 16)
 
     resetZkHarness()
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
@@ -327,7 +327,7 @@ class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
       any[RequestChannel.Request](), anyLong)).thenReturn(throttleMs)
     stubReplicaManagerEchoSuccess()
 
-    val epochs = buildEpochs(Seq((topic, Seq((part, le, RecordBatch.NO_PARTITION_LEADER_EPOCH)))))
+    val epochs = buildEpochs(Seq((topic, Seq((partitionIndex, leaderEpoch, RecordBatch.NO_PARTITION_LEADER_EPOCH)))))
     val built = OffsetsForLeaderEpochRequest.Builder.forFollower(version, epochs, replicaId).build(version)
     val request = buildRequest(built)
 
@@ -342,8 +342,8 @@ class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
     val replicaId = data.consumeInt(0, 10)
     val reqThrottleMs = data.consumeInt(0, 100)
     val topic = safeTopicName(data, "fuzz-ofle-fwd")
-    val part = data.consumeInt(0, 6)
-    val le = data.consumeInt(0, 24)
+    val partitionIndex = data.consumeInt(0, 6)
+    val leaderEpoch = data.consumeInt(0, 24)
 
     resetZkHarness()
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
@@ -352,7 +352,7 @@ class HandleOffsetForLeaderEpochRequestFuzzTest extends KafkaApisTest {
       any[RequestChannel.Request](), anyLong)).thenReturn(reqThrottleMs)
     stubReplicaManagerEchoSuccess()
 
-    val epochs = buildEpochs(Seq((topic, Seq((part, le, RecordBatch.NO_PARTITION_LEADER_EPOCH)))))
+    val epochs = buildEpochs(Seq((topic, Seq((partitionIndex, leaderEpoch, RecordBatch.NO_PARTITION_LEADER_EPOCH)))))
     val built = OffsetsForLeaderEpochRequest.Builder.forFollower(version, epochs, replicaId).build(version)
     val request = buildForwardedRequest(built)
 
