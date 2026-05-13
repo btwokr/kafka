@@ -361,6 +361,23 @@ LEADER_AND_ISR_TESTS=(
     fuzzTestLeaderAndIsrForwardedInnerRequest
 )
 
+# handleTopicMetadataRequest fuzz targets (HandleTopicMetadataRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+TOPIC_METADATA_TESTS=(
+    fuzzTestTopicMetadataInvalidNullTopicName
+    fuzzTestTopicMetadataInvalidTopicIdPreV12
+    fuzzTestTopicMetadataAllTopics
+    fuzzTestTopicMetadataByNameKnownTopic
+    fuzzTestTopicMetadataUnknownTopicIdV12
+    fuzzTestTopicMetadataMixedTopicIdsAuthorized
+    fuzzTestTopicMetadataDescribeDeniedByName
+    fuzzTestTopicMetadataThrottledResponse
+    fuzzTestTopicMetadataForwardedInnerRequest
+    fuzzTestTopicMetadataIncludeAuthorizedOperations
+    fuzzTestTopicMetadataVersionZeroEmptyMeansAllTopics
+    fuzzTestTopicMetadataAutoCreateNonExistingTopic
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -445,6 +462,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${LEADER_AND_ISR_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleLeaderAndIsrRequestFuzzTest" "$t"
+    done
+    for t in "${TOPIC_METADATA_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleTopicMetadataRequestFuzzTest" "$t"
     done
 fi
 
