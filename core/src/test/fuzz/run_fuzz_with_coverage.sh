@@ -255,6 +255,20 @@ DELETE_TOPICS_TESTS=(
     fuzzTestDeleteTopicsForwardedInnerRequest
 )
 
+# handleOffsetForLeaderEpochRequest fuzz targets (HandleOffsetForLeaderEpochRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+OFFSET_FOR_LEADER_EPOCH_TESTS=(
+    fuzzTestOffsetForLeaderEpochNoAuthorizerClusterPath
+    fuzzTestOffsetForLeaderEpochAuthorizerClusterActionAllowed
+    fuzzTestOffsetForLeaderEpochClusterDeniedMixedDescribe
+    fuzzTestOffsetForLeaderEpochClusterDeniedAllTopicsUnauthorized
+    fuzzTestOffsetForLeaderEpochEmptyTopics
+    fuzzTestOffsetForLeaderEpochMultiPartitionAuthorized
+    fuzzTestOffsetForLeaderEpochConsumerBuilderPath
+    fuzzTestOffsetForLeaderEpochThrottledResponse
+    fuzzTestOffsetForLeaderEpochForwardedInnerRequest
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -318,6 +332,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${DELETE_TOPICS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDeleteTopicsRequestFuzzTest" "$t"
+    done
+    for t in "${OFFSET_FOR_LEADER_EPOCH_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleOffsetForLeaderEpochRequestFuzzTest" "$t"
     done
 fi
 
