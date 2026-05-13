@@ -81,14 +81,6 @@ class HandleTopicMetadataRequestFuzzTest extends KafkaApisTest {
       candidate
   }
 
-  private def twoDistinctUuidsFromFuzz(data: FuzzedDataProvider): (Uuid, Uuid) = {
-    val first = uuidFromTwoLongs(data)
-    var second = uuidFromTwoLongs(data)
-    if (second == first)
-      second = new Uuid(second.getMostSignificantBits, second.getLeastSignificantBits ^ 1L)
-    (first, second)
-  }
-
   private def resetTopicMetadataHarness(): Unit = {
     metadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.latestTesting())
     brokerEpochManager = new ZkBrokerEpochManager(metadataCache, controller, None)
@@ -246,7 +238,8 @@ class HandleTopicMetadataRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestTopicMetadataMixedTopicIdsAuthorized(data: FuzzedDataProvider): Unit = {
     val version = 12.toShort
-    val (allowedId, deniedId) = twoDistinctUuidsFromFuzz(data)
+    val allowedId = uuidFromTwoLongs(data)
+    val deniedId = uuidFromTwoLongs(data)
     val allowedTopic = safeTopicName(data, "fuzz-md-mix-ok")
     val deniedTopic = safeTopicName(data, "fuzz-md-mix-no")
 
