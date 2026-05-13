@@ -70,6 +70,25 @@ class HandleTopicMetadataRequestFuzzTest extends KafkaApisTest {
     base.replaceAll("[^a-zA-Z0-9._-]", "_").take(200)
   }
 
+  /** Topic id from fuzz entropy; avoids `Uuid.ZERO_UUID` and other reserved ids. */
+  private def uuidFromTwoLongs(data: FuzzedDataProvider): Uuid = {
+    val mostSig = data.consumeLong(Long.MinValue, Long.MaxValue)
+    val leastSig = data.consumeLong(Long.MinValue, Long.MaxValue)
+    val candidate = new Uuid(mostSig, leastSig)
+    if (candidate == Uuid.ZERO_UUID || Uuid.RESERVED.contains(candidate))
+      new Uuid(mostSig | 1L, leastSig ^ 1L)
+    else
+      candidate
+  }
+
+  private def twoDistinctUuidsFromFuzz(data: FuzzedDataProvider): (Uuid, Uuid) = {
+    val first = uuidFromTwoLongs(data)
+    var second = uuidFromTwoLongs(data)
+    if (second == first)
+      second = new Uuid(second.getMostSignificantBits, second.getLeastSignificantBits ^ 1L)
+    (first, second)
+  }
+
   private def resetTopicMetadataHarness(): Unit = {
     metadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.latestTesting())
     brokerEpochManager = new ZkBrokerEpochManager(metadataCache, controller, None)
@@ -155,7 +174,7 @@ class HandleTopicMetadataRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestTopicMetadataInvalidTopicIdPreV12(data: FuzzedDataProvider): Unit = {
     val version = data.consumeShort(10, 11)
-    val topicId = Uuid.randomUuid()
+    val topicId = uuidFromTwoLongs(data)
     val topicEntry = new MetadataRequestTopic().setName("fuzz-md-tid").setTopicId(topicId)
     val metadataRequestData = new MetadataRequestData()
       .setTopics(Collections.singletonList(topicEntry))
@@ -211,7 +230,7 @@ class HandleTopicMetadataRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestTopicMetadataUnknownTopicIdV12(data: FuzzedDataProvider): Unit = {
     val version = 12.toShort
-    val unknownId = Uuid.randomUuid()
+    val unknownId = uuidFromTwoLongs(data)
 
     resetTopicMetadataHarness()
     stubNoThrottle()
@@ -227,10 +246,9 @@ class HandleTopicMetadataRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestTopicMetadataMixedTopicIdsAuthorized(data: FuzzedDataProvider): Unit = {
     val version = 12.toShort
+    val (allowedId, deniedId) = twoDistinctUuidsFromFuzz(data)
     val allowedTopic = safeTopicName(data, "fuzz-md-mix-ok")
     val deniedTopic = safeTopicName(data, "fuzz-md-mix-no")
-    val allowedId = Uuid.randomUuid()
-    val deniedId = Uuid.randomUuid()
 
     resetTopicMetadataHarness()
     addTopicToMetadataCache(allowedTopic, numPartitions = 1, numBrokers = 2, topicId = allowedId)
