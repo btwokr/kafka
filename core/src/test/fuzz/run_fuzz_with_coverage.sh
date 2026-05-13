@@ -330,6 +330,24 @@ WRITE_TXN_MARKERS_TESTS=(
     fuzzTestWriteTxnMarkersUnsupportedInterBrokerVersion
 )
 
+# handleOffsetCommitRequest fuzz targets (HandleOffsetCommitRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+OFFSET_COMMIT_TESTS=(
+    fuzzTestOffsetCommitGroupReadDenied
+    fuzzTestOffsetCommitStaticMembershipUnsupported
+    fuzzTestOffsetCommitTopicReadDenied
+    fuzzTestOffsetCommitUnknownTopic
+    fuzzTestOffsetCommitUnknownPartition
+    fuzzTestOffsetCommitNoAuthorizedPartitions
+    fuzzTestOffsetCommitCoordinatorSuccess
+    fuzzTestOffsetCommitCoordinatorCompleteExceptionally
+    fuzzTestOffsetCommitCommitOffsetsThrowsSync
+    fuzzTestOffsetCommitThrottledResponse
+    fuzzTestOffsetCommitForwardedInnerRequest
+    fuzzTestOffsetCommitVersion0ZkPaths
+    fuzzTestOffsetCommitVersion0RaftUnsupported
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -408,6 +426,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${WRITE_TXN_MARKERS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleWriteTxnMarkersRequestFuzzTest" "$t"
+    done
+    for t in "${OFFSET_COMMIT_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleOffsetCommitRequestFuzzTest" "$t"
     done
 fi
 
