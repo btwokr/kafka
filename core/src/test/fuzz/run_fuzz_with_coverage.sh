@@ -316,6 +316,20 @@ END_TXN_TESTS=(
     fuzzTestEndTxnUnsupportedInterBrokerVersion
 )
 
+# handleWriteTxnMarkersRequest fuzz targets (HandleWriteTxnMarkersRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+WRITE_TXN_MARKERS_TESTS=(
+    fuzzTestWriteTxnMarkersEmptyMarkers
+    fuzzTestWriteTxnMarkersClusterAuthorizationDenied
+    fuzzTestWriteTxnMarkersUnknownTopicOrPartition
+    fuzzTestWriteTxnMarkersUnsupportedMessageFormat
+    fuzzTestWriteTxnMarkersAppendSuccessClassicCoordinator
+    fuzzTestWriteTxnMarkersNewGroupCoordinatorOffsetsTopic
+    fuzzTestWriteTxnMarkersMixedMagicAppendAndError
+    fuzzTestWriteTxnMarkersForwardedInnerRequest
+    fuzzTestWriteTxnMarkersUnsupportedInterBrokerVersion
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -391,6 +405,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${END_TXN_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleEndTxnRequestFuzzTest" "$t"
+    done
+    for t in "${WRITE_TXN_MARKERS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleWriteTxnMarkersRequestFuzzTest" "$t"
     done
 fi
 
