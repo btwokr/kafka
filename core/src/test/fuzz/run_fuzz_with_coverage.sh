@@ -288,6 +288,20 @@ ADD_PARTITIONS_TO_TXN_TESTS=(
     fuzzTestAddPartitionsToTxnUnsupportedInterBrokerVersion
 )
 
+# handleAddOffsetsToTxnRequest fuzz targets (HandleAddOffsetsToTxnRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+ADD_OFFSETS_TO_TXN_TESTS=(
+    fuzzTestAddOffsetsToTxnSuccess
+    fuzzTestAddOffsetsToTxnTransactionalIdWriteDenied
+    fuzzTestAddOffsetsToTxnGroupReadDenied
+    fuzzTestAddOffsetsToTxnProducerFencedLegacyClient
+    fuzzTestAddOffsetsToTxnProducerFencedModernClient
+    fuzzTestAddOffsetsToTxnCoordinatorConcurrentTransactions
+    fuzzTestAddOffsetsToTxnThrottledResponse
+    fuzzTestAddOffsetsToTxnForwardedInnerRequest
+    fuzzTestAddOffsetsToTxnUnsupportedInterBrokerVersion
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -357,6 +371,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${ADD_PARTITIONS_TO_TXN_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleAddPartitionsToTxnRequestFuzzTest" "$t"
+    done
+    for t in "${ADD_OFFSETS_TO_TXN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleAddOffsetsToTxnRequestFuzzTest" "$t"
     done
 fi
 
