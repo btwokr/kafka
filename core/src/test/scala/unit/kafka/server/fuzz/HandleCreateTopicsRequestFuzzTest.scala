@@ -32,6 +32,7 @@ import org.apache.kafka.common.requests.{ApiError, CreateTopicsRequest}
 import org.apache.kafka.common.resource.ResourceType
 import org.apache.kafka.server.authorizer.{Action, AuthorizationResult, Authorizer}
 import org.apache.kafka.server.common.MetadataVersion
+import org.mockito.ArgumentMatchers
 import org.mockito.ArgumentMatchers.{any, anyBoolean, anyDouble, anyInt, anyLong}
 import org.mockito.Mockito.{mock, reset, when}
 
@@ -60,8 +61,7 @@ class HandleCreateTopicsRequestFuzzTest extends KafkaApisTest {
     metadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.latestTesting())
     brokerEpochManager = new ZkBrokerEpochManager(metadataCache, controller, None)
     reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel,
-      txnCoordinator, groupCoordinator, controller)
-    resetAdminManager()
+      txnCoordinator, groupCoordinator, controller, adminManager)
   }
 
   private def stubNoThrottle(): Unit = {
@@ -71,11 +71,14 @@ class HandleCreateTopicsRequestFuzzTest extends KafkaApisTest {
       any[RequestChannel.Request](), anyLong)).thenReturn(0)
   }
 
-  private def stubControllerMutationQuota(quota: ControllerMutationQuota): Unit =
-    whenCreateTopicsControllerMutationQuotaReturns(quota)
+  private def stubControllerMutationQuota(quota: ControllerMutationQuota): Unit = {
+    when(clientControllerQuotaManager.newQuotaFor(
+      any[RequestChannel.Request](),
+      ArgumentMatchers.eq(6))).thenReturn(quota)
+  }
 
   private def stubCreateTopicsCallback(result: Map[String, ApiError]): Unit = {
-    when(zkAdminManagerMock.createTopics(anyInt(), anyBoolean(), any(), any(), any(), any()))
+    when(adminManager.createTopics(anyInt(), anyBoolean(), any(), any(), any(), any()))
       .thenAnswer(invocation => {
         val cb = invocation.getArgument(5).asInstanceOf[scala.collection.Map[String, ApiError] => Unit]
         cb(result)

@@ -108,37 +108,37 @@ import scala.jdk.CollectionConverters._
 class KafkaApisTest extends Logging {
   final val FUZZ_DURATION = "10s"
   val requestChannel: RequestChannel = mock(classOf[RequestChannel])
-  private val requestChannelMetrics: RequestChannel.Metrics = mock(classOf[RequestChannel.Metrics])
+  val requestChannelMetrics: RequestChannel.Metrics = mock(classOf[RequestChannel.Metrics])
   val replicaManager: ReplicaManager = mock(classOf[ReplicaManager])
   val groupCoordinator: GroupCoordinator = mock(classOf[GroupCoordinator])
-  private val adminManager: ZkAdminManager = mock(classOf[ZkAdminManager])
+  val adminManager: ZkAdminManager = mock(classOf[ZkAdminManager])
   val txnCoordinator: TransactionCoordinator = mock(classOf[TransactionCoordinator])
   val controller: KafkaController = mock(classOf[KafkaController])
-  private val forwardingManager: ForwardingManager = mock(classOf[ForwardingManager])
+  val forwardingManager: ForwardingManager = mock(classOf[ForwardingManager])
   val autoTopicCreationManager: AutoTopicCreationManager = mock(classOf[AutoTopicCreationManager])
 
-  private val kafkaPrincipalSerde = new KafkaPrincipalSerde {
+  val kafkaPrincipalSerde = new KafkaPrincipalSerde {
     override def serialize(principal: KafkaPrincipal): Array[Byte] = Utils.utf8(principal.toString)
     override def deserialize(bytes: Array[Byte]): KafkaPrincipal = SecurityUtils.parseKafkaPrincipal(Utils.utf8(bytes))
   }
-  val zkClient: KafkaZkClient = mock(classOf[KafkaZkClient])
+  protected val zkClient: KafkaZkClient = mock(classOf[KafkaZkClient])
   private val metrics = new Metrics()
   val brokerId = 1
-  // KRaft tests should override this with a KRaftMetadataCache.
+  // KRaft tests should override this with a KRaftMetadataCache
   var metadataCache: MetadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.latestTesting())
   var brokerEpochManager: ZkBrokerEpochManager = new ZkBrokerEpochManager(metadataCache, controller, None)
   val clientQuotaManager: ClientQuotaManager = mock(classOf[ClientQuotaManager])
   val clientRequestQuotaManager: ClientRequestQuotaManager = mock(classOf[ClientRequestQuotaManager])
-  private val clientControllerQuotaManager: ControllerMutationQuotaManager = mock(classOf[ControllerMutationQuotaManager])
-  private val replicaQuotaManager: ReplicationQuotaManager = mock(classOf[ReplicationQuotaManager])
-  private val quotas = QuotaManagers(clientQuotaManager, clientQuotaManager, clientRequestQuotaManager,
+  val clientControllerQuotaManager: ControllerMutationQuotaManager = mock(classOf[ControllerMutationQuotaManager])
+  val replicaQuotaManager: ReplicationQuotaManager = mock(classOf[ReplicationQuotaManager])
+  val quotas = QuotaManagers(clientQuotaManager, clientQuotaManager, clientRequestQuotaManager,
     clientControllerQuotaManager, replicaQuotaManager, replicaQuotaManager, replicaQuotaManager, None)
   val fetchManager: FetchManager = mock(classOf[FetchManager])
-  private val clientMetricsManager: ClientMetricsManager = mock(classOf[ClientMetricsManager])
-  private val brokerTopicStats = new BrokerTopicStats
-  private val clusterId = "clusterId"
-  private val time = new MockTime
-  private val clientId = ""
+  val clientMetricsManager: ClientMetricsManager = mock(classOf[ClientMetricsManager])
+  val brokerTopicStats = new BrokerTopicStats
+  val clusterId = "clusterId"
+  val time = new MockTime
+  val clientId = ""
   private var kafkaApis: KafkaApis = _
 
   @AfterEach
@@ -150,16 +150,11 @@ class KafkaApisTest extends Logging {
     metrics.close()
   }
 
-  /** Resets the ZK `adminManager` mock for fuzz tests that re-stub `createTopics` across Jazzer iterations. */
-  protected def resetAdminManager(): Unit = reset(adminManager)
-
   protected def whenCreateTopicsControllerMutationQuotaReturns(quota: ControllerMutationQuota): Unit = {
     when(clientControllerQuotaManager.newQuotaFor(
       any[RequestChannel.Request](),
       ArgumentMatchers.eq(6))).thenReturn(quota)
   }
-
-  protected def zkAdminManagerMock: ZkAdminManager = adminManager
 
   def createKafkaApis(interBrokerProtocolVersion: MetadataVersion = MetadataVersion.latestTesting,
                       authorizer: Option[Authorizer] = None,
