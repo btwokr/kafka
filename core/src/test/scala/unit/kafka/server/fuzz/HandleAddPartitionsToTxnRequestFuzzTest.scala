@@ -489,7 +489,8 @@ class HandleAddPartitionsToTxnRequestFuzzTest extends KafkaApisTest {
     try {
       try kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.NoCaching)
       catch {
-        case _: InvalidRequestException =>
+        case e: InvalidRequestException =>
+          if (e.getMessage != "Transactional ID can not be null in request.") throw e
       }
     } finally kafkaApis.close()
   }
