@@ -237,6 +237,24 @@ CREATE_TOPICS_TESTS=(
     fuzzTestCreateTopicsForwardedInnerRequest
 )
 
+# handleDeleteTopicsRequest fuzz targets (HandleDeleteTopicsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DELETE_TOPICS_TESTS=(
+    fuzzTestDeleteTopicsNotController
+    fuzzTestDeleteTopicsDeletionDisabled
+    fuzzTestDeleteTopicsInvalidNameAndNonZeroTopicId
+    fuzzTestDeleteTopicsUnknownTopicByName
+    fuzzTestDeleteTopicsByIdDescribeDenied
+    fuzzTestDeleteTopicsByNameDeleteDenied
+    fuzzTestDeleteTopicsByIdUnknownTopicId
+    fuzzTestDeleteTopicsByIdDeleteDenied
+    fuzzTestDeleteTopicsAdminManagerSuccess
+    fuzzTestDeleteTopicsAdminManagerCallbackErrors
+    fuzzTestDeleteTopicsEmptyToDeleteImmediateResponse
+    fuzzTestDeleteTopicsThrottledResponse
+    fuzzTestDeleteTopicsForwardedInnerRequest
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -297,6 +315,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${CREATE_TOPICS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleCreateTopicsRequestFuzzTest" "$t"
+    done
+    for t in "${DELETE_TOPICS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDeleteTopicsRequestFuzzTest" "$t"
     done
 fi
 
