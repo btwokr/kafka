@@ -59,14 +59,6 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
     else fuzzString
   }
 
-  private def nonZeroUuid(data: FuzzedDataProvider): Uuid = {
-    val uuidMostSignificantBits = data.consumeLong()
-    val rawLeastSignificantBits = data.consumeLong()
-    val uuidLeastSignificantBits =
-      if (uuidMostSignificantBits == 0L && rawLeastSignificantBits == 0L) 1L else rawLeastSignificantBits
-    new Uuid(uuidMostSignificantBits, uuidLeastSignificantBits)
-  }
-
   private def resetZkAndCommonMocks(): Unit = {
     metadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.latestTesting())
     brokerEpochManager = new ZkBrokerEpochManager(metadataCache, controller, None)
@@ -194,7 +186,7 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeShort(6.toShort, ApiKeys.DELETE_TOPICS.latestVersion())
     val timeoutMs = data.consumeInt(0, 120_000)
     val badName = safeTopicName(data, "fuzz-dt-bad")
-    val badId = nonZeroUuid(data)
+    val badId = uuidFromTwoLongs(data)
 
     resetZkAndCommonMocks()
     stubNoThrottle()
@@ -251,7 +243,7 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
     stubDeleteTopicsMutationQuota(UnboundedControllerMutationQuota)
     when(controller.isActive).thenReturn(true)
 
-    val topicId = nonZeroUuid(data)
+    val topicId = uuidFromTwoLongs(data)
     val mockControllerContext = mock(classOf[ControllerContext])
     when(controller.controllerContext).thenReturn(mockControllerContext)
     when(mockControllerContext.topicName(topicId)).thenReturn(Some(topic))
@@ -300,7 +292,7 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
   def fuzzTestDeleteTopicsByIdUnknownTopicId(data: FuzzedDataProvider): Unit = {
     val version = data.consumeShort(6.toShort, ApiKeys.DELETE_TOPICS.latestVersion())
     val timeoutMs = data.consumeInt(0, 120_000)
-    val topicId = nonZeroUuid(data)
+    val topicId = uuidFromTwoLongs(data)
 
     resetZkAndCommonMocks()
     installMetadataCacheContains(Set.empty)
@@ -326,7 +318,7 @@ class HandleDeleteTopicsRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeShort(6.toShort, ApiKeys.DELETE_TOPICS.latestVersion())
     val timeoutMs = data.consumeInt(0, 120_000)
     val topic = safeTopicName(data, "fuzz-dt-idndel")
-    val topicId = nonZeroUuid(data)
+    val topicId = uuidFromTwoLongs(data)
 
     resetZkAndCommonMocks()
     installMetadataCacheContains(Set(topic))

@@ -70,17 +70,6 @@ class HandleTopicMetadataRequestFuzzTest extends KafkaApisTest {
     base.replaceAll("[^a-zA-Z0-9._-]", "_").take(200)
   }
 
-  /** Topic id from fuzz entropy; avoids `Uuid.ZERO_UUID` and other reserved ids. */
-  private def uuidFromTwoLongs(data: FuzzedDataProvider): Uuid = {
-    val mostSig = data.consumeLong(Long.MinValue, Long.MaxValue)
-    val leastSig = data.consumeLong(Long.MinValue, Long.MaxValue)
-    val candidate = new Uuid(mostSig, leastSig)
-    if (candidate == Uuid.ZERO_UUID || Uuid.RESERVED.contains(candidate))
-      new Uuid(mostSig | 1L, leastSig ^ 1L)
-    else
-      candidate
-  }
-
   private def resetTopicMetadataHarness(): Unit = {
     metadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.latestTesting())
     brokerEpochManager = new ZkBrokerEpochManager(metadataCache, controller, None)

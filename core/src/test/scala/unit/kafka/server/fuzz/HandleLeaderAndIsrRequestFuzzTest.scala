@@ -106,10 +106,11 @@ class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
     controllerEpoch: Int,
     brokerEpoch: Long,
     topicName: String,
-    kraftController: Boolean
+    kraftController: Boolean,
+    topicId: Uuid
   ): LeaderAndIsrRequest.Builder = {
     val partitionStates = Collections.singletonList(partitionState(topicName, 1))
-    val topicIds = Collections.singletonMap(topicName, Uuid.randomUuid())
+    val topicIds = Collections.singletonMap(topicName, topicId)
     if (version >= 7) {
       new LeaderAndIsrRequest.Builder(
         version,
@@ -143,12 +144,13 @@ class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
     val currentBrokerEpoch = data.consumeLong(1000L, 1L << 40)
     val brokerEpochInRequest = data.consumeLong(currentBrokerEpoch, currentBrokerEpoch + 1000L)
     val topicName = safeTopicName(data, "fuzz-lai-success")
+    val topicId = uuidFromTwoLongs(data)
 
     resetZkLeaderAndIsrHarness()
     when(controller.brokerEpoch).thenReturn(currentBrokerEpoch)
 
     val leaderAndIsrRequest = newLeaderAndIsrBuilder(
-      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = false
+      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = false, topicId
     ).build(version)
     val request = buildRequest(leaderAndIsrRequest)
 
@@ -185,8 +187,9 @@ class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
     resetZkLeaderAndIsrHarness()
     when(controller.brokerEpoch).thenReturn(currentBrokerEpoch)
 
+    val topicId = uuidFromTwoLongs(data)
     val leaderAndIsrRequest = newLeaderAndIsrBuilder(
-      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = false
+      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = false, topicId
     ).build(version)
     val request = buildRequest(leaderAndIsrRequest)
 
@@ -208,13 +211,15 @@ class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
     resetZkLeaderAndIsrHarness()
     when(controller.brokerEpoch).thenReturn(currentBrokerEpoch)
 
+    val topicId = uuidFromTwoLongs(data)
     val leaderAndIsrRequest = newLeaderAndIsrBuilder(
       version,
       controllerId,
       controllerEpoch,
       AbstractControlRequest.UNKNOWN_BROKER_EPOCH,
       topicName,
-      kraftController = false
+      kraftController = false,
+      topicId
     ).build(version)
     val request = buildRequest(leaderAndIsrRequest)
 
@@ -256,8 +261,9 @@ class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
       out
     })
 
+    val topicId = uuidFromTwoLongs(data)
     val leaderAndIsrRequest = newLeaderAndIsrBuilder(
-      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = false
+      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = false, topicId
     ).build(version)
     val request = buildRequest(leaderAndIsrRequest)
 
@@ -283,8 +289,9 @@ class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
       txnCoordinator, groupCoordinator, controller, adminManager)
     metadataCache = MetadataCache.kRaftMetadataCache(brokerId, () => KRaftVersion.KRAFT_VERSION_0)
 
+    val topicId = uuidFromTwoLongs(data)
     val leaderAndIsrRequest = newLeaderAndIsrBuilder(
-      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = false
+      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = false, topicId
     ).build(version)
     val request = buildRequest(leaderAndIsrRequest)
 
@@ -308,8 +315,9 @@ class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
     resetZkLeaderAndIsrHarness()
     when(controller.brokerEpoch).thenReturn(1L)
 
+    val topicId = uuidFromTwoLongs(data)
     val leaderAndIsrRequest = newLeaderAndIsrBuilder(
-      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = true
+      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = true, topicId
     ).build(version)
     val request = buildRequest(leaderAndIsrRequest)
 
@@ -332,13 +340,15 @@ class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
     resetZkLeaderAndIsrHarness()
     when(controller.brokerEpoch).thenReturn(999L)
 
+    val topicId = uuidFromTwoLongs(data)
     val leaderAndIsrRequest = newLeaderAndIsrBuilder(
       version,
       controllerId,
       controllerEpoch,
       AbstractControlRequest.UNKNOWN_BROKER_EPOCH,
       topicName,
-      kraftController = true
+      kraftController = true,
+      topicId
     ).build(version)
     val request = buildRequest(leaderAndIsrRequest)
 
@@ -364,6 +374,7 @@ class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
     val controllerEpoch = data.consumeInt(1, 30)
     val currentBrokerEpoch = data.consumeLong(3000L, 1L << 37)
     val brokerEpochInRequest = data.consumeLong(currentBrokerEpoch, currentBrokerEpoch + 200L)
+    val topicUuid = uuidFromTwoLongs(data)
     val splitSize = data.consumeInt(1, 32)
     val fuzzTail = data.consumeRemainingAsBytes()
     val topicSuffix = new String(fuzzTail.take(splitSize)).replaceAll("[^a-zA-Z0-9._-]", "_").take(80)
@@ -373,7 +384,7 @@ class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
     when(controller.brokerEpoch).thenReturn(currentBrokerEpoch)
 
     val leaderAndIsrRequest = newLeaderAndIsrBuilder(
-      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = false
+      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = false, topicUuid
     ).build(version)
     val request = buildForwardedRequest(leaderAndIsrRequest)
 
