@@ -45,6 +45,7 @@ import scala.jdk.CollectionConverters._
  * `OPERATION_NOT_ATTEMPTED`, `txnCoordinator` add vs verify-only callbacks
  * (including `PRODUCER_FENCED` remapping for legacy clients), batched broker
  * transactions, cluster-action denial on v4+, null transactional id,
+ * unsupported inter-broker metadata (`ensureInterBrokerVersion`),
  * throttling, and forwarded inner requests.
  */
 class HandleAddPartitionsToTxnRequestFuzzTest extends KafkaApisTest {
