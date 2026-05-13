@@ -269,6 +269,24 @@ OFFSET_FOR_LEADER_EPOCH_TESTS=(
     fuzzTestOffsetForLeaderEpochForwardedInnerRequest
 )
 
+# handleAddPartitionsToTxnRequest fuzz targets (HandleAddPartitionsToTxnRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+ADD_PARTITIONS_TO_TXN_TESTS=(
+    fuzzTestAddPartitionsToTxnClientSuccess
+    fuzzTestAddPartitionsToTxnClientTransactionalIdDenied
+    fuzzTestAddPartitionsToTxnClientTopicWriteDenied
+    fuzzTestAddPartitionsToTxnClientUnknownPartitionMixed
+    fuzzTestAddPartitionsToTxnClientProducerFencedRemappedLegacy
+    fuzzTestAddPartitionsToTxnClientProducerFencedModern
+    fuzzTestAddPartitionsToTxnBrokerAddPartitions
+    fuzzTestAddPartitionsToTxnBrokerVerifyOnly
+    fuzzTestAddPartitionsToTxnBrokerBatchedTwoTransactions
+    fuzzTestAddPartitionsToTxnBrokerClusterActionDenied
+    fuzzTestAddPartitionsToTxnBrokerNullTransactionalId
+    fuzzTestAddPartitionsToTxnThrottledResponse
+    fuzzTestAddPartitionsToTxnForwardedInnerRequest
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -335,6 +353,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${OFFSET_FOR_LEADER_EPOCH_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleOffsetForLeaderEpochRequestFuzzTest" "$t"
+    done
+    for t in "${ADD_PARTITIONS_TO_TXN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleAddPartitionsToTxnRequestFuzzTest" "$t"
     done
 fi
 
