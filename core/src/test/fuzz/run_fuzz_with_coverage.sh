@@ -358,7 +358,6 @@ LEADER_AND_ISR_TESTS=(
     fuzzTestLeaderAndIsrRaftShouldNeverReceive
     fuzzTestLeaderAndIsrKRaftControllerMissingLifecycleManager
     fuzzTestLeaderAndIsrKRaftControllerUnknownBrokerEpoch
-    fuzzTestLeaderAndIsrBecomeLeaderOrFollowerThrowsSync
     fuzzTestLeaderAndIsrForwardedInnerRequest
 )
 

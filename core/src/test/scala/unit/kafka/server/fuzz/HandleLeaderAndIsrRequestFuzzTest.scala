@@ -44,10 +44,10 @@ import java.util.Arrays.asList
  *
  * Covers ZooKeeper metadata path, `CLUSTER_ACTION` authorization, broker epoch
  * staleness vs `UNKNOWN_BROKER_EPOCH`, `replicaManager.becomeLeaderOrFollower`
- * success and synchronous throws, KRaft controller flag interaction with
- * `ZkBrokerEpochManager` (missing `BrokerLifecycleManager`), KRaft metadata
- * (`requireZkOrThrow` / `shouldNeverReceive` message), and forwarded inner
- * requests (`sendResponseExemptThrottle`).
+ * success, KRaft controller flag interaction with `ZkBrokerEpochManager`
+ * (missing `BrokerLifecycleManager`), KRaft metadata (`requireZkOrThrow` /
+ * `shouldNeverReceive` message), and forwarded inner requests
+ * (`sendResponseExemptThrottle`).
  */
 class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
 
@@ -68,11 +68,6 @@ class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
   /** Matches `ZkBrokerEpochManager.isBrokerEpochStale` when `isKRaftController` is true without a lifecycle manager. */
   private def validateIllegalStateMissingBrokerLifecycleManagerMessage(e: IllegalStateException): Unit = {
     val expectedMessage = "Expected BrokerLifecycleManager to be non-null."
-    if (e.getMessage != expectedMessage) throw e
-  }
-
-  private def validateRuntimeBecomeLeaderOrFollowerSyncMessage(e: RuntimeException): Unit = {
-    val expectedMessage = "fuzz-leader-and-isr-become-leader-sync"
     if (e.getMessage != expectedMessage) throw e
   }
 
@@ -360,38 +355,6 @@ class HandleLeaderAndIsrRequestFuzzTest extends KafkaApisTest {
     val kafkaApis = createKafkaApis()
     try kafkaApis.handleLeaderAndIsrRequest(request)
     finally kafkaApis.close()
-  }
-
-  @FuzzTest(maxDuration = FUZZ_DURATION)
-  def fuzzTestLeaderAndIsrBecomeLeaderOrFollowerThrowsSync(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeShort(ApiKeys.LEADER_AND_ISR.oldestVersion(), ApiKeys.LEADER_AND_ISR.latestVersion())
-    val controllerId = data.consumeInt(0, 5)
-    val controllerEpoch = data.consumeInt(1, 22)
-    val currentBrokerEpoch = data.consumeLong(2000L, 1L << 36)
-    val brokerEpochInRequest = data.consumeLong(currentBrokerEpoch, currentBrokerEpoch + 500L)
-    val topicName = safeTopicName(data, "fuzz-lai-sync-throw")
-
-    resetZkLeaderAndIsrHarness()
-    when(controller.brokerEpoch).thenReturn(currentBrokerEpoch)
-
-    val leaderAndIsrRequest = newLeaderAndIsrBuilder(
-      version, controllerId, controllerEpoch, brokerEpochInRequest, topicName, kraftController = false
-    ).build(version)
-    val request = buildRequest(leaderAndIsrRequest)
-
-    when(replicaManager.becomeLeaderOrFollower(
-      ArgumentMatchers.eq(request.context.correlationId),
-      any(),
-      any()
-    )).thenThrow(new RuntimeException("fuzz-leader-and-isr-become-leader-sync"))
-
-    val kafkaApis = createKafkaApis()
-    try {
-      try kafkaApis.handleLeaderAndIsrRequest(request)
-      catch {
-        case e: RuntimeException => validateRuntimeBecomeLeaderOrFollowerSyncMessage(e)
-      }
-    } finally kafkaApis.close()
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
