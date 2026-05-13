@@ -285,6 +285,7 @@ ADD_PARTITIONS_TO_TXN_TESTS=(
     fuzzTestAddPartitionsToTxnBrokerNullTransactionalId
     fuzzTestAddPartitionsToTxnThrottledResponse
     fuzzTestAddPartitionsToTxnForwardedInnerRequest
+    fuzzTestAddPartitionsToTxnUnsupportedInterBrokerVersion
 )
 
 mkdir -p "$JACOCO_DIR"

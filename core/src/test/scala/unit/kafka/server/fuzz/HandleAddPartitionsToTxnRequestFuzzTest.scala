@@ -23,7 +23,7 @@ import kafka.network.RequestChannel
 import kafka.server.{KafkaApisTest, MetadataCache, RequestLocal, ZkBrokerEpochManager}
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.acl.AclOperation
-import org.apache.kafka.common.errors.{ClusterAuthorizationException, InvalidRequestException}
+import org.apache.kafka.common.errors.{ClusterAuthorizationException, InvalidRequestException, UnsupportedVersionException}
 import org.apache.kafka.common.message.AddPartitionsToTxnRequestData.{AddPartitionsToTxnTopic, AddPartitionsToTxnTopicCollection, AddPartitionsToTxnTransaction, AddPartitionsToTxnTransactionCollection}
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
 import org.apache.kafka.common.requests.{AddPartitionsToTxnRequest, AddPartitionsToTxnResponse}
@@ -547,5 +547,27 @@ class HandleAddPartitionsToTxnRequestFuzzTest extends KafkaApisTest {
     val kafkaApis = createKafkaApis()
     try kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.NoCaching)
     finally kafkaApis.close()
+  }
+
+  @FuzzTest(maxDuration = FUZZ_DURATION)
+  def fuzzTestAddPartitionsToTxnUnsupportedInterBrokerVersion(data: FuzzedDataProvider): Unit = {
+    val useNoCaching = data.consumeBoolean()
+
+    reset(replicaManager, clientQuotaManager, clientRequestQuotaManager, requestChannel,
+      txnCoordinator, groupCoordinator, controller, adminManager)
+    metadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.IBP_0_10_2_IV0)
+    brokerEpochManager = new ZkBrokerEpochManager(metadataCache, controller, None)
+
+    val requestLocal =
+      if (useNoCaching) RequestLocal.NoCaching
+      else RequestLocal.withThreadConfinedCaching
+
+    val kafkaApis = createKafkaApis(MetadataVersion.IBP_0_10_2_IV0)
+    try {
+      try kafkaApis.handleAddPartitionsToTxnRequest(null, requestLocal)
+      catch {
+        case _: UnsupportedVersionException =>
+      }
+    } finally kafkaApis.close()
   }
 }
