@@ -50,6 +50,20 @@ import scala.jdk.CollectionConverters._
  */
 class HandleAddPartitionsToTxnRequestFuzzTest extends KafkaApisTest {
 
+  /** Matches `AuthHelper.authorizeClusterOperation` when cluster action is denied. */
+  private def validateClusterAuthorizationExceptionMessage(e: ClusterAuthorizationException): Unit = {
+    val message = e.getMessage
+    if (message == null || !message.startsWith("Request ") || !message.endsWith(" is not authorized."))
+      throw e
+  }
+
+  /** Matches `KafkaApis.ensureInterBrokerVersion` for this test's cache vs required `IBP_0_11_0_IV0`. */
+  private def validateUnsupportedVersionInterBrokerGuardMessage(e: UnsupportedVersionException): Unit = {
+    val expectedMessage =
+      s"metadata.version: ${MetadataVersion.IBP_0_10_2_IV0} is less than the required version: ${MetadataVersion.IBP_0_11_0_IV0}"
+    if (e.getMessage != expectedMessage) throw e
+  }
+
   private def safeString(data: FuzzedDataProvider, fallback: String): String = {
     val fuzzString = data.consumeString(64)
     if (fuzzString == null || fuzzString.isEmpty) fallback
@@ -453,7 +467,8 @@ class HandleAddPartitionsToTxnRequestFuzzTest extends KafkaApisTest {
     try {
       try kafkaApis.handleAddPartitionsToTxnRequest(request, RequestLocal.NoCaching)
       catch {
-        case _: ClusterAuthorizationException =>
+        case e: ClusterAuthorizationException =>
+          validateClusterAuthorizationExceptionMessage(e)
       }
     } finally kafkaApis.close()
   }
@@ -568,7 +583,8 @@ class HandleAddPartitionsToTxnRequestFuzzTest extends KafkaApisTest {
     try {
       try kafkaApis.handleAddPartitionsToTxnRequest(null, requestLocal)
       catch {
-        case _: UnsupportedVersionException =>
+        case e: UnsupportedVersionException =>
+          validateUnsupportedVersionInterBrokerGuardMessage(e)
       }
     } finally kafkaApis.close()
   }
