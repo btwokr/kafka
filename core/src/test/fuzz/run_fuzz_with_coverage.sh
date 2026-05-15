@@ -348,6 +348,26 @@ OFFSET_COMMIT_TESTS=(
     fuzzTestOffsetCommitVersion0RaftUnsupported
 )
 
+# handleTxnOffsetCommitRequest fuzz targets (HandleTxnOffsetCommitRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+TXN_OFFSET_COMMIT_TESTS=(
+    fuzzTestTxnOffsetCommitTransactionalIdWriteDenied
+    fuzzTestTxnOffsetCommitGroupReadDenied
+    fuzzTestTxnOffsetCommitTopicReadDeniedMixedTopics
+    fuzzTestTxnOffsetCommitUnknownTopic
+    fuzzTestTxnOffsetCommitUnknownPartitionAndValidSameTopic
+    fuzzTestTxnOffsetCommitOnlyInvalidPartitionsNoCoordinator
+    fuzzTestTxnOffsetCommitUnknownTopicAndValidTopic
+    fuzzTestTxnOffsetCommitCoordinatorSuccess
+    fuzzTestTxnOffsetCommitCoordinatorCompleteExceptionally
+    fuzzTestTxnOffsetCommitCommitTransactionalOffsetsThrowsSync
+    fuzzTestTxnOffsetCommitThrottleResponse
+    fuzzTestTxnOffsetCommitForwardedInnerRequest
+    fuzzTestTxnOffsetCommitUnsupportedInterBrokerVersion
+    fuzzTestTxnOffsetCommitV3GroupMetadataPassthrough
+    fuzzTestTxnOffsetCommitCoordinatorLoadInProgressLegacyRemap
+)
+
 # handleLeaderAndIsrRequest fuzz targets (HandleLeaderAndIsrRequestFuzzTest,
 # maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
 LEADER_AND_ISR_TESTS=(
@@ -459,6 +479,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${OFFSET_COMMIT_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleOffsetCommitRequestFuzzTest" "$t"
+    done
+    for t in "${TXN_OFFSET_COMMIT_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleTxnOffsetCommitRequestFuzzTest" "$t"
     done
     for t in "${LEADER_AND_ISR_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleLeaderAndIsrRequestFuzzTest" "$t"
