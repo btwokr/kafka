@@ -237,6 +237,26 @@ CREATE_TOPICS_TESTS=(
     fuzzTestCreateTopicsForwardedInnerRequest
 )
 
+# handleDeleteAcls / AclApis.handleDeleteAcls fuzz targets (HandleDeleteAclsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DELETE_ACLS_TESTS=(
+    fuzzTestDeleteAclsRaftAlwaysForwardUnsupported
+    fuzzTestDeleteAclsSecurityDisabledNoAuthorizer
+    fuzzTestDeleteAclsClusterAlterDenied
+    fuzzTestDeleteAclsAuthorizerDeleteEmptyResults
+    fuzzTestDeleteAclsAuthorizerDeleteOneBindingSuccess
+    fuzzTestDeleteAclsAuthorizerBindingDeleteError
+    fuzzTestDeleteAclsAuthorizerDeleteFilterError
+    fuzzTestDeleteAclsTwoFiltersBothSuccess
+    fuzzTestDeleteAclsThrottledResponse
+    fuzzTestDeleteAclsForwardedInnerRequest
+    fuzzTestDeleteAclsWireVersion0PatternAnyNormalized
+    fuzzTestDeleteAclsRequestValidateUnknownElementsThrows
+    fuzzTestDeleteAclsRequestValidateV0UnsupportedPatternThrows
+    fuzzTestDeleteAclsResponseV0NonLiteralMatchingAclThrows
+    fuzzTestDeleteAclsResponseUnknownMatchingAclThrows
+)
+
 # handleDeleteTopicsRequest fuzz targets (HandleDeleteTopicsRequestFuzzTest,
 # maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
 DELETE_TOPICS_TESTS=(
@@ -438,6 +458,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${CREATE_TOPICS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleCreateTopicsRequestFuzzTest" "$t"
+    done
+    for t in "${DELETE_ACLS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDeleteAclsRequestFuzzTest" "$t"
     done
     for t in "${DELETE_TOPICS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDeleteTopicsRequestFuzzTest" "$t"
