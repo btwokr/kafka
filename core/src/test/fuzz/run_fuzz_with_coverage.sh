@@ -292,6 +292,29 @@ DELETE_ACLS_TESTS=(
     fuzzTestDeleteAclsResponseUnknownMatchingAclThrows
 )
 
+# handleAlterConfigsRequest fuzz targets (HandleAlterConfigsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+ALTER_CONFIGS_TESTS=(
+    fuzzTestAlterConfigsZkEmptyResources
+    fuzzTestAlterConfigsKRaftEmptyResources
+    fuzzTestAlterConfigsKRaftPreprocessNullValueResponse
+    fuzzTestAlterConfigsRaftForwardedProcessLegacyThrows
+    fuzzTestAlterConfigsZkTopicAuthorizedSuccess
+    fuzzTestAlterConfigsZkTopicMixedAuthorization
+    fuzzTestAlterConfigsZkBrokerIdMatchSuccess
+    fuzzTestAlterConfigsZkBrokerClusterWideEmptyNameSuccess
+    fuzzTestAlterConfigsZkClientMetricsAuthorized
+    fuzzTestAlterConfigsZkBrokerWrongIdPreprocessResponse
+    fuzzTestAlterConfigsDataDuplicateResourcesPreprocess
+    fuzzTestAlterConfigsDataUnknownResourceTypePreprocess
+    fuzzTestAlterConfigsDataDuplicateConfigKeysPreprocess
+    fuzzTestAlterConfigsZkForwardingToController
+    fuzzTestAlterConfigsKRaftForwardingToController
+    fuzzTestAlterConfigsThrottledResponse
+    fuzzTestAlterConfigsZkForwardedInnerEnvelope
+    fuzzTestAlterConfigsZkAdminManagerReturnsError
+)
+
 # handleDeleteTopicsRequest fuzz targets (HandleDeleteTopicsRequestFuzzTest,
 # maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
 DELETE_TOPICS_TESTS=(
@@ -521,6 +544,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${DELETE_ACLS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDeleteAclsRequestFuzzTest" "$t"
+    done
+    for t in "${ALTER_CONFIGS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleAlterConfigsRequestFuzzTest" "$t"
     done
     for t in "${DELETE_TOPICS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDeleteTopicsRequestFuzzTest" "$t"
