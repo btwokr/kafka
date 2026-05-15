@@ -191,7 +191,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-txn-deny")
     val groupId = safeString(data, "fuzz-toc-g-deny")
     val producerId = data.consumeLong(1L, 1L << 40)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val topicName = topicSafe(data, "fuzz-toc-topic-deny")
     val committedOffset = data.consumeLong(0L, 1L << 30)
     val leaderNoise = data.consumeInt(-5, 2000000000)
@@ -224,7 +224,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-gread-txn")
     val groupId = safeString(data, "fuzz-toc-gread-g")
     val producerId = data.consumeLong(1L, 1L << 39)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val topicName = topicSafe(data, "fuzz-toc-gread-topic")
     val committedOffset = data.consumeLong(0L, 1L << 28)
     val leaderNoise = data.consumeInt(-3, 2000000000)
@@ -253,7 +253,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-topdeny-txn")
     val groupId = safeString(data, "fuzz-toc-topdeny-g")
     val producerId = data.consumeLong(1L, 1L << 38)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val deniedTopic = topicSafe(data, "fuzz-toc-secret")
     val allowedTopic = topicSafe(data, "fuzz-toc-open")
     val offDenied = data.consumeLong(0L, 100L)
@@ -303,7 +303,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-unk-txn")
     val groupId = safeString(data, "fuzz-toc-unk-g")
     val producerId = data.consumeLong(1L, 1L << 37)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val missingTopic = topicSafe(data, "fuzz-toc-missing")
     val committedOffset = data.consumeLong(0L, 1L << 20)
     val leaderNoise = data.consumeInt(0, 9)
@@ -332,7 +332,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-badpart-txn")
     val groupId = safeString(data, "fuzz-toc-badpart-g")
     val producerId = data.consumeLong(1L, 1L << 36)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val topicName = topicSafe(data, "fuzz-toc-badpart-topic")
     val badPartition = data.consumeInt(1, 16)
     val offOk = data.consumeLong(1L, 100L)
@@ -378,7 +378,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-onlybad-txn")
     val groupId = safeString(data, "fuzz-toc-onlybad-g")
     val producerId = data.consumeLong(1L, 1L << 35)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val topicName = topicSafe(data, "fuzz-toc-onlybad-topic")
     val badPartition = data.consumeInt(1, 12)
     val leaderNoise = data.consumeInt(0, 5)
@@ -411,7 +411,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-mix-txn")
     val groupId = safeString(data, "fuzz-toc-mix-g")
     val producerId = data.consumeLong(1L, 1L << 34)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val missingTopic = topicSafe(data, "fuzz-toc-mix-missing")
     val knownTopic = topicSafe(data, "fuzz-toc-mix-known")
     val offMissing = data.consumeLong(0L, 50L)
@@ -460,7 +460,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-ok-txn")
     val groupId = safeString(data, "fuzz-toc-ok-g")
     val producerId = data.consumeLong(1L, 1L << 33)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val topicName = topicSafe(data, "fuzz-toc-ok-topic")
     val committedOffset = data.consumeLong(0L, 1L << 29)
     val leaderNoise = data.consumeInt(-2, 11)
@@ -502,7 +502,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-ex-txn")
     val groupId = safeString(data, "fuzz-toc-ex-g")
     val producerId = data.consumeLong(1L, 1L << 32)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val topicName = topicSafe(data, "fuzz-toc-ex-topic")
     val committedOffset = data.consumeLong(0L, 1L << 19)
     val leaderNoise = data.consumeInt(0, 8)
@@ -537,7 +537,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-sync-txn")
     val groupId = safeString(data, "fuzz-toc-sync-g")
     val producerId = data.consumeLong(1L, 1L << 31)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val topicName = topicSafe(data, "fuzz-toc-sync-topic")
     val committedOffset = data.consumeLong(0L, 1L << 18)
     val leaderNoise = data.consumeInt(0, 7)
@@ -575,7 +575,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-thr-txn")
     val groupId = safeString(data, "fuzz-toc-thr-g")
     val producerId = data.consumeLong(1L, 1L << 30)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val topicName = topicSafe(data, "fuzz-toc-thr-topic")
     val committedOffset = data.consumeLong(0L, 1L << 17)
     val leaderNoise = data.consumeInt(0, 6)
@@ -618,7 +618,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-fwd-txn")
     val groupId = safeString(data, "fuzz-toc-fwd-g")
     val producerId = data.consumeLong(1L, 1L << 29)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val topicName = topicSafe(data, "fuzz-toc-fwd-topic")
     val committedOffset = data.consumeLong(0L, 1L << 16)
     val leaderNoise = data.consumeInt(0, 5)
@@ -660,7 +660,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-ibp-txn")
     val groupId = safeString(data, "fuzz-toc-ibp-g")
     val producerId = data.consumeLong(1L, 1L << 28)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val topicName = topicSafe(data, "fuzz-toc-ibp-topic")
     val committedOffset = data.consumeLong(0L, 100L)
     val leaderNoise = data.consumeInt(0, 4)
@@ -694,7 +694,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-v3-txn")
     val groupId = safeString(data, "fuzz-toc-v3-g")
     val producerId = data.consumeLong(1L, 1L << 27)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val memberId = safeString(data, "fuzz-toc-member")
     val generationId = data.consumeInt(0, 50)
     val groupInstanceId = safeString(data, "fuzz-toc-instance")
@@ -743,7 +743,7 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     val transactionalId = safeString(data, "fuzz-toc-load-txn")
     val groupId = safeString(data, "fuzz-toc-load-g")
     val producerId = data.consumeLong(1L, 1L << 26)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue).toShort
+    val producerEpoch = data.consumeShort(0, Short.MaxValue)
     val topicName = topicSafe(data, "fuzz-toc-load-topic")
     val committedOffset = data.consumeLong(0L, 1L << 14)
     val leaderNoise = data.consumeInt(0, 2)
