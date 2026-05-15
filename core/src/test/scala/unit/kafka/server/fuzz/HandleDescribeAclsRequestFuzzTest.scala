@@ -58,8 +58,9 @@ import java.util.Collections
  * forwarded inner requests, wire version 0 pattern normalization for `ANY`,
  * `DescribeAclsResponse` validation on wire version 0 when `Authorizer#acls`
  * returns non-literal pattern types (`UnsupportedVersionException` with message check),
- * `DescribeAclsRequest` construction failure (`IllegalArgumentException` with message check),
- * and mixed wire versions with literal filters.
+ * `DescribeAclsResponse` validation when `Authorizer#acls` returns bindings with
+ * UNKNOWN resource type, ACL operation, or permission type (`IllegalArgumentException`
+ * with message check), and mixed wire versions with literal filters.
  */
 class HandleDescribeAclsRequestFuzzTest extends KafkaApisTest {
 
@@ -75,9 +76,9 @@ class HandleDescribeAclsRequestFuzzTest extends KafkaApisTest {
     if (e.getMessage != expected) throw e
   }
 
-  private def validateDescribeAclsUnknownElementsMessage(e: IllegalArgumentException): Unit = {
-    val m = e.getMessage
-    if (m == null || !m.startsWith("DescribeAclsRequest contains UNKNOWN elements: ")) throw e
+  private def validateDescribeAclsResponseUnknownElementsMessage(e: IllegalArgumentException): Unit = {
+    val expected = "Contain UNKNOWN elements"
+    if (e.getMessage != expected) throw e
   }
 
   private def safeString(data: FuzzedDataProvider, fallback: String): String = {
@@ -365,21 +366,45 @@ class HandleDescribeAclsRequestFuzzTest extends KafkaApisTest {
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDescribeAclsUnknownFilterElementsThrows(data: FuzzedDataProvider): Unit = {
     val version = data.consumeShort(1.toShort, ApiKeys.DESCRIBE_ACLS.latestVersion())
-    val name = topicSafe(data, "fuzz-dacl-unkn")
+    val filterTopicName = topicSafe(data, "fuzz-dacl-unk-filter")
+    val bindingName = topicSafe(data, "fuzz-dacl-unk-name")
+    val branch = data.consumeInt(0, 2)
+    val principalSuffix = safeString(data, "X")
+    val host = safeString(data, "*")
 
     resetDescribeAclsHarness()
     stubNoThrottle()
 
-    val filter = new AclBindingFilter(
-      new ResourcePatternFilter(ResourceType.UNKNOWN, name, PatternType.LITERAL),
-      AccessControlEntryFilter.ANY)
-
-    try {
-      try new DescribeAclsRequest.Builder(filter).build(version)
-      catch {
-        case e: IllegalArgumentException => validateDescribeAclsUnknownElementsMessage(e)
+    val principal = if (principalSuffix.startsWith("User:")) principalSuffix else s"User:$principalSuffix"
+    val binding =
+      if (branch == 0) {
+        new AclBinding(
+          new ResourcePattern(ResourceType.UNKNOWN, bindingName, PatternType.LITERAL),
+          new AccessControlEntry(principal, host, AclOperation.READ, AclPermissionType.ALLOW))
+      } else if (branch == 1) {
+        new AclBinding(
+          new ResourcePattern(ResourceType.TOPIC, bindingName, PatternType.LITERAL),
+          new AccessControlEntry(principal, host, AclOperation.UNKNOWN, AclPermissionType.ALLOW))
+      } else {
+        new AclBinding(
+          new ResourcePattern(ResourceType.TOPIC, bindingName, PatternType.LITERAL),
+          new AccessControlEntry(principal, host, AclOperation.READ, AclPermissionType.UNKNOWN))
       }
-    } finally { }
+    val bindings = Collections.singletonList(binding)
+
+    val filter = new AclBindingFilter(
+      new ResourcePatternFilter(ResourceType.TOPIC, filterTopicName, PatternType.LITERAL),
+      AccessControlEntryFilter.ANY)
+    val built = new DescribeAclsRequest.Builder(filter).build(version)
+    val request = buildRequest(built)
+
+    val kafkaApis = createKafkaApis(authorizer = Some(authorizerAllowClusterStubAcls(bindings)))
+    try {
+      try kafkaApis.handleDescribeAcls(request)
+      catch {
+        case e: IllegalArgumentException => validateDescribeAclsResponseUnknownElementsMessage(e)
+      }
+    } finally kafkaApis.close()
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
