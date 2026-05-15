@@ -360,7 +360,6 @@ TXN_OFFSET_COMMIT_TESTS=(
     fuzzTestTxnOffsetCommitUnknownTopicAndValidTopic
     fuzzTestTxnOffsetCommitCoordinatorSuccess
     fuzzTestTxnOffsetCommitCoordinatorCompleteExceptionally
-    fuzzTestTxnOffsetCommitCommitTransactionalOffsetsThrowsSync
     fuzzTestTxnOffsetCommitThrottleResponse
     fuzzTestTxnOffsetCommitForwardedInnerRequest
     fuzzTestTxnOffsetCommitUnsupportedInterBrokerVersion

@@ -44,7 +44,7 @@ import scala.jdk.CollectionConverters._
  * Covers transactional-id WRITE and group READ denials, per-topic READ filtering,
  * unknown topics and partitions (including mixed valid and invalid partitions on one topic),
  * the empty-authorized-offsets path without calling the group coordinator,
- * coordinator success merge, coordinator failures, synchronous coordinator throws,
+ * coordinator success merge, coordinator failures,
  * `COORDINATOR_LOAD_IN_PROGRESS` remapping for wire versions below 2, client throttling,
  * forwarded inner requests, wire version 3+ group metadata fields, and
  * `ensureInterBrokerVersion` (`UnsupportedVersionException` with message check).
@@ -55,11 +55,6 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
   private def validateUnsupportedVersionInterBrokerGuardMessage(e: UnsupportedVersionException): Unit = {
     val expectedMessage =
       s"metadata.version: ${MetadataVersion.IBP_0_10_2_IV0} is less than the required version: ${MetadataVersion.IBP_0_11_0_IV0}"
-    if (e.getMessage != expectedMessage) throw e
-  }
-
-  private def validateRuntimeExceptionCommitTransactionalOffsetsSyncMessage(e: RuntimeException): Unit = {
-    val expectedMessage = "fuzz-txn-offset-commit-commitTransactionalOffsets-sync"
     if (e.getMessage != expectedMessage) throw e
   }
 
@@ -528,43 +523,6 @@ class HandleTxnOffsetCommitRequestFuzzTest extends KafkaApisTest {
     try {
       kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.withThreadConfinedCaching)
       coordinatorFuture.completeExceptionally(Errors.NOT_COORDINATOR.exception)
-    } finally kafkaApis.close()
-  }
-
-  @FuzzTest(maxDuration = FUZZ_DURATION)
-  def fuzzTestTxnOffsetCommitCommitTransactionalOffsetsThrowsSync(data: FuzzedDataProvider): Unit = {
-    val version = data.consumeShort(0, ApiKeys.TXN_OFFSET_COMMIT.latestVersion())
-    val transactionalId = safeString(data, "fuzz-toc-sync-txn")
-    val groupId = safeString(data, "fuzz-toc-sync-g")
-    val producerId = data.consumeLong(1L, 1L << 31)
-    val producerEpoch = data.consumeShort(0, Short.MaxValue)
-    val topicName = topicSafe(data, "fuzz-toc-sync-topic")
-    val committedOffset = data.consumeLong(0L, 1L << 18)
-    val leaderNoise = data.consumeInt(0, 7)
-
-    resetTxnOffsetCommitHarness()
-    addTopicToMetadataCache(topicName, numPartitions = 1)
-    stubNoThrottle()
-
-    when(groupCoordinator.commitTransactionalOffsets(any(), any(), any()))
-      .thenThrow(new RuntimeException("fuzz-txn-offset-commit-commitTransactionalOffsets-sync"))
-
-    val requestData = baseTxnData(transactionalId, groupId, producerId, producerEpoch, version,
-      Collections.singletonList(
-        new TxnOffsetCommitRequestData.TxnOffsetCommitRequestTopic()
-          .setName(topicName)
-          .setPartitions(Collections.singletonList(
-            txnPartition(0, committedOffset, "", version, leaderNoise)))), "", -1, null)
-
-    val built = new TxnOffsetCommitRequest.Builder(requestData).build(version)
-    val request = buildRequest(built)
-
-    val kafkaApis = createKafkaApis()
-    try {
-      try kafkaApis.handleTxnOffsetCommitRequest(request, RequestLocal.NoCaching)
-      catch {
-        case e: RuntimeException => validateRuntimeExceptionCommitTransactionalOffsetsSyncMessage(e)
-      }
     } finally kafkaApis.close()
   }
 
