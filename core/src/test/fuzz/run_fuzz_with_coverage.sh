@@ -237,6 +237,147 @@ CREATE_TOPICS_TESTS=(
     fuzzTestCreateTopicsForwardedInnerRequest
 )
 
+# handleDeleteTopicsRequest fuzz targets (HandleDeleteTopicsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DELETE_TOPICS_TESTS=(
+    fuzzTestDeleteTopicsNotController
+    fuzzTestDeleteTopicsDeletionDisabled
+    fuzzTestDeleteTopicsInvalidNameAndNonZeroTopicId
+    fuzzTestDeleteTopicsUnknownTopicByName
+    fuzzTestDeleteTopicsByIdDescribeDenied
+    fuzzTestDeleteTopicsByNameDeleteDenied
+    fuzzTestDeleteTopicsByIdUnknownTopicId
+    fuzzTestDeleteTopicsByIdDeleteDenied
+    fuzzTestDeleteTopicsAdminManagerSuccess
+    fuzzTestDeleteTopicsAdminManagerCallbackErrors
+    fuzzTestDeleteTopicsEmptyToDeleteImmediateResponse
+    fuzzTestDeleteTopicsThrottledResponse
+    fuzzTestDeleteTopicsForwardedInnerRequest
+)
+
+# handleOffsetForLeaderEpochRequest fuzz targets (HandleOffsetForLeaderEpochRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+OFFSET_FOR_LEADER_EPOCH_TESTS=(
+    fuzzTestOffsetForLeaderEpochNoAuthorizerClusterPath
+    fuzzTestOffsetForLeaderEpochAuthorizerClusterActionAllowed
+    fuzzTestOffsetForLeaderEpochClusterDeniedMixedDescribe
+    fuzzTestOffsetForLeaderEpochClusterDeniedAllTopicsUnauthorized
+    fuzzTestOffsetForLeaderEpochEmptyTopics
+    fuzzTestOffsetForLeaderEpochMultiPartitionAuthorized
+    fuzzTestOffsetForLeaderEpochConsumerBuilderPath
+    fuzzTestOffsetForLeaderEpochThrottledResponse
+    fuzzTestOffsetForLeaderEpochForwardedInnerRequest
+)
+
+# handleAddPartitionsToTxnRequest fuzz targets (HandleAddPartitionsToTxnRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+ADD_PARTITIONS_TO_TXN_TESTS=(
+    fuzzTestAddPartitionsToTxnClientSuccess
+    fuzzTestAddPartitionsToTxnClientTransactionalIdDenied
+    fuzzTestAddPartitionsToTxnClientTopicWriteDenied
+    fuzzTestAddPartitionsToTxnClientUnknownPartitionMixed
+    fuzzTestAddPartitionsToTxnClientProducerFencedRemappedLegacy
+    fuzzTestAddPartitionsToTxnClientProducerFencedModern
+    fuzzTestAddPartitionsToTxnBrokerAddPartitions
+    fuzzTestAddPartitionsToTxnBrokerVerifyOnly
+    fuzzTestAddPartitionsToTxnBrokerBatchedTwoTransactions
+    fuzzTestAddPartitionsToTxnBrokerClusterActionDenied
+    fuzzTestAddPartitionsToTxnBrokerNullTransactionalId
+    fuzzTestAddPartitionsToTxnThrottledResponse
+    fuzzTestAddPartitionsToTxnForwardedInnerRequest
+    fuzzTestAddPartitionsToTxnUnsupportedInterBrokerVersion
+)
+
+# handleAddOffsetsToTxnRequest fuzz targets (HandleAddOffsetsToTxnRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+ADD_OFFSETS_TO_TXN_TESTS=(
+    fuzzTestAddOffsetsToTxnSuccess
+    fuzzTestAddOffsetsToTxnTransactionalIdWriteDenied
+    fuzzTestAddOffsetsToTxnGroupReadDenied
+    fuzzTestAddOffsetsToTxnProducerFencedLegacyClient
+    fuzzTestAddOffsetsToTxnProducerFencedModernClient
+    fuzzTestAddOffsetsToTxnCoordinatorConcurrentTransactions
+    fuzzTestAddOffsetsToTxnThrottledResponse
+    fuzzTestAddOffsetsToTxnForwardedInnerRequest
+    fuzzTestAddOffsetsToTxnUnsupportedInterBrokerVersion
+)
+
+# handleEndTxnRequest fuzz targets (HandleEndTxnRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+END_TXN_TESTS=(
+    fuzzTestEndTxnSuccessCommit
+    fuzzTestEndTxnSuccessAbort
+    fuzzTestEndTxnTransactionalIdWriteDenied
+    fuzzTestEndTxnProducerFencedLegacyClient
+    fuzzTestEndTxnProducerFencedModernClient
+    fuzzTestEndTxnCoordinatorConcurrentTransactions
+    fuzzTestEndTxnThrottledResponse
+    fuzzTestEndTxnForwardedInnerRequest
+    fuzzTestEndTxnUnsupportedInterBrokerVersion
+)
+
+# handleWriteTxnMarkersRequest fuzz targets (HandleWriteTxnMarkersRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+WRITE_TXN_MARKERS_TESTS=(
+    fuzzTestWriteTxnMarkersEmptyMarkers
+    fuzzTestWriteTxnMarkersClusterAuthorizationDenied
+    fuzzTestWriteTxnMarkersUnknownTopicOrPartition
+    fuzzTestWriteTxnMarkersUnsupportedMessageFormat
+    fuzzTestWriteTxnMarkersAppendSuccessClassicCoordinator
+    fuzzTestWriteTxnMarkersNewGroupCoordinatorOffsetsTopic
+    fuzzTestWriteTxnMarkersMixedMagicAppendAndError
+    fuzzTestWriteTxnMarkersForwardedInnerRequest
+    fuzzTestWriteTxnMarkersUnsupportedInterBrokerVersion
+)
+
+# handleOffsetCommitRequest fuzz targets (HandleOffsetCommitRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+OFFSET_COMMIT_TESTS=(
+    fuzzTestOffsetCommitGroupReadDenied
+    fuzzTestOffsetCommitStaticMembershipUnsupported
+    fuzzTestOffsetCommitTopicReadDenied
+    fuzzTestOffsetCommitUnknownTopic
+    fuzzTestOffsetCommitUnknownPartition
+    fuzzTestOffsetCommitNoAuthorizedPartitions
+    fuzzTestOffsetCommitCoordinatorSuccess
+    fuzzTestOffsetCommitCoordinatorCompleteExceptionally
+    fuzzTestOffsetCommitCommitOffsetsThrowsSync
+    fuzzTestOffsetCommitThrottledResponse
+    fuzzTestOffsetCommitForwardedInnerRequest
+    fuzzTestOffsetCommitVersion0ZkPaths
+    fuzzTestOffsetCommitVersion0RaftUnsupported
+)
+
+# handleLeaderAndIsrRequest fuzz targets (HandleLeaderAndIsrRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+LEADER_AND_ISR_TESTS=(
+    fuzzTestLeaderAndIsrBecomeLeaderOrFollowerSuccess
+    fuzzTestLeaderAndIsrStaleBrokerEpoch
+    fuzzTestLeaderAndIsrUnknownBrokerEpoch
+    fuzzTestLeaderAndIsrClusterActionDenied
+    fuzzTestLeaderAndIsrRaftShouldNeverReceive
+    fuzzTestLeaderAndIsrKRaftControllerMissingLifecycleManager
+    fuzzTestLeaderAndIsrKRaftControllerUnknownBrokerEpoch
+    fuzzTestLeaderAndIsrForwardedInnerRequest
+)
+
+# handleTopicMetadataRequest fuzz targets (HandleTopicMetadataRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+TOPIC_METADATA_TESTS=(
+    fuzzTestTopicMetadataInvalidNullTopicName
+    fuzzTestTopicMetadataInvalidTopicIdPreV12
+    fuzzTestTopicMetadataAllTopics
+    fuzzTestTopicMetadataByNameKnownTopic
+    fuzzTestTopicMetadataUnknownTopicIdV12
+    fuzzTestTopicMetadataMixedTopicIdsAuthorized
+    fuzzTestTopicMetadataDescribeDeniedByName
+    fuzzTestTopicMetadataThrottledResponse
+    fuzzTestTopicMetadataForwardedInnerRequest
+    fuzzTestTopicMetadataIncludeAuthorizedOperations
+    fuzzTestTopicMetadataVersionZeroEmptyMeansAllTopics
+    fuzzTestTopicMetadataAutoCreateNonExistingTopic
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -297,6 +438,33 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${CREATE_TOPICS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleCreateTopicsRequestFuzzTest" "$t"
+    done
+    for t in "${DELETE_TOPICS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDeleteTopicsRequestFuzzTest" "$t"
+    done
+    for t in "${OFFSET_FOR_LEADER_EPOCH_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleOffsetForLeaderEpochRequestFuzzTest" "$t"
+    done
+    for t in "${ADD_PARTITIONS_TO_TXN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleAddPartitionsToTxnRequestFuzzTest" "$t"
+    done
+    for t in "${ADD_OFFSETS_TO_TXN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleAddOffsetsToTxnRequestFuzzTest" "$t"
+    done
+    for t in "${END_TXN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleEndTxnRequestFuzzTest" "$t"
+    done
+    for t in "${WRITE_TXN_MARKERS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleWriteTxnMarkersRequestFuzzTest" "$t"
+    done
+    for t in "${OFFSET_COMMIT_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleOffsetCommitRequestFuzzTest" "$t"
+    done
+    for t in "${LEADER_AND_ISR_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleLeaderAndIsrRequestFuzzTest" "$t"
+    done
+    for t in "${TOPIC_METADATA_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleTopicMetadataRequestFuzzTest" "$t"
     done
 fi
 

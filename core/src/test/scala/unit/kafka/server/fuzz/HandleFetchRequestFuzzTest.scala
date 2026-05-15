@@ -185,11 +185,11 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
     val minBytes = data.consumeInt(0, 1024)
     val maxWait = data.consumeInt(0, 5000)
     val splitSize = data.consumeInt(10, 4096)
+    val topicId = uuidFromTwoLongs(data)
     val (rawTopic, recordBytes) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
     // Topic name must be non-empty for FetchRequest builder; fall back to
     // a constant if the fuzzer hands us an empty string.
     val topic = if (rawTopic.isEmpty) "fuzz-topic" else rawTopic
-    val topicId = Uuid.randomUuid()
     val partition = 0
     val tip = new TopicIdPartition(topicId, new TopicPartition(topic, partition))
 
@@ -289,9 +289,9 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
     val maxWait = data.consumeInt(0, 5000)
     val splitSize = data.consumeInt(10, 4096)
     val isReassignmentFetch = data.consumeBoolean()
+    val topicId = uuidFromTwoLongs(data)
     val (rawTopic, recordBytes) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
     val topic = if (rawTopic.isEmpty) "fuzz-follower-topic" else rawTopic
-    val topicId = Uuid.randomUuid()
     val partition = 0
     val tip = new TopicIdPartition(topicId, new TopicPartition(topic, partition))
 
@@ -355,10 +355,10 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
     val bandwidthThrottle = if (dominant == 0) data.consumeInt(2, 100) else 1
     val requestThrottle = if (dominant == 0) 1 else data.consumeInt(2, 100)
 
+    val topicId = uuidFromTwoLongs(data)
     val splitSize = data.consumeInt(10, 4096)
     val (rawTopic, _) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
     val topic = if (rawTopic.isEmpty) "fuzz-throttle-topic" else rawTopic
-    val topicId = Uuid.randomUuid()
     val tip = new TopicIdPartition(topicId, new TopicPartition(topic, 0))
 
     reset(replicaManager, fetchManager, clientQuotaManager, clientRequestQuotaManager, requestChannel)
@@ -399,10 +399,10 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
     val maxBytes = data.consumeInt(1, 1024 * 1024)
     val minBytes = data.consumeInt(0, 1024)
     val maxWait = data.consumeInt(0, 5000)
+    val topicId = uuidFromTwoLongs(data)
     val splitSize = data.consumeInt(10, 4096)
     val (rawTopic, _) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
     val topic = if (rawTopic.isEmpty) "fuzz-empty-topic" else rawTopic
-    val topicId = Uuid.randomUuid()
     val tip = new TopicIdPartition(topicId, new TopicPartition(topic, 0))
 
     reset(replicaManager, fetchManager, clientQuotaManager, clientRequestQuotaManager, requestChannel)
@@ -460,10 +460,10 @@ class HandleFetchRequestFuzzTest extends KafkaApisTest {
     // Pick on-disk magic via MESSAGE_FORMAT_VERSION_CONFIG. v2 (RecordBatch.MAGIC_VALUE_V2)
     // forces the down-convert path; v0 / v1 take the no-op None branch.
     val onDiskMagic = data.consumeInt(0, 2)
+    val topicId = uuidFromTwoLongs(data)
     val splitSize = data.consumeInt(10, 4096)
     val (rawTopic, recordBytes) = helperSplitByteArray(data.consumeRemainingAsBytes(), splitSize)
     val topic = if (rawTopic.isEmpty) "fuzz-downconv-topic" else rawTopic
-    val topicId = Uuid.randomUuid()
     val tip = new TopicIdPartition(topicId, new TopicPartition(topic, 0))
 
     reset(replicaManager, fetchManager, clientQuotaManager, clientRequestQuotaManager, requestChannel)

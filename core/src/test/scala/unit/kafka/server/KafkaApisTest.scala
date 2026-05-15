@@ -105,8 +105,25 @@ import java.util.{Collections, Comparator, Optional, OptionalInt, OptionalLong, 
 import scala.collection.{Map, Seq, mutable}
 import scala.jdk.CollectionConverters._
 
+import com.code_intelligence.jazzer.api.FuzzedDataProvider
+
 class KafkaApisTest extends Logging {
   final val FUZZ_DURATION = "10s"
+
+  /**
+   * Shared by Jazzer fuzz tests: build a topic [[Uuid]] from two longs. Avoids
+   * [[Uuid.ZERO_UUID]] and [[Uuid.RESERVED]] so ids are safe for metadata and cache APIs.
+   */
+  protected def uuidFromTwoLongs(data: FuzzedDataProvider): Uuid = {
+    val mostSig = data.consumeLong(Long.MinValue, Long.MaxValue)
+    val leastSig = data.consumeLong(Long.MinValue, Long.MaxValue)
+    val candidate = new Uuid(mostSig, leastSig)
+    if (candidate == Uuid.ZERO_UUID || Uuid.RESERVED.contains(candidate))
+      new Uuid(mostSig | 1L, leastSig ^ 1L)
+    else
+      candidate
+  }
+
   val requestChannel: RequestChannel = mock(classOf[RequestChannel])
   val requestChannelMetrics: RequestChannel.Metrics = mock(classOf[RequestChannel.Metrics])
   val replicaManager: ReplicaManager = mock(classOf[ReplicaManager])
