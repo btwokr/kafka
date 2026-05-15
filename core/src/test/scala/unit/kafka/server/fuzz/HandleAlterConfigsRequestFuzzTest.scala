@@ -115,6 +115,11 @@ class HandleAlterConfigsRequestFuzzTest extends KafkaApisTest {
     auth
   }
 
+  /**
+   * Authorizer stub for alter-configs on two topic resources: `allowTopic` is granted
+   * `ALTER_CONFIGS`, `denyTopic` is denied; any other topic action is denied. Non-topic
+   * actions (e.g. cluster checks) are allowed so the handler can proceed.
+   */
   private def authorizerAlterConfigsTopicsAllowDeny(allowTopic: String, denyTopic: String): Authorizer = {
     val auth = mock(classOf[Authorizer])
     when(auth.authorize(any(), any[util.List[Action]])).thenAnswer(invocation => {
@@ -123,9 +128,12 @@ class HandleAlterConfigsRequestFuzzTest extends KafkaApisTest {
       actions.asScala.foreach { a =>
         if (a.operation == AclOperation.ALTER_CONFIGS &&
           a.resourcePattern.resourceType == ResourceType.TOPIC) {
-          out.add(
-            if (a.resourcePattern.name == allowTopic) AuthorizationResult.ALLOWED
-            else AuthorizationResult.DENIED)
+          val topicName = a.resourcePattern.name
+          val result =
+            if (topicName == allowTopic) AuthorizationResult.ALLOWED
+            else if (topicName == denyTopic) AuthorizationResult.DENIED
+            else AuthorizationResult.DENIED
+          out.add(result)
         } else {
           out.add(AuthorizationResult.ALLOWED)
         }
