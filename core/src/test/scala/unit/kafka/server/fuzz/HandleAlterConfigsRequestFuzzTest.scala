@@ -50,6 +50,11 @@ import scala.jdk.CollectionConverters._
  * preprocessing, empty remaining short-circuit, KRaft forwarding vs
  * `processLegacyAlterConfigsRequest` (ZK / forwarded-on-Raft), authorization,
  * `ZkAdminManager#alterConfigs`, and client throttling.
+ *
+ * Legacy `AlterConfigs` does not support `BROKER_LOGGER` in preprocessing: it is
+ * rejected in `ConfigAdminManager` with `InvalidRequestException` ("Unknown resource type …"),
+ * so it never reaches `KafkaApis.processLegacyAlterConfigsRequest`'s explicit
+ * `BROKER_LOGGER` branch. `ConfigResource.Type.UNKNOWN` is handled the same way.
  */
 class HandleAlterConfigsRequestFuzzTest extends KafkaApisTest {
 
@@ -62,6 +67,12 @@ class HandleAlterConfigsRequestFuzzTest extends KafkaApisTest {
   private def validateNullConfigValueResponseMessage(msg: String): Unit = {
     if (msg == null || !msg.startsWith("Null value not supported for : ")) {
       throw new AssertionError(s"unexpected error message: $msg")
+    }
+  }
+
+  private def validatePreprocessUnknownResourceTypeMessage(msg: String): Unit = {
+    if (msg == null || !msg.startsWith("Unknown resource type ")) {
+      throw new AssertionError(s"unexpected preprocess message: $msg")
     }
   }
 
@@ -424,7 +435,7 @@ class HandleAlterConfigsRequestFuzzTest extends KafkaApisTest {
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
-  def fuzzTestAlterConfigsDataUnknownResourceTypePreprocess(data: FuzzedDataProvider): Unit = {
+  def fuzzTestAlterConfigsDataUnrecognizedWireResourceTypePreprocess(data: FuzzedDataProvider): Unit = {
     val version = data.consumeShort(ApiKeys.ALTER_CONFIGS.oldestVersion(), ApiKeys.ALTER_CONFIGS.latestVersion())
     val name = topicSafe(data, "fuzz-ac-unk-res")
 
@@ -444,6 +455,59 @@ class HandleAlterConfigsRequestFuzzTest extends KafkaApisTest {
     val kafkaApis = createKafkaApis()
     try kafkaApis.handleAlterConfigsRequest(request)
     finally kafkaApis.close()
+  }
+
+  @FuzzTest(maxDuration = FUZZ_DURATION)
+  def fuzzTestAlterConfigsDataConfigResourceTypeUnknownPreprocess(data: FuzzedDataProvider): Unit = {
+    val version = data.consumeShort(ApiKeys.ALTER_CONFIGS.oldestVersion(), ApiKeys.ALTER_CONFIGS.latestVersion())
+    val name = topicSafe(data, "fuzz-ac-unknown-type")
+
+    resetZkAlterConfigsHarness()
+    when(controller.isActive).thenReturn(true)
+    stubNoThrottle()
+
+    val coll = new LAlterConfigsResourceCollection()
+    coll.add(new LAlterConfigsResource()
+      .setResourceType(Type.UNKNOWN.id())
+      .setResourceName(name)
+      .setConfigs(new LAlterableConfigCollection(
+        Collections.singletonList(topicConfigEntry("k", "v")).iterator())))
+    val built = new AlterConfigsRequest(new AlterConfigsRequestData().setResources(coll), version)
+    val request = buildRequest(built)
+
+    val kafkaApis = createKafkaApis()
+    try {
+      kafkaApis.handleAlterConfigsRequest(request)
+      val response = verifyNoThrottling[AlterConfigsResponse](request)
+      validatePreprocessUnknownResourceTypeMessage(response.data().responses().iterator().next().errorMessage())
+    } finally kafkaApis.close()
+  }
+
+  @FuzzTest(maxDuration = FUZZ_DURATION)
+  def fuzzTestAlterConfigsDataConfigResourceTypeBrokerLoggerPreprocess(data: FuzzedDataProvider): Unit = {
+    val version = data.consumeShort(ApiKeys.ALTER_CONFIGS.oldestVersion(), ApiKeys.ALTER_CONFIGS.latestVersion())
+    val cfgName = safeString(data, "level")
+    val cfgValue = safeString(data, "INFO")
+
+    resetZkAlterConfigsHarness()
+    when(controller.isActive).thenReturn(true)
+    stubNoThrottle()
+
+    val coll = new LAlterConfigsResourceCollection()
+    coll.add(new LAlterConfigsResource()
+      .setResourceType(Type.BROKER_LOGGER.id())
+      .setResourceName(brokerId.toString)
+      .setConfigs(new LAlterableConfigCollection(
+        Collections.singletonList(topicConfigEntry(cfgName, cfgValue)).iterator())))
+    val built = new AlterConfigsRequest(new AlterConfigsRequestData().setResources(coll), version)
+    val request = buildRequest(built)
+
+    val kafkaApis = createKafkaApis()
+    try {
+      kafkaApis.handleAlterConfigsRequest(request)
+      val response = verifyNoThrottling[AlterConfigsResponse](request)
+      validatePreprocessUnknownResourceTypeMessage(response.data().responses().iterator().next().errorMessage())
+    } finally kafkaApis.close()
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)

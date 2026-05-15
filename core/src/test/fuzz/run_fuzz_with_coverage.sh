@@ -306,7 +306,9 @@ ALTER_CONFIGS_TESTS=(
     fuzzTestAlterConfigsZkClientMetricsAuthorized
     fuzzTestAlterConfigsZkBrokerWrongIdPreprocessResponse
     fuzzTestAlterConfigsDataDuplicateResourcesPreprocess
-    fuzzTestAlterConfigsDataUnknownResourceTypePreprocess
+    fuzzTestAlterConfigsDataUnrecognizedWireResourceTypePreprocess
+    fuzzTestAlterConfigsDataConfigResourceTypeUnknownPreprocess
+    fuzzTestAlterConfigsDataConfigResourceTypeBrokerLoggerPreprocess
     fuzzTestAlterConfigsDataDuplicateConfigKeysPreprocess
     fuzzTestAlterConfigsZkForwardingToController
     fuzzTestAlterConfigsKRaftForwardingToController
