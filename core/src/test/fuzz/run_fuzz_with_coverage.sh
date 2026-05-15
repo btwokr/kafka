@@ -179,6 +179,22 @@ DESCRIBE_GROUPS_TESTS=(
     fuzzTestDescribeGroupsThrottledResponse
 )
 
+# handleDescribeAcls / AclApis.handleDescribeAcls fuzz targets (HandleDescribeAclsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DESCRIBE_ACLS_TESTS=(
+    fuzzTestDescribeAclsSecurityDisabledNoAuthorizer
+    fuzzTestDescribeAclsClusterDescribeDenied
+    fuzzTestDescribeAclsAuthorizerReturnsEmpty
+    fuzzTestDescribeAclsAuthorizerReturnsBindings
+    fuzzTestDescribeAclsAuthorizerReturnsClusterBinding
+    fuzzTestDescribeAclsThrottledResponse
+    fuzzTestDescribeAclsForwardedInnerRequest
+    fuzzTestDescribeAclsWireVersion0PatternAnyNormalized
+    fuzzTestDescribeAclsWireVersion0NonLiteralPatternThrows
+    fuzzTestDescribeAclsUnknownFilterElementsThrows
+    fuzzTestDescribeAclsMixedWireVersionLiteralFilter
+)
+
 # handleListGroupsRequest fuzz targets (HandleListGroupsRequestFuzzTest,
 # maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
 LIST_GROUPS_TESTS=(
@@ -442,6 +458,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${DESCRIBE_GROUPS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDescribeGroupsRequestFuzzTest" "$t"
+    done
+    for t in "${DESCRIBE_ACLS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDescribeAclsRequestFuzzTest" "$t"
     done
     for t in "${LIST_GROUPS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleListGroupsRequestFuzzTest" "$t"
