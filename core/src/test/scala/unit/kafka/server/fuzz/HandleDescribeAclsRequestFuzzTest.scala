@@ -56,9 +56,10 @@ import java.util.Collections
  * with empty and non-empty `Authorizer#acls` results (including multiple
  * resource patterns for `DescribeAclsResponse.aclsResources`), client throttling,
  * forwarded inner requests, wire version 0 pattern normalization for `ANY`,
- * request construction failures (`UnsupportedVersionException` and
- * `IllegalArgumentException` with message checks), and mixed wire versions with
- * literal filters.
+ * `DescribeAclsResponse` validation on wire version 0 when `Authorizer#acls`
+ * returns non-literal pattern types (`UnsupportedVersionException` with message check),
+ * `DescribeAclsRequest` construction failure (`IllegalArgumentException` with message check),
+ * and mixed wire versions with literal filters.
  */
 class HandleDescribeAclsRequestFuzzTest extends KafkaApisTest {
 
@@ -330,21 +331,35 @@ class HandleDescribeAclsRequestFuzzTest extends KafkaApisTest {
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDescribeAclsWireVersion0NonLiteralPatternThrows(data: FuzzedDataProvider): Unit = {
-    val topicName = topicSafe(data, "fuzz-dacl-v0pre-topic")
+    val filterTopicName = topicSafe(data, "fuzz-dacl-v0nl-filter")
+    val bindingTopicName = topicSafe(data, "fuzz-dacl-v0nl-acl")
+    val useMatchPattern = data.consumeBoolean()
+    val principalSuffix = safeString(data, "Alice")
+    val host = safeString(data, "*")
 
     resetDescribeAclsHarness()
     stubNoThrottle()
 
-    val filter = new AclBindingFilter(
-      new ResourcePatternFilter(ResourceType.TOPIC, topicName, PatternType.PREFIXED),
-      AccessControlEntryFilter.ANY)
+    val patternType = if (useMatchPattern) PatternType.MATCH else PatternType.PREFIXED
+    val principal = if (principalSuffix.startsWith("User:")) principalSuffix else s"User:$principalSuffix"
+    val binding = new AclBinding(
+      new ResourcePattern(ResourceType.TOPIC, bindingTopicName, patternType),
+      new AccessControlEntry(principal, host, AclOperation.READ, AclPermissionType.ALLOW))
+    val bindings = Collections.singletonList(binding)
 
+    val filter = new AclBindingFilter(
+      new ResourcePatternFilter(ResourceType.TOPIC, filterTopicName, PatternType.LITERAL),
+      AccessControlEntryFilter.ANY)
+    val built = new DescribeAclsRequest.Builder(filter).build(0.toShort)
+    val request = buildRequest(built)
+
+    val kafkaApis = createKafkaApis(authorizer = Some(authorizerAllowClusterStubAcls(bindings)))
     try {
-      try new DescribeAclsRequest.Builder(filter).build(0.toShort)
+      try kafkaApis.handleDescribeAcls(request)
       catch {
         case e: UnsupportedVersionException => validateDescribeAclsV0NonLiteralPatternMessage(e)
       }
-    } finally { }
+    } finally kafkaApis.close()
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
