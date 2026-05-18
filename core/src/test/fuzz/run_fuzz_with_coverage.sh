@@ -27,7 +27,8 @@
 #   /tmp/jacoco/report/coverage.csv      CSV coverage report (per-class)
 #
 # Optional: `FUZZ_SUITE=all` (default) runs every fuzz target; set
-# `FUZZ_SUITE=offset-fetch` to run only `HandleOffsetFetchRequestFuzzTest`
+# `FUZZ_SUITE=offset-fetch` to run only `HandleOffsetFetchRequestFuzzTest`, or
+# `FUZZ_SUITE=describe-configs` for `HandleDescribeConfigsRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -48,13 +49,14 @@ esac
 
 # Optional: run a subset of fuzz tests (default: full suite). Use with
 # FUZZ_MODE=resume to append only new targets onto the committed snapshot.
-#   FUZZ_SUITE=all            8 produce + 5 fetch + 3 describe + 4 offset-fetch
-#   FUZZ_SUITE=offset-fetch   4 offset-fetch tests only
+#   FUZZ_SUITE=all               full suite
+#   FUZZ_SUITE=offset-fetch      HandleOffsetFetchRequestFuzzTest only
+#   FUZZ_SUITE=describe-configs  HandleDescribeConfigsRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch) ;;
+    all|offset-fetch|describe-configs) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs)" >&2
         exit 2
         ;;
 esac
@@ -317,6 +319,30 @@ ALTER_CONFIGS_TESTS=(
     fuzzTestAlterConfigsZkAdminManagerReturnsError
 )
 
+# handleDescribeConfigsRequest fuzz targets (HandleDescribeConfigsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DESCRIBE_CONFIGS_TESTS=(
+    fuzzTestDescribeConfigsEmptyResources
+    fuzzTestDescribeConfigsTopicAuthorizedKnown
+    fuzzTestDescribeConfigsTopicAuthorizedUnknown
+    fuzzTestDescribeConfigsTopicAuthorizationDenied
+    fuzzTestDescribeConfigsTopicInvalidNameHandled
+    fuzzTestDescribeConfigsClusterDeniedForBroker
+    fuzzTestDescribeConfigsBrokerClusterWideAndPerBroker
+    fuzzTestDescribeConfigsBrokerWrongId
+    fuzzTestDescribeConfigsBrokerNonIntegerId
+    fuzzTestDescribeConfigsBrokerLoggerEmptyName
+    fuzzTestDescribeConfigsBrokerLoggerWrongBrokerId
+    fuzzTestDescribeConfigsBrokerLoggerMatchingBrokerId
+    fuzzTestDescribeConfigsClientMetricsEmptyName
+    fuzzTestDescribeConfigsClientMetricsWithRepository
+    fuzzTestDescribeConfigsMixedTopicDeniedAndAllowed
+    fuzzTestDescribeConfigsThrottledResponse
+    fuzzTestDescribeConfigsForwardedInnerRequest
+    fuzzTestDescribeConfigsUnknownResourceTypeThrows
+    fuzzTestDescribeConfigsNoAuthorizerSecurityDisabled
+)
+
 # handleDeleteTopicsRequest fuzz targets (HandleDeleteTopicsRequestFuzzTest,
 # maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
 DELETE_TOPICS_TESTS=(
@@ -550,6 +576,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${ALTER_CONFIGS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleAlterConfigsRequestFuzzTest" "$t"
     done
+    for t in "${DESCRIBE_CONFIGS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDescribeConfigsRequestFuzzTest" "$t"
+    done
     for t in "${DELETE_TOPICS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDeleteTopicsRequestFuzzTest" "$t"
     done
@@ -579,6 +608,14 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${TOPIC_METADATA_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleTopicMetadataRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "offset-fetch" ]]; then
+    for t in "${OFFSET_FETCH_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "describe-configs" ]]; then
+    for t in "${DESCRIBE_CONFIGS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDescribeConfigsRequestFuzzTest" "$t"
     done
 fi
 
@@ -626,6 +663,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleDescribeTopicPartitionsRequest", 1445, 1461),
     ("KafkaApis.scala",          "handleHeartbeatRequest",               1924, 1948),
     ("KafkaApis.scala",          "handleOffsetFetchRequest",             1466, 1630),
+    ("KafkaApis.scala",          "handleDescribeConfigsRequest",         3111, 3115),
     ("RequestHandlerHelper.scala", "sendMaybeThrottle",                   112,  122),
 ]
 
