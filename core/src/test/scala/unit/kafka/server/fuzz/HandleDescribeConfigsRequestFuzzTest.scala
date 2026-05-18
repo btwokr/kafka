@@ -55,9 +55,9 @@ import scala.jdk.CollectionConverters._
 class HandleDescribeConfigsRequestFuzzTest extends KafkaApisTest {
 
   private def safeString(data: FuzzedDataProvider, fallback: String): String = {
-    val fuzzString = data.consumeString(48)
-    if (fuzzString == null || fuzzString.isEmpty) fallback
-    else fuzzString
+    val consumedString = data.consumeString(48)
+    if (consumedString == null || consumedString.isEmpty) fallback
+    else consumedString
   }
 
   private def topicSafe(data: FuzzedDataProvider, fallback: String): String = {
@@ -103,10 +103,10 @@ class HandleDescribeConfigsRequestFuzzTest extends KafkaApisTest {
     when(auth.authorize(any(), any[util.List[Action]])).thenAnswer(invocation => {
       val actions = invocation.getArgument(1, classOf[util.List[Action]])
       val out = new util.ArrayList[AuthorizationResult]()
-      actions.asScala.foreach { a =>
-        val denied = a.operation == AclOperation.DESCRIBE_CONFIGS &&
-          a.resourcePattern.resourceType == ResourceType.CLUSTER &&
-          CLUSTER_NAME == a.resourcePattern.name
+      actions.asScala.foreach { action =>
+        val denied = action.operation == AclOperation.DESCRIBE_CONFIGS &&
+          action.resourcePattern.resourceType == ResourceType.CLUSTER &&
+          CLUSTER_NAME == action.resourcePattern.name
         out.add(if (denied) AuthorizationResult.DENIED else AuthorizationResult.ALLOWED)
       }
       out
@@ -120,11 +120,11 @@ class HandleDescribeConfigsRequestFuzzTest extends KafkaApisTest {
     when(auth.authorize(any(), any[util.List[Action]])).thenAnswer(invocation => {
       val actions = invocation.getArgument(1, classOf[util.List[Action]])
       val out = new util.ArrayList[AuthorizationResult]()
-      actions.asScala.foreach { a =>
-        if (a.operation == AclOperation.DESCRIBE_CONFIGS &&
-          a.resourcePattern.resourceType == ResourceType.TOPIC) {
+      actions.asScala.foreach { action =>
+        if (action.operation == AclOperation.DESCRIBE_CONFIGS &&
+          action.resourcePattern.resourceType == ResourceType.TOPIC) {
           out.add(
-            if (a.resourcePattern.name == deniedTopic) AuthorizationResult.DENIED
+            if (action.resourcePattern.name == deniedTopic) AuthorizationResult.DENIED
             else AuthorizationResult.ALLOWED)
         } else {
           out.add(AuthorizationResult.ALLOWED)
@@ -170,8 +170,8 @@ class HandleDescribeConfigsRequestFuzzTest extends KafkaApisTest {
     val includeSynonyms = data.consumeBoolean()
     val includeDocumentation = data.consumeBoolean()
     val useConfigurationKeys = data.consumeBoolean()
-    val cfgKey = safeString(data, "retention.ms")
-    val cfgValue = safeString(data, "1000")
+    val configKeyName = safeString(data, "retention.ms")
+    val configValue = safeString(data, "1000")
     val topicName = topicSafe(data, "fuzz-dc-known-topic")
 
     resetDescribeConfigsHarness()
@@ -182,13 +182,13 @@ class HandleDescribeConfigsRequestFuzzTest extends KafkaApisTest {
     metadataCache = zkCache
 
     val repo = new MockConfigRepository()
-    repo.setTopicConfig(topicName, cfgKey, cfgValue)
+    repo.setTopicConfig(topicName, configKeyName, configValue)
 
     val resource = new DescribeConfigsResource()
       .setResourceType(ConfigResource.Type.TOPIC.id)
       .setResourceName(topicName)
     if (useConfigurationKeys)
-      resource.setConfigurationKeys(Collections.singletonList(cfgKey))
+      resource.setConfigurationKeys(Collections.singletonList(configKeyName))
 
     val built = new DescribeConfigsRequest.Builder(
       describeConfigsRequestData(
@@ -318,15 +318,15 @@ class HandleDescribeConfigsRequestFuzzTest extends KafkaApisTest {
     resetDescribeConfigsHarness()
     stubNoThrottle()
 
-    val wide = new DescribeConfigsResource()
+    val brokerClusterWideResource = new DescribeConfigsResource()
       .setResourceType(ConfigResource.Type.BROKER.id)
       .setResourceName("")
-    val perBroker = new DescribeConfigsResource()
+    val perBrokerConfigResource = new DescribeConfigsResource()
       .setResourceType(ConfigResource.Type.BROKER.id)
       .setResourceName(brokerId.toString)
     val resources = new util.ArrayList[DescribeConfigsResource]()
-    resources.add(wide)
-    resources.add(perBroker)
+    resources.add(brokerClusterWideResource)
+    resources.add(perBrokerConfigResource)
 
     val built = new DescribeConfigsRequest.Builder(
       describeConfigsRequestData(resources, includeSynonyms, includeDocumentation)
@@ -493,22 +493,22 @@ class HandleDescribeConfigsRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeShort(ApiKeys.DESCRIBE_CONFIGS.oldestVersion(), ApiKeys.DESCRIBE_CONFIGS.latestVersion())
     val includeSynonyms = data.consumeBoolean()
     val includeDocumentation = data.consumeBoolean()
-    val subscription = topicSafe(data, "fuzz-dc-cm-sub")
+    val subscriptionName = topicSafe(data, "fuzz-dc-cm-sub")
 
     resetDescribeConfigsHarness()
     stubNoThrottle()
 
     val repo = new MockConfigRepository()
-    ClientMetricsTestUtils.defaultProperties().asScala.foreach { case (k, v) =>
+    ClientMetricsTestUtils.defaultProperties().asScala.foreach { case (propertyName, propertyValue) =>
       repo.setConfig(
-        new ConfigResource(ConfigResource.Type.CLIENT_METRICS, subscription),
-        k,
-        String.valueOf(v))
+        new ConfigResource(ConfigResource.Type.CLIENT_METRICS, subscriptionName),
+        propertyName,
+        String.valueOf(propertyValue))
     }
 
     val resource = new DescribeConfigsResource()
       .setResourceType(ConfigResource.Type.CLIENT_METRICS.id)
-      .setResourceName(subscription)
+      .setResourceName(subscriptionName)
     val built = new DescribeConfigsRequest.Builder(
       describeConfigsRequestData(
         Collections.singletonList(resource),
@@ -537,15 +537,15 @@ class HandleDescribeConfigsRequestFuzzTest extends KafkaApisTest {
     when(zkCache.contains(allowedTopic)).thenReturn(false)
     metadataCache = zkCache
 
-    val r0 = new DescribeConfigsResource()
+    val deniedTopicResource = new DescribeConfigsResource()
       .setResourceType(ConfigResource.Type.TOPIC.id)
       .setResourceName(deniedTopic)
-    val r1 = new DescribeConfigsResource()
+    val allowedTopicResource = new DescribeConfigsResource()
       .setResourceType(ConfigResource.Type.TOPIC.id)
       .setResourceName(allowedTopic)
     val resources = new util.ArrayList[DescribeConfigsResource]()
-    resources.add(r0)
-    resources.add(r1)
+    resources.add(deniedTopicResource)
+    resources.add(allowedTopicResource)
 
     val built = new DescribeConfigsRequest.Builder(
       describeConfigsRequestData(resources, includeSynonyms, includeDocumentation)

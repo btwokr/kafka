@@ -50,8 +50,8 @@ import scala.jdk.CollectionConverters._
 class HandleAlterReplicaLogDirsRequestFuzzTest extends KafkaApisTest {
 
   private def safeString(data: FuzzedDataProvider, fallback: String): String = {
-    val s = data.consumeString(64)
-    if (s == null || s.isEmpty) fallback else s
+    val consumedString = data.consumeString(64)
+    if (consumedString == null || consumedString.isEmpty) fallback else consumedString
   }
 
   private def topicSafe(data: FuzzedDataProvider, fallback: String): String = {
@@ -102,10 +102,10 @@ class HandleAlterReplicaLogDirsRequestFuzzTest extends KafkaApisTest {
     when(auth.authorize(any(), any[util.List[Action]])).thenAnswer(invocation => {
       val actions = invocation.getArgument(1, classOf[util.List[Action]])
       val out = new util.ArrayList[AuthorizationResult]()
-      actions.asScala.foreach { a =>
-        val denied = a.operation == AclOperation.ALTER &&
-          a.resourcePattern.resourceType == ResourceType.CLUSTER &&
-          CLUSTER_NAME == a.resourcePattern.name
+      actions.asScala.foreach { action =>
+        val denied = action.operation == AclOperation.ALTER &&
+          action.resourcePattern.resourceType == ResourceType.CLUSTER &&
+          CLUSTER_NAME == action.resourcePattern.name
         out.add(if (denied) AuthorizationResult.DENIED else AuthorizationResult.ALLOWED)
       }
       out
@@ -130,19 +130,19 @@ class HandleAlterReplicaLogDirsRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeShort(
       ApiKeys.ALTER_REPLICA_LOG_DIRS.oldestVersion(),
       ApiKeys.ALTER_REPLICA_LOG_DIRS.latestVersion())
-    val path = pathSafe(data, "/fuzz/arl-deny")
-    val topic = topicSafe(data, "fuzz-arl-deny-topic")
-    val p0 = data.consumeInt(0, 7)
-    val p1 = data.consumeInt(0, 7)
+    val logDirectoryPath = pathSafe(data, "/fuzz/arl-deny")
+    val topicName = topicSafe(data, "fuzz-arl-deny-topic")
+    val partition0 = data.consumeInt(0, 7)
+    val partition1 = data.consumeInt(0, 7)
 
     resetHarness()
     stubNoThrottle()
 
-    val dir = new AlterReplicaLogDir().setPath(path)
-    dir.topics().add(new AlterReplicaLogDirTopic().setName(topic).setPartitions(util.Arrays.asList(
-      Integer.valueOf(p0), Integer.valueOf(p1))))
+    val alterReplicaLogDir = new AlterReplicaLogDir().setPath(logDirectoryPath)
+    alterReplicaLogDir.topics().add(new AlterReplicaLogDirTopic().setName(topicName).setPartitions(util.Arrays.asList(
+      Integer.valueOf(partition0), Integer.valueOf(partition1))))
     val reqData = new AlterReplicaLogDirsRequestData()
-    reqData.dirs().add(dir)
+    reqData.dirs().add(alterReplicaLogDir)
     val built = new AlterReplicaLogDirsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
 
@@ -178,29 +178,32 @@ class HandleAlterReplicaLogDirsRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeShort(
       ApiKeys.ALTER_REPLICA_LOG_DIRS.oldestVersion(),
       ApiKeys.ALTER_REPLICA_LOG_DIRS.latestVersion())
-    val path = pathSafe(data, "/fuzz/arl-one")
-    val topic = topicSafe(data, "fuzz-arl-one-topic")
-    val p0 = data.consumeInt(0, 11)
-    val p1 = data.consumeInt(0, 11)
-    val p2 = data.consumeInt(0, 11)
-    val e0 = pickError(data)
-    val e1 = pickError(data)
-    val e2 = pickError(data)
+    val logDirectoryPath = pathSafe(data, "/fuzz/arl-one")
+    val topicName = topicSafe(data, "fuzz-arl-one-topic")
+    val partition0 = data.consumeInt(0, 11)
+    val partition1 = data.consumeInt(0, 11)
+    val partition2 = data.consumeInt(0, 11)
+    val errorPartition0 = pickError(data)
+    val errorPartition1 = pickError(data)
+    val errorPartition2 = pickError(data)
 
     resetHarness()
     stubNoThrottle()
 
-    val dir = new AlterReplicaLogDir().setPath(path)
-    dir.topics().add(new AlterReplicaLogDirTopic().setName(topic).setPartitions(util.Arrays.asList(
-      Integer.valueOf(p0), Integer.valueOf(p1), Integer.valueOf(p2))))
+    val alterReplicaLogDir = new AlterReplicaLogDir().setPath(logDirectoryPath)
+    alterReplicaLogDir.topics().add(new AlterReplicaLogDirTopic().setName(topicName).setPartitions(util.Arrays.asList(
+      Integer.valueOf(partition0), Integer.valueOf(partition1), Integer.valueOf(partition2))))
     val reqData = new AlterReplicaLogDirsRequestData()
-    reqData.dirs().add(dir)
+    reqData.dirs().add(alterReplicaLogDir)
     val partitionDirs = new AlterReplicaLogDirsRequest(reqData, version).partitionDirs()
-    val tp0 = new TopicPartition(topic, p0)
-    val tp1 = new TopicPartition(topic, p1)
-    val tp2 = new TopicPartition(topic, p2)
-    val expected = Map(tp0 -> e0, tp1 -> e1, tp2 -> e2)
-    when(replicaManager.alterReplicaLogDirs(partitionDirs.asScala.toMap)).thenReturn(expected)
+    val topicPartition0 = new TopicPartition(topicName, partition0)
+    val topicPartition1 = new TopicPartition(topicName, partition1)
+    val topicPartition2 = new TopicPartition(topicName, partition2)
+    val replicaManagerResults = Map(
+      topicPartition0 -> errorPartition0,
+      topicPartition1 -> errorPartition1,
+      topicPartition2 -> errorPartition2)
+    when(replicaManager.alterReplicaLogDirs(partitionDirs.asScala.toMap)).thenReturn(replicaManagerResults)
 
     val built = new AlterReplicaLogDirsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
@@ -215,27 +218,27 @@ class HandleAlterReplicaLogDirsRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeShort(
       ApiKeys.ALTER_REPLICA_LOG_DIRS.oldestVersion(),
       ApiKeys.ALTER_REPLICA_LOG_DIRS.latestVersion())
-    val path = pathSafe(data, "/fuzz/arl-multi")
-    val topicA = topicSafe(data, "fuzz-arl-topic-a")
-    val topicB = topicSafe(data, "fuzz-arl-topic-b")
-    val pa = data.consumeInt(0, 5)
-    val pb = data.consumeInt(0, 5)
-    val ea = pickError(data)
-    val eb = pickError(data)
+    val logDirectoryPath = pathSafe(data, "/fuzz/arl-multi")
+    val topicNameA = topicSafe(data, "fuzz-arl-topic-a")
+    val topicNameB = topicSafe(data, "fuzz-arl-topic-b")
+    val partitionTopicA = data.consumeInt(0, 5)
+    val partitionTopicB = data.consumeInt(0, 5)
+    val errorTopicA = pickError(data)
+    val errorTopicB = pickError(data)
 
     resetHarness()
     stubNoThrottle()
 
-    val dir = new AlterReplicaLogDir().setPath(path)
-    dir.topics().add(new AlterReplicaLogDirTopic().setName(topicA).setPartitions(util.Arrays.asList(Integer.valueOf(pa))))
-    dir.topics().add(new AlterReplicaLogDirTopic().setName(topicB).setPartitions(util.Arrays.asList(Integer.valueOf(pb))))
+    val alterReplicaLogDir = new AlterReplicaLogDir().setPath(logDirectoryPath)
+    alterReplicaLogDir.topics().add(new AlterReplicaLogDirTopic().setName(topicNameA).setPartitions(util.Arrays.asList(Integer.valueOf(partitionTopicA))))
+    alterReplicaLogDir.topics().add(new AlterReplicaLogDirTopic().setName(topicNameB).setPartitions(util.Arrays.asList(Integer.valueOf(partitionTopicB))))
     val reqData = new AlterReplicaLogDirsRequestData()
-    reqData.dirs().add(dir)
+    reqData.dirs().add(alterReplicaLogDir)
     val partitionDirs = new AlterReplicaLogDirsRequest(reqData, version).partitionDirs()
-    val tpa = new TopicPartition(topicA, pa)
-    val tpb = new TopicPartition(topicB, pb)
-    val expected = Map(tpa -> ea, tpb -> eb)
-    when(replicaManager.alterReplicaLogDirs(partitionDirs.asScala.toMap)).thenReturn(expected)
+    val topicPartitionA = new TopicPartition(topicNameA, partitionTopicA)
+    val topicPartitionB = new TopicPartition(topicNameB, partitionTopicB)
+    val replicaManagerResults = Map(topicPartitionA -> errorTopicA, topicPartitionB -> errorTopicB)
+    when(replicaManager.alterReplicaLogDirs(partitionDirs.asScala.toMap)).thenReturn(replicaManagerResults)
 
     val built = new AlterReplicaLogDirsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
@@ -250,29 +253,31 @@ class HandleAlterReplicaLogDirsRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeShort(
       ApiKeys.ALTER_REPLICA_LOG_DIRS.oldestVersion(),
       ApiKeys.ALTER_REPLICA_LOG_DIRS.latestVersion())
-    val path1 = pathSafe(data, "/fuzz/arl-d1")
-    val path2 = pathSafe(data, "/fuzz/arl-d2")
-    val topic = topicSafe(data, "fuzz-arl-two-dir-topic")
-    val p1 = data.consumeInt(0, 4)
-    val p2 = data.consumeInt(0, 4)
-    val e1 = pickError(data)
-    val e2 = pickError(data)
+    val logDirectoryPathFirst = pathSafe(data, "/fuzz/arl-d1")
+    val logDirectoryPathSecond = pathSafe(data, "/fuzz/arl-d2")
+    val topicName = topicSafe(data, "fuzz-arl-two-dir-topic")
+    val partitionFirstDirectory = data.consumeInt(0, 4)
+    val partitionSecondDirectory = data.consumeInt(0, 4)
+    val errorFirstDirectory = pickError(data)
+    val errorSecondDirectory = pickError(data)
 
     resetHarness()
     stubNoThrottle()
 
-    val dir1 = new AlterReplicaLogDir().setPath(path1)
-    dir1.topics().add(new AlterReplicaLogDirTopic().setName(topic).setPartitions(util.Arrays.asList(Integer.valueOf(p1))))
-    val dir2 = new AlterReplicaLogDir().setPath(path2)
-    dir2.topics().add(new AlterReplicaLogDirTopic().setName(topic).setPartitions(util.Arrays.asList(Integer.valueOf(p2))))
+    val alterReplicaLogDirFirst = new AlterReplicaLogDir().setPath(logDirectoryPathFirst)
+    alterReplicaLogDirFirst.topics().add(new AlterReplicaLogDirTopic().setName(topicName).setPartitions(util.Arrays.asList(Integer.valueOf(partitionFirstDirectory))))
+    val alterReplicaLogDirSecond = new AlterReplicaLogDir().setPath(logDirectoryPathSecond)
+    alterReplicaLogDirSecond.topics().add(new AlterReplicaLogDirTopic().setName(topicName).setPartitions(util.Arrays.asList(Integer.valueOf(partitionSecondDirectory))))
     val reqData = new AlterReplicaLogDirsRequestData()
-    reqData.dirs().add(dir1)
-    reqData.dirs().add(dir2)
+    reqData.dirs().add(alterReplicaLogDirFirst)
+    reqData.dirs().add(alterReplicaLogDirSecond)
     val partitionDirs = new AlterReplicaLogDirsRequest(reqData, version).partitionDirs()
-    val tp1 = new TopicPartition(topic, p1)
-    val tp2 = new TopicPartition(topic, p2)
-    val expected = Map(tp1 -> e1, tp2 -> e2)
-    when(replicaManager.alterReplicaLogDirs(partitionDirs.asScala.toMap)).thenReturn(expected)
+    val topicPartitionFirstDirectory = new TopicPartition(topicName, partitionFirstDirectory)
+    val topicPartitionSecondDirectory = new TopicPartition(topicName, partitionSecondDirectory)
+    val replicaManagerResults = Map(
+      topicPartitionFirstDirectory -> errorFirstDirectory,
+      topicPartitionSecondDirectory -> errorSecondDirectory)
+    when(replicaManager.alterReplicaLogDirs(partitionDirs.asScala.toMap)).thenReturn(replicaManagerResults)
 
     val built = new AlterReplicaLogDirsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
@@ -287,21 +292,21 @@ class HandleAlterReplicaLogDirsRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeShort(
       ApiKeys.ALTER_REPLICA_LOG_DIRS.oldestVersion(),
       ApiKeys.ALTER_REPLICA_LOG_DIRS.latestVersion())
-    val path = pathSafe(data, "/fuzz/arl-noauth")
-    val topic = topicSafe(data, "fuzz-arl-noauth")
-    val p0 = data.consumeInt(0, 3)
+    val logDirectoryPath = pathSafe(data, "/fuzz/arl-noauth")
+    val topicName = topicSafe(data, "fuzz-arl-noauth")
+    val partitionIndex = data.consumeInt(0, 3)
 
     resetHarness()
     stubNoThrottle()
 
-    val dir = new AlterReplicaLogDir().setPath(path)
-    dir.topics().add(new AlterReplicaLogDirTopic().setName(topic).setPartitions(util.Arrays.asList(Integer.valueOf(p0))))
+    val alterReplicaLogDir = new AlterReplicaLogDir().setPath(logDirectoryPath)
+    alterReplicaLogDir.topics().add(new AlterReplicaLogDirTopic().setName(topicName).setPartitions(util.Arrays.asList(Integer.valueOf(partitionIndex))))
     val reqData = new AlterReplicaLogDirsRequestData()
-    reqData.dirs().add(dir)
+    reqData.dirs().add(alterReplicaLogDir)
     val partitionDirs = new AlterReplicaLogDirsRequest(reqData, version).partitionDirs()
-    val tp = new TopicPartition(topic, p0)
+    val topicPartition = new TopicPartition(topicName, partitionIndex)
     when(replicaManager.alterReplicaLogDirs(partitionDirs.asScala.toMap))
-      .thenReturn(Map(tp -> Errors.NONE))
+      .thenReturn(Map(topicPartition -> Errors.NONE))
 
     val built = new AlterReplicaLogDirsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
@@ -317,21 +322,21 @@ class HandleAlterReplicaLogDirsRequestFuzzTest extends KafkaApisTest {
       ApiKeys.ALTER_REPLICA_LOG_DIRS.oldestVersion(),
       ApiKeys.ALTER_REPLICA_LOG_DIRS.latestVersion())
     val throttleMs = data.consumeInt(1, 500)
-    val path = pathSafe(data, "/fuzz/arl-throttle")
-    val topic = topicSafe(data, "fuzz-arl-throttle")
-    val p0 = data.consumeInt(0, 3)
+    val logDirectoryPath = pathSafe(data, "/fuzz/arl-throttle")
+    val topicName = topicSafe(data, "fuzz-arl-throttle")
+    val partitionIndex = data.consumeInt(0, 3)
 
     resetHarness()
     stubClientThrottle(throttleMs)
 
-    val dir = new AlterReplicaLogDir().setPath(path)
-    dir.topics().add(new AlterReplicaLogDirTopic().setName(topic).setPartitions(util.Arrays.asList(Integer.valueOf(p0))))
+    val alterReplicaLogDir = new AlterReplicaLogDir().setPath(logDirectoryPath)
+    alterReplicaLogDir.topics().add(new AlterReplicaLogDirTopic().setName(topicName).setPartitions(util.Arrays.asList(Integer.valueOf(partitionIndex))))
     val reqData = new AlterReplicaLogDirsRequestData()
-    reqData.dirs().add(dir)
+    reqData.dirs().add(alterReplicaLogDir)
     val partitionDirs = new AlterReplicaLogDirsRequest(reqData, version).partitionDirs()
-    val tp = new TopicPartition(topic, p0)
+    val topicPartition = new TopicPartition(topicName, partitionIndex)
     when(replicaManager.alterReplicaLogDirs(partitionDirs.asScala.toMap))
-      .thenReturn(Map(tp -> Errors.NONE))
+      .thenReturn(Map(topicPartition -> Errors.NONE))
 
     val built = new AlterReplicaLogDirsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
@@ -347,9 +352,9 @@ class HandleAlterReplicaLogDirsRequestFuzzTest extends KafkaApisTest {
       ApiKeys.ALTER_REPLICA_LOG_DIRS.oldestVersion(),
       ApiKeys.ALTER_REPLICA_LOG_DIRS.latestVersion())
     val throttleMs = data.consumeInt(0, 200)
-    val path = pathSafe(data, "/fuzz/arl-fwd")
-    val topic = topicSafe(data, "fuzz-arl-fwd")
-    val p0 = data.consumeInt(0, 3)
+    val logDirectoryPath = pathSafe(data, "/fuzz/arl-fwd")
+    val topicName = topicSafe(data, "fuzz-arl-fwd")
+    val partitionIndex = data.consumeInt(0, 3)
 
     resetHarness()
     when(clientQuotaManager.maybeRecordAndGetThrottleTimeMs(
@@ -357,14 +362,14 @@ class HandleAlterReplicaLogDirsRequestFuzzTest extends KafkaApisTest {
     when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyLong)).thenReturn(throttleMs)
 
-    val dir = new AlterReplicaLogDir().setPath(path)
-    dir.topics().add(new AlterReplicaLogDirTopic().setName(topic).setPartitions(util.Arrays.asList(Integer.valueOf(p0))))
+    val alterReplicaLogDir = new AlterReplicaLogDir().setPath(logDirectoryPath)
+    alterReplicaLogDir.topics().add(new AlterReplicaLogDirTopic().setName(topicName).setPartitions(util.Arrays.asList(Integer.valueOf(partitionIndex))))
     val reqData = new AlterReplicaLogDirsRequestData()
-    reqData.dirs().add(dir)
+    reqData.dirs().add(alterReplicaLogDir)
     val partitionDirs = new AlterReplicaLogDirsRequest(reqData, version).partitionDirs()
-    val tp = new TopicPartition(topic, p0)
+    val topicPartition = new TopicPartition(topicName, partitionIndex)
     when(replicaManager.alterReplicaLogDirs(partitionDirs.asScala.toMap))
-      .thenReturn(Map(tp -> Errors.NONE))
+      .thenReturn(Map(topicPartition -> Errors.NONE))
 
     val built = new AlterReplicaLogDirsRequest.Builder(reqData).build(version)
     val request = buildForwardedRequest(built)
@@ -379,26 +384,26 @@ class HandleAlterReplicaLogDirsRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeShort(
       ApiKeys.ALTER_REPLICA_LOG_DIRS.oldestVersion(),
       ApiKeys.ALTER_REPLICA_LOG_DIRS.latestVersion())
-    val pathFirst = pathSafe(data, "/fuzz/arl-dup-a")
-    val pathSecond = pathSafe(data, "/fuzz/arl-dup-b")
-    val topic = topicSafe(data, "fuzz-arl-dup-topic")
-    val part = data.consumeInt(0, 5)
-    val err = pickError(data)
+    val logDirectoryPathFirst = pathSafe(data, "/fuzz/arl-dup-a")
+    val logDirectoryPathSecond = pathSafe(data, "/fuzz/arl-dup-b")
+    val topicName = topicSafe(data, "fuzz-arl-dup-topic")
+    val partitionIndex = data.consumeInt(0, 5)
+    val expectedError = pickError(data)
 
     resetHarness()
     stubNoThrottle()
 
-    val dir1 = new AlterReplicaLogDir().setPath(pathFirst)
-    dir1.topics().add(new AlterReplicaLogDirTopic().setName(topic).setPartitions(util.Arrays.asList(Integer.valueOf(part))))
-    val dir2 = new AlterReplicaLogDir().setPath(pathSecond)
-    dir2.topics().add(new AlterReplicaLogDirTopic().setName(topic).setPartitions(util.Arrays.asList(Integer.valueOf(part))))
+    val alterReplicaLogDirFirst = new AlterReplicaLogDir().setPath(logDirectoryPathFirst)
+    alterReplicaLogDirFirst.topics().add(new AlterReplicaLogDirTopic().setName(topicName).setPartitions(util.Arrays.asList(Integer.valueOf(partitionIndex))))
+    val alterReplicaLogDirSecond = new AlterReplicaLogDir().setPath(logDirectoryPathSecond)
+    alterReplicaLogDirSecond.topics().add(new AlterReplicaLogDirTopic().setName(topicName).setPartitions(util.Arrays.asList(Integer.valueOf(partitionIndex))))
     val reqData = new AlterReplicaLogDirsRequestData()
-    reqData.dirs().add(dir1)
-    reqData.dirs().add(dir2)
+    reqData.dirs().add(alterReplicaLogDirFirst)
+    reqData.dirs().add(alterReplicaLogDirSecond)
     val partitionDirs = new AlterReplicaLogDirsRequest(reqData, version).partitionDirs()
-    val tp = new TopicPartition(topic, part)
+    val topicPartition = new TopicPartition(topicName, partitionIndex)
     when(replicaManager.alterReplicaLogDirs(partitionDirs.asScala.toMap))
-      .thenReturn(Map(tp -> err))
+      .thenReturn(Map(topicPartition -> expectedError))
 
     val built = new AlterReplicaLogDirsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
