@@ -50,22 +50,6 @@ coordinator requests for versions 1&ndash;7, batched multi-group
 requests for version 8 and above, and the asynchronous coordinator
 completion path (`sendMaybeThrottle`) including forwarded requests.
 
-### `HandleDescribeConfigsRequestFuzzTest` (target: `handleDescribeConfigsRequest`)
-
-Eighteen `@FuzzTest` cases (`maxDuration` matches `KafkaApisTest.FUZZ_DURATION`,
-currently `10s` each) live in
-`core/src/test/scala/unit/kafka/server/fuzz/HandleDescribeConfigsRequestFuzzTest.scala`.
-They exercise `ConfigHelper.handleDescribeConfigsRequest` through the thin
-`KafkaApis` wrapper: empty resource lists; topic describe (known topic with
-optional configuration-key filtering, unknown topic, authorization denial,
-invalid empty topic name); broker dynamic defaults and per-broker id describe,
-wrong broker id, and non-integer broker id strings; broker logger empty name,
-wrong broker id, and matching id; client metrics empty subscription name and
-repository-backed success; mixed authorized and denied topics; request-quota
-throttling and forwarded inner requests; unknown `ConfigResource.Type` during
-partitioning (`InvalidRequestException`); and the no-authorizer path for topic
-describe.
-
 ## How fuzz mode is enabled
 
 `jazzer-junit` only fuzzes (rather than running a single regression iteration
@@ -117,12 +101,11 @@ What the script does (≈ 65-75 minutes wall time on a developer machine):
 2. Sets `JAVA_TOOL_OPTIONS` to attach `jacocoagent.jar` (writing to
    `/tmp/jacoco/coverage.exec`, `append=true`).
 3. Sets `JAZZER_FUZZ=1` so `jazzer-junit` actually fuzzes.
-4. Loops over every registered `@FuzzTest` method (including 8 in
-   `HandleProduceRequestFuzzTest`, 5 in `HandleFetchRequestFuzzTest`, 3 in
+4. Loops over the 26 fuzz tests (8 in `HandleProduceRequestFuzzTest`, 5 in
+   `HandleFetchRequestFuzzTest`, 3 in
    `HandleDescribeTopicPartitionsRequestFuzzTest`, 5 in
-   `HandleHeartbeatRequestFuzzTest`, 5 in `HandleOffsetFetchRequestFuzzTest`,
-   18 in `HandleDescribeConfigsRequestFuzzTest`, and the remaining
-   `Handle*RequestFuzzTest` classes) and runs each in its
+   `HandleHeartbeatRequestFuzzTest` and 5 in
+   `HandleOffsetFetchRequestFuzzTest`) and runs each in its
    **own** `./gradlew :core:test --no-daemon --rerun-tasks --tests ...`
    invocation, so every test reaches Jazzer's fuzzing mode (one fuzz
    target per JVM). Each test runs for the duration declared in its
@@ -136,8 +119,7 @@ What the script does (≈ 65-75 minutes wall time on a developer machine):
    `handleHeartbeatRequest` (lines 1924-1948),
    `handleOffsetFetchRequest` (lines 1466-1630, including private helpers
    `handleOffsetFetchRequestFromZookeeper` / `handleOffsetFetchRequestFromCoordinator`
-   and related closures in that span),
-   `handleDescribeConfigsRequest` (lines 3111-3115),
+   and related closures in that span)
    and `RequestHandlerHelper.sendMaybeThrottle` (lines 112-122).
 
 Open `/tmp/jacoco/report/html/index.html` and navigate to
@@ -146,7 +128,7 @@ whole class.
 
 The XML report (`/tmp/jacoco/report/coverage.xml`) provides per-method
 counters; the entries of interest are
-`<method name="handle{Produce,Fetch,DescribeTopicPartitions,Heartbeat,OffsetFetch,DescribeConfigs}Request">` under
+`<method name="handle{Produce,Fetch,DescribeTopicPartitions,Heartbeat,OffsetFetch}Request">` under
 `class kafka/server/KafkaApis`, plus the `$anonfun$...$N` siblings
 (Scala-generated closures of the same method).
 
@@ -169,9 +151,8 @@ The runner has three modes, selectable via the `FUZZ_MODE` env var:
 | `snapshot`  | `rm -f /tmp/jacoco/coverage.exec`                       | `xz -9e -c /tmp/jacoco/coverage.exec > coverage_results/coverage.exec.xz` |
 
 Optional **`FUZZ_SUITE`** (default `all`): set `FUZZ_SUITE=offset-fetch` to run only
-`HandleOffsetFetchRequestFuzzTest`, or `FUZZ_SUITE=describe-configs` to run only
-`HandleDescribeConfigsRequestFuzzTest`. Useful with `FUZZ_MODE=resume` to
-append JaCoCo data for the new targets without re-running the full suite.
+`HandleOffsetFetchRequestFuzzTest` (four tests). Useful with `FUZZ_MODE=resume` to
+append JaCoCo data for the new targets without re-running produce/fetch/describe.
 
 Typical workflow:
 
