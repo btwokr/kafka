@@ -179,6 +179,22 @@ DESCRIBE_GROUPS_TESTS=(
     fuzzTestDescribeGroupsThrottledResponse
 )
 
+# handleDescribeAcls / AclApis.handleDescribeAcls fuzz targets (HandleDescribeAclsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DESCRIBE_ACLS_TESTS=(
+    fuzzTestDescribeAclsSecurityDisabledNoAuthorizer
+    fuzzTestDescribeAclsClusterDescribeDenied
+    fuzzTestDescribeAclsAuthorizerReturnsEmpty
+    fuzzTestDescribeAclsAuthorizerReturnsBindings
+    fuzzTestDescribeAclsAuthorizerReturnsClusterBinding
+    fuzzTestDescribeAclsThrottledResponse
+    fuzzTestDescribeAclsForwardedInnerRequest
+    fuzzTestDescribeAclsWireVersion0PatternAnyNormalized
+    fuzzTestDescribeAclsWireVersion0NonLiteralPatternThrows
+    fuzzTestDescribeAclsUnknownFilterElementsThrows
+    fuzzTestDescribeAclsMixedWireVersionLiteralFilter
+)
+
 # handleListGroupsRequest fuzz targets (HandleListGroupsRequestFuzzTest,
 # maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
 LIST_GROUPS_TESTS=(
@@ -235,6 +251,70 @@ CREATE_TOPICS_TESTS=(
     fuzzTestCreateTopicsAllTopicsUnauthorizedEmptyToCreate
     fuzzTestCreateTopicsThrottling
     fuzzTestCreateTopicsForwardedInnerRequest
+)
+
+# handleCreateAcls / AclApis.handleCreateAcls fuzz targets (HandleCreateAclsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+CREATE_ACLS_TESTS=(
+    fuzzTestCreateAclsRaftAlwaysForwardUnsupported
+    fuzzTestCreateAclsSecurityDisabledNoAuthorizer
+    fuzzTestCreateAclsClusterAlterDenied
+    fuzzTestCreateAclsInvalidClusterResourceName
+    fuzzTestCreateAclsInvalidEmptyResourceName
+    fuzzTestCreateAclsMixedInvalidClusterAndValidTopic
+    fuzzTestCreateAclsAuthorizerCreateSuccess
+    fuzzTestCreateAclsAuthorizerCreateReturnsError
+    fuzzTestCreateAclsTwoCreationsBothSuccess
+    fuzzTestCreateAclsThrottledResponse
+    fuzzTestCreateAclsForwardedInnerRequest
+    fuzzTestCreateAclsLiteralClusterNameSuccess
+    fuzzTestCreateAclsRequestValidateUnknownElementsThrows
+    fuzzTestCreateAclsRequestValidateV0NonLiteralPatternThrows
+)
+
+# handleDeleteAcls / AclApis.handleDeleteAcls fuzz targets (HandleDeleteAclsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DELETE_ACLS_TESTS=(
+    fuzzTestDeleteAclsRaftAlwaysForwardUnsupported
+    fuzzTestDeleteAclsSecurityDisabledNoAuthorizer
+    fuzzTestDeleteAclsClusterAlterDenied
+    fuzzTestDeleteAclsAuthorizerDeleteEmptyResults
+    fuzzTestDeleteAclsAuthorizerDeleteOneBindingSuccess
+    fuzzTestDeleteAclsAuthorizerBindingDeleteError
+    fuzzTestDeleteAclsAuthorizerDeleteFilterError
+    fuzzTestDeleteAclsTwoFiltersBothSuccess
+    fuzzTestDeleteAclsThrottledResponse
+    fuzzTestDeleteAclsForwardedInnerRequest
+    fuzzTestDeleteAclsWireVersion0PatternAnyNormalized
+    fuzzTestDeleteAclsRequestValidateUnknownElementsThrows
+    fuzzTestDeleteAclsRequestValidateV0UnsupportedPatternThrows
+    fuzzTestDeleteAclsResponseV0NonLiteralMatchingAclThrows
+    fuzzTestDeleteAclsResponseUnknownMatchingAclThrows
+)
+
+# handleAlterConfigsRequest fuzz targets (HandleAlterConfigsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+ALTER_CONFIGS_TESTS=(
+    fuzzTestAlterConfigsZkEmptyResources
+    fuzzTestAlterConfigsKRaftEmptyResources
+    fuzzTestAlterConfigsKRaftPreprocessNullValueResponse
+    fuzzTestAlterConfigsRaftForwardedProcessLegacyThrows
+    fuzzTestAlterConfigsZkTopicAuthorizedSuccess
+    fuzzTestAlterConfigsZkTopicMixedAuthorization
+    fuzzTestAlterConfigsZkBrokerIdMatchSuccess
+    fuzzTestAlterConfigsZkBrokerClusterWideEmptyNameSuccess
+    fuzzTestAlterConfigsZkClientMetricsAuthorized
+    fuzzTestAlterConfigsZkBrokerWrongIdPreprocessResponse
+    fuzzTestAlterConfigsDataDuplicateResourcesPreprocess
+    fuzzTestAlterConfigsDataUnrecognizedWireResourceTypePreprocess
+    fuzzTestAlterConfigsDataConfigResourceTypeUnknownPreprocess
+    fuzzTestAlterConfigsDataConfigResourceTypeBrokerLoggerPreprocess
+    fuzzTestAlterConfigsDataDuplicateConfigKeysPreprocess
+    fuzzTestAlterConfigsZkForwardingToController
+    fuzzTestAlterConfigsKRaftForwardingToController
+    fuzzTestAlterConfigsThrottledResponse
+    fuzzTestAlterConfigsZkForwardedInnerEnvelope
+    fuzzTestAlterConfigsZkAdminManagerReturnsError
 )
 
 # handleDeleteTopicsRequest fuzz targets (HandleDeleteTopicsRequestFuzzTest,
@@ -348,6 +428,25 @@ OFFSET_COMMIT_TESTS=(
     fuzzTestOffsetCommitVersion0RaftUnsupported
 )
 
+# handleTxnOffsetCommitRequest fuzz targets (HandleTxnOffsetCommitRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+TXN_OFFSET_COMMIT_TESTS=(
+    fuzzTestTxnOffsetCommitTransactionalIdWriteDenied
+    fuzzTestTxnOffsetCommitGroupReadDenied
+    fuzzTestTxnOffsetCommitTopicReadDeniedMixedTopics
+    fuzzTestTxnOffsetCommitUnknownTopic
+    fuzzTestTxnOffsetCommitUnknownPartitionAndValidSameTopic
+    fuzzTestTxnOffsetCommitOnlyInvalidPartitionsNoCoordinator
+    fuzzTestTxnOffsetCommitUnknownTopicAndValidTopic
+    fuzzTestTxnOffsetCommitCoordinatorSuccess
+    fuzzTestTxnOffsetCommitCoordinatorCompleteExceptionally
+    fuzzTestTxnOffsetCommitThrottleResponse
+    fuzzTestTxnOffsetCommitForwardedInnerRequest
+    fuzzTestTxnOffsetCommitUnsupportedInterBrokerVersion
+    fuzzTestTxnOffsetCommitV3GroupMetadataPassthrough
+    fuzzTestTxnOffsetCommitCoordinatorLoadInProgressLegacyRemap
+)
+
 # handleLeaderAndIsrRequest fuzz targets (HandleLeaderAndIsrRequestFuzzTest,
 # maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
 LEADER_AND_ISR_TESTS=(
@@ -424,6 +523,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${DESCRIBE_GROUPS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDescribeGroupsRequestFuzzTest" "$t"
     done
+    for t in "${DESCRIBE_ACLS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDescribeAclsRequestFuzzTest" "$t"
+    done
     for t in "${LIST_GROUPS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleListGroupsRequestFuzzTest" "$t"
     done
@@ -438,6 +540,15 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${CREATE_TOPICS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleCreateTopicsRequestFuzzTest" "$t"
+    done
+    for t in "${CREATE_ACLS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleCreateAclsRequestFuzzTest" "$t"
+    done
+    for t in "${DELETE_ACLS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDeleteAclsRequestFuzzTest" "$t"
+    done
+    for t in "${ALTER_CONFIGS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleAlterConfigsRequestFuzzTest" "$t"
     done
     for t in "${DELETE_TOPICS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDeleteTopicsRequestFuzzTest" "$t"
@@ -459,6 +570,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${OFFSET_COMMIT_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleOffsetCommitRequestFuzzTest" "$t"
+    done
+    for t in "${TXN_OFFSET_COMMIT_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleTxnOffsetCommitRequestFuzzTest" "$t"
     done
     for t in "${LEADER_AND_ISR_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleLeaderAndIsrRequestFuzzTest" "$t"

@@ -6527,7 +6527,7 @@ class KafkaApisTest extends Logging {
       envelope = Some(envelope))
   }
 
-  private def verifyNoThrottling[T <: AbstractResponse](
+  protected def verifyNoThrottling[T <: AbstractResponse](
     request: RequestChannel.Request
   ): T = {
     val capturedResponse: ArgumentCaptor[AbstractResponse] = ArgumentCaptor.forClass(classOf[AbstractResponse])
