@@ -30,6 +30,7 @@
 # `FUZZ_SUITE=offset-fetch` to run only `HandleOffsetFetchRequestFuzzTest`, or
 # `FUZZ_SUITE=describe-configs` for `HandleDescribeConfigsRequestFuzzTest`, or
 # `FUZZ_SUITE=describe-log-dirs` for `HandleDescribeLogDirsRequestFuzzTest`, or
+# `FUZZ_SUITE=sasl-authenticate` for `HandleSaslAuthenticateRequestFuzzTest`, or
 # `FUZZ_SUITE=alter-replica-log-dirs` for `HandleAlterReplicaLogDirsRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
@@ -55,12 +56,13 @@ esac
 #   FUZZ_SUITE=offset-fetch      HandleOffsetFetchRequestFuzzTest only
 #   FUZZ_SUITE=describe-configs       HandleDescribeConfigsRequestFuzzTest only
 #   FUZZ_SUITE=describe-log-dirs      HandleDescribeLogDirsRequestFuzzTest only
+#   FUZZ_SUITE=sasl-authenticate      HandleSaslAuthenticateRequestFuzzTest only
 #   FUZZ_SUITE=alter-replica-log-dirs HandleAlterReplicaLogDirsRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch|describe-configs|describe-log-dirs|alter-replica-log-dirs) ;;
+    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|alter-replica-log-dirs) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|alter-replica-log-dirs)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|alter-replica-log-dirs)" >&2
         exit 2
         ;;
 esac
@@ -361,6 +363,16 @@ DESCRIBE_LOG_DIRS_TESTS=(
     fuzzTestDescribeLogDirsAllPartitionsNoLogs
 )
 
+# handleSaslAuthenticateRequest fuzz targets (HandleSaslAuthenticateRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+SASL_AUTHENTICATE_TESTS=(
+    fuzzTestSaslAuthenticateIllegalStateRandomVersionAndAuthBytes
+    fuzzTestSaslAuthenticateIllegalStateEmptyAuthBytes
+    fuzzTestSaslAuthenticateVerifiedIllegalStateResponse
+    fuzzTestSaslAuthenticateThrottledResponse
+    fuzzTestSaslAuthenticateForwardedInnerRequest
+)
+
 # handleAlterReplicaLogDirsRequest fuzz targets (HandleAlterReplicaLogDirsRequestFuzzTest,
 # maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
 ALTER_REPLICA_LOG_DIRS_TESTS=(
@@ -614,6 +626,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${DESCRIBE_LOG_DIRS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDescribeLogDirsRequestFuzzTest" "$t"
     done
+    for t in "${SASL_AUTHENTICATE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleSaslAuthenticateRequestFuzzTest" "$t"
+    done
     for t in "${ALTER_REPLICA_LOG_DIRS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleAlterReplicaLogDirsRequestFuzzTest" "$t"
     done
@@ -658,6 +673,10 @@ elif [[ "$FUZZ_SUITE" == "describe-configs" ]]; then
 elif [[ "$FUZZ_SUITE" == "describe-log-dirs" ]]; then
     for t in "${DESCRIBE_LOG_DIRS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDescribeLogDirsRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "sasl-authenticate" ]]; then
+    for t in "${SASL_AUTHENTICATE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleSaslAuthenticateRequestFuzzTest" "$t"
     done
 elif [[ "$FUZZ_SUITE" == "alter-replica-log-dirs" ]]; then
     for t in "${ALTER_REPLICA_LOG_DIRS_TESTS[@]}"; do
@@ -709,6 +728,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleDescribeTopicPartitionsRequest", 1445, 1461),
     ("KafkaApis.scala",          "handleHeartbeatRequest",               1924, 1948),
     ("KafkaApis.scala",          "handleOffsetFetchRequest",             1466, 1630),
+    ("KafkaApis.scala",          "handleSaslAuthenticateRequest",       1975, 1980),
     ("KafkaApis.scala",          "handleDescribeConfigsRequest",         3111, 3115),
     ("KafkaApis.scala",          "handleAlterReplicaLogDirsRequest",     3117, 3137),
     ("KafkaApis.scala",          "handleDescribeLogDirsRequest",         3139, 3160),
