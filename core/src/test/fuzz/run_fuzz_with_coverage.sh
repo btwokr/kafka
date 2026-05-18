@@ -31,7 +31,8 @@
 # `FUZZ_SUITE=describe-configs` for `HandleDescribeConfigsRequestFuzzTest`, or
 # `FUZZ_SUITE=describe-log-dirs` for `HandleDescribeLogDirsRequestFuzzTest`, or
 # `FUZZ_SUITE=sasl-authenticate` for `HandleSaslAuthenticateRequestFuzzTest`, or
-# `FUZZ_SUITE=alter-replica-log-dirs` for `HandleAlterReplicaLogDirsRequestFuzzTest`.
+# `FUZZ_SUITE=alter-replica-log-dirs` for `HandleAlterReplicaLogDirsRequestFuzzTest`, or
+# `FUZZ_SUITE=create-partitions` for `HandleCreatePartitionsRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -58,11 +59,12 @@ esac
 #   FUZZ_SUITE=describe-log-dirs      HandleDescribeLogDirsRequestFuzzTest only
 #   FUZZ_SUITE=sasl-authenticate      HandleSaslAuthenticateRequestFuzzTest only
 #   FUZZ_SUITE=alter-replica-log-dirs HandleAlterReplicaLogDirsRequestFuzzTest only
+#   FUZZ_SUITE=create-partitions      HandleCreatePartitionsRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|alter-replica-log-dirs) ;;
+    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|alter-replica-log-dirs|create-partitions) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|alter-replica-log-dirs)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|alter-replica-log-dirs|create-partitions)" >&2
         exit 2
         ;;
 esac
@@ -259,6 +261,23 @@ CREATE_TOPICS_TESTS=(
     fuzzTestCreateTopicsAllTopicsUnauthorizedEmptyToCreate
     fuzzTestCreateTopicsThrottling
     fuzzTestCreateTopicsForwardedInnerRequest
+)
+
+# handleCreatePartitionsRequest fuzz targets (HandleCreatePartitionsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+CREATE_PARTITIONS_TESTS=(
+    fuzzTestCreatePartitionsRaftAlwaysForwardUnsupported
+    fuzzTestCreatePartitionsNotController
+    fuzzTestCreatePartitionsDuplicateTopicNamesInRequest
+    fuzzTestCreatePartitionsTopicAuthorizationDenied
+    fuzzTestCreatePartitionsTopicQueuedForDeletion
+    fuzzTestCreatePartitionsAdminManagerSuccess
+    fuzzTestCreatePartitionsAdminManagerErrorMerge
+    fuzzTestCreatePartitionsAllTopicsUnauthorizedEmptyValid
+    fuzzTestCreatePartitionsEmptyTopicsList
+    fuzzTestCreatePartitionsMixedDupAuthQueueAndAdmin
+    fuzzTestCreatePartitionsThrottling
+    fuzzTestCreatePartitionsForwardedInnerRequest
 )
 
 # handleCreateAcls / AclApis.handleCreateAcls fuzz targets (HandleCreateAclsRequestFuzzTest,
@@ -611,6 +630,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${CREATE_TOPICS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleCreateTopicsRequestFuzzTest" "$t"
     done
+    for t in "${CREATE_PARTITIONS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleCreatePartitionsRequestFuzzTest" "$t"
+    done
     for t in "${CREATE_ACLS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleCreateAclsRequestFuzzTest" "$t"
     done
@@ -682,6 +704,10 @@ elif [[ "$FUZZ_SUITE" == "alter-replica-log-dirs" ]]; then
     for t in "${ALTER_REPLICA_LOG_DIRS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleAlterReplicaLogDirsRequestFuzzTest" "$t"
     done
+elif [[ "$FUZZ_SUITE" == "create-partitions" ]]; then
+    for t in "${CREATE_PARTITIONS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleCreatePartitionsRequestFuzzTest" "$t"
+    done
 fi
 
 
@@ -729,6 +755,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleHeartbeatRequest",               1924, 1948),
     ("KafkaApis.scala",          "handleOffsetFetchRequest",             1466, 1630),
     ("KafkaApis.scala",          "handleSaslAuthenticateRequest",       1975, 1980),
+    ("KafkaApis.scala",          "handleCreatePartitionsRequest",        2100, 2148),
     ("KafkaApis.scala",          "handleDescribeConfigsRequest",         3111, 3115),
     ("KafkaApis.scala",          "handleAlterReplicaLogDirsRequest",     3117, 3137),
     ("KafkaApis.scala",          "handleDescribeLogDirsRequest",         3139, 3160),
