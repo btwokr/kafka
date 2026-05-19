@@ -37,7 +37,8 @@
 # `FUZZ_SUITE=create-delegation-token` for `HandleCreateTokenRequestFuzzTest`, or
 # `FUZZ_SUITE=renew-delegation-token` for `HandleRenewTokenRequestFuzzTest`, or
 # `FUZZ_SUITE=expire-delegation-token` for `HandleExpireTokenRequestFuzzTest`, or
-# `FUZZ_SUITE=describe-delegation-token` for `HandleDescribeTokensRequestFuzzTest`.
+# `FUZZ_SUITE=describe-delegation-token` for `HandleDescribeTokensRequestFuzzTest`, or
+# `FUZZ_SUITE=delete-groups` for `HandleDeleteGroupsRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -70,11 +71,12 @@ esac
 #   FUZZ_SUITE=renew-delegation-token   HandleRenewTokenRequestFuzzTest only
 #   FUZZ_SUITE=expire-delegation-token  HandleExpireTokenRequestFuzzTest only
 #   FUZZ_SUITE=describe-delegation-token HandleDescribeTokensRequestFuzzTest only
+#   FUZZ_SUITE=delete-groups           HandleDeleteGroupsRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token) ;;
+    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups)" >&2
         exit 2
         ;;
 esac
@@ -187,6 +189,19 @@ LEAVE_GROUP_TESTS=(
     fuzzTestLeaveGroupAuthorizationDenied
     fuzzTestLeaveGroupCoordinatorFuture
     fuzzTestLeaveGroupThrottledResponse
+)
+
+# handleDeleteGroupsRequest fuzz targets (HandleDeleteGroupsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DELETE_GROUPS_TESTS=(
+    fuzzTestDeleteGroupsAuthorizedGroupIdNotFound
+    fuzzTestDeleteGroupsAllUnauthorized
+    fuzzTestDeleteGroupsMixedAuthGroupIdNotFound
+    fuzzTestDeleteGroupsDuplicateGroupIds
+    fuzzTestDeleteGroupsNotCoordinatorOtherPartition
+    fuzzTestDeleteGroupsEmptyGroupList
+    fuzzTestDeleteGroupsThrottledResponse
+    fuzzTestDeleteGroupsForwardedInnerRequest
 )
 
 # handleDescribeGroupsRequest fuzz targets (HandleDescribeGroupsRequestFuzzTest,
@@ -676,6 +691,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${LEAVE_GROUP_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleLeaveGroupRequestFuzzTest" "$t"
     done
+    for t in "${DELETE_GROUPS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDeleteGroupsRequestFuzzTest" "$t"
+    done
     for t in "${DESCRIBE_GROUPS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDescribeGroupsRequestFuzzTest" "$t"
     done
@@ -810,6 +828,10 @@ elif [[ "$FUZZ_SUITE" == "describe-delegation-token" ]]; then
     for t in "${DESCRIBE_DELEGATION_TOKEN_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDescribeTokensRequestFuzzTest" "$t"
     done
+elif [[ "$FUZZ_SUITE" == "delete-groups" ]]; then
+    for t in "${DELETE_GROUPS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDeleteGroupsRequestFuzzTest" "$t"
+    done
 fi
 
 
@@ -855,6 +877,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleFetchRequest",                    757, 1077),
     ("KafkaApis.scala",          "handleDescribeTopicPartitionsRequest", 1445, 1461),
     ("KafkaApis.scala",          "handleHeartbeatRequest",               1924, 1948),
+    ("KafkaApis.scala",          "handleDeleteGroupsRequest",            1886, 1922),
     ("KafkaApis.scala",          "handleOffsetFetchRequest",             1466, 1630),
     ("KafkaApis.scala",          "handleSaslHandshakeRequest",           1970, 1973),
     ("KafkaApis.scala",          "handleSaslAuthenticateRequest",       1975, 1980),
