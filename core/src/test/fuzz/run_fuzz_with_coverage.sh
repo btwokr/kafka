@@ -34,7 +34,8 @@
 # `FUZZ_SUITE=sasl-handshake` for `HandleSaslHandshakeRequestFuzzTest`, or
 # `FUZZ_SUITE=alter-replica-log-dirs` for `HandleAlterReplicaLogDirsRequestFuzzTest`, or
 # `FUZZ_SUITE=create-partitions` for `HandleCreatePartitionsRequestFuzzTest`, or
-# `FUZZ_SUITE=create-delegation-token` for `HandleCreateTokenRequestFuzzTest`.
+# `FUZZ_SUITE=create-delegation-token` for `HandleCreateTokenRequestFuzzTest`, or
+# `FUZZ_SUITE=renew-delegation-token` for `HandleRenewTokenRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -64,11 +65,12 @@ esac
 #   FUZZ_SUITE=alter-replica-log-dirs HandleAlterReplicaLogDirsRequestFuzzTest only
 #   FUZZ_SUITE=create-partitions      HandleCreatePartitionsRequestFuzzTest only
 #   FUZZ_SUITE=create-delegation-token HandleCreateTokenRequestFuzzTest only
+#   FUZZ_SUITE=renew-delegation-token   HandleRenewTokenRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token) ;;
+    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token)" >&2
         exit 2
         ;;
 esac
@@ -295,6 +297,17 @@ CREATE_DELEGATION_TOKEN_TESTS=(
     fuzzTestCreateTokenRequestZkMigrationInactiveController
     fuzzTestCreateTokenRequestThrottledResponse
     fuzzTestCreateTokenRequestForwardedInnerRequest
+)
+
+# handleRenewTokenRequest / handleRenewTokenRequestZk fuzz targets (HandleRenewTokenRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+RENEW_DELEGATION_TOKEN_TESTS=(
+    fuzzTestRenewTokenRequestNotAllowedPlaintext
+    fuzzTestRenewTokenRequestZkDelegationTokenManagerSuccess
+    fuzzTestRenewTokenRequestZkDelegationTokenManagerReturnsError
+    fuzzTestRenewTokenRequestZkMigrationInactiveController
+    fuzzTestRenewTokenRequestThrottledResponse
+    fuzzTestRenewTokenRequestForwardedInnerRequest
 )
 
 # handleCreateAcls / AclApis.handleCreateAcls fuzz targets (HandleCreateAclsRequestFuzzTest,
@@ -663,6 +676,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${CREATE_DELEGATION_TOKEN_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleCreateTokenRequestFuzzTest" "$t"
     done
+    for t in "${RENEW_DELEGATION_TOKEN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleRenewTokenRequestFuzzTest" "$t"
+    done
     for t in "${CREATE_ACLS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleCreateAclsRequestFuzzTest" "$t"
     done
@@ -749,6 +765,10 @@ elif [[ "$FUZZ_SUITE" == "create-delegation-token" ]]; then
     for t in "${CREATE_DELEGATION_TOKEN_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleCreateTokenRequestFuzzTest" "$t"
     done
+elif [[ "$FUZZ_SUITE" == "renew-delegation-token" ]]; then
+    for t in "${RENEW_DELEGATION_TOKEN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleRenewTokenRequestFuzzTest" "$t"
+    done
 fi
 
 
@@ -800,6 +820,8 @@ TARGETS = [
     ("KafkaApis.scala",          "handleCreatePartitionsRequest",        2100, 2148),
     ("KafkaApis.scala",          "handleCreateTokenRequest",              3162, 3189),
     ("KafkaApis.scala",          "handleCreateTokenRequestZk",           3192, 3229),
+    ("KafkaApis.scala",          "handleRenewTokenRequest",               3232, 3243),
+    ("KafkaApis.scala",          "handleRenewTokenRequestZk",            3245, 3276),
     ("KafkaApis.scala",          "handleDescribeConfigsRequest",         3111, 3115),
     ("KafkaApis.scala",          "handleAlterReplicaLogDirsRequest",     3117, 3137),
     ("KafkaApis.scala",          "handleDescribeLogDirsRequest",         3139, 3160),
