@@ -200,6 +200,7 @@ DELETE_GROUPS_TESTS=(
     fuzzTestDeleteGroupsDuplicateGroupIds
     fuzzTestDeleteGroupsNotCoordinatorOtherPartition
     fuzzTestDeleteGroupsEmptyGroupList
+    fuzzTestDeleteGroupsCoordinatorFutureFailed
     fuzzTestDeleteGroupsThrottledResponse
     fuzzTestDeleteGroupsForwardedInnerRequest
 )

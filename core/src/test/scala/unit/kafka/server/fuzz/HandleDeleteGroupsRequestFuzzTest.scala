@@ -19,37 +19,30 @@ package unit.kafka.server.fuzz
 
 import com.code_intelligence.jazzer.api.FuzzedDataProvider
 import com.code_intelligence.jazzer.junit.FuzzTest
-import kafka.coordinator.group.DeleteGroupsFuzzCoordinatorHarness
 import kafka.network.RequestChannel
-import kafka.server.{KafkaApisTest, KafkaConfig, MetadataCache, ReplicaManager, RequestLocal, ZkBrokerEpochManager}
-import kafka.utils.TestUtils
-import org.apache.kafka.common.internals.Topic
-import org.apache.kafka.common.message.DeleteGroupsRequestData
+import kafka.server.{KafkaApisTest, MetadataCache, RequestLocal, ZkBrokerEpochManager}
+import org.apache.kafka.common.message.{DeleteGroupsRequestData, DeleteGroupsResponseData}
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
 import org.apache.kafka.common.requests.{DeleteGroupsRequest, DeleteGroupsResponse}
 import org.apache.kafka.server.authorizer.{Action, AuthorizationResult, Authorizer}
 import org.apache.kafka.server.common.MetadataVersion
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.mockito.ArgumentMatchers
 import org.mockito.ArgumentMatchers.{any, anyDouble, anyLong}
 import org.mockito.Mockito.{mock, reset, when}
 
 import java.util
 import java.util.Collections
+import java.util.concurrent.CompletableFuture
 import scala.jdk.CollectionConverters._
 
 /**
  * Jazzer fuzz tests for `KafkaApis.handleDeleteGroupsRequest`.
  *
- * Uses a real classic [[GroupCoordinatorAdapter]] stack (no Mockito on
- * `org.apache.kafka.coordinator.group.GroupCoordinator`). A dedicated
- * [[ReplicaManager]] mock feeds only the coordinator; `KafkaApis` keeps the
- * usual harness `replicaManager` mock for unrelated paths.
+ * Uses the shared [[kafka.server.KafkaApisTest.groupCoordinator]] Mockito mock
+ * (same style as `testHandleDeleteGroups` / `testHandleDeleteGroupsFutureFailed`).
  */
 class HandleDeleteGroupsRequestFuzzTest extends KafkaApisTest {
-
-  /** Same ids as [[kafka.coordinator.group.GroupCoordinatorTest]]: distinct `partitionFor` under two partitions. */
-  private val CoordinatorPartitionGroupA = "groupId"
-  private val CoordinatorPartitionGroupB = "otherGroup"
 
   private def resetHarness(): Unit = {
     metadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.latestTesting())
@@ -71,29 +64,6 @@ class HandleDeleteGroupsRequestFuzzTest extends KafkaApisTest {
     when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyLong)).thenReturn(throttleTimeMs)
   }
-
-  private def coordinatorConfig(iv: MetadataVersion): KafkaConfig = {
-    val properties = TestUtils.createBrokerConfig(brokerId, "zk")
-    TestUtils.setIbpAndMessageFormatVersions(properties, iv)
-    new KafkaConfig(properties)
-  }
-
-  private def startClassicGroupCoordinator(
-    coordConfig: KafkaConfig,
-    coordReplicaManager: ReplicaManager
-  ): org.apache.kafka.coordinator.group.GroupCoordinator = {
-    when(zkClient.getTopicPartitionCount(Topic.GROUP_METADATA_TOPIC_NAME))
-      .thenReturn(Some(2))
-    DeleteGroupsFuzzCoordinatorHarness.newStartedAdapter(
-      coordConfig,
-      coordReplicaManager,
-      time,
-      metrics,
-      zkClient.getTopicPartitionCount(Topic.GROUP_METADATA_TOPIC_NAME).getOrElse(2))
-  }
-
-  private def installOwnedPartition(adapter: org.apache.kafka.coordinator.group.GroupCoordinator, groupId: String): Unit =
-    DeleteGroupsFuzzCoordinatorHarness.installOwnedPartition(adapter, groupId)
 
   private def deleteResultsByGroupId(response: DeleteGroupsResponse): Map[String, Errors] =
     response.data.results.asScala.map(r => r.groupId -> Errors.forCode(r.errorCode)).toMap
@@ -119,6 +89,16 @@ class HandleDeleteGroupsRequestFuzzTest extends KafkaApisTest {
     authorizer
   }
 
+  private def resultCollection(pairs: Seq[(String, Errors)]): DeleteGroupsResponseData.DeletableGroupResultCollection = {
+    val col = new DeleteGroupsResponseData.DeletableGroupResultCollection()
+    pairs.foreach { case (gid, err) =>
+      col.add(new DeleteGroupsResponseData.DeletableGroupResult()
+        .setGroupId(gid)
+        .setErrorCode(err.code))
+    }
+    col
+  }
+
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestDeleteGroupsAuthorizedGroupIdNotFound(data: FuzzedDataProvider): Unit = {
     val wireVersion = data.consumeShort(
@@ -131,23 +111,24 @@ class HandleDeleteGroupsRequestFuzzTest extends KafkaApisTest {
     resetHarness()
     stubNoThrottle()
 
-    val coordRm = mock(classOf[ReplicaManager])
-    val gc = startClassicGroupCoordinator(coordinatorConfig(iv), coordRm)
+    val built = new DeleteGroupsRequest.Builder(
+      new DeleteGroupsRequestData().setGroupsNames(Collections.singletonList(groupId))
+    ).build(wireVersion)
+    val request = buildRequest(built)
+
+    val future = CompletableFuture.completedFuture(resultCollection(Seq(groupId -> Errors.GROUP_ID_NOT_FOUND)))
+    when(groupCoordinator.deleteGroups(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(Collections.singletonList(groupId)),
+      ArgumentMatchers.eq(RequestLocal.NoCaching.bufferSupplier)
+    )).thenReturn(future)
+
+    val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv)
     try {
-      installOwnedPartition(gc, groupId)
-
-      val built = new DeleteGroupsRequest.Builder(
-        new DeleteGroupsRequestData().setGroupsNames(Collections.singletonList(groupId))
-      ).build(wireVersion)
-      val request = buildRequest(built)
-
-      val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv, groupCoordinatorForApis = Some(gc))
-      try {
-        kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
-        val response = verifyNoThrottling[DeleteGroupsResponse](request)
-        assertEquals(Map(groupId -> Errors.GROUP_ID_NOT_FOUND), deleteResultsByGroupId(response))
-      } finally kafkaApis.close()
-    } finally gc.shutdown()
+      kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
+      val response = verifyNoThrottling[DeleteGroupsResponse](request)
+      assertEquals(Map(groupId -> Errors.GROUP_ID_NOT_FOUND), deleteResultsByGroupId(response))
+    } finally kafkaApis.close()
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
@@ -162,25 +143,24 @@ class HandleDeleteGroupsRequestFuzzTest extends KafkaApisTest {
     resetHarness()
     stubNoThrottle()
 
-    val coordRm = mock(classOf[ReplicaManager])
-    val gc = startClassicGroupCoordinator(coordinatorConfig(iv), coordRm)
-    try {
-      val built = new DeleteGroupsRequest.Builder(
-        new DeleteGroupsRequestData().setGroupsNames(names)
-      ).build(wireVersion)
-      val request = buildRequest(built)
+    val built = new DeleteGroupsRequest.Builder(
+      new DeleteGroupsRequestData().setGroupsNames(names)
+    ).build(wireVersion)
+    val request = buildRequest(built)
 
-      val kafkaApis = createKafkaApis(
-        interBrokerProtocolVersion = iv,
-        authorizer = Some(denyAllAuthorizer()),
-        groupCoordinatorForApis = Some(gc))
-      try {
-        kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
-        val response = verifyNoThrottling[DeleteGroupsResponse](request)
-        val expected = names.asScala.map(_ -> Errors.GROUP_AUTHORIZATION_FAILED).toMap
-        assertEquals(expected, deleteResultsByGroupId(response))
-      } finally kafkaApis.close()
-    } finally gc.shutdown()
+    when(groupCoordinator.deleteGroups(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(Collections.emptyList()),
+      ArgumentMatchers.eq(RequestLocal.NoCaching.bufferSupplier)
+    )).thenReturn(CompletableFuture.completedFuture(new DeleteGroupsResponseData.DeletableGroupResultCollection()))
+
+    val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv, authorizer = Some(denyAllAuthorizer()))
+    try {
+      kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
+      val response = verifyNoThrottling[DeleteGroupsResponse](request)
+      val expected = names.asScala.map(_ -> Errors.GROUP_AUTHORIZATION_FAILED).toMap
+      assertEquals(expected, deleteResultsByGroupId(response))
+    } finally kafkaApis.close()
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
@@ -196,30 +176,31 @@ class HandleDeleteGroupsRequestFuzzTest extends KafkaApisTest {
     resetHarness()
     stubNoThrottle()
 
-    val coordRm = mock(classOf[ReplicaManager])
-    val gc = startClassicGroupCoordinator(coordinatorConfig(iv), coordRm)
+    val built = new DeleteGroupsRequest.Builder(
+      new DeleteGroupsRequestData().setGroupsNames(List(gDenied, g1, g2).asJava)
+    ).build(wireVersion)
+    val request = buildRequest(built)
+
+    val authList = List(g1, g2).asJava
+    when(groupCoordinator.deleteGroups(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(authList),
+      ArgumentMatchers.eq(RequestLocal.NoCaching.bufferSupplier)
+    )).thenReturn(CompletableFuture.completedFuture(resultCollection(Seq(
+      g1 -> Errors.GROUP_ID_NOT_FOUND,
+      g2 -> Errors.GROUP_ID_NOT_FOUND))))
+
+    val kafkaApis = createKafkaApis(
+      interBrokerProtocolVersion = iv,
+      authorizer = Some(selectiveDeleteAuthorizer(Set(g1, g2))))
     try {
-      installOwnedPartition(gc, g1)
-      installOwnedPartition(gc, g2)
-
-      val built = new DeleteGroupsRequest.Builder(
-        new DeleteGroupsRequestData().setGroupsNames(List(gDenied, g1, g2).asJava)
-      ).build(wireVersion)
-      val request = buildRequest(built)
-
-      val kafkaApis = createKafkaApis(
-        interBrokerProtocolVersion = iv,
-        authorizer = Some(selectiveDeleteAuthorizer(Set(g1, g2))),
-        groupCoordinatorForApis = Some(gc))
-      try {
-        kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
-        val response = verifyNoThrottling[DeleteGroupsResponse](request)
-        val m = deleteResultsByGroupId(response)
-        assertEquals(Errors.GROUP_AUTHORIZATION_FAILED, m(gDenied))
-        assertEquals(Errors.GROUP_ID_NOT_FOUND, m(g1))
-        assertEquals(Errors.GROUP_ID_NOT_FOUND, m(g2))
-      } finally kafkaApis.close()
-    } finally gc.shutdown()
+      kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
+      val response = verifyNoThrottling[DeleteGroupsResponse](request)
+      val m = deleteResultsByGroupId(response)
+      assertEquals(Errors.GROUP_AUTHORIZATION_FAILED, m(gDenied))
+      assertEquals(Errors.GROUP_ID_NOT_FOUND, m(g1))
+      assertEquals(Errors.GROUP_ID_NOT_FOUND, m(g2))
+    } finally kafkaApis.close()
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
@@ -234,23 +215,23 @@ class HandleDeleteGroupsRequestFuzzTest extends KafkaApisTest {
     resetHarness()
     stubNoThrottle()
 
-    val coordRm = mock(classOf[ReplicaManager])
-    val gc = startClassicGroupCoordinator(coordinatorConfig(iv), coordRm)
+    val built = new DeleteGroupsRequest.Builder(
+      new DeleteGroupsRequestData().setGroupsNames(List(groupId, groupId).asJava)
+    ).build(wireVersion)
+    val request = buildRequest(built)
+
+    when(groupCoordinator.deleteGroups(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(Collections.singletonList(groupId)),
+      ArgumentMatchers.eq(RequestLocal.NoCaching.bufferSupplier)
+    )).thenReturn(CompletableFuture.completedFuture(resultCollection(Seq(groupId -> Errors.GROUP_ID_NOT_FOUND))))
+
+    val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv)
     try {
-      installOwnedPartition(gc, groupId)
-
-      val built = new DeleteGroupsRequest.Builder(
-        new DeleteGroupsRequestData().setGroupsNames(List(groupId, groupId).asJava)
-      ).build(wireVersion)
-      val request = buildRequest(built)
-
-      val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv, groupCoordinatorForApis = Some(gc))
-      try {
-        kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
-        val response = verifyNoThrottling[DeleteGroupsResponse](request)
-        assertEquals(Map(groupId -> Errors.GROUP_ID_NOT_FOUND), deleteResultsByGroupId(response))
-      } finally kafkaApis.close()
-    } finally gc.shutdown()
+      kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
+      val response = verifyNoThrottling[DeleteGroupsResponse](request)
+      assertEquals(Map(groupId -> Errors.GROUP_ID_NOT_FOUND), deleteResultsByGroupId(response))
+    } finally kafkaApis.close()
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
@@ -259,30 +240,34 @@ class HandleDeleteGroupsRequestFuzzTest extends KafkaApisTest {
       ApiKeys.DELETE_GROUPS.oldestVersion(),
       ApiKeys.DELETE_GROUPS.latestVersion())
     val iv = MetadataVersion.latestTesting()
+    val ga = data.consumeString(16) match { case null | "" => "fuzz-nc-a"; case s => s }
+    var gb = data.consumeString(16) match { case null | "" => "fuzz-nc-b"; case s => s }
+    if (gb == ga) gb = gb + "-x"
 
     resetHarness()
     stubNoThrottle()
 
-    val coordRm = mock(classOf[ReplicaManager])
-    val gc = startClassicGroupCoordinator(coordinatorConfig(iv), coordRm)
+    val built = new DeleteGroupsRequest.Builder(
+      new DeleteGroupsRequestData().setGroupsNames(List(ga, gb).asJava)
+    ).build(wireVersion)
+    val request = buildRequest(built)
+
+    when(groupCoordinator.deleteGroups(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(List(ga, gb).asJava),
+      ArgumentMatchers.eq(RequestLocal.NoCaching.bufferSupplier)
+    )).thenReturn(CompletableFuture.completedFuture(resultCollection(Seq(
+      ga -> Errors.GROUP_ID_NOT_FOUND,
+      gb -> Errors.NOT_COORDINATOR))))
+
+    val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv)
     try {
-      installOwnedPartition(gc, CoordinatorPartitionGroupA)
-
-      val built = new DeleteGroupsRequest.Builder(
-        new DeleteGroupsRequestData().setGroupsNames(
-          List(CoordinatorPartitionGroupA, CoordinatorPartitionGroupB).asJava)
-      ).build(wireVersion)
-      val request = buildRequest(built)
-
-      val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv, groupCoordinatorForApis = Some(gc))
-      try {
-        kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
-        val response = verifyNoThrottling[DeleteGroupsResponse](request)
-        val m = deleteResultsByGroupId(response)
-        assertEquals(Errors.GROUP_ID_NOT_FOUND, m(CoordinatorPartitionGroupA))
-        assertEquals(Errors.NOT_COORDINATOR, m(CoordinatorPartitionGroupB))
-      } finally kafkaApis.close()
-    } finally gc.shutdown()
+      kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
+      val response = verifyNoThrottling[DeleteGroupsResponse](request)
+      val m = deleteResultsByGroupId(response)
+      assertEquals(Errors.GROUP_ID_NOT_FOUND, m(ga))
+      assertEquals(Errors.NOT_COORDINATOR, m(gb))
+    } finally kafkaApis.close()
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
@@ -295,21 +280,61 @@ class HandleDeleteGroupsRequestFuzzTest extends KafkaApisTest {
     resetHarness()
     stubNoThrottle()
 
-    val coordRm = mock(classOf[ReplicaManager])
-    val gc = startClassicGroupCoordinator(coordinatorConfig(iv), coordRm)
-    try {
-      val built = new DeleteGroupsRequest.Builder(
-        new DeleteGroupsRequestData().setGroupsNames(Collections.emptyList())
-      ).build(wireVersion)
-      val request = buildRequest(built)
+    val built = new DeleteGroupsRequest.Builder(
+      new DeleteGroupsRequestData().setGroupsNames(Collections.emptyList())
+    ).build(wireVersion)
+    val request = buildRequest(built)
 
-      val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv, groupCoordinatorForApis = Some(gc))
-      try {
-        kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
-        val response = verifyNoThrottling[DeleteGroupsResponse](request)
-        assertEquals(0, response.data.results.size)
-      } finally kafkaApis.close()
-    } finally gc.shutdown()
+    when(groupCoordinator.deleteGroups(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(Collections.emptyList()),
+      ArgumentMatchers.eq(RequestLocal.NoCaching.bufferSupplier)
+    )).thenReturn(CompletableFuture.completedFuture(new DeleteGroupsResponseData.DeletableGroupResultCollection()))
+
+    val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv)
+    try {
+      kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
+      val response = verifyNoThrottling[DeleteGroupsResponse](request)
+      assertEquals(0, response.data.results.size)
+    } finally kafkaApis.close()
+  }
+
+  @FuzzTest(maxDuration = FUZZ_DURATION)
+  def fuzzTestDeleteGroupsCoordinatorFutureFailed(data: FuzzedDataProvider): Unit = {
+    val wireVersion = data.consumeShort(
+      ApiKeys.DELETE_GROUPS.oldestVersion(),
+      ApiKeys.DELETE_GROUPS.latestVersion())
+    val iv = MetadataVersion.latestTesting()
+    val n = data.consumeInt(1, 4)
+    val groupIds = (0 until n).map(i => s"fuzz-fail-$i-${data.consumeString(6)}").toList
+
+    resetHarness()
+    stubNoThrottle()
+
+    val built = new DeleteGroupsRequest.Builder(
+      new DeleteGroupsRequestData().setGroupsNames(groupIds.asJava)
+    ).build(wireVersion)
+    val request = buildRequest(built)
+
+    val future = new CompletableFuture[DeleteGroupsResponseData.DeletableGroupResultCollection]()
+    when(groupCoordinator.deleteGroups(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(groupIds.asJava),
+      ArgumentMatchers.eq(RequestLocal.NoCaching.bufferSupplier)
+    )).thenReturn(future)
+
+    val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv)
+    try {
+      val handled = kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching)
+      val useNotController = data.consumeBoolean()
+      if (useNotController) future.completeExceptionally(Errors.NOT_CONTROLLER.exception())
+      else future.completeExceptionally(Errors.COORDINATOR_NOT_AVAILABLE.exception())
+      handled.join()
+      val response = verifyNoThrottling[DeleteGroupsResponse](request)
+      val err = if (useNotController) Errors.NOT_CONTROLLER else Errors.COORDINATOR_NOT_AVAILABLE
+      val expected = groupIds.map(_ -> err).toMap
+      assertEquals(expected, deleteResultsByGroupId(response))
+    } finally kafkaApis.close()
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
@@ -327,20 +352,20 @@ class HandleDeleteGroupsRequestFuzzTest extends KafkaApisTest {
     resetHarness()
     stubClientThrottle(throttleMs)
 
-    val coordRm = mock(classOf[ReplicaManager])
-    val gc = startClassicGroupCoordinator(coordinatorConfig(iv), coordRm)
-    try {
-      installOwnedPartition(gc, groupId)
+    val built = new DeleteGroupsRequest.Builder(
+      new DeleteGroupsRequestData().setGroupsNames(Collections.singletonList(groupId))
+    ).build(wireVersion)
+    val request = buildRequest(built)
 
-      val built = new DeleteGroupsRequest.Builder(
-        new DeleteGroupsRequestData().setGroupsNames(Collections.singletonList(groupId))
-      ).build(wireVersion)
-      val request = buildRequest(built)
+    when(groupCoordinator.deleteGroups(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(Collections.singletonList(groupId)),
+      ArgumentMatchers.eq(RequestLocal.NoCaching.bufferSupplier)
+    )).thenReturn(CompletableFuture.completedFuture(resultCollection(Seq(groupId -> Errors.NONE))))
 
-      val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv, groupCoordinatorForApis = Some(gc))
-      try kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
-      finally kafkaApis.close()
-    } finally gc.shutdown()
+    val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv)
+    try kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
+    finally kafkaApis.close()
   }
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
@@ -361,19 +386,19 @@ class HandleDeleteGroupsRequestFuzzTest extends KafkaApisTest {
     when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyLong)).thenReturn(requestThrottleMs)
 
-    val coordRm = mock(classOf[ReplicaManager])
-    val gc = startClassicGroupCoordinator(coordinatorConfig(iv), coordRm)
-    try {
-      installOwnedPartition(gc, groupId)
+    val built = new DeleteGroupsRequest.Builder(
+      new DeleteGroupsRequestData().setGroupsNames(Collections.singletonList(groupId))
+    ).build(wireVersion)
+    val request = buildForwardedRequest(built)
 
-      val built = new DeleteGroupsRequest.Builder(
-        new DeleteGroupsRequestData().setGroupsNames(Collections.singletonList(groupId))
-      ).build(wireVersion)
-      val request = buildForwardedRequest(built)
+    when(groupCoordinator.deleteGroups(
+      ArgumentMatchers.eq(request.context),
+      ArgumentMatchers.eq(Collections.singletonList(groupId)),
+      ArgumentMatchers.eq(RequestLocal.NoCaching.bufferSupplier)
+    )).thenReturn(CompletableFuture.completedFuture(resultCollection(Seq(groupId -> Errors.NONE))))
 
-      val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv, groupCoordinatorForApis = Some(gc))
-      try kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
-      finally kafkaApis.close()
-    } finally gc.shutdown()
+    val kafkaApis = createKafkaApis(interBrokerProtocolVersion = iv)
+    try kafkaApis.handleDeleteGroupsRequest(request, RequestLocal.NoCaching).join()
+    finally kafkaApis.close()
   }
 }

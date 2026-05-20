@@ -139,7 +139,7 @@ class KafkaApisTest extends Logging {
     override def deserialize(bytes: Array[Byte]): KafkaPrincipal = SecurityUtils.parseKafkaPrincipal(Utils.utf8(bytes))
   }
   protected val zkClient: KafkaZkClient = mock(classOf[KafkaZkClient])
-  protected val metrics = new Metrics()
+  private val metrics = new Metrics()
   val brokerId = 1
   // KRaft tests should override this with a KRaftMetadataCache
   var metadataCache: MetadataCache = MetadataCache.zkMetadataCache(brokerId, MetadataVersion.latestTesting())
@@ -179,8 +179,7 @@ class KafkaApisTest extends Logging {
                       configRepository: ConfigRepository = new MockConfigRepository(),
                       raftSupport: Boolean = false,
                       overrideProperties: Map[String, String] = Map.empty,
-                      tokenManager: DelegationTokenManager = null,
-                      groupCoordinatorForApis: Option[GroupCoordinator] = None): KafkaApis = {
+                      tokenManager: DelegationTokenManager = null): KafkaApis = {
     val properties = if (raftSupport) {
       val properties = TestUtils.createBrokerConfig(brokerId, "")
       properties.put(KRaftConfigs.NODE_ID_CONFIG, brokerId.toString)
@@ -232,13 +231,11 @@ class KafkaApisTest extends Logging {
 
     val clientMetricsManagerOpt = if (raftSupport) Some(clientMetricsManager) else None
 
-    val groupCoordinatorInstance = groupCoordinatorForApis.getOrElse(this.groupCoordinator)
-
     new KafkaApis(
       requestChannel = requestChannel,
       metadataSupport = metadataSupport,
       replicaManager = replicaManager,
-      groupCoordinator = groupCoordinatorInstance,
+      groupCoordinator = groupCoordinator,
       txnCoordinator = txnCoordinator,
       autoTopicCreationManager = autoTopicCreationManager,
       brokerId = brokerId,
