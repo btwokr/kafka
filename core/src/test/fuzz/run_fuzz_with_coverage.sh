@@ -27,7 +27,18 @@
 #   /tmp/jacoco/report/coverage.csv      CSV coverage report (per-class)
 #
 # Optional: `FUZZ_SUITE=all` (default) runs every fuzz target; set
-# `FUZZ_SUITE=offset-fetch` to run only `HandleOffsetFetchRequestFuzzTest`
+# `FUZZ_SUITE=offset-fetch` to run only `HandleOffsetFetchRequestFuzzTest`, or
+# `FUZZ_SUITE=describe-configs` for `HandleDescribeConfigsRequestFuzzTest`, or
+# `FUZZ_SUITE=describe-log-dirs` for `HandleDescribeLogDirsRequestFuzzTest`, or
+# `FUZZ_SUITE=sasl-authenticate` for `HandleSaslAuthenticateRequestFuzzTest`, or
+# `FUZZ_SUITE=sasl-handshake` for `HandleSaslHandshakeRequestFuzzTest`, or
+# `FUZZ_SUITE=alter-replica-log-dirs` for `HandleAlterReplicaLogDirsRequestFuzzTest`, or
+# `FUZZ_SUITE=create-partitions` for `HandleCreatePartitionsRequestFuzzTest`, or
+# `FUZZ_SUITE=create-delegation-token` for `HandleCreateTokenRequestFuzzTest`, or
+# `FUZZ_SUITE=renew-delegation-token` for `HandleRenewTokenRequestFuzzTest`, or
+# `FUZZ_SUITE=expire-delegation-token` for `HandleExpireTokenRequestFuzzTest`, or
+# `FUZZ_SUITE=describe-delegation-token` for `HandleDescribeTokensRequestFuzzTest`, or
+# `FUZZ_SUITE=delete-groups` for `HandleDeleteGroupsRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -48,13 +59,24 @@ esac
 
 # Optional: run a subset of fuzz tests (default: full suite). Use with
 # FUZZ_MODE=resume to append only new targets onto the committed snapshot.
-#   FUZZ_SUITE=all            8 produce + 5 fetch + 3 describe + 4 offset-fetch
-#   FUZZ_SUITE=offset-fetch   4 offset-fetch tests only
+#   FUZZ_SUITE=all               full suite
+#   FUZZ_SUITE=offset-fetch      HandleOffsetFetchRequestFuzzTest only
+#   FUZZ_SUITE=describe-configs       HandleDescribeConfigsRequestFuzzTest only
+#   FUZZ_SUITE=describe-log-dirs      HandleDescribeLogDirsRequestFuzzTest only
+#   FUZZ_SUITE=sasl-authenticate      HandleSaslAuthenticateRequestFuzzTest only
+#   FUZZ_SUITE=sasl-handshake         HandleSaslHandshakeRequestFuzzTest only
+#   FUZZ_SUITE=alter-replica-log-dirs HandleAlterReplicaLogDirsRequestFuzzTest only
+#   FUZZ_SUITE=create-partitions      HandleCreatePartitionsRequestFuzzTest only
+#   FUZZ_SUITE=create-delegation-token HandleCreateTokenRequestFuzzTest only
+#   FUZZ_SUITE=renew-delegation-token   HandleRenewTokenRequestFuzzTest only
+#   FUZZ_SUITE=expire-delegation-token  HandleExpireTokenRequestFuzzTest only
+#   FUZZ_SUITE=describe-delegation-token HandleDescribeTokensRequestFuzzTest only
+#   FUZZ_SUITE=delete-groups           HandleDeleteGroupsRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch) ;;
+    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups)" >&2
         exit 2
         ;;
 esac
@@ -169,6 +191,20 @@ LEAVE_GROUP_TESTS=(
     fuzzTestLeaveGroupThrottledResponse
 )
 
+# handleDeleteGroupsRequest fuzz targets (HandleDeleteGroupsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DELETE_GROUPS_TESTS=(
+    fuzzTestDeleteGroupsAuthorizedGroupIdNotFound
+    fuzzTestDeleteGroupsAllUnauthorized
+    fuzzTestDeleteGroupsMixedAuthGroupIdNotFound
+    fuzzTestDeleteGroupsDuplicateGroupIds
+    fuzzTestDeleteGroupsNotCoordinatorOtherPartition
+    fuzzTestDeleteGroupsEmptyGroupList
+    fuzzTestDeleteGroupsCoordinatorFutureFailed
+    fuzzTestDeleteGroupsThrottledResponse
+    fuzzTestDeleteGroupsForwardedInnerRequest
+)
+
 # handleDescribeGroupsRequest fuzz targets (HandleDescribeGroupsRequestFuzzTest,
 # maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
 DESCRIBE_GROUPS_TESTS=(
@@ -253,6 +289,70 @@ CREATE_TOPICS_TESTS=(
     fuzzTestCreateTopicsForwardedInnerRequest
 )
 
+# handleCreatePartitionsRequest fuzz targets (HandleCreatePartitionsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+CREATE_PARTITIONS_TESTS=(
+    fuzzTestCreatePartitionsRaftAlwaysForwardUnsupported
+    fuzzTestCreatePartitionsNotController
+    fuzzTestCreatePartitionsDuplicateTopicNamesInRequest
+    fuzzTestCreatePartitionsTopicAuthorizationDenied
+    fuzzTestCreatePartitionsTopicQueuedForDeletion
+    fuzzTestCreatePartitionsAdminManagerSuccess
+    fuzzTestCreatePartitionsAdminManagerErrorMerge
+    fuzzTestCreatePartitionsAllTopicsUnauthorizedEmptyValid
+    fuzzTestCreatePartitionsEmptyTopicsList
+    fuzzTestCreatePartitionsMixedDupAuthQueueAndAdmin
+    fuzzTestCreatePartitionsThrottling
+    fuzzTestCreatePartitionsForwardedInnerRequest
+)
+
+# handleCreateTokenRequest / handleCreateTokenRequestZk fuzz targets (HandleCreateTokenRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+CREATE_DELEGATION_TOKEN_TESTS=(
+    fuzzTestCreateTokenRequestNotAllowedPlaintext
+    fuzzTestCreateTokenRequestAuthorizationFailedDifferentOwner
+    fuzzTestCreateTokenRequestInvalidRenewerPrincipalType
+    fuzzTestCreateTokenRequestZkDelegationTokenManagerSuccess
+    fuzzTestCreateTokenRequestZkDelegationTokenManagerReturnsError
+    fuzzTestCreateTokenRequestZkMigrationInactiveController
+    fuzzTestCreateTokenRequestThrottledResponse
+    fuzzTestCreateTokenRequestForwardedInnerRequest
+)
+
+# handleRenewTokenRequest / handleRenewTokenRequestZk fuzz targets (HandleRenewTokenRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+RENEW_DELEGATION_TOKEN_TESTS=(
+    fuzzTestRenewTokenRequestNotAllowedPlaintext
+    fuzzTestRenewTokenRequestZkDelegationTokenManagerSuccess
+    fuzzTestRenewTokenRequestZkDelegationTokenManagerReturnsError
+    fuzzTestRenewTokenRequestZkMigrationInactiveController
+    fuzzTestRenewTokenRequestThrottledResponse
+    fuzzTestRenewTokenRequestForwardedInnerRequest
+)
+
+# handleExpireTokenRequest / handleExpireTokenRequestZk fuzz targets (HandleExpireTokenRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+EXPIRE_DELEGATION_TOKEN_TESTS=(
+    fuzzTestExpireTokenRequestNotAllowedPlaintext
+    fuzzTestExpireTokenRequestZkDelegationTokenManagerSuccess
+    fuzzTestExpireTokenRequestZkDelegationTokenManagerReturnsError
+    fuzzTestExpireTokenRequestZkMigrationInactiveController
+    fuzzTestExpireTokenRequestThrottledResponse
+    fuzzTestExpireTokenRequestForwardedInnerRequest
+)
+
+# handleDescribeTokensRequest fuzz targets (HandleDescribeTokensRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DESCRIBE_DELEGATION_TOKEN_TESTS=(
+    fuzzTestDescribeTokensRequestNotAllowedPlaintext
+    fuzzTestDescribeTokensRequestAuthDisabled
+    fuzzTestDescribeTokensRequestOwnersListExplicitlyEmpty
+    fuzzTestDescribeTokensRequestOwnersNullGetTokens
+    fuzzTestDescribeTokensRequestWithOwnersReturnsTokens
+    fuzzTestDescribeTokensRequestThrottledResponse
+    fuzzTestDescribeTokensRequestForwardedInnerRequest
+)
+
 # handleCreateAcls / AclApis.handleCreateAcls fuzz targets (HandleCreateAclsRequestFuzzTest,
 # maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
 CREATE_ACLS_TESTS=(
@@ -315,6 +415,78 @@ ALTER_CONFIGS_TESTS=(
     fuzzTestAlterConfigsThrottledResponse
     fuzzTestAlterConfigsZkForwardedInnerEnvelope
     fuzzTestAlterConfigsZkAdminManagerReturnsError
+)
+
+# handleDescribeConfigsRequest fuzz targets (HandleDescribeConfigsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DESCRIBE_CONFIGS_TESTS=(
+    fuzzTestDescribeConfigsEmptyResources
+    fuzzTestDescribeConfigsTopicAuthorizedKnown
+    fuzzTestDescribeConfigsTopicAuthorizedUnknown
+    fuzzTestDescribeConfigsTopicAuthorizationDenied
+    fuzzTestDescribeConfigsTopicInvalidNameHandled
+    fuzzTestDescribeConfigsClusterDeniedForBroker
+    fuzzTestDescribeConfigsBrokerClusterWideAndPerBroker
+    fuzzTestDescribeConfigsBrokerWrongId
+    fuzzTestDescribeConfigsBrokerNonIntegerId
+    fuzzTestDescribeConfigsBrokerLoggerEmptyName
+    fuzzTestDescribeConfigsBrokerLoggerWrongBrokerId
+    fuzzTestDescribeConfigsBrokerLoggerMatchingBrokerId
+    fuzzTestDescribeConfigsClientMetricsEmptyName
+    fuzzTestDescribeConfigsClientMetricsWithRepository
+    fuzzTestDescribeConfigsMixedTopicDeniedAndAllowed
+    fuzzTestDescribeConfigsThrottledResponse
+    fuzzTestDescribeConfigsForwardedInnerRequest
+    fuzzTestDescribeConfigsUnknownResourceTypeThrows
+    fuzzTestDescribeConfigsNoAuthorizerSecurityDisabled
+)
+
+# handleDescribeLogDirsRequest fuzz targets (HandleDescribeLogDirsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+DESCRIBE_LOG_DIRS_TESTS=(
+    fuzzTestDescribeLogDirsClusterDescribeDenied
+    fuzzTestDescribeLogDirsAllTopicPartitions
+    fuzzTestDescribeLogDirsSpecificSingleTopicMultiplePartitions
+    fuzzTestDescribeLogDirsSpecificMultiTopic
+    fuzzTestDescribeLogDirsSpecificTopicEmptyPartitionList
+    fuzzTestDescribeLogDirsNoAuthorizerAllPartitions
+    fuzzTestDescribeLogDirsThrottledResponse
+    fuzzTestDescribeLogDirsForwardedInnerRequest
+    fuzzTestDescribeLogDirsAllPartitionsNoLogs
+)
+
+# handleSaslHandshakeRequest fuzz targets (HandleSaslHandshakeRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+SASL_HANDSHAKE_TESTS=(
+    fuzzTestSaslHandshakeIllegalStateRandomVersionAndMechanism
+    fuzzTestSaslHandshakeIllegalStateEmptyMechanism
+    fuzzTestSaslHandshakeVerifiedIllegalStateResponse
+    fuzzTestSaslHandshakeThrottledResponse
+    fuzzTestSaslHandshakeForwardedInnerRequest
+)
+
+# handleSaslAuthenticateRequest fuzz targets (HandleSaslAuthenticateRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+SASL_AUTHENTICATE_TESTS=(
+    fuzzTestSaslAuthenticateIllegalStateRandomVersionAndAuthBytes
+    fuzzTestSaslAuthenticateIllegalStateEmptyAuthBytes
+    fuzzTestSaslAuthenticateVerifiedIllegalStateResponse
+    fuzzTestSaslAuthenticateThrottledResponse
+    fuzzTestSaslAuthenticateForwardedInnerRequest
+)
+
+# handleAlterReplicaLogDirsRequest fuzz targets (HandleAlterReplicaLogDirsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+ALTER_REPLICA_LOG_DIRS_TESTS=(
+    fuzzTestAlterReplicaLogDirsClusterAuthorizationDenied
+    fuzzTestAlterReplicaLogDirsEmptyDirsAuthorized
+    fuzzTestAlterReplicaLogDirsSingleTopicMultiplePartitions
+    fuzzTestAlterReplicaLogDirsMultipleTopicsGrouped
+    fuzzTestAlterReplicaLogDirsTwoDirectories
+    fuzzTestAlterReplicaLogDirsNoAuthorizer
+    fuzzTestAlterReplicaLogDirsThrottledResponse
+    fuzzTestAlterReplicaLogDirsForwardedInnerRequest
+    fuzzTestAlterReplicaLogDirsDuplicateTopicPartitionLastDirWins
 )
 
 # handleDeleteTopicsRequest fuzz targets (HandleDeleteTopicsRequestFuzzTest,
@@ -520,6 +692,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${LEAVE_GROUP_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleLeaveGroupRequestFuzzTest" "$t"
     done
+    for t in "${DELETE_GROUPS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDeleteGroupsRequestFuzzTest" "$t"
+    done
     for t in "${DESCRIBE_GROUPS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDescribeGroupsRequestFuzzTest" "$t"
     done
@@ -541,6 +716,21 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${CREATE_TOPICS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleCreateTopicsRequestFuzzTest" "$t"
     done
+    for t in "${CREATE_PARTITIONS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleCreatePartitionsRequestFuzzTest" "$t"
+    done
+    for t in "${CREATE_DELEGATION_TOKEN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleCreateTokenRequestFuzzTest" "$t"
+    done
+    for t in "${RENEW_DELEGATION_TOKEN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleRenewTokenRequestFuzzTest" "$t"
+    done
+    for t in "${EXPIRE_DELEGATION_TOKEN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleExpireTokenRequestFuzzTest" "$t"
+    done
+    for t in "${DESCRIBE_DELEGATION_TOKEN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDescribeTokensRequestFuzzTest" "$t"
+    done
     for t in "${CREATE_ACLS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleCreateAclsRequestFuzzTest" "$t"
     done
@@ -549,6 +739,21 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${ALTER_CONFIGS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleAlterConfigsRequestFuzzTest" "$t"
+    done
+    for t in "${DESCRIBE_CONFIGS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDescribeConfigsRequestFuzzTest" "$t"
+    done
+    for t in "${DESCRIBE_LOG_DIRS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDescribeLogDirsRequestFuzzTest" "$t"
+    done
+    for t in "${SASL_AUTHENTICATE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleSaslAuthenticateRequestFuzzTest" "$t"
+    done
+    for t in "${SASL_HANDSHAKE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleSaslHandshakeRequestFuzzTest" "$t"
+    done
+    for t in "${ALTER_REPLICA_LOG_DIRS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleAlterReplicaLogDirsRequestFuzzTest" "$t"
     done
     for t in "${DELETE_TOPICS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDeleteTopicsRequestFuzzTest" "$t"
@@ -579,6 +784,54 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${TOPIC_METADATA_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleTopicMetadataRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "offset-fetch" ]]; then
+    for t in "${OFFSET_FETCH_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "describe-configs" ]]; then
+    for t in "${DESCRIBE_CONFIGS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDescribeConfigsRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "describe-log-dirs" ]]; then
+    for t in "${DESCRIBE_LOG_DIRS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDescribeLogDirsRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "sasl-authenticate" ]]; then
+    for t in "${SASL_AUTHENTICATE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleSaslAuthenticateRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "sasl-handshake" ]]; then
+    for t in "${SASL_HANDSHAKE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleSaslHandshakeRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "alter-replica-log-dirs" ]]; then
+    for t in "${ALTER_REPLICA_LOG_DIRS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleAlterReplicaLogDirsRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "create-partitions" ]]; then
+    for t in "${CREATE_PARTITIONS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleCreatePartitionsRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "create-delegation-token" ]]; then
+    for t in "${CREATE_DELEGATION_TOKEN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleCreateTokenRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "renew-delegation-token" ]]; then
+    for t in "${RENEW_DELEGATION_TOKEN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleRenewTokenRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "expire-delegation-token" ]]; then
+    for t in "${EXPIRE_DELEGATION_TOKEN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleExpireTokenRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "describe-delegation-token" ]]; then
+    for t in "${DESCRIBE_DELEGATION_TOKEN_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDescribeTokensRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "delete-groups" ]]; then
+    for t in "${DELETE_GROUPS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleDeleteGroupsRequestFuzzTest" "$t"
     done
 fi
 
@@ -625,7 +878,21 @@ TARGETS = [
     ("KafkaApis.scala",          "handleFetchRequest",                    757, 1077),
     ("KafkaApis.scala",          "handleDescribeTopicPartitionsRequest", 1445, 1461),
     ("KafkaApis.scala",          "handleHeartbeatRequest",               1924, 1948),
+    ("KafkaApis.scala",          "handleDeleteGroupsRequest",            1886, 1922),
     ("KafkaApis.scala",          "handleOffsetFetchRequest",             1466, 1630),
+    ("KafkaApis.scala",          "handleSaslHandshakeRequest",           1970, 1973),
+    ("KafkaApis.scala",          "handleSaslAuthenticateRequest",       1975, 1980),
+    ("KafkaApis.scala",          "handleCreatePartitionsRequest",        2100, 2148),
+    ("KafkaApis.scala",          "handleCreateTokenRequest",              3162, 3189),
+    ("KafkaApis.scala",          "handleCreateTokenRequestZk",           3192, 3229),
+    ("KafkaApis.scala",          "handleRenewTokenRequest",               3232, 3243),
+    ("KafkaApis.scala",          "handleRenewTokenRequestZk",            3245, 3276),
+    ("KafkaApis.scala",          "handleExpireTokenRequest",              3278, 3289),
+    ("KafkaApis.scala",          "handleExpireTokenRequestZk",           3291, 3322),
+    ("KafkaApis.scala",          "handleDescribeTokensRequest",          3324, 3358),
+    ("KafkaApis.scala",          "handleDescribeConfigsRequest",         3111, 3115),
+    ("KafkaApis.scala",          "handleAlterReplicaLogDirsRequest",     3117, 3137),
+    ("KafkaApis.scala",          "handleDescribeLogDirsRequest",         3139, 3160),
     ("RequestHandlerHelper.scala", "sendMaybeThrottle",                   112,  122),
 ]
 

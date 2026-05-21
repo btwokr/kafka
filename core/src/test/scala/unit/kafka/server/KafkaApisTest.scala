@@ -178,7 +178,8 @@ class KafkaApisTest extends Logging {
                       enableForwarding: Boolean = false,
                       configRepository: ConfigRepository = new MockConfigRepository(),
                       raftSupport: Boolean = false,
-                      overrideProperties: Map[String, String] = Map.empty): KafkaApis = {
+                      overrideProperties: Map[String, String] = Map.empty,
+                      tokenManager: DelegationTokenManager = null): KafkaApis = {
     val properties = if (raftSupport) {
       val properties = TestUtils.createBrokerConfig(brokerId, "")
       properties.put(KRaftConfigs.NODE_ID_CONFIG, brokerId.toString)
@@ -248,7 +249,7 @@ class KafkaApisTest extends Logging {
       brokerTopicStats = brokerTopicStats,
       clusterId = clusterId,
       time = time,
-      tokenManager = null,
+      tokenManager = tokenManager,
       apiVersionManager = apiVersionManager,
       clientMetricsManager = clientMetricsManagerOpt)
   }
