@@ -43,7 +43,8 @@
 # `FUZZ_SUITE=push-telemetry` for `HandlePushTelemetryRequestFuzzTest`, or
 # `FUZZ_SUITE=list-client-metrics-resources` for `HandleListClientMetricsResourcesRequestFuzzTest`, or
 # `FUZZ_SUITE=share-group-heartbeat` for `HandleShareGroupHeartbeatRequestFuzzTest`, or
-# `FUZZ_SUITE=share-group-describe` for `HandleShareGroupDescribeRequestFuzzTest`.
+# `FUZZ_SUITE=share-group-describe` for `HandleShareGroupDescribeRequestFuzzTest`, or
+# `FUZZ_SUITE=share-fetch` for `HandleShareFetchRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -82,11 +83,12 @@ esac
 #   FUZZ_SUITE=list-client-metrics-resources HandleListClientMetricsResourcesRequestFuzzTest only
 #   FUZZ_SUITE=share-group-heartbeat HandleShareGroupHeartbeatRequestFuzzTest only
 #   FUZZ_SUITE=share-group-describe HandleShareGroupDescribeRequestFuzzTest only
+#   FUZZ_SUITE=share-fetch HandleShareFetchRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions|push-telemetry|list-client-metrics-resources|share-group-heartbeat|share-group-describe) ;;
+    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions|push-telemetry|list-client-metrics-resources|share-group-heartbeat|share-group-describe|share-fetch) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions|push-telemetry|list-client-metrics-resources|share-group-heartbeat|share-group-describe)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions|push-telemetry|list-client-metrics-resources|share-group-heartbeat|share-group-describe|share-fetch)" >&2
         exit 2
         ;;
 esac
@@ -734,6 +736,15 @@ SHARE_GROUP_DESCRIBE_TESTS=(
     fuzzTestShareGroupDescribeCoordinatorSuccessForwardedThrottled
 )
 
+# handleShareFetchRequest fuzz targets (HandleShareFetchRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+SHARE_FETCH_TESTS=(
+    fuzzTestShareFetchUnsupportedVersionKRaft
+    fuzzTestShareFetchUnsupportedVersionZk
+    fuzzTestShareFetchUnsupportedThrottled
+    fuzzTestShareFetchUnsupportedForwarded
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -885,6 +896,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${SHARE_GROUP_DESCRIBE_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleShareGroupDescribeRequestFuzzTest" "$t"
     done
+    for t in "${SHARE_FETCH_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleShareFetchRequestFuzzTest" "$t"
+    done
 elif [[ "$FUZZ_SUITE" == "offset-fetch" ]]; then
     for t in "${OFFSET_FETCH_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
@@ -953,6 +967,10 @@ elif [[ "$FUZZ_SUITE" == "share-group-describe" ]]; then
     for t in "${SHARE_GROUP_DESCRIBE_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleShareGroupDescribeRequestFuzzTest" "$t"
     done
+elif [[ "$FUZZ_SUITE" == "share-fetch" ]]; then
+    for t in "${SHARE_FETCH_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleShareFetchRequestFuzzTest" "$t"
+    done
 fi
 
 
@@ -1001,6 +1019,8 @@ TARGETS = [
     ("KafkaApis.scala",          "handlePushTelemetryRequest", 3950, 3965),
     ("KafkaApis.scala",          "handleListClientMetricsResources", 3967, 3986),
     ("KafkaApis.scala",          "handleShareGroupHeartbeat", 3988, 4010),
+    ("KafkaApis.scala",          "handleShareGroupDescribe", 4012, 4052),
+    ("KafkaApis.scala",          "handleShareFetchRequest", 4054, 4059),
     ("KafkaApis.scala",          "handleHeartbeatRequest",               1924, 1948),
     ("KafkaApis.scala",          "handleDeleteGroupsRequest",            1886, 1922),
     ("KafkaApis.scala",          "handleOffsetFetchRequest",             1466, 1630),
