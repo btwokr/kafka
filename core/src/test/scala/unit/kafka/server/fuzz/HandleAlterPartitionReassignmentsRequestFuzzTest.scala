@@ -49,8 +49,8 @@ import scala.jdk.CollectionConverters._
 class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
 
   private def safeString(data: FuzzedDataProvider, fallback: String): String = {
-    val s = data.consumeString(48)
-    if (s == null || s.isEmpty) fallback else s
+    val consumedString = data.consumeString(48)
+    if (consumedString == null || consumedString.isEmpty) fallback else consumedString
   }
 
   private def topicSafe(data: FuzzedDataProvider, fallback: String): String = {
@@ -88,9 +88,9 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
     val auth = mock(classOf[Authorizer])
     when(auth.authorize(any(), any[util.List[Action]])).thenAnswer(invocation => {
       val actions = invocation.getArgument(1, classOf[util.List[Action]])
-      val out = new util.ArrayList[AuthorizationResult]()
-      (0 until actions.size()).foreach(_ => out.add(AuthorizationResult.ALLOWED))
-      out
+      val authorizationResults = new util.ArrayList[AuthorizationResult]()
+      (0 until actions.size()).foreach(_ => authorizationResults.add(AuthorizationResult.ALLOWED))
+      authorizationResults
     })
     auth
   }
@@ -100,34 +100,34 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
     val auth = mock(classOf[Authorizer])
     when(auth.authorize(any(), any[util.List[Action]])).thenAnswer(invocation => {
       val actions = invocation.getArgument(1, classOf[util.List[Action]])
-      val out = new util.ArrayList[AuthorizationResult]()
+      val authorizationResults = new util.ArrayList[AuthorizationResult]()
       actions.asScala.foreach { action =>
         if (action.operation == AclOperation.ALTER &&
           action.resourcePattern.resourceType == ResourceType.CLUSTER) {
-          out.add(AuthorizationResult.DENIED)
+          authorizationResults.add(AuthorizationResult.DENIED)
         } else {
-          out.add(AuthorizationResult.ALLOWED)
+          authorizationResults.add(AuthorizationResult.ALLOWED)
         }
       }
-      out
+      authorizationResults
     })
     auth
   }
 
   private def validateKRaftAlwaysForwardMessage(e: UnsupportedVersionException): Unit = {
     val prefix = "Should always be forwarded to the Active Controller when using a Raft-based metadata quorum: "
-    val m = e.getMessage
-    if (m == null || !m.startsWith(prefix)) throw e
-    if (!m.contains(ApiKeys.ALTER_PARTITION_REASSIGNMENTS.toString)) throw e
+    val exceptionMessage = e.getMessage
+    if (exceptionMessage == null || !exceptionMessage.startsWith(prefix)) throw e
+    if (!exceptionMessage.contains(ApiKeys.ALTER_PARTITION_REASSIGNMENTS.toString)) throw e
   }
 
   private def validateClusterAuthDeniedMessage(e: ClusterAuthorizationException): Unit = {
-    val m = e.getMessage
-    if (m == null || !m.contains("is not authorized")) throw e
+    val exceptionMessage = e.getMessage
+    if (exceptionMessage == null || !exceptionMessage.contains("is not authorized")) throw e
   }
 
-  private def intReplicaList(b0: Int, b1: Int): util.List[Integer] =
-    util.Arrays.asList(Integer.valueOf(b0), Integer.valueOf(b1))
+  private def intReplicaList(replicaBrokerId0: Int, replicaBrokerId1: Int): util.List[Integer] =
+    util.Arrays.asList(Integer.valueOf(replicaBrokerId0), Integer.valueOf(replicaBrokerId1))
 
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestAlterPartitionReassignmentsKRaftThrows(data: FuzzedDataProvider): Unit = {
@@ -207,8 +207,8 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
     stubNoThrottle()
 
     doAnswer(invocation => {
-      val cb = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
-      cb(Left(Map.empty))
+      val reassignmentsCompletionCallback = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
+      reassignmentsCompletionCallback(Left(Map.empty))
       null
     }).when(controller).alterPartitionReassignments(any(), any())
 
@@ -231,27 +231,27 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
       ApiKeys.ALTER_PARTITION_REASSIGNMENTS.latestVersion())
     val topic = topicSafe(data, "fuzz-apr-one-topic")
     val partition = data.consumeInt(0, 7)
-    val r0 = data.consumeInt(0, 5)
-    val r1 = data.consumeInt(0, 5)
+    val replicaBrokerId0 = data.consumeInt(0, 5)
+    val replicaBrokerId1 = data.consumeInt(0, 5)
 
     resetZkHarness()
     stubNoThrottle()
 
     doAnswer(invocation => {
-      val parts = invocation.getArgument(0).asInstanceOf[Map[TopicPartition, Option[Seq[Int]]]]
-      val cb = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
-      val tp = new TopicPartition(topic, partition)
-      assertEquals(Some(Seq(r0, r1)), parts.get(tp).flatten)
-      cb(Left(Map(tp -> ApiError.NONE)))
+      val reassignmentsByTopicPartition = invocation.getArgument(0).asInstanceOf[Map[TopicPartition, Option[Seq[Int]]]]
+      val reassignmentsCompletionCallback = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
+      val topicPartition = new TopicPartition(topic, partition)
+      assertEquals(Some(Seq(replicaBrokerId0, replicaBrokerId1)), reassignmentsByTopicPartition.get(topicPartition).flatten)
+      reassignmentsCompletionCallback(Left(Map(topicPartition -> ApiError.NONE)))
       null
     }).when(controller).alterPartitionReassignments(any(), any())
 
-    val topicData = new ReassignableTopic()
+    val reassignableTopic = new ReassignableTopic()
       .setName(topic)
       .setPartitions(Collections.singletonList(
-        new ReassignablePartition().setPartitionIndex(partition).setReplicas(intReplicaList(r0, r1))))
+        new ReassignablePartition().setPartitionIndex(partition).setReplicas(intReplicaList(replicaBrokerId0, replicaBrokerId1))))
     val reqData = new AlterPartitionReassignmentsRequestData()
-    reqData.topics.add(topicData)
+    reqData.topics.add(reassignableTopic)
     val built = new AlterPartitionReassignmentsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
 
@@ -261,11 +261,11 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
       val response = verifyNoThrottling[AlterPartitionReassignmentsResponse](request)
       assertEquals(Errors.NONE.code, response.data.errorCode)
       assertEquals(1, response.data.responses.size)
-      val tr = response.data.responses.get(0)
-      assertEquals(topic, tr.name)
-      assertEquals(1, tr.partitions.size)
-      assertEquals(partition, tr.partitions.get(0).partitionIndex)
-      assertEquals(Errors.NONE.code, tr.partitions.get(0).errorCode)
+      val reassignableTopicResponse = response.data.responses.get(0)
+      assertEquals(topic, reassignableTopicResponse.name)
+      assertEquals(1, reassignableTopicResponse.partitions.size)
+      assertEquals(partition, reassignableTopicResponse.partitions.get(0).partitionIndex)
+      assertEquals(Errors.NONE.code, reassignableTopicResponse.partitions.get(0).errorCode)
     } finally kafkaApis.close()
   }
 
@@ -281,20 +281,20 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
     stubNoThrottle()
 
     doAnswer(invocation => {
-      val parts = invocation.getArgument(0).asInstanceOf[Map[TopicPartition, Option[Seq[Int]]]]
-      val cb = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
-      val tp = new TopicPartition(topic, partition)
-      assertEquals(None, parts.get(tp).flatten)
-      cb(Left(Map(tp -> ApiError.NONE)))
+      val reassignmentsByTopicPartition = invocation.getArgument(0).asInstanceOf[Map[TopicPartition, Option[Seq[Int]]]]
+      val reassignmentsCompletionCallback = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
+      val topicPartition = new TopicPartition(topic, partition)
+      assertEquals(None, reassignmentsByTopicPartition.get(topicPartition).flatten)
+      reassignmentsCompletionCallback(Left(Map(topicPartition -> ApiError.NONE)))
       null
     }).when(controller).alterPartitionReassignments(any(), any())
 
-    val topicData = new ReassignableTopic()
+    val reassignableTopic = new ReassignableTopic()
       .setName(topic)
       .setPartitions(Collections.singletonList(
         new ReassignablePartition().setPartitionIndex(partition).setReplicas(null)))
     val reqData = new AlterPartitionReassignmentsRequestData()
-    reqData.topics.add(topicData)
+    reqData.topics.add(reassignableTopic)
     val built = new AlterPartitionReassignmentsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
 
@@ -318,17 +318,17 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
     stubNoThrottle()
 
     doAnswer(invocation => {
-      val cb = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
-      cb(Right(new ApiError(Errors.NOT_CONTROLLER, "fuzz-controller")))
+      val reassignmentsCompletionCallback = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
+      reassignmentsCompletionCallback(Right(new ApiError(Errors.NOT_CONTROLLER, "fuzz-controller")))
       null
     }).when(controller).alterPartitionReassignments(any(), any())
 
-    val topicData = new ReassignableTopic()
+    val reassignableTopic = new ReassignableTopic()
       .setName(topic)
       .setPartitions(Collections.singletonList(
         new ReassignablePartition().setPartitionIndex(partition).setReplicas(intReplicaList(0, 1))))
     val reqData = new AlterPartitionReassignmentsRequestData()
-    reqData.topics.add(topicData)
+    reqData.topics.add(reassignableTopic)
     val built = new AlterPartitionReassignmentsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
 
@@ -337,9 +337,9 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
       kafkaApis.handleAlterPartitionReassignmentsRequest(request)
       val response = verifyNoThrottling[AlterPartitionReassignmentsResponse](request)
       assertEquals(Errors.NOT_CONTROLLER.code, response.data.errorCode)
-      val msg = response.data.errorMessage
-      if (msg == null || !msg.contains("fuzz-controller")) {
-        throw new AssertionError(s"unexpected top-level error message: $msg")
+      val topLevelErrorMessage = response.data.errorMessage
+      if (topLevelErrorMessage == null || !topLevelErrorMessage.contains("fuzz-controller")) {
+        throw new AssertionError(s"unexpected top-level error message: $topLevelErrorMessage")
       }
     } finally kafkaApis.close()
   }
@@ -351,17 +351,17 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
       ApiKeys.ALTER_PARTITION_REASSIGNMENTS.latestVersion())
     val topicA = topicSafe(data, "fuzz-apr-err-topic-a")
     val topicB = topicSafe(data, "fuzz-apr-err-topic-b")
-    val pA = data.consumeInt(0, 2)
-    val pB = data.consumeInt(0, 2)
+    val partitionIndexA = data.consumeInt(0, 2)
+    val partitionIndexB = data.consumeInt(0, 2)
 
     resetZkHarness()
     stubNoThrottle()
 
     doAnswer(invocation => {
-      val cb = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
-      cb(Left(Map(
-        new TopicPartition(topicA, pA) -> new ApiError(Errors.UNKNOWN_TOPIC_OR_PARTITION),
-        new TopicPartition(topicB, pB) -> new ApiError(Errors.NOT_LEADER_OR_FOLLOWER, "fuzz-nlof")
+      val reassignmentsCompletionCallback = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
+      reassignmentsCompletionCallback(Left(Map(
+        new TopicPartition(topicA, partitionIndexA) -> new ApiError(Errors.UNKNOWN_TOPIC_OR_PARTITION),
+        new TopicPartition(topicB, partitionIndexB) -> new ApiError(Errors.NOT_LEADER_OR_FOLLOWER, "fuzz-nlof")
       )))
       null
     }).when(controller).alterPartitionReassignments(any(), any())
@@ -370,11 +370,11 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
     reqData.topics.add(new ReassignableTopic()
       .setName(topicA)
       .setPartitions(Collections.singletonList(
-        new ReassignablePartition().setPartitionIndex(pA).setReplicas(intReplicaList(0, 1)))))
+        new ReassignablePartition().setPartitionIndex(partitionIndexA).setReplicas(intReplicaList(0, 1)))))
     reqData.topics.add(new ReassignableTopic()
       .setName(topicB)
       .setPartitions(Collections.singletonList(
-        new ReassignablePartition().setPartitionIndex(pB).setReplicas(intReplicaList(1, 0)))))
+        new ReassignablePartition().setPartitionIndex(partitionIndexB).setReplicas(intReplicaList(1, 0)))))
 
     val built = new AlterPartitionReassignmentsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
@@ -385,12 +385,12 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
       val response = verifyNoThrottling[AlterPartitionReassignmentsResponse](request)
       assertEquals(0, response.data.errorCode)
       assertEquals(2, response.data.responses.size)
-      val byName = response.data.responses.asScala.map(tr => tr.name -> tr).toMap
-      assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, byName(topicA).partitions.get(0).errorCode)
-      assertEquals(Errors.NOT_LEADER_OR_FOLLOWER.code, byName(topicB).partitions.get(0).errorCode)
-      val m = byName(topicB).partitions.get(0).errorMessage
-      if (m == null || !m.contains("fuzz-nlof")) {
-        throw new AssertionError(s"unexpected partition error message: $m")
+      val topicResponsesByName = response.data.responses.asScala.map(topicResponse => topicResponse.name -> topicResponse).toMap
+      assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, topicResponsesByName(topicA).partitions.get(0).errorCode)
+      assertEquals(Errors.NOT_LEADER_OR_FOLLOWER.code, topicResponsesByName(topicB).partitions.get(0).errorCode)
+      val partitionErrorMessage = topicResponsesByName(topicB).partitions.get(0).errorMessage
+      if (partitionErrorMessage == null || !partitionErrorMessage.contains("fuzz-nlof")) {
+        throw new AssertionError(s"unexpected partition error message: $partitionErrorMessage")
       }
     } finally kafkaApis.close()
   }
@@ -402,20 +402,20 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
       ApiKeys.ALTER_PARTITION_REASSIGNMENTS.latestVersion())
     val topicA = topicSafe(data, "fuzz-apr-mix-topic-a")
     val topicB = topicSafe(data, "fuzz-apr-mix-topic-b")
-    val pA = data.consumeInt(0, 1)
-    val pB = data.consumeInt(0, 1)
+    val partitionIndexA = data.consumeInt(0, 1)
+    val partitionIndexB = data.consumeInt(0, 1)
 
     resetZkHarness()
     stubNoThrottle()
 
     doAnswer(invocation => {
-      val parts = invocation.getArgument(0).asInstanceOf[Map[TopicPartition, Option[Seq[Int]]]]
-      val cb = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
-      val tpa = new TopicPartition(topicA, pA)
-      val tpb = new TopicPartition(topicB, pB)
-      assertEquals(Some(Seq(0, 2)), parts.get(tpa).flatten)
-      assertEquals(None, parts.get(tpb).flatten)
-      cb(Left(Map(tpa -> ApiError.NONE, tpb -> ApiError.NONE)))
+      val reassignmentsByTopicPartition = invocation.getArgument(0).asInstanceOf[Map[TopicPartition, Option[Seq[Int]]]]
+      val reassignmentsCompletionCallback = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
+      val topicPartitionA = new TopicPartition(topicA, partitionIndexA)
+      val topicPartitionB = new TopicPartition(topicB, partitionIndexB)
+      assertEquals(Some(Seq(0, 2)), reassignmentsByTopicPartition.get(topicPartitionA).flatten)
+      assertEquals(None, reassignmentsByTopicPartition.get(topicPartitionB).flatten)
+      reassignmentsCompletionCallback(Left(Map(topicPartitionA -> ApiError.NONE, topicPartitionB -> ApiError.NONE)))
       null
     }).when(controller).alterPartitionReassignments(any(), any())
 
@@ -423,11 +423,11 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
     reqData.topics.add(new ReassignableTopic()
       .setName(topicA)
       .setPartitions(Collections.singletonList(
-        new ReassignablePartition().setPartitionIndex(pA).setReplicas(intReplicaList(0, 2)))))
+        new ReassignablePartition().setPartitionIndex(partitionIndexA).setReplicas(intReplicaList(0, 2)))))
     reqData.topics.add(new ReassignableTopic()
       .setName(topicB)
       .setPartitions(Collections.singletonList(
-        new ReassignablePartition().setPartitionIndex(pB).setReplicas(null))))
+        new ReassignablePartition().setPartitionIndex(partitionIndexB).setReplicas(null))))
 
     val built = new AlterPartitionReassignmentsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
@@ -454,17 +454,17 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
     stubClientThrottle(throttleMs)
 
     doAnswer(invocation => {
-      val cb = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
-      cb(Left(Map(new TopicPartition(topic, partition) -> ApiError.NONE)))
+      val reassignmentsCompletionCallback = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
+      reassignmentsCompletionCallback(Left(Map(new TopicPartition(topic, partition) -> ApiError.NONE)))
       null
     }).when(controller).alterPartitionReassignments(any(), any())
 
-    val topicData = new ReassignableTopic()
+    val reassignableTopic = new ReassignableTopic()
       .setName(topic)
       .setPartitions(Collections.singletonList(
         new ReassignablePartition().setPartitionIndex(partition).setReplicas(intReplicaList(0, 1))))
     val reqData = new AlterPartitionReassignmentsRequestData()
-    reqData.topics.add(topicData)
+    reqData.topics.add(reassignableTopic)
     val built = new AlterPartitionReassignmentsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
 
@@ -492,17 +492,17 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
       any[RequestChannel.Request](), anyLong)).thenReturn(throttleMs)
 
     doAnswer(invocation => {
-      val cb = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
-      cb(Left(Map(new TopicPartition(topic, partition) -> ApiError.NONE)))
+      val reassignmentsCompletionCallback = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
+      reassignmentsCompletionCallback(Left(Map(new TopicPartition(topic, partition) -> ApiError.NONE)))
       null
     }).when(controller).alterPartitionReassignments(any(), any())
 
-    val topicData = new ReassignableTopic()
+    val reassignableTopic = new ReassignableTopic()
       .setName(topic)
       .setPartitions(Collections.singletonList(
         new ReassignablePartition().setPartitionIndex(partition).setReplicas(intReplicaList(1, 0))))
     val reqData = new AlterPartitionReassignmentsRequestData()
-    reqData.topics.add(topicData)
+    reqData.topics.add(reassignableTopic)
     val built = new AlterPartitionReassignmentsRequest.Builder(reqData).build(version)
     val request = buildForwardedRequest(built)
 
@@ -519,30 +519,31 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
     val version = data.consumeShort(
       ApiKeys.ALTER_PARTITION_REASSIGNMENTS.oldestVersion(),
       ApiKeys.ALTER_PARTITION_REASSIGNMENTS.latestVersion())
-    val partition = data.consumeInt(0, 3)
+    val partitionIndex = data.consumeInt(0, 3)
     val splitSize = data.consumeInt(1, 64)
     val tailBytes = data.consumeRemainingAsBytes()
-    val rawLen = if (tailBytes == null || tailBytes.isEmpty) 0 else Math.min(splitSize, tailBytes.length)
-    val rawTopic =
-      if (rawLen == 0) ""
-      else new String(tailBytes, 0, rawLen, StandardCharsets.UTF_8)
-    val topic = topicFromRaw(rawTopic, "fuzz-apr-tail-topic")
+    val rawTopicByteLength = if (tailBytes == null || tailBytes.isEmpty) 0 else Math.min(splitSize, tailBytes.length)
+    val rawTopicPrefix =
+      if (rawTopicByteLength == 0) ""
+      else new String(tailBytes, 0, rawTopicByteLength, StandardCharsets.UTF_8)
+    val sanitizedTopicName = topicFromRaw(rawTopicPrefix, "fuzz-apr-tail-topic")
 
     resetZkHarness()
     stubNoThrottle()
 
     doAnswer(invocation => {
-      val cb = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
-      cb(Left(Map(new TopicPartition(topic, partition) -> ApiError.NONE)))
+      val reassignmentsCompletionCallback = invocation.getArgument(1).asInstanceOf[Either[Map[TopicPartition, ApiError], ApiError] => Unit]
+      val topicPartition = new TopicPartition(sanitizedTopicName, partitionIndex)
+      reassignmentsCompletionCallback(Left(Map(topicPartition -> ApiError.NONE)))
       null
     }).when(controller).alterPartitionReassignments(any(), any())
 
-    val topicData = new ReassignableTopic()
-      .setName(topic)
+    val reassignableTopic = new ReassignableTopic()
+      .setName(sanitizedTopicName)
       .setPartitions(Collections.singletonList(
-        new ReassignablePartition().setPartitionIndex(partition).setReplicas(intReplicaList(0, 1))))
+        new ReassignablePartition().setPartitionIndex(partitionIndex).setReplicas(intReplicaList(0, 1))))
     val reqData = new AlterPartitionReassignmentsRequestData()
-    reqData.topics.add(topicData)
+    reqData.topics.add(reassignableTopic)
     val built = new AlterPartitionReassignmentsRequest.Builder(reqData).build(version)
     val request = buildRequest(built)
 
@@ -550,7 +551,7 @@ class HandleAlterPartitionReassignmentsRequestFuzzTest extends KafkaApisTest {
     try {
       kafkaApis.handleAlterPartitionReassignmentsRequest(request)
       val response = verifyNoThrottling[AlterPartitionReassignmentsResponse](request)
-      assertEquals(topic, response.data.responses.get(0).name)
+      assertEquals(sanitizedTopicName, response.data.responses.get(0).name)
     } finally kafkaApis.close()
   }
 }
