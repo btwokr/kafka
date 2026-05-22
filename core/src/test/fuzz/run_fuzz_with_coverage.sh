@@ -144,19 +144,12 @@ FETCH_TESTS=(
     fuzzTestFetchDownConversion
 )
 
-# handleDescribeTopicPartitionsRequest fuzz targets
-# (HandleDescribeTopicPartitionsRequestFuzzTest, maxDuration = 20s each)
+# handleDescribeTopicPartitionsRequest fuzz targets (ZK arm only;
+# HandleDescribeTopicPartitionsRequestFuzzTest, maxDuration = 20s each)
 DESCRIBE_TP_TESTS=(
     fuzzTestZkUnsupportedVersion
     fuzzTestZkUnsupportedVersionThrottled
     fuzzTestZkUnsupportedVersionForwarded
-    fuzzTestZkUnsupportedVersionManyTopicsFromFuzzTail
-    fuzzTestDescribeTopicPartitionsKRaftFetchAll
-    fuzzTestDescribeTopicPartitionsKRaftNamedTopics
-    fuzzTestDescribeTopicPartitionsKRaftTopicDescribeDenied
-    fuzzTestDescribeTopicPartitionsKRaftInvalidCursorTopicMissing
-    fuzzTestDescribeTopicPartitionsKRaftInvalidCursorNegativePartition
-    fuzzTestDescribeTopicPartitionsKRaftForwardedThrottled
 )
 
 # handleHeartbeatRequest fuzz targets (HandleHeartbeatRequestFuzzTest,
@@ -839,6 +832,10 @@ elif [[ "$FUZZ_SUITE" == "describe-delegation-token" ]]; then
 elif [[ "$FUZZ_SUITE" == "delete-groups" ]]; then
     for t in "${DELETE_GROUPS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDeleteGroupsRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "get-telemetry-subscriptions" ]]; then
+    for t in "${GET_TELEMETRY_SUBSCRIPTIONS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleGetTelemetrySubscriptionsRequestFuzzTest" "$t"
     done
 fi
 
