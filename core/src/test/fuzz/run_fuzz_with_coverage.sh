@@ -39,7 +39,8 @@
 # `FUZZ_SUITE=expire-delegation-token` for `HandleExpireTokenRequestFuzzTest`, or
 # `FUZZ_SUITE=describe-delegation-token` for `HandleDescribeTokensRequestFuzzTest`, or
 # `FUZZ_SUITE=delete-groups` for `HandleDeleteGroupsRequestFuzzTest`, or
-# `FUZZ_SUITE=elect-leaders` for `HandleElectLeadersRequestFuzzTest`.
+# `FUZZ_SUITE=elect-leaders` for `HandleElectLeadersRequestFuzzTest`, or
+# `FUZZ_SUITE=incremental-alter-configs` for `HandleIncrementalAlterConfigsRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -74,11 +75,12 @@ esac
 #   FUZZ_SUITE=describe-delegation-token HandleDescribeTokensRequestFuzzTest only
 #   FUZZ_SUITE=delete-groups           HandleDeleteGroupsRequestFuzzTest only
 #   FUZZ_SUITE=elect-leaders           HandleElectLeadersRequestFuzzTest only
+#   FUZZ_SUITE=incremental-alter-configs HandleIncrementalAlterConfigsRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch|elect-leaders|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups) ;;
+    all|offset-fetch|elect-leaders|incremental-alter-configs|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|elect-leaders|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|elect-leaders)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|elect-leaders|incremental-alter-configs|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|elect-leaders)" >&2
         exit 2
         ;;
 esac
@@ -432,6 +434,26 @@ ALTER_CONFIGS_TESTS=(
     fuzzTestAlterConfigsZkAdminManagerReturnsError
 )
 
+# handleIncrementalAlterConfigsRequest fuzz targets (HandleIncrementalAlterConfigsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+INCREMENTAL_ALTER_CONFIGS_TESTS=(
+    fuzzTestIncrementalAlterConfigsEmptyResources
+    fuzzTestIncrementalAlterConfigsBrokerLoggerValidateOnlyPreprocessed
+    fuzzTestIncrementalAlterConfigsPreprocessDuplicateResources
+    fuzzTestIncrementalAlterConfigsPreprocessNullConfigValue
+    fuzzTestIncrementalAlterConfigsPreprocessUnknownResourceType
+    fuzzTestIncrementalAlterConfigsPreprocessDuplicateConfigKeys
+    fuzzTestIncrementalAlterConfigsPreprocessBrokerWrongNodeId
+    fuzzTestIncrementalAlterConfigsZkTopicMixedAuthorization
+    fuzzTestIncrementalAlterConfigsBrokerLoggerClusterAuthDenied
+    fuzzTestIncrementalAlterConfigsZkForwardWhenControllerIsKRaft
+    fuzzTestIncrementalAlterConfigsKRaftBrokerForwards
+    fuzzTestIncrementalAlterConfigsForwardedInnerProcessesLocally
+    fuzzTestIncrementalAlterConfigsThrottledResponse
+    fuzzTestIncrementalAlterConfigsClientMetricsAuthorized
+    fuzzTestIncrementalAlterConfigsTopicNamesFromRemainingBytes
+)
+
 # handleDescribeConfigsRequest fuzz targets (HandleDescribeConfigsRequestFuzzTest,
 # maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
 DESCRIBE_CONFIGS_TESTS=(
@@ -758,6 +780,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${ALTER_CONFIGS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleAlterConfigsRequestFuzzTest" "$t"
     done
+    for t in "${INCREMENTAL_ALTER_CONFIGS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleIncrementalAlterConfigsRequestFuzzTest" "$t"
+    done
     for t in "${DESCRIBE_CONFIGS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDescribeConfigsRequestFuzzTest" "$t"
     done
@@ -810,6 +835,10 @@ elif [[ "$FUZZ_SUITE" == "offset-fetch" ]]; then
 elif [[ "$FUZZ_SUITE" == "elect-leaders" ]]; then
     for t in "${ELECT_LEADERS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleElectLeadersRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "incremental-alter-configs" ]]; then
+    for t in "${INCREMENTAL_ALTER_CONFIGS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleIncrementalAlterConfigsRequestFuzzTest" "$t"
     done
 elif [[ "$FUZZ_SUITE" == "describe-configs" ]]; then
     for t in "${DESCRIBE_CONFIGS_TESTS[@]}"; do
@@ -914,6 +943,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleDescribeTokensRequest",          3324, 3358),
     ("KafkaApis.scala",          "handleElectLeaders",                   3371, 3439),
     ("KafkaApis.scala",          "handleDescribeConfigsRequest",         3111, 3115),
+    ("KafkaApis.scala",          "handleIncrementalAlterConfigsRequest", 3041, 3109),
     ("KafkaApis.scala",          "handleAlterReplicaLogDirsRequest",     3117, 3137),
     ("KafkaApis.scala",          "handleDescribeLogDirsRequest",         3139, 3160),
     ("RequestHandlerHelper.scala", "sendMaybeThrottle",                   112,  122),
