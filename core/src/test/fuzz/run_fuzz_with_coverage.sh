@@ -38,7 +38,8 @@
 # `FUZZ_SUITE=renew-delegation-token` for `HandleRenewTokenRequestFuzzTest`, or
 # `FUZZ_SUITE=expire-delegation-token` for `HandleExpireTokenRequestFuzzTest`, or
 # `FUZZ_SUITE=describe-delegation-token` for `HandleDescribeTokensRequestFuzzTest`, or
-# `FUZZ_SUITE=delete-groups` for `HandleDeleteGroupsRequestFuzzTest`.
+# `FUZZ_SUITE=delete-groups` for `HandleDeleteGroupsRequestFuzzTest`, or
+# `FUZZ_SUITE=elect-leaders` for `HandleElectLeadersRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -72,11 +73,12 @@ esac
 #   FUZZ_SUITE=expire-delegation-token  HandleExpireTokenRequestFuzzTest only
 #   FUZZ_SUITE=describe-delegation-token HandleDescribeTokensRequestFuzzTest only
 #   FUZZ_SUITE=delete-groups           HandleDeleteGroupsRequestFuzzTest only
+#   FUZZ_SUITE=elect-leaders           HandleElectLeadersRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups) ;;
+    all|offset-fetch|elect-leaders|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|elect-leaders|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|elect-leaders)" >&2
         exit 2
         ;;
 esac
@@ -170,6 +172,19 @@ OFFSET_FETCH_TESTS=(
     fuzzTestOffsetFetchCoordinatorV1To7
     fuzzTestOffsetFetchCoordinatorThrottleAndForwarded
     fuzzTestOffsetFetchCoordinatorAuthAndHandleExceptions
+)
+
+# handleElectLeaders fuzz targets (HandleElectLeadersRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+ELECT_LEADERS_TESTS=(
+    fuzzTestElectLeadersClusterAuthDeniedExplicitPartitions
+    fuzzTestElectLeadersClusterAuthDeniedAllPartitions
+    fuzzTestElectLeadersAuthorizedAllPartitionsFiltersNotNeeded
+    fuzzTestElectLeadersAuthorizedExplicitKeepsNotNeeded
+    fuzzTestElectLeadersAuthorizedEmptyExplicitPartitions
+    fuzzTestElectLeadersThrottled
+    fuzzTestElectLeadersForwardedSkipsChannelThrottle
+    fuzzTestElectLeadersAuthorizedExplicitFromRemainingBytes
 )
 
 # handleSyncGroupRequest fuzz targets (HandleSyncGroupRequestFuzzTest,
@@ -686,6 +701,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${OFFSET_FETCH_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
     done
+    for t in "${ELECT_LEADERS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleElectLeadersRequestFuzzTest" "$t"
+    done
     for t in "${SYNC_GROUP_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleSyncGroupRequestFuzzTest" "$t"
     done
@@ -789,6 +807,10 @@ elif [[ "$FUZZ_SUITE" == "offset-fetch" ]]; then
     for t in "${OFFSET_FETCH_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
     done
+elif [[ "$FUZZ_SUITE" == "elect-leaders" ]]; then
+    for t in "${ELECT_LEADERS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleElectLeadersRequestFuzzTest" "$t"
+    done
 elif [[ "$FUZZ_SUITE" == "describe-configs" ]]; then
     for t in "${DESCRIBE_CONFIGS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDescribeConfigsRequestFuzzTest" "$t"
@@ -890,6 +912,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleExpireTokenRequest",              3278, 3289),
     ("KafkaApis.scala",          "handleExpireTokenRequestZk",           3291, 3322),
     ("KafkaApis.scala",          "handleDescribeTokensRequest",          3324, 3358),
+    ("KafkaApis.scala",          "handleElectLeaders",                   3371, 3439),
     ("KafkaApis.scala",          "handleDescribeConfigsRequest",         3111, 3115),
     ("KafkaApis.scala",          "handleAlterReplicaLogDirsRequest",     3117, 3137),
     ("KafkaApis.scala",          "handleDescribeLogDirsRequest",         3139, 3160),
