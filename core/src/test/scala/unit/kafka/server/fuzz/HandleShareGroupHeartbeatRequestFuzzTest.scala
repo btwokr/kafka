@@ -20,7 +20,7 @@ package unit.kafka.server.fuzz
 import com.code_intelligence.jazzer.api.FuzzedDataProvider
 import com.code_intelligence.jazzer.junit.FuzzTest
 import kafka.network.RequestChannel
-import kafka.server.{KafkaApisTest, MetadataCache, RequestLocal, ZkBrokerEpochManager}
+import kafka.server.{KafkaApisTest, MetadataCache, ZkBrokerEpochManager}
 import org.apache.kafka.common.message.ShareGroupHeartbeatRequestData
 import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.protocol.Errors
@@ -37,14 +37,14 @@ import java.util
 import java.util.concurrent.CompletableFuture
 
 /**
- * Jazzer fuzz tests for `KafkaApis.handleShareGroupHeartbeat` (via
- * `KafkaApis.handle`, matching production wiring and async completion).
+ * Jazzer fuzz tests for `KafkaApis.handleShareGroupHeartbeat`.
  *
  * Covers share protocol disabled (`UNSUPPORTED_VERSION`), `READ` on `GROUP`
  * denied (`GROUP_AUTHORIZATION_FAILED`), coordinator success, and coordinator
  * failure (`getErrorResponse` from an `ApiException` or generic
  * `RuntimeException` → `UNKNOWN_SERVER_ERROR`), plus throttling and forwarded
- * requests.
+ * requests. Coordinator paths await the returned `CompletableFuture` after
+ * completing the mocked coordinator future.
  */
 class HandleShareGroupHeartbeatRequestFuzzTest extends KafkaApisTest {
 
@@ -125,7 +125,7 @@ class HandleShareGroupHeartbeatRequestFuzzTest extends KafkaApisTest {
 
     val kafkaApis = createKafkaApis(raftSupport = true)
     try {
-      kafkaApis.handle(request, RequestLocal.NoCaching)
+      kafkaApis.handleShareGroupHeartbeat(request).join()
       val resp = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
       assertEquals(Errors.UNSUPPORTED_VERSION.code, resp.data().errorCode)
       assertEquals(Errors.UNSUPPORTED_VERSION.message, Errors.forCode(resp.data().errorCode).message)
@@ -143,7 +143,7 @@ class HandleShareGroupHeartbeatRequestFuzzTest extends KafkaApisTest {
 
     val kafkaApis = createKafkaApis(raftSupport = true)
     try {
-      kafkaApis.handle(request, RequestLocal.NoCaching)
+      kafkaApis.handleShareGroupHeartbeat(request).join()
       val resp = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
       assertEquals(Errors.UNSUPPORTED_VERSION.code, resp.data().errorCode)
       assertEquals(throttleMs, resp.data().throttleTimeMs)
@@ -161,7 +161,7 @@ class HandleShareGroupHeartbeatRequestFuzzTest extends KafkaApisTest {
 
     val kafkaApis = createKafkaApis(raftSupport = true)
     try {
-      kafkaApis.handle(request, RequestLocal.NoCaching)
+      kafkaApis.handleShareGroupHeartbeat(request).join()
       val resp = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
       assertEquals(Errors.UNSUPPORTED_VERSION.code, resp.data().errorCode)
       assertEquals(throttleMs, resp.data().throttleTimeMs)
@@ -181,7 +181,7 @@ class HandleShareGroupHeartbeatRequestFuzzTest extends KafkaApisTest {
       authorizer = Some(authorizerDenyAll()),
       raftSupport = true)
     try {
-      kafkaApis.handle(request, RequestLocal.NoCaching)
+      kafkaApis.handleShareGroupHeartbeat(request).join()
       val resp = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
       assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, resp.data().errorCode)
       assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.message, Errors.forCode(resp.data().errorCode).message)
@@ -202,7 +202,7 @@ class HandleShareGroupHeartbeatRequestFuzzTest extends KafkaApisTest {
       authorizer = Some(authorizerDenyAll()),
       raftSupport = true)
     try {
-      kafkaApis.handle(request, RequestLocal.NoCaching)
+      kafkaApis.handleShareGroupHeartbeat(request).join()
       val resp = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
       assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, resp.data().errorCode)
       assertEquals(throttleMs, resp.data().throttleTimeMs)
@@ -223,7 +223,7 @@ class HandleShareGroupHeartbeatRequestFuzzTest extends KafkaApisTest {
       authorizer = Some(authorizerDenyAll()),
       raftSupport = true)
     try {
-      kafkaApis.handle(request, RequestLocal.NoCaching)
+      kafkaApis.handleShareGroupHeartbeat(request).join()
       val resp = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
       assertEquals(Errors.GROUP_AUTHORIZATION_FAILED.code, resp.data().errorCode)
       assertEquals(throttleMs, resp.data().throttleTimeMs)
@@ -252,8 +252,9 @@ class HandleShareGroupHeartbeatRequestFuzzTest extends KafkaApisTest {
 
     val kafkaApis = createKafkaApis(overrideProperties = shareEnabledOverrides, raftSupport = true)
     try {
-      kafkaApis.handle(request, RequestLocal.NoCaching)
+      val hb = kafkaApis.handleShareGroupHeartbeat(request)
       future.complete(responseData)
+      hb.join()
       val resp = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
       assertEquals(Errors.NONE.code, resp.data().errorCode)
       assertEquals(memberIdOut, resp.data().memberId)
@@ -282,8 +283,9 @@ class HandleShareGroupHeartbeatRequestFuzzTest extends KafkaApisTest {
 
     val kafkaApis = createKafkaApis(overrideProperties = shareEnabledOverrides, raftSupport = true)
     try {
-      kafkaApis.handle(request, RequestLocal.NoCaching)
+      val hb = kafkaApis.handleShareGroupHeartbeat(request)
       future.completeExceptionally(err.exception())
+      hb.join()
       val resp = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
       assertEquals(err.code, resp.data().errorCode)
       assertEquals(err.message, Errors.forCode(resp.data().errorCode).message)
@@ -303,8 +305,9 @@ class HandleShareGroupHeartbeatRequestFuzzTest extends KafkaApisTest {
 
     val kafkaApis = createKafkaApis(overrideProperties = shareEnabledOverrides, raftSupport = true)
     try {
-      kafkaApis.handle(request, RequestLocal.NoCaching)
+      val hb = kafkaApis.handleShareGroupHeartbeat(request)
       future.completeExceptionally(new RuntimeException(s"fuzz-share-hb-${data.consumeInt(0, Int.MaxValue)}"))
+      hb.join()
       val resp = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
       assertEquals(Errors.UNKNOWN_SERVER_ERROR.code, resp.data().errorCode)
       assertEquals(Errors.UNKNOWN_SERVER_ERROR.message, Errors.forCode(resp.data().errorCode).message)
@@ -331,8 +334,9 @@ class HandleShareGroupHeartbeatRequestFuzzTest extends KafkaApisTest {
 
     val kafkaApis = createKafkaApis(overrideProperties = shareEnabledOverrides, raftSupport = true)
     try {
-      kafkaApis.handle(request, RequestLocal.NoCaching)
+      val hb = kafkaApis.handleShareGroupHeartbeat(request)
       future.complete(responseData)
+      hb.join()
       val resp = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
       assertEquals(Errors.NONE.code, resp.data().errorCode)
       assertEquals(throttleMs, resp.data().throttleTimeMs)
@@ -356,8 +360,9 @@ class HandleShareGroupHeartbeatRequestFuzzTest extends KafkaApisTest {
 
     val kafkaApis = createKafkaApis(overrideProperties = shareEnabledOverrides, raftSupport = true)
     try {
-      kafkaApis.handle(request, RequestLocal.NoCaching)
+      val hb = kafkaApis.handleShareGroupHeartbeat(request)
       future.complete(responseData)
+      hb.join()
       val resp = verifyNoThrottling[ShareGroupHeartbeatResponse](request)
       assertEquals(Errors.NONE.code, resp.data().errorCode)
       assertEquals(throttleMs, resp.data().throttleTimeMs)
