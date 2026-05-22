@@ -57,8 +57,7 @@ against the corpus) when the env var `JAZZER_FUZZ=1` is set during the test
 JVM's lifetime. Fuzzing duration is controlled by the `maxDuration` argument
 of the `@FuzzTest` annotation; in this branch the produce baseline tests
 run for `100s` each, the produce coverage-improvement tests, fetch,
-describe-topic-partitions (using `KafkaApisTest.FUZZ_DURATION`, currently `10s`),
-heartbeat and offset-fetch tests run for `20s` each.
+describe-topic-partitions, heartbeat and offset-fetch tests run for `20s` each.
 
 > Important: Jazzer only fuzzes the **first** `@FuzzTest` it sees in a JVM;
 > the rest run a single regression pass. To get every `@FuzzTest` in a class
