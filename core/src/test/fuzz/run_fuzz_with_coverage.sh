@@ -41,7 +41,8 @@
 # `FUZZ_SUITE=delete-groups` for `HandleDeleteGroupsRequestFuzzTest`, or
 # `FUZZ_SUITE=get-telemetry-subscriptions` for `HandleGetTelemetrySubscriptionsRequestFuzzTest`, or
 # `FUZZ_SUITE=push-telemetry` for `HandlePushTelemetryRequestFuzzTest`, or
-# `FUZZ_SUITE=list-client-metrics-resources` for `HandleListClientMetricsResourcesRequestFuzzTest`.
+# `FUZZ_SUITE=list-client-metrics-resources` for `HandleListClientMetricsResourcesRequestFuzzTest`, or
+# `FUZZ_SUITE=share-group-heartbeat` for `HandleShareGroupHeartbeatRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -78,11 +79,12 @@ esac
 #   FUZZ_SUITE=get-telemetry-subscriptions HandleGetTelemetrySubscriptionsRequestFuzzTest only
 #   FUZZ_SUITE=push-telemetry HandlePushTelemetryRequestFuzzTest only
 #   FUZZ_SUITE=list-client-metrics-resources HandleListClientMetricsResourcesRequestFuzzTest only
+#   FUZZ_SUITE=share-group-heartbeat HandleShareGroupHeartbeatRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions|push-telemetry|list-client-metrics-resources) ;;
+    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions|push-telemetry|list-client-metrics-resources|share-group-heartbeat) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions|push-telemetry|list-client-metrics-resources)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions|push-telemetry|list-client-metrics-resources|share-group-heartbeat)" >&2
         exit 2
         ;;
 esac
@@ -696,6 +698,22 @@ LIST_CLIENT_METRICS_RESOURCES_TESTS=(
     fuzzTestListClientMetricsResourcesKRaftForwardedThrottled
 )
 
+# handleShareGroupHeartbeat fuzz targets (HandleShareGroupHeartbeatRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+SHARE_GROUP_HEARTBEAT_TESTS=(
+    fuzzTestShareGroupHeartbeatShareDisabledUnsupportedVersion
+    fuzzTestShareGroupHeartbeatShareDisabledUnsupportedThrottled
+    fuzzTestShareGroupHeartbeatShareDisabledUnsupportedForwarded
+    fuzzTestShareGroupHeartbeatAuthDenied
+    fuzzTestShareGroupHeartbeatAuthDeniedThrottled
+    fuzzTestShareGroupHeartbeatAuthDeniedForwarded
+    fuzzTestShareGroupHeartbeatCoordinatorSuccess
+    fuzzTestShareGroupHeartbeatCoordinatorCompletesExceptionallyApiError
+    fuzzTestShareGroupHeartbeatCoordinatorCompletesExceptionallyRuntime
+    fuzzTestShareGroupHeartbeatCoordinatorSuccessThrottled
+    fuzzTestShareGroupHeartbeatCoordinatorSuccessForwardedThrottled
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -841,6 +859,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${LIST_CLIENT_METRICS_RESOURCES_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleListClientMetricsResourcesRequestFuzzTest" "$t"
     done
+    for t in "${SHARE_GROUP_HEARTBEAT_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleShareGroupHeartbeatRequestFuzzTest" "$t"
+    done
 elif [[ "$FUZZ_SUITE" == "offset-fetch" ]]; then
     for t in "${OFFSET_FETCH_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
@@ -901,6 +922,10 @@ elif [[ "$FUZZ_SUITE" == "list-client-metrics-resources" ]]; then
     for t in "${LIST_CLIENT_METRICS_RESOURCES_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleListClientMetricsResourcesRequestFuzzTest" "$t"
     done
+elif [[ "$FUZZ_SUITE" == "share-group-heartbeat" ]]; then
+    for t in "${SHARE_GROUP_HEARTBEAT_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleShareGroupHeartbeatRequestFuzzTest" "$t"
+    done
 fi
 
 
@@ -948,6 +973,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleGetTelemetrySubscriptionsRequest", 3933, 3948),
     ("KafkaApis.scala",          "handlePushTelemetryRequest", 3950, 3965),
     ("KafkaApis.scala",          "handleListClientMetricsResources", 3967, 3986),
+    ("KafkaApis.scala",          "handleShareGroupHeartbeat", 3988, 4010),
     ("KafkaApis.scala",          "handleHeartbeatRequest",               1924, 1948),
     ("KafkaApis.scala",          "handleDeleteGroupsRequest",            1886, 1922),
     ("KafkaApis.scala",          "handleOffsetFetchRequest",             1466, 1630),
