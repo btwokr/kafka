@@ -24,14 +24,16 @@ import kafka.network.RequestChannel
 import kafka.server.{KafkaApisTest, MetadataCache, ZkBrokerEpochManager}
 import org.apache.kafka.common.{ElectionType, TopicPartition}
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
-import org.apache.kafka.common.requests.{ApiError, ElectLeadersRequest}
+import org.apache.kafka.common.requests.{ApiError, ElectLeadersRequest, ElectLeadersResponse}
 import org.apache.kafka.server.authorizer.{Action, AuthorizationResult, Authorizer}
 import org.apache.kafka.server.common.MetadataVersion
+import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertTrue}
 import org.mockito.ArgumentMatchers.{any, anyInt, anyLong}
 import org.mockito.Mockito.{doAnswer, mock, reset, when}
 
 import java.util
 import java.util.Collections
+import scala.jdk.CollectionConverters._
 
 /**
  * Jazzer fuzz tests targeting `KafkaApis.handleElectLeaders`.
@@ -60,15 +62,15 @@ class HandleElectLeadersRequestFuzzTest extends KafkaApisTest {
     authorizer
   }
 
-  private def stubThrottle(throttleMs: Int): Unit = {
+  private def stubThrottle(throttleTimeMs: Int): Unit = {
     when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
-      any[RequestChannel.Request](), anyLong)).thenReturn(throttleMs)
+      any[RequestChannel.Request](), anyLong)).thenReturn(throttleTimeMs)
   }
 
-  private def stubElectLeadersInvoke(results: Map[TopicPartition, ApiError]): Unit = {
+  private def stubElectLeadersInvoke(electionResults: Map[TopicPartition, ApiError]): Unit = {
     doAnswer { inv =>
       val callback = inv.getArgument(3).asInstanceOf[Map[TopicPartition, ApiError] => Unit]
-      callback(results)
+      callback(electionResults)
       null
     }.when(replicaManager).electLeaders(
       any[KafkaController](),
@@ -79,22 +81,40 @@ class HandleElectLeadersRequestFuzzTest extends KafkaApisTest {
     )
   }
 
-  private def safeTopicLabel(raw: String, idx: Int): String = {
-    val base = if (raw == null || raw.isEmpty) s"fuzz-el-$idx" else raw
+  private def safeTopicLabel(raw: String, fallbackSuffix: Int): String = {
+    val base = if (raw == null || raw.isEmpty) s"fuzz-el-$fallbackSuffix" else raw
     base.replaceAll("[^a-zA-Z0-9._-]", "_").take(200)
   }
 
+  private def partitionErrorCodes(response: ElectLeadersResponse): Map[TopicPartition, Short] = {
+    response.data.replicaElectionResults.iterator.asScala.flatMap { topicResult =>
+      topicResult.partitionResult.iterator.asScala.map { partitionResult =>
+        new TopicPartition(topicResult.topic, partitionResult.partitionId) -> partitionResult.errorCode
+      }
+    }.toMap
+  }
+
+  /** Top-level `ErrorCode` exists only on ElectLeaders response v1+. */
+  private def assertTopLevelErrorIfPresent(
+    requestVersion: Short,
+    response: ElectLeadersResponse,
+    expected: Errors
+  ): Unit = {
+    if (requestVersion >= 1)
+      assertEquals(expected.code, response.data.errorCode)
+  }
+
   /** API v0 only allows `PREFERRED`; unclean elections need v1+. */
-  private def versionAndElectionType(
-    version: Short,
-    preferUnclean: Boolean
+  private def requestVersionAndElectionType(
+    requestVersion: Short,
+    preferUncleanElection: Boolean
   ): (Short, ElectionType) = {
-    if (version == 0)
+    if (requestVersion == 0)
       (0, ElectionType.PREFERRED)
-    else if (preferUnclean)
-      (version, ElectionType.UNCLEAN)
+    else if (preferUncleanElection)
+      (requestVersion, ElectionType.UNCLEAN)
     else
-      (version, ElectionType.PREFERRED)
+      (requestVersion, ElectionType.PREFERRED)
   }
 
   /**
@@ -103,33 +123,41 @@ class HandleElectLeadersRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestElectLeadersClusterAuthDeniedExplicitPartitions(data: FuzzedDataProvider): Unit = {
-    val versionRaw = data.consumeShort(
+    val requestVersionRaw = data.consumeShort(
       ApiKeys.ELECT_LEADERS.oldestVersion(),
       ApiKeys.ELECT_LEADERS.latestVersion()
     )
-    val preferUnclean = data.consumeBoolean()
-    val timeoutMs = data.consumeInt(0, 120_000)
-    val throttleMs = data.consumeInt(0, 100)
-    val t1 = safeTopicLabel(data.consumeString(64), 1)
-    val t2 = safeTopicLabel(data.consumeString(64), 2)
-    val p1 = data.consumeInt(0, 64)
-    val p2 = data.consumeInt(0, 64)
+    val preferUncleanElection = data.consumeBoolean()
+    val electionTimeoutMs = data.consumeInt(0, 120_000)
+    val throttleTimeMs = data.consumeInt(0, 100)
+    val topicName1 = safeTopicLabel(data.consumeString(64), 1)
+    val topicName2 = safeTopicLabel(data.consumeString(64), 2)
+    val partitionId1 = data.consumeInt(0, 64)
+    val partitionId2 = data.consumeInt(0, 64)
 
-    val (version, electionType) = versionAndElectionType(versionRaw, preferUnclean)
-    val tpA = new TopicPartition(t1, p1)
-    val tpB = new TopicPartition(t2, p2)
-    val partitions = util.Arrays.asList(tpA, tpB)
-    val electReq = new ElectLeadersRequest.Builder(electionType, partitions, timeoutMs).build(version)
-    val request = buildRequest(electReq)
+    val (requestVersion, electionType) = requestVersionAndElectionType(requestVersionRaw, preferUncleanElection)
+    val topicPartition1 = new TopicPartition(topicName1, partitionId1)
+    val topicPartition2 = new TopicPartition(topicName2, partitionId2)
+    val requestedPartitions = util.Arrays.asList(topicPartition1, topicPartition2)
+    val electLeadersRequest = new ElectLeadersRequest.Builder(
+      electionType, requestedPartitions, electionTimeoutMs).build(requestVersion)
+    val request = buildRequest(electLeadersRequest)
 
     resetZkMetadataToLatestTesting()
     reset(replicaManager, clientRequestQuotaManager, requestChannel, txnCoordinator, groupCoordinator)
-    stubThrottle(throttleMs)
+    stubThrottle(throttleTimeMs)
 
-    val denied = authorizerUniform(AuthorizationResult.DENIED)
-    val kafkaApis = createKafkaApis(authorizer = Some(denied))
-    try kafkaApis.handleElectLeaders(request)
-    finally kafkaApis.close()
+    val deniedAuthorizer = authorizerUniform(AuthorizationResult.DENIED)
+    val kafkaApis = createKafkaApis(authorizer = Some(deniedAuthorizer))
+    try {
+      kafkaApis.handleElectLeaders(request)
+      val response = verifyNoThrottling[ElectLeadersResponse](request)
+      assertEquals(throttleTimeMs, response.data.throttleTimeMs)
+      assertTopLevelErrorIfPresent(requestVersion, response, Errors.CLUSTER_AUTHORIZATION_FAILED)
+      val errorsByPartition = partitionErrorCodes(response)
+      assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, errorsByPartition(topicPartition1))
+      assertEquals(Errors.CLUSTER_AUTHORIZATION_FAILED.code, errorsByPartition(topicPartition2))
+    } finally kafkaApis.close()
   }
 
   /**
@@ -139,26 +167,32 @@ class HandleElectLeadersRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestElectLeadersClusterAuthDeniedAllPartitions(data: FuzzedDataProvider): Unit = {
-    val versionRaw = data.consumeShort(
+    val requestVersionRaw = data.consumeShort(
       ApiKeys.ELECT_LEADERS.oldestVersion(),
       ApiKeys.ELECT_LEADERS.latestVersion()
     )
-    val preferUnclean = data.consumeBoolean()
-    val timeoutMs = data.consumeInt(0, 120_000)
-    val throttleMs = data.consumeInt(0, 100)
+    val preferUncleanElection = data.consumeBoolean()
+    val electionTimeoutMs = data.consumeInt(0, 120_000)
+    val throttleTimeMs = data.consumeInt(0, 100)
 
-    val (version, electionType) = versionAndElectionType(versionRaw, preferUnclean)
-    val electReq = new ElectLeadersRequest.Builder(electionType, null, timeoutMs).build(version)
-    val request = buildRequest(electReq)
+    val (requestVersion, electionType) = requestVersionAndElectionType(requestVersionRaw, preferUncleanElection)
+    val electLeadersRequest = new ElectLeadersRequest.Builder(electionType, null, electionTimeoutMs)
+      .build(requestVersion)
+    val request = buildRequest(electLeadersRequest)
 
     resetZkMetadataToLatestTesting()
     reset(replicaManager, clientRequestQuotaManager, requestChannel, txnCoordinator, groupCoordinator)
-    stubThrottle(throttleMs)
+    stubThrottle(throttleTimeMs)
 
-    val denied = authorizerUniform(AuthorizationResult.DENIED)
-    val kafkaApis = createKafkaApis(authorizer = Some(denied))
-    try kafkaApis.handleElectLeaders(request)
-    finally kafkaApis.close()
+    val deniedAuthorizer = authorizerUniform(AuthorizationResult.DENIED)
+    val kafkaApis = createKafkaApis(authorizer = Some(deniedAuthorizer))
+    try {
+      kafkaApis.handleElectLeaders(request)
+      val response = verifyNoThrottling[ElectLeadersResponse](request)
+      assertEquals(throttleTimeMs, response.data.throttleTimeMs)
+      assertTopLevelErrorIfPresent(requestVersion, response, Errors.CLUSTER_AUTHORIZATION_FAILED)
+      assertTrue(response.data.replicaElectionResults.isEmpty)
+    } finally kafkaApis.close()
   }
 
   /**
@@ -168,38 +202,46 @@ class HandleElectLeadersRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestElectLeadersAuthorizedAllPartitionsFiltersNotNeeded(data: FuzzedDataProvider): Unit = {
-    val versionRaw = data.consumeShort(
+    val requestVersionRaw = data.consumeShort(
       ApiKeys.ELECT_LEADERS.oldestVersion(),
       ApiKeys.ELECT_LEADERS.latestVersion()
     )
-    val preferUnclean = data.consumeBoolean()
-    val timeoutMs = data.consumeInt(0, 120_000)
-    val throttleMs = data.consumeInt(0, 100)
-    val t1 = safeTopicLabel(data.consumeString(64), 1)
-    val t2 = safeTopicLabel(data.consumeString(64), 2)
+    val preferUncleanElection = data.consumeBoolean()
+    val electionTimeoutMs = data.consumeInt(0, 120_000)
+    val throttleTimeMs = data.consumeInt(0, 100)
+    val topicName1 = safeTopicLabel(data.consumeString(64), 1)
+    val topicName2 = safeTopicLabel(data.consumeString(64), 2)
 
-    val (version, electionType) = versionAndElectionType(versionRaw, preferUnclean)
-    val electReq = new ElectLeadersRequest.Builder(electionType, null, timeoutMs).build(version)
-    val request = buildRequest(electReq)
+    val (requestVersion, electionType) = requestVersionAndElectionType(requestVersionRaw, preferUncleanElection)
+    val electLeadersRequest = new ElectLeadersRequest.Builder(electionType, null, electionTimeoutMs)
+      .build(requestVersion)
+    val request = buildRequest(electLeadersRequest)
 
     resetZkMetadataToLatestTesting()
-    addTopicToMetadataCache(t1, numPartitions = 2, numBrokers = 2)
-    addTopicToMetadataCache(t2, numPartitions = 2, numBrokers = 2)
-    val tpA = new TopicPartition(t1, 0)
-    val tpB = new TopicPartition(t2, 1)
-    val callbackMap = Map(
-      tpA -> new ApiError(Errors.ELECTION_NOT_NEEDED),
-      tpB -> new ApiError(Errors.NONE)
+    addTopicToMetadataCache(topicName1, numPartitions = 2, numBrokers = 2)
+    addTopicToMetadataCache(topicName2, numPartitions = 2, numBrokers = 2)
+    val cachedTopicPartition1 = new TopicPartition(topicName1, 0)
+    val cachedTopicPartition2 = new TopicPartition(topicName2, 1)
+    val electionCallbackResults = Map(
+      cachedTopicPartition1 -> new ApiError(Errors.ELECTION_NOT_NEEDED),
+      cachedTopicPartition2 -> new ApiError(Errors.NONE)
     )
 
     reset(replicaManager, clientRequestQuotaManager, requestChannel, txnCoordinator, groupCoordinator)
-    stubThrottle(throttleMs)
-    stubElectLeadersInvoke(callbackMap)
+    stubThrottle(throttleTimeMs)
+    stubElectLeadersInvoke(electionCallbackResults)
 
-    val allowed = authorizerUniform(AuthorizationResult.ALLOWED)
-    val kafkaApis = createKafkaApis(authorizer = Some(allowed))
-    try kafkaApis.handleElectLeaders(request)
-    finally kafkaApis.close()
+    val allowedAuthorizer = authorizerUniform(AuthorizationResult.ALLOWED)
+    val kafkaApis = createKafkaApis(authorizer = Some(allowedAuthorizer))
+    try {
+      kafkaApis.handleElectLeaders(request)
+      val response = verifyNoThrottling[ElectLeadersResponse](request)
+      assertEquals(throttleTimeMs, response.data.throttleTimeMs)
+      assertTopLevelErrorIfPresent(requestVersion, response, Errors.NONE)
+      val errorsByPartition = partitionErrorCodes(response)
+      assertFalse(errorsByPartition.contains(cachedTopicPartition1))
+      assertEquals(Errors.NONE.code, errorsByPartition(cachedTopicPartition2))
+    } finally kafkaApis.close()
   }
 
   /**
@@ -208,42 +250,49 @@ class HandleElectLeadersRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestElectLeadersAuthorizedExplicitKeepsNotNeeded(data: FuzzedDataProvider): Unit = {
-    val versionRaw = data.consumeShort(
+    val requestVersionRaw = data.consumeShort(
       ApiKeys.ELECT_LEADERS.oldestVersion(),
       ApiKeys.ELECT_LEADERS.latestVersion()
     )
-    val preferUnclean = data.consumeBoolean()
-    val timeoutMs = data.consumeInt(0, 120_000)
-    val throttleMs = data.consumeInt(0, 100)
-    val t1 = safeTopicLabel(data.consumeString(64), 1)
-    val t2 = safeTopicLabel(data.consumeString(64), 2)
-    val p1 = data.consumeInt(0, 32)
-    val p2 = data.consumeInt(0, 32)
+    val preferUncleanElection = data.consumeBoolean()
+    val electionTimeoutMs = data.consumeInt(0, 120_000)
+    val throttleTimeMs = data.consumeInt(0, 100)
+    val topicName1 = safeTopicLabel(data.consumeString(64), 1)
+    val topicName2 = safeTopicLabel(data.consumeString(64), 2)
+    val partitionId1 = data.consumeInt(0, 32)
+    val partitionId2 = data.consumeInt(0, 32)
 
-    val (version, electionType) = versionAndElectionType(versionRaw, preferUnclean)
-    val tpA = new TopicPartition(t1, p1)
-    val tpB = new TopicPartition(t2, p2)
-    val electReq = new ElectLeadersRequest.Builder(
+    val (requestVersion, electionType) = requestVersionAndElectionType(requestVersionRaw, preferUncleanElection)
+    val topicPartition1 = new TopicPartition(topicName1, partitionId1)
+    val topicPartition2 = new TopicPartition(topicName2, partitionId2)
+    val electLeadersRequest = new ElectLeadersRequest.Builder(
       electionType,
-      util.Arrays.asList(tpA, tpB),
-      timeoutMs
-    ).build(version)
-    val request = buildRequest(electReq)
+      util.Arrays.asList(topicPartition1, topicPartition2),
+      electionTimeoutMs
+    ).build(requestVersion)
+    val request = buildRequest(electLeadersRequest)
 
     resetZkMetadataToLatestTesting()
-    val callbackMap = Map(
-      tpA -> new ApiError(Errors.ELECTION_NOT_NEEDED),
-      tpB -> new ApiError(Errors.NOT_LEADER_OR_FOLLOWER, "fuzz-msg")
+    val electionCallbackResults = Map(
+      topicPartition1 -> new ApiError(Errors.ELECTION_NOT_NEEDED),
+      topicPartition2 -> new ApiError(Errors.NOT_LEADER_OR_FOLLOWER, "fuzz-msg")
     )
 
     reset(replicaManager, clientRequestQuotaManager, requestChannel, txnCoordinator, groupCoordinator)
-    stubThrottle(throttleMs)
-    stubElectLeadersInvoke(callbackMap)
+    stubThrottle(throttleTimeMs)
+    stubElectLeadersInvoke(electionCallbackResults)
 
-    val allowed = authorizerUniform(AuthorizationResult.ALLOWED)
-    val kafkaApis = createKafkaApis(authorizer = Some(allowed))
-    try kafkaApis.handleElectLeaders(request)
-    finally kafkaApis.close()
+    val allowedAuthorizer = authorizerUniform(AuthorizationResult.ALLOWED)
+    val kafkaApis = createKafkaApis(authorizer = Some(allowedAuthorizer))
+    try {
+      kafkaApis.handleElectLeaders(request)
+      val response = verifyNoThrottling[ElectLeadersResponse](request)
+      assertEquals(throttleTimeMs, response.data.throttleTimeMs)
+      assertTopLevelErrorIfPresent(requestVersion, response, Errors.NONE)
+      val errorsByPartition = partitionErrorCodes(response)
+      assertEquals(Errors.ELECTION_NOT_NEEDED.code, errorsByPartition(topicPartition1))
+      assertEquals(Errors.NOT_LEADER_OR_FOLLOWER.code, errorsByPartition(topicPartition2))
+    } finally kafkaApis.close()
   }
 
   /**
@@ -252,31 +301,36 @@ class HandleElectLeadersRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestElectLeadersAuthorizedEmptyExplicitPartitions(data: FuzzedDataProvider): Unit = {
-    val versionRaw = data.consumeShort(
+    val requestVersionRaw = data.consumeShort(
       ApiKeys.ELECT_LEADERS.oldestVersion(),
       ApiKeys.ELECT_LEADERS.latestVersion()
     )
-    val preferUnclean = data.consumeBoolean()
-    val timeoutMs = data.consumeInt(0, 120_000)
-    val throttleMs = data.consumeInt(0, 100)
+    val preferUncleanElection = data.consumeBoolean()
+    val electionTimeoutMs = data.consumeInt(0, 120_000)
+    val throttleTimeMs = data.consumeInt(0, 100)
 
-    val (version, electionType) = versionAndElectionType(versionRaw, preferUnclean)
-    val electReq = new ElectLeadersRequest.Builder(
+    val (requestVersion, electionType) = requestVersionAndElectionType(requestVersionRaw, preferUncleanElection)
+    val electLeadersRequest = new ElectLeadersRequest.Builder(
       electionType,
       Collections.emptyList(),
-      timeoutMs
-    ).build(version)
-    val request = buildRequest(electReq)
+      electionTimeoutMs
+    ).build(requestVersion)
+    val request = buildRequest(electLeadersRequest)
 
     resetZkMetadataToLatestTesting()
     reset(replicaManager, clientRequestQuotaManager, requestChannel, txnCoordinator, groupCoordinator)
-    stubThrottle(throttleMs)
+    stubThrottle(throttleTimeMs)
     stubElectLeadersInvoke(Map.empty)
 
-    val allowed = authorizerUniform(AuthorizationResult.ALLOWED)
-    val kafkaApis = createKafkaApis(authorizer = Some(allowed))
-    try kafkaApis.handleElectLeaders(request)
-    finally kafkaApis.close()
+    val allowedAuthorizer = authorizerUniform(AuthorizationResult.ALLOWED)
+    val kafkaApis = createKafkaApis(authorizer = Some(allowedAuthorizer))
+    try {
+      kafkaApis.handleElectLeaders(request)
+      val response = verifyNoThrottling[ElectLeadersResponse](request)
+      assertEquals(throttleTimeMs, response.data.throttleTimeMs)
+      assertTopLevelErrorIfPresent(requestVersion, response, Errors.NONE)
+      assertTrue(partitionErrorCodes(response).isEmpty)
+    } finally kafkaApis.close()
   }
 
   /**
@@ -285,34 +339,39 @@ class HandleElectLeadersRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestElectLeadersThrottled(data: FuzzedDataProvider): Unit = {
-    val versionRaw = data.consumeShort(
+    val requestVersionRaw = data.consumeShort(
       ApiKeys.ELECT_LEADERS.oldestVersion(),
       ApiKeys.ELECT_LEADERS.latestVersion()
     )
-    val preferUnclean = data.consumeBoolean()
-    val timeoutMs = data.consumeInt(0, 120_000)
-    val throttleMs = data.consumeInt(1, 500)
-    val t1 = safeTopicLabel(data.consumeString(64), 1)
-    val p1 = data.consumeInt(0, 16)
+    val preferUncleanElection = data.consumeBoolean()
+    val electionTimeoutMs = data.consumeInt(0, 120_000)
+    val throttleTimeMs = data.consumeInt(1, 500)
+    val topicName1 = safeTopicLabel(data.consumeString(64), 1)
+    val partitionId1 = data.consumeInt(0, 16)
 
-    val (version, electionType) = versionAndElectionType(versionRaw, preferUnclean)
-    val tp = new TopicPartition(t1, p1)
-    val electReq = new ElectLeadersRequest.Builder(
+    val (requestVersion, electionType) = requestVersionAndElectionType(requestVersionRaw, preferUncleanElection)
+    val topicPartition1 = new TopicPartition(topicName1, partitionId1)
+    val electLeadersRequest = new ElectLeadersRequest.Builder(
       electionType,
-      Collections.singletonList(tp),
-      timeoutMs
-    ).build(version)
-    val request = buildRequest(electReq)
+      Collections.singletonList(topicPartition1),
+      electionTimeoutMs
+    ).build(requestVersion)
+    val request = buildRequest(electLeadersRequest)
 
     resetZkMetadataToLatestTesting()
     reset(replicaManager, clientRequestQuotaManager, requestChannel, txnCoordinator, groupCoordinator)
-    stubThrottle(throttleMs)
-    stubElectLeadersInvoke(Map(tp -> ApiError.NONE))
+    stubThrottle(throttleTimeMs)
+    stubElectLeadersInvoke(Map(topicPartition1 -> ApiError.NONE))
 
-    val allowed = authorizerUniform(AuthorizationResult.ALLOWED)
-    val kafkaApis = createKafkaApis(authorizer = Some(allowed))
-    try kafkaApis.handleElectLeaders(request)
-    finally kafkaApis.close()
+    val allowedAuthorizer = authorizerUniform(AuthorizationResult.ALLOWED)
+    val kafkaApis = createKafkaApis(authorizer = Some(allowedAuthorizer))
+    try {
+      kafkaApis.handleElectLeaders(request)
+      val response = verifyNoThrottling[ElectLeadersResponse](request)
+      assertEquals(throttleTimeMs, response.data.throttleTimeMs)
+      assertTopLevelErrorIfPresent(requestVersion, response, Errors.NONE)
+      assertEquals(Errors.NONE.code, partitionErrorCodes(response)(topicPartition1))
+    } finally kafkaApis.close()
   }
 
   /**
@@ -321,34 +380,39 @@ class HandleElectLeadersRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestElectLeadersForwardedSkipsChannelThrottle(data: FuzzedDataProvider): Unit = {
-    val versionRaw = data.consumeShort(
+    val requestVersionRaw = data.consumeShort(
       ApiKeys.ELECT_LEADERS.oldestVersion(),
       ApiKeys.ELECT_LEADERS.latestVersion()
     )
-    val preferUnclean = data.consumeBoolean()
-    val timeoutMs = data.consumeInt(0, 120_000)
-    val throttleMs = data.consumeInt(1, 500)
-    val t1 = safeTopicLabel(data.consumeString(64), 1)
-    val p1 = data.consumeInt(0, 16)
+    val preferUncleanElection = data.consumeBoolean()
+    val electionTimeoutMs = data.consumeInt(0, 120_000)
+    val throttleTimeMs = data.consumeInt(1, 500)
+    val topicName1 = safeTopicLabel(data.consumeString(64), 1)
+    val partitionId1 = data.consumeInt(0, 16)
 
-    val (version, electionType) = versionAndElectionType(versionRaw, preferUnclean)
-    val tp = new TopicPartition(t1, p1)
-    val electReq = new ElectLeadersRequest.Builder(
+    val (requestVersion, electionType) = requestVersionAndElectionType(requestVersionRaw, preferUncleanElection)
+    val topicPartition1 = new TopicPartition(topicName1, partitionId1)
+    val electLeadersRequest = new ElectLeadersRequest.Builder(
       electionType,
-      Collections.singletonList(tp),
-      timeoutMs
-    ).build(version)
-    val request = buildForwardedRequest(electReq)
+      Collections.singletonList(topicPartition1),
+      electionTimeoutMs
+    ).build(requestVersion)
+    val request = buildForwardedRequest(electLeadersRequest)
 
     resetZkMetadataToLatestTesting()
     reset(replicaManager, clientRequestQuotaManager, requestChannel, txnCoordinator, groupCoordinator)
-    stubThrottle(throttleMs)
-    stubElectLeadersInvoke(Map(tp -> ApiError.NONE))
+    stubThrottle(throttleTimeMs)
+    stubElectLeadersInvoke(Map(topicPartition1 -> ApiError.NONE))
 
-    val allowed = authorizerUniform(AuthorizationResult.ALLOWED)
-    val kafkaApis = createKafkaApis(authorizer = Some(allowed))
-    try kafkaApis.handleElectLeaders(request)
-    finally kafkaApis.close()
+    val allowedAuthorizer = authorizerUniform(AuthorizationResult.ALLOWED)
+    val kafkaApis = createKafkaApis(authorizer = Some(allowedAuthorizer))
+    try {
+      kafkaApis.handleElectLeaders(request)
+      val response = verifyNoThrottling[ElectLeadersResponse](request)
+      assertEquals(throttleTimeMs, response.data.throttleTimeMs)
+      assertTopLevelErrorIfPresent(requestVersion, response, Errors.NONE)
+      assertEquals(Errors.NONE.code, partitionErrorCodes(response)(topicPartition1))
+    } finally kafkaApis.close()
   }
 
   /**
@@ -357,46 +421,57 @@ class HandleElectLeadersRequestFuzzTest extends KafkaApisTest {
    */
   @FuzzTest(maxDuration = FUZZ_DURATION)
   def fuzzTestElectLeadersAuthorizedExplicitFromRemainingBytes(data: FuzzedDataProvider): Unit = {
-    val versionRaw = data.consumeShort(
+    val requestVersionRaw = data.consumeShort(
       ApiKeys.ELECT_LEADERS.oldestVersion(),
       ApiKeys.ELECT_LEADERS.latestVersion()
     )
-    val preferUnclean = data.consumeBoolean()
-    val timeoutMs = data.consumeInt(0, 120_000)
-    val throttleMs = data.consumeInt(0, 100)
-    val splitA = data.consumeInt(1, 32)
-    val splitB = data.consumeInt(1, 32)
-    val p1 = data.consumeInt(0, 8)
-    val p2 = data.consumeInt(0, 8)
-    val rawBytes = data.consumeRemainingAsBytes()
+    val preferUncleanElection = data.consumeBoolean()
+    val electionTimeoutMs = data.consumeInt(0, 120_000)
+    val throttleTimeMs = data.consumeInt(0, 100)
+    val firstTopicBytesLength = data.consumeInt(1, 32)
+    val secondTopicBytesLength = data.consumeInt(1, 32)
+    val partitionId1 = data.consumeInt(0, 8)
+    val partitionId2 = data.consumeInt(0, 8)
+    val remainingRawBytes = data.consumeRemainingAsBytes()
 
-    val (version, electionType) = versionAndElectionType(versionRaw, preferUnclean)
-    val (s1, rest1) = rawBytes.splitAt(splitA min rawBytes.length)
-    val (s2, _) = rest1.splitAt(splitB min rest1.length)
-    val t1 = safeTopicLabel(new String(s1, java.nio.charset.StandardCharsets.UTF_8), 1)
-    val t2 = safeTopicLabel(new String(s2, java.nio.charset.StandardCharsets.UTF_8), 2)
-    val tpA = new TopicPartition(t1, p1)
-    val tpB = new TopicPartition(t2, p2)
-    val electReq = new ElectLeadersRequest.Builder(
+    val (requestVersion, electionType) = requestVersionAndElectionType(requestVersionRaw, preferUncleanElection)
+    val (firstTopicBytes, restAfterFirst) =
+      remainingRawBytes.splitAt(firstTopicBytesLength min remainingRawBytes.length)
+    val (secondTopicBytes, _) =
+      restAfterFirst.splitAt(secondTopicBytesLength min restAfterFirst.length)
+    val topicName1 = safeTopicLabel(
+      new String(firstTopicBytes, java.nio.charset.StandardCharsets.UTF_8), 1)
+    val topicName2 = safeTopicLabel(
+      new String(secondTopicBytes, java.nio.charset.StandardCharsets.UTF_8), 2)
+    val topicPartition1 = new TopicPartition(topicName1, partitionId1)
+    val topicPartition2 = new TopicPartition(topicName2, partitionId2)
+    val electLeadersRequest = new ElectLeadersRequest.Builder(
       electionType,
-      util.Arrays.asList(tpA, tpB),
-      timeoutMs
-    ).build(version)
-    val request = buildRequest(electReq)
+      util.Arrays.asList(topicPartition1, topicPartition2),
+      electionTimeoutMs
+    ).build(requestVersion)
+    val request = buildRequest(electLeadersRequest)
 
     resetZkMetadataToLatestTesting()
-    val callbackMap = Map(
-      tpA -> new ApiError(Errors.KAFKA_STORAGE_ERROR),
-      tpB -> ApiError.NONE
+    val electionCallbackResults = Map(
+      topicPartition1 -> new ApiError(Errors.KAFKA_STORAGE_ERROR),
+      topicPartition2 -> ApiError.NONE
     )
 
     reset(replicaManager, clientRequestQuotaManager, requestChannel, txnCoordinator, groupCoordinator)
-    stubThrottle(throttleMs)
-    stubElectLeadersInvoke(callbackMap)
+    stubThrottle(throttleTimeMs)
+    stubElectLeadersInvoke(electionCallbackResults)
 
-    val allowed = authorizerUniform(AuthorizationResult.ALLOWED)
-    val kafkaApis = createKafkaApis(authorizer = Some(allowed))
-    try kafkaApis.handleElectLeaders(request)
-    finally kafkaApis.close()
+    val allowedAuthorizer = authorizerUniform(AuthorizationResult.ALLOWED)
+    val kafkaApis = createKafkaApis(authorizer = Some(allowedAuthorizer))
+    try {
+      kafkaApis.handleElectLeaders(request)
+      val response = verifyNoThrottling[ElectLeadersResponse](request)
+      assertEquals(throttleTimeMs, response.data.throttleTimeMs)
+      assertTopLevelErrorIfPresent(requestVersion, response, Errors.NONE)
+      val errorsByPartition = partitionErrorCodes(response)
+      assertEquals(Errors.KAFKA_STORAGE_ERROR.code, errorsByPartition(topicPartition1))
+      assertEquals(Errors.NONE.code, errorsByPartition(topicPartition2))
+    } finally kafkaApis.close()
   }
 }
