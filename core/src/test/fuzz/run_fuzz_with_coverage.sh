@@ -39,7 +39,8 @@
 # `FUZZ_SUITE=expire-delegation-token` for `HandleExpireTokenRequestFuzzTest`, or
 # `FUZZ_SUITE=describe-delegation-token` for `HandleDescribeTokensRequestFuzzTest`, or
 # `FUZZ_SUITE=delete-groups` for `HandleDeleteGroupsRequestFuzzTest`, or
-# `FUZZ_SUITE=get-telemetry-subscriptions` for `HandleGetTelemetrySubscriptionsRequestFuzzTest`.
+# `FUZZ_SUITE=get-telemetry-subscriptions` for `HandleGetTelemetrySubscriptionsRequestFuzzTest`, or
+# `FUZZ_SUITE=push-telemetry` for `HandlePushTelemetryRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -74,11 +75,12 @@ esac
 #   FUZZ_SUITE=describe-delegation-token HandleDescribeTokensRequestFuzzTest only
 #   FUZZ_SUITE=delete-groups           HandleDeleteGroupsRequestFuzzTest only
 #   FUZZ_SUITE=get-telemetry-subscriptions HandleGetTelemetrySubscriptionsRequestFuzzTest only
+#   FUZZ_SUITE=push-telemetry HandlePushTelemetryRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions) ;;
+    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions|push-telemetry) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions|push-telemetry)" >&2
         exit 2
         ;;
 esac
@@ -664,6 +666,19 @@ GET_TELEMETRY_SUBSCRIPTIONS_TESTS=(
     fuzzTestGetTelemetrySubscriptionsKRaftForwardedThrottled
 )
 
+# handlePushTelemetryRequest fuzz targets (HandlePushTelemetryRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+PUSH_TELEMETRY_TESTS=(
+    fuzzTestPushTelemetryZkUnsupportedVersion
+    fuzzTestPushTelemetryZkUnsupportedThrottled
+    fuzzTestPushTelemetryZkUnsupportedForwarded
+    fuzzTestPushTelemetryKRaftSuccess
+    fuzzTestPushTelemetryKRaftProcessThrowsMapsToInvalidRequest
+    fuzzTestPushTelemetryKRaftProcessThrowsInvalidRequestException
+    fuzzTestPushTelemetryKRaftManagerReturnsErrorCode
+    fuzzTestPushTelemetryKRaftForwardedThrottled
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -803,6 +818,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${GET_TELEMETRY_SUBSCRIPTIONS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleGetTelemetrySubscriptionsRequestFuzzTest" "$t"
     done
+    for t in "${PUSH_TELEMETRY_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandlePushTelemetryRequestFuzzTest" "$t"
+    done
 elif [[ "$FUZZ_SUITE" == "offset-fetch" ]]; then
     for t in "${OFFSET_FETCH_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
@@ -855,6 +873,10 @@ elif [[ "$FUZZ_SUITE" == "get-telemetry-subscriptions" ]]; then
     for t in "${GET_TELEMETRY_SUBSCRIPTIONS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleGetTelemetrySubscriptionsRequestFuzzTest" "$t"
     done
+elif [[ "$FUZZ_SUITE" == "push-telemetry" ]]; then
+    for t in "${PUSH_TELEMETRY_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandlePushTelemetryRequestFuzzTest" "$t"
+    done
 fi
 
 
@@ -900,6 +922,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleFetchRequest",                    757, 1077),
     ("KafkaApis.scala",          "handleDescribeTopicPartitionsRequest", 1445, 1461),
     ("KafkaApis.scala",          "handleGetTelemetrySubscriptionsRequest", 3933, 3948),
+    ("KafkaApis.scala",          "handlePushTelemetryRequest", 3950, 3965),
     ("KafkaApis.scala",          "handleHeartbeatRequest",               1924, 1948),
     ("KafkaApis.scala",          "handleDeleteGroupsRequest",            1886, 1922),
     ("KafkaApis.scala",          "handleOffsetFetchRequest",             1466, 1630),
