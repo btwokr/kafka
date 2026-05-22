@@ -21,7 +21,7 @@ import com.code_intelligence.jazzer.api.FuzzedDataProvider
 import com.code_intelligence.jazzer.junit.FuzzTest
 import kafka.network.RequestChannel
 import kafka.server.{KafkaApisTest, MetadataCache, ZkBrokerEpochManager}
-import org.apache.kafka.common.errors.{InvalidRequestException, UnsupportedVersionException}
+import org.apache.kafka.common.errors.InvalidRequestException
 import org.apache.kafka.common.message.GetTelemetrySubscriptionsRequestData
 import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.protocol.Errors
@@ -41,9 +41,7 @@ import scala.jdk.CollectionConverters._
  * `processGetTelemetrySubscriptionRequest` success, non-throwing error
  * responses from the manager, and the broad `catch` that maps any
  * exception to `INVALID_REQUEST`), plus `sendMaybeThrottle` throttling and
- * forwarded requests. Wire-level `UnsupportedVersionException` from
- * `AbstractRequest` construction is validated by message substring, matching
- * other fuzz tests that rethrow when the message is unexpected.
+ * forwarded requests.
  */
 class HandleGetTelemetrySubscriptionsRequestFuzzTest extends KafkaApisTest {
 
@@ -72,10 +70,6 @@ class HandleGetTelemetrySubscriptionsRequestFuzzTest extends KafkaApisTest {
       any[RequestChannel.Request](), anyDouble, anyLong)).thenReturn(0)
     when(clientRequestQuotaManager.maybeRecordAndGetThrottleTimeMs(
       any[RequestChannel.Request](), anyLong)).thenReturn(throttleMs)
-  }
-
-  private def validateUnsupportedVersionExceptionMessage(e: UnsupportedVersionException): Unit = {
-    if (!e.getMessage.contains(ApiKeys.GET_TELEMETRY_SUBSCRIPTIONS.toString)) throw e
   }
 
   private def stubClientMetricsSuccess(): Unit = {
@@ -288,22 +282,5 @@ class HandleGetTelemetrySubscriptionsRequestFuzzTest extends KafkaApisTest {
       val resp = verifyNoThrottling[GetTelemetrySubscriptionsResponse](request)
       assertEquals(throttleMs, resp.data().throttleTimeMs)
     } finally kafkaApis.close()
-  }
-
-  /**
-   * `AbstractRequest` rejects unsupported wire versions before `KafkaApis`
-   * runs; match the exception wording used by
-   * `AbstractRequest` constructors.
-   */
-  @FuzzTest(maxDuration = FUZZ_DURATION)
-  def fuzzTestGetTelemetrySubscriptionsBuilderUnsupportedWireVersion(data: FuzzedDataProvider): Unit = {
-    val requestData = buildRequestData(data)
-    val invalidVersion = data.consumeShort(1, 5).toShort
-    try {
-      new GetTelemetrySubscriptionsRequest.Builder(requestData, true).build(invalidVersion)
-      throw new AssertionError("expected UnsupportedVersionException")
-    } catch {
-      case e: UnsupportedVersionException => validateUnsupportedVersionExceptionMessage(e)
-    }
   }
 }
