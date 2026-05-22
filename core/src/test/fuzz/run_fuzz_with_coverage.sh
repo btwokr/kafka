@@ -42,7 +42,8 @@
 # `FUZZ_SUITE=elect-leaders` for `HandleElectLeadersRequestFuzzTest`, or
 # `FUZZ_SUITE=incremental-alter-configs` for `HandleIncrementalAlterConfigsRequestFuzzTest`, or
 # `FUZZ_SUITE=alter-partition-reassignments` for `HandleAlterPartitionReassignmentsRequestFuzzTest`, or
-# `FUZZ_SUITE=list-partition-reassignments` for `HandleListPartitionReassignmentsRequestFuzzTest`.
+# `FUZZ_SUITE=list-partition-reassignments` for `HandleListPartitionReassignmentsRequestFuzzTest`, or
+# `FUZZ_SUITE=offset-delete` for `HandleOffsetDeleteRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -80,11 +81,12 @@ esac
 #   FUZZ_SUITE=incremental-alter-configs HandleIncrementalAlterConfigsRequestFuzzTest only
 #   FUZZ_SUITE=alter-partition-reassignments HandleAlterPartitionReassignmentsRequestFuzzTest only
 #   FUZZ_SUITE=list-partition-reassignments HandleListPartitionReassignmentsRequestFuzzTest only
+#   FUZZ_SUITE=offset-delete           HandleOffsetDeleteRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch|elect-leaders|incremental-alter-configs|alter-partition-reassignments|list-partition-reassignments|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups) ;;
+    all|offset-fetch|elect-leaders|incremental-alter-configs|alter-partition-reassignments|list-partition-reassignments|offset-delete|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|elect-leaders|incremental-alter-configs|alter-partition-reassignments|list-partition-reassignments|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|elect-leaders)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|elect-leaders|incremental-alter-configs|alter-partition-reassignments|list-partition-reassignments|offset-delete|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|elect-leaders)" >&2
         exit 2
         ;;
 esac
@@ -724,6 +726,21 @@ LIST_PARTITION_REASSIGNMENTS_TESTS=(
     fuzzTestListPartitionReassignmentsTopicFromFuzzTail
 )
 
+# handleOffsetDeleteRequest fuzz targets (HandleOffsetDeleteRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+OFFSET_DELETE_TESTS=(
+    fuzzTestOffsetDeleteGroupAuthorizationDenied
+    fuzzTestOffsetDeleteHappyPathCoordinatorMerge
+    fuzzTestOffsetDeleteUnknownTopicInMetadata
+    fuzzTestOffsetDeleteTopicReadDenied
+    fuzzTestOffsetDeleteInvalidPartitionIndex
+    fuzzTestOffsetDeleteCoordinatorException
+    fuzzTestOffsetDeleteEmptyTopicsCallsCoordinator
+    fuzzTestOffsetDeleteThrottledResponse
+    fuzzTestOffsetDeleteForwardedInnerThrottled
+    fuzzTestOffsetDeleteTopicFromFuzzTail
+)
+
 
 mkdir -p "$JACOCO_DIR"
 
@@ -873,6 +890,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${LIST_PARTITION_REASSIGNMENTS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleListPartitionReassignmentsRequestFuzzTest" "$t"
     done
+    for t in "${OFFSET_DELETE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleOffsetDeleteRequestFuzzTest" "$t"
+    done
 elif [[ "$FUZZ_SUITE" == "offset-fetch" ]]; then
     for t in "${OFFSET_FETCH_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
@@ -892,6 +912,10 @@ elif [[ "$FUZZ_SUITE" == "alter-partition-reassignments" ]]; then
 elif [[ "$FUZZ_SUITE" == "list-partition-reassignments" ]]; then
     for t in "${LIST_PARTITION_REASSIGNMENTS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleListPartitionReassignmentsRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "offset-delete" ]]; then
+    for t in "${OFFSET_DELETE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleOffsetDeleteRequestFuzzTest" "$t"
     done
 elif [[ "$FUZZ_SUITE" == "describe-configs" ]]; then
     for t in "${DESCRIBE_CONFIGS_TESTS[@]}"; do
@@ -999,6 +1023,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleIncrementalAlterConfigsRequest", 3041, 3109),
     ("KafkaApis.scala",          "handleAlterPartitionReassignmentsRequest", 2946, 2986),
     ("KafkaApis.scala",          "handleListPartitionReassignmentsRequest", 2988, 3030),
+    ("KafkaApis.scala",          "handleOffsetDeleteRequest",               3442, 3506),
     ("KafkaApis.scala",          "handleAlterReplicaLogDirsRequest",     3117, 3137),
     ("KafkaApis.scala",          "handleDescribeLogDirsRequest",         3139, 3160),
     ("RequestHandlerHelper.scala", "sendMaybeThrottle",                   112,  122),
