@@ -451,6 +451,7 @@ INCREMENTAL_ALTER_CONFIGS_TESTS=(
     fuzzTestIncrementalAlterConfigsForwardedInnerProcessesLocally
     fuzzTestIncrementalAlterConfigsThrottledResponse
     fuzzTestIncrementalAlterConfigsClientMetricsAuthorized
+    fuzzTestIncrementalAlterConfigsClientMetricsClusterDeniedUnexpectedResourceType
     fuzzTestIncrementalAlterConfigsTopicNamesFromRemainingBytes
 )
 

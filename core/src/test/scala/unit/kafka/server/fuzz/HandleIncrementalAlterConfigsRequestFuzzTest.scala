@@ -27,6 +27,7 @@ import org.apache.kafka.clients.admin.AlterConfigOp.OpType
 import org.apache.kafka.common.acl.AclOperation
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.config.ConfigResource.Type
+import org.apache.kafka.common.errors.InvalidRequestException
 import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData
 import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData.{
   AlterableConfigCollection,
@@ -38,7 +39,7 @@ import org.apache.kafka.common.requests.{AbstractResponse, ApiError, Incremental
 import org.apache.kafka.common.resource.{Resource, ResourceType}
 import org.apache.kafka.server.authorizer.{Action, AuthorizationResult, Authorizer}
 import org.apache.kafka.server.common.MetadataVersion
-import org.junit.jupiter.api.Assertions.{assertEquals, assertTrue}
+import org.junit.jupiter.api.Assertions.{assertEquals, assertThrows, assertTrue}
 import org.mockito.ArgumentCaptor
 import org.mockito.ArgumentMatchers.{any, anyDouble, anyLong}
 import org.mockito.Mockito.{mock, reset, spy, verify, when}
@@ -52,7 +53,8 @@ import scala.jdk.CollectionConverters._
  * `ConfigAdminManager.preprocess` (with `ALTER_CONFIGS` authorization for
  * `BROKER_LOGGER`), empty-remaining short-circuit, forwarding when the ZK cache
  * reports a KRaft controller (or on a KRaft broker), local persistence with
- * `ZkAdminManager.incrementalAlterConfigs`, mixed topic authorization, and
+ * `ZkAdminManager.incrementalAlterConfigs`, mixed topic authorization,
+ * `configsAuthorizationApiError` when `CLIENT_METRICS` is unauthorized, and
  * throttling.
  */
 class HandleIncrementalAlterConfigsRequestFuzzTest extends KafkaApisTest {
@@ -632,6 +634,43 @@ class HandleIncrementalAlterConfigsRequestFuzzTest extends KafkaApisTest {
       val response = verifyNoThrottling[IncrementalAlterConfigsResponse](request)
       assertEquals(throttleTimeMs, response.data.throttleTimeMs)
       assertEquals(Errors.NONE, errorsByResourceName(response)(topicName))
+    } finally kafkaApis.close()
+  }
+
+
+  /**
+   * When `ALTER_CONFIGS` on the cluster is denied, a `CLIENT_METRICS` resource is
+   * classified as unauthorized and `configsAuthorizationApiError` runs. That helper
+   * does not handle `CLIENT_METRICS`, so it throws `InvalidRequestException` with the
+   * message produced next to `processIncrementalAlterConfigsRequest` in `KafkaApis`.
+   */
+  @FuzzTest(maxDuration = FUZZ_DURATION)
+  def fuzzTestIncrementalAlterConfigsClientMetricsClusterDeniedUnexpectedResourceType(data: FuzzedDataProvider): Unit = {
+    val requestVersion = data.consumeShort(
+      ApiKeys.INCREMENTAL_ALTER_CONFIGS.oldestVersion(),
+      ApiKeys.INCREMENTAL_ALTER_CONFIGS.latestVersion()
+    )
+    val subscriptionName = safeConfigString(data, "fuzz-iac-cm-deny-sub")
+    val entryName = safeConfigString(data, "metrics")
+    val entryValue = safeConfigString(data, "foo.bar")
+
+    resetZkIncrementalHarness()
+    when(controller.isActive).thenReturn(true)
+    stubNoThrottle()
+
+    val clientMetricsResource = new ConfigResource(Type.CLIENT_METRICS, subscriptionName)
+    val alterOp = new AlterConfigOp(new ConfigEntry(entryName, entryValue), OpType.SET)
+    val javaMap = new util.HashMap[ConfigResource, util.Collection[AlterConfigOp]]()
+    javaMap.put(clientMetricsResource, Collections.singletonList(alterOp))
+    val request = incrementalRequestFromJavaMap(javaMap, validateOnly = false, requestVersion)
+
+    val deniedClusterAuthorizer = authorizerDenyClusterAlterConfigs()
+    val kafkaApis = createKafkaApis(authorizer = Some(deniedClusterAuthorizer))
+    try {
+      val thrown = assertThrows(classOf[InvalidRequestException], () =>
+        kafkaApis.handleIncrementalAlterConfigsRequest(request))
+      val expectedMessage = s"Unexpected resource type ${Type.CLIENT_METRICS} for resource $subscriptionName"
+      assertEquals(expectedMessage, thrown.getMessage)
     } finally kafkaApis.close()
   }
 
