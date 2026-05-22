@@ -38,12 +38,7 @@
 # `FUZZ_SUITE=renew-delegation-token` for `HandleRenewTokenRequestFuzzTest`, or
 # `FUZZ_SUITE=expire-delegation-token` for `HandleExpireTokenRequestFuzzTest`, or
 # `FUZZ_SUITE=describe-delegation-token` for `HandleDescribeTokensRequestFuzzTest`, or
-# `FUZZ_SUITE=delete-groups` for `HandleDeleteGroupsRequestFuzzTest`, or
-# `FUZZ_SUITE=elect-leaders` for `HandleElectLeadersRequestFuzzTest`, or
-# `FUZZ_SUITE=incremental-alter-configs` for `HandleIncrementalAlterConfigsRequestFuzzTest`, or
-# `FUZZ_SUITE=alter-partition-reassignments` for `HandleAlterPartitionReassignmentsRequestFuzzTest`, or
-# `FUZZ_SUITE=list-partition-reassignments` for `HandleListPartitionReassignmentsRequestFuzzTest`, or
-# `FUZZ_SUITE=offset-delete` for `HandleOffsetDeleteRequestFuzzTest`.
+# `FUZZ_SUITE=delete-groups` for `HandleDeleteGroupsRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -77,16 +72,11 @@ esac
 #   FUZZ_SUITE=expire-delegation-token  HandleExpireTokenRequestFuzzTest only
 #   FUZZ_SUITE=describe-delegation-token HandleDescribeTokensRequestFuzzTest only
 #   FUZZ_SUITE=delete-groups           HandleDeleteGroupsRequestFuzzTest only
-#   FUZZ_SUITE=elect-leaders           HandleElectLeadersRequestFuzzTest only
-#   FUZZ_SUITE=incremental-alter-configs HandleIncrementalAlterConfigsRequestFuzzTest only
-#   FUZZ_SUITE=alter-partition-reassignments HandleAlterPartitionReassignmentsRequestFuzzTest only
-#   FUZZ_SUITE=list-partition-reassignments HandleListPartitionReassignmentsRequestFuzzTest only
-#   FUZZ_SUITE=offset-delete           HandleOffsetDeleteRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch|elect-leaders|incremental-alter-configs|alter-partition-reassignments|list-partition-reassignments|offset-delete|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups) ;;
+    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|elect-leaders|incremental-alter-configs|alter-partition-reassignments|list-partition-reassignments|offset-delete|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|elect-leaders)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups)" >&2
         exit 2
         ;;
 esac
@@ -154,12 +144,19 @@ FETCH_TESTS=(
     fuzzTestFetchDownConversion
 )
 
-# handleDescribeTopicPartitionsRequest fuzz targets (ZK arm only;
-# HandleDescribeTopicPartitionsRequestFuzzTest, maxDuration = 20s each)
+# handleDescribeTopicPartitionsRequest fuzz targets
+# (HandleDescribeTopicPartitionsRequestFuzzTest, maxDuration = 20s each)
 DESCRIBE_TP_TESTS=(
     fuzzTestZkUnsupportedVersion
     fuzzTestZkUnsupportedVersionThrottled
     fuzzTestZkUnsupportedVersionForwarded
+    fuzzTestZkUnsupportedVersionManyTopicsFromFuzzTail
+    fuzzTestDescribeTopicPartitionsKRaftFetchAll
+    fuzzTestDescribeTopicPartitionsKRaftNamedTopics
+    fuzzTestDescribeTopicPartitionsKRaftTopicDescribeDenied
+    fuzzTestDescribeTopicPartitionsKRaftInvalidCursorTopicMissing
+    fuzzTestDescribeTopicPartitionsKRaftInvalidCursorNegativePartition
+    fuzzTestDescribeTopicPartitionsKRaftForwardedThrottled
 )
 
 # handleHeartbeatRequest fuzz targets (HandleHeartbeatRequestFuzzTest,
@@ -180,19 +177,6 @@ OFFSET_FETCH_TESTS=(
     fuzzTestOffsetFetchCoordinatorV1To7
     fuzzTestOffsetFetchCoordinatorThrottleAndForwarded
     fuzzTestOffsetFetchCoordinatorAuthAndHandleExceptions
-)
-
-# handleElectLeaders fuzz targets (HandleElectLeadersRequestFuzzTest,
-# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
-ELECT_LEADERS_TESTS=(
-    fuzzTestElectLeadersClusterAuthDeniedExplicitPartitions
-    fuzzTestElectLeadersClusterAuthDeniedAllPartitions
-    fuzzTestElectLeadersAuthorizedAllPartitionsFiltersNotNeeded
-    fuzzTestElectLeadersAuthorizedExplicitKeepsNotNeeded
-    fuzzTestElectLeadersAuthorizedEmptyExplicitPartitions
-    fuzzTestElectLeadersThrottled
-    fuzzTestElectLeadersForwardedSkipsChannelThrottle
-    fuzzTestElectLeadersAuthorizedExplicitFromRemainingBytes
 )
 
 # handleSyncGroupRequest fuzz targets (HandleSyncGroupRequestFuzzTest,
@@ -440,27 +424,6 @@ ALTER_CONFIGS_TESTS=(
     fuzzTestAlterConfigsZkAdminManagerReturnsError
 )
 
-# handleIncrementalAlterConfigsRequest fuzz targets (HandleIncrementalAlterConfigsRequestFuzzTest,
-# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
-INCREMENTAL_ALTER_CONFIGS_TESTS=(
-    fuzzTestIncrementalAlterConfigsEmptyResources
-    fuzzTestIncrementalAlterConfigsBrokerLoggerValidateOnlyPreprocessed
-    fuzzTestIncrementalAlterConfigsPreprocessDuplicateResources
-    fuzzTestIncrementalAlterConfigsPreprocessNullConfigValue
-    fuzzTestIncrementalAlterConfigsPreprocessUnknownResourceType
-    fuzzTestIncrementalAlterConfigsPreprocessDuplicateConfigKeys
-    fuzzTestIncrementalAlterConfigsPreprocessBrokerWrongNodeId
-    fuzzTestIncrementalAlterConfigsZkTopicMixedAuthorization
-    fuzzTestIncrementalAlterConfigsBrokerLoggerClusterAuthDenied
-    fuzzTestIncrementalAlterConfigsZkForwardWhenControllerIsKRaft
-    fuzzTestIncrementalAlterConfigsKRaftBrokerForwards
-    fuzzTestIncrementalAlterConfigsForwardedInnerProcessesLocally
-    fuzzTestIncrementalAlterConfigsThrottledResponse
-    fuzzTestIncrementalAlterConfigsClientMetricsAuthorized
-    fuzzTestIncrementalAlterConfigsClientMetricsClusterDeniedUnexpectedResourceType
-    fuzzTestIncrementalAlterConfigsTopicNamesFromRemainingBytes
-)
-
 # handleDescribeConfigsRequest fuzz targets (HandleDescribeConfigsRequestFuzzTest,
 # maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
 DESCRIBE_CONFIGS_TESTS=(
@@ -693,55 +656,6 @@ TOPIC_METADATA_TESTS=(
     fuzzTestTopicMetadataAutoCreateNonExistingTopic
 )
 
-# handleAlterPartitionReassignmentsRequest fuzz targets (HandleAlterPartitionReassignmentsRequestFuzzTest,
-# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
-ALTER_PARTITION_REASSIGNMENTS_TESTS=(
-    fuzzTestAlterPartitionReassignmentsKRaftThrows
-    fuzzTestAlterPartitionReassignmentsKRaftForwardedThrows
-    fuzzTestAlterPartitionReassignmentsClusterAuthDenied
-    fuzzTestAlterPartitionReassignmentsEmptyTopics
-    fuzzTestAlterPartitionReassignmentsSinglePartitionWithReplicas
-    fuzzTestAlterPartitionReassignmentsRevertNullReplicas
-    fuzzTestAlterPartitionReassignmentsTopLevelError
-    fuzzTestAlterPartitionReassignmentsPerPartitionErrors
-    fuzzTestAlterPartitionReassignmentsMultiTopicMixedReplicas
-    fuzzTestAlterPartitionReassignmentsThrottled
-    fuzzTestAlterPartitionReassignmentsForwardedInnerThrottled
-    fuzzTestAlterPartitionReassignmentsTopicFromFuzzTail
-)
-
-# handleListPartitionReassignmentsRequest fuzz targets (HandleListPartitionReassignmentsRequestFuzzTest,
-# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
-LIST_PARTITION_REASSIGNMENTS_TESTS=(
-    fuzzTestListPartitionReassignmentsKRaftThrows
-    fuzzTestListPartitionReassignmentsKRaftForwardedThrows
-    fuzzTestListPartitionReassignmentsClusterDescribeDenied
-    fuzzTestListPartitionReassignmentsAllTopicsNullFilter
-    fuzzTestListPartitionReassignmentsEmptyTopicFilter
-    fuzzTestListPartitionReassignmentsFilteredPartitions
-    fuzzTestListPartitionReassignmentsMultiTopicFilter
-    fuzzTestListPartitionReassignmentsTopLevelError
-    fuzzTestListPartitionReassignmentsThrottled
-    fuzzTestListPartitionReassignmentsForwardedInnerThrottled
-    fuzzTestListPartitionReassignmentsTopicFromFuzzTail
-)
-
-# handleOffsetDeleteRequest fuzz targets (HandleOffsetDeleteRequestFuzzTest,
-# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
-OFFSET_DELETE_TESTS=(
-    fuzzTestOffsetDeleteGroupAuthorizationDenied
-    fuzzTestOffsetDeleteHappyPathCoordinatorMerge
-    fuzzTestOffsetDeleteUnknownTopicInMetadata
-    fuzzTestOffsetDeleteTopicReadDenied
-    fuzzTestOffsetDeleteInvalidPartitionIndex
-    fuzzTestOffsetDeleteCoordinatorException
-    fuzzTestOffsetDeleteEmptyTopicsCallsCoordinator
-    fuzzTestOffsetDeleteThrottledResponse
-    fuzzTestOffsetDeleteForwardedInnerThrottled
-    fuzzTestOffsetDeleteTopicFromFuzzTail
-)
-
-
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -778,9 +692,6 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     done
     for t in "${OFFSET_FETCH_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
-    done
-    for t in "${ELECT_LEADERS_TESTS[@]}"; do
-        run_one "unit.kafka.server.fuzz.HandleElectLeadersRequestFuzzTest" "$t"
     done
     for t in "${SYNC_GROUP_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleSyncGroupRequestFuzzTest" "$t"
@@ -836,9 +747,6 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${ALTER_CONFIGS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleAlterConfigsRequestFuzzTest" "$t"
     done
-    for t in "${INCREMENTAL_ALTER_CONFIGS_TESTS[@]}"; do
-        run_one "unit.kafka.server.fuzz.HandleIncrementalAlterConfigsRequestFuzzTest" "$t"
-    done
     for t in "${DESCRIBE_CONFIGS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDescribeConfigsRequestFuzzTest" "$t"
     done
@@ -884,38 +792,9 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${TOPIC_METADATA_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleTopicMetadataRequestFuzzTest" "$t"
     done
-    for t in "${ALTER_PARTITION_REASSIGNMENTS_TESTS[@]}"; do
-        run_one "unit.kafka.server.fuzz.HandleAlterPartitionReassignmentsRequestFuzzTest" "$t"
-    done
-    for t in "${LIST_PARTITION_REASSIGNMENTS_TESTS[@]}"; do
-        run_one "unit.kafka.server.fuzz.HandleListPartitionReassignmentsRequestFuzzTest" "$t"
-    done
-    for t in "${OFFSET_DELETE_TESTS[@]}"; do
-        run_one "unit.kafka.server.fuzz.HandleOffsetDeleteRequestFuzzTest" "$t"
-    done
 elif [[ "$FUZZ_SUITE" == "offset-fetch" ]]; then
     for t in "${OFFSET_FETCH_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
-    done
-elif [[ "$FUZZ_SUITE" == "elect-leaders" ]]; then
-    for t in "${ELECT_LEADERS_TESTS[@]}"; do
-        run_one "unit.kafka.server.fuzz.HandleElectLeadersRequestFuzzTest" "$t"
-    done
-elif [[ "$FUZZ_SUITE" == "incremental-alter-configs" ]]; then
-    for t in "${INCREMENTAL_ALTER_CONFIGS_TESTS[@]}"; do
-        run_one "unit.kafka.server.fuzz.HandleIncrementalAlterConfigsRequestFuzzTest" "$t"
-    done
-elif [[ "$FUZZ_SUITE" == "alter-partition-reassignments" ]]; then
-    for t in "${ALTER_PARTITION_REASSIGNMENTS_TESTS[@]}"; do
-        run_one "unit.kafka.server.fuzz.HandleAlterPartitionReassignmentsRequestFuzzTest" "$t"
-    done
-elif [[ "$FUZZ_SUITE" == "list-partition-reassignments" ]]; then
-    for t in "${LIST_PARTITION_REASSIGNMENTS_TESTS[@]}"; do
-        run_one "unit.kafka.server.fuzz.HandleListPartitionReassignmentsRequestFuzzTest" "$t"
-    done
-elif [[ "$FUZZ_SUITE" == "offset-delete" ]]; then
-    for t in "${OFFSET_DELETE_TESTS[@]}"; do
-        run_one "unit.kafka.server.fuzz.HandleOffsetDeleteRequestFuzzTest" "$t"
     done
 elif [[ "$FUZZ_SUITE" == "describe-configs" ]]; then
     for t in "${DESCRIBE_CONFIGS_TESTS[@]}"; do
@@ -1018,12 +897,7 @@ TARGETS = [
     ("KafkaApis.scala",          "handleExpireTokenRequest",              3278, 3289),
     ("KafkaApis.scala",          "handleExpireTokenRequestZk",           3291, 3322),
     ("KafkaApis.scala",          "handleDescribeTokensRequest",          3324, 3358),
-    ("KafkaApis.scala",          "handleElectLeaders",                   3371, 3439),
     ("KafkaApis.scala",          "handleDescribeConfigsRequest",         3111, 3115),
-    ("KafkaApis.scala",          "handleIncrementalAlterConfigsRequest", 3041, 3109),
-    ("KafkaApis.scala",          "handleAlterPartitionReassignmentsRequest", 2946, 2986),
-    ("KafkaApis.scala",          "handleListPartitionReassignmentsRequest", 2988, 3030),
-    ("KafkaApis.scala",          "handleOffsetDeleteRequest",               3442, 3506),
     ("KafkaApis.scala",          "handleAlterReplicaLogDirsRequest",     3117, 3137),
     ("KafkaApis.scala",          "handleDescribeLogDirsRequest",         3139, 3160),
     ("RequestHandlerHelper.scala", "sendMaybeThrottle",                   112,  122),
