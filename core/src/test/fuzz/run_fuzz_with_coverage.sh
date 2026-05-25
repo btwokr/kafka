@@ -38,7 +38,14 @@
 # `FUZZ_SUITE=renew-delegation-token` for `HandleRenewTokenRequestFuzzTest`, or
 # `FUZZ_SUITE=expire-delegation-token` for `HandleExpireTokenRequestFuzzTest`, or
 # `FUZZ_SUITE=describe-delegation-token` for `HandleDescribeTokensRequestFuzzTest`, or
-# `FUZZ_SUITE=delete-groups` for `HandleDeleteGroupsRequestFuzzTest`.
+# `FUZZ_SUITE=delete-groups` for `HandleDeleteGroupsRequestFuzzTest`, or
+# `FUZZ_SUITE=get-telemetry-subscriptions` for `HandleGetTelemetrySubscriptionsRequestFuzzTest`, or
+# `FUZZ_SUITE=push-telemetry` for `HandlePushTelemetryRequestFuzzTest`, or
+# `FUZZ_SUITE=list-client-metrics-resources` for `HandleListClientMetricsResourcesRequestFuzzTest`, or
+# `FUZZ_SUITE=share-group-heartbeat` for `HandleShareGroupHeartbeatRequestFuzzTest`, or
+# `FUZZ_SUITE=share-group-describe` for `HandleShareGroupDescribeRequestFuzzTest`, or
+# `FUZZ_SUITE=share-fetch` for `HandleShareFetchRequestFuzzTest`, or
+# `FUZZ_SUITE=share-acknowledge` for `HandleShareAcknowledgeRequestFuzzTest`.
 # (useful with `FUZZ_MODE=resume` to append coverage for the new tests only).
 #
 set -u
@@ -72,11 +79,18 @@ esac
 #   FUZZ_SUITE=expire-delegation-token  HandleExpireTokenRequestFuzzTest only
 #   FUZZ_SUITE=describe-delegation-token HandleDescribeTokensRequestFuzzTest only
 #   FUZZ_SUITE=delete-groups           HandleDeleteGroupsRequestFuzzTest only
+#   FUZZ_SUITE=get-telemetry-subscriptions HandleGetTelemetrySubscriptionsRequestFuzzTest only
+#   FUZZ_SUITE=push-telemetry HandlePushTelemetryRequestFuzzTest only
+#   FUZZ_SUITE=list-client-metrics-resources HandleListClientMetricsResourcesRequestFuzzTest only
+#   FUZZ_SUITE=share-group-heartbeat HandleShareGroupHeartbeatRequestFuzzTest only
+#   FUZZ_SUITE=share-group-describe HandleShareGroupDescribeRequestFuzzTest only
+#   FUZZ_SUITE=share-fetch HandleShareFetchRequestFuzzTest only
+#   FUZZ_SUITE=share-acknowledge HandleShareAcknowledgeRequestFuzzTest only
 FUZZ_SUITE="${FUZZ_SUITE:-all}"
 case "$FUZZ_SUITE" in
-    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups) ;;
+    all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions|push-telemetry|list-client-metrics-resources|share-group-heartbeat|share-group-describe|share-fetch|share-acknowledge) ;;
     *)
-        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups)" >&2
+        echo "[fuzz] unknown FUZZ_SUITE=$FUZZ_SUITE (expected: all|offset-fetch|describe-configs|describe-log-dirs|sasl-authenticate|sasl-handshake|alter-replica-log-dirs|create-partitions|create-delegation-token|renew-delegation-token|expire-delegation-token|describe-delegation-token|delete-groups|get-telemetry-subscriptions|push-telemetry|list-client-metrics-resources|share-group-heartbeat|share-group-describe|share-fetch|share-acknowledge)" >&2
         exit 2
         ;;
 esac
@@ -649,6 +663,100 @@ TOPIC_METADATA_TESTS=(
     fuzzTestTopicMetadataAutoCreateNonExistingTopic
 )
 
+# handleGetTelemetrySubscriptionsRequest fuzz targets (HandleGetTelemetrySubscriptionsRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+GET_TELEMETRY_SUBSCRIPTIONS_TESTS=(
+    fuzzTestGetTelemetrySubscriptionsZkUnsupportedVersion
+    fuzzTestGetTelemetrySubscriptionsZkUnsupportedThrottled
+    fuzzTestGetTelemetrySubscriptionsZkUnsupportedForwarded
+    fuzzTestGetTelemetrySubscriptionsKRaftSuccess
+    fuzzTestGetTelemetrySubscriptionsKRaftProcessThrowsMapsToInvalidRequest
+    fuzzTestGetTelemetrySubscriptionsKRaftProcessThrowsInvalidRequestException
+    fuzzTestGetTelemetrySubscriptionsKRaftManagerReturnsErrorCode
+    fuzzTestGetTelemetrySubscriptionsKRaftForwardedThrottled
+)
+
+# handlePushTelemetryRequest fuzz targets (HandlePushTelemetryRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+PUSH_TELEMETRY_TESTS=(
+    fuzzTestPushTelemetryZkUnsupportedVersion
+    fuzzTestPushTelemetryZkUnsupportedThrottled
+    fuzzTestPushTelemetryZkUnsupportedForwarded
+    fuzzTestPushTelemetryKRaftSuccess
+    fuzzTestPushTelemetryKRaftProcessThrowsMapsToInvalidRequest
+    fuzzTestPushTelemetryKRaftProcessThrowsInvalidRequestException
+    fuzzTestPushTelemetryKRaftManagerReturnsErrorCode
+    fuzzTestPushTelemetryKRaftForwardedThrottled
+)
+
+# handleListClientMetricsResources fuzz targets (HandleListClientMetricsResourcesRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+LIST_CLIENT_METRICS_RESOURCES_TESTS=(
+    fuzzTestListClientMetricsResourcesClusterDescribeConfigsDenied
+    fuzzTestListClientMetricsResourcesClusterDescribeConfigsDeniedThrottled
+    fuzzTestListClientMetricsResourcesClusterDescribeConfigsDeniedForwarded
+    fuzzTestListClientMetricsResourcesZkUnsupportedVersion
+    fuzzTestListClientMetricsResourcesZkUnsupportedThrottled
+    fuzzTestListClientMetricsResourcesZkUnsupportedForwarded
+    fuzzTestListClientMetricsResourcesKRaftReturnsResources
+    fuzzTestListClientMetricsResourcesKRaftEmptyResources
+    fuzzTestListClientMetricsResourcesKRaftListThrowsUnknownServerError
+    fuzzTestListClientMetricsResourcesKRaftForwardedThrottled
+)
+
+# handleShareGroupHeartbeat fuzz targets (HandleShareGroupHeartbeatRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+SHARE_GROUP_HEARTBEAT_TESTS=(
+    fuzzTestShareGroupHeartbeatShareDisabledUnsupportedVersion
+    fuzzTestShareGroupHeartbeatShareDisabledUnsupportedThrottled
+    fuzzTestShareGroupHeartbeatShareDisabledUnsupportedForwarded
+    fuzzTestShareGroupHeartbeatAuthDenied
+    fuzzTestShareGroupHeartbeatAuthDeniedThrottled
+    fuzzTestShareGroupHeartbeatAuthDeniedForwarded
+    fuzzTestShareGroupHeartbeatCoordinatorSuccess
+    fuzzTestShareGroupHeartbeatCoordinatorCompletesExceptionallyApiError
+    fuzzTestShareGroupHeartbeatCoordinatorCompletesExceptionallyRuntime
+    fuzzTestShareGroupHeartbeatCoordinatorSuccessThrottled
+    fuzzTestShareGroupHeartbeatCoordinatorSuccessForwardedThrottled
+)
+
+# handleShareGroupDescribe fuzz targets (HandleShareGroupDescribeRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+SHARE_GROUP_DESCRIBE_TESTS=(
+    fuzzTestShareGroupDescribeShareDisabledUnsupportedVersion
+    fuzzTestShareGroupDescribeShareDisabledUnsupportedThrottled
+    fuzzTestShareGroupDescribeShareDisabledUnsupportedForwarded
+    fuzzTestShareGroupDescribeAuthDeniedAllGroups
+    fuzzTestShareGroupDescribeAuthDeniedAllThrottled
+    fuzzTestShareGroupDescribeAuthDeniedAllForwarded
+    fuzzTestShareGroupDescribeMixedAuthOneDeniedOneAllowed
+    fuzzTestShareGroupDescribeCoordinatorSuccess
+    fuzzTestShareGroupDescribeEmptyGroupList
+    fuzzTestShareGroupDescribeCoordinatorCompletesExceptionallyApiError
+    fuzzTestShareGroupDescribeCoordinatorCompletesExceptionallyRuntime
+    fuzzTestShareGroupDescribeCoordinatorSuccessThrottled
+    fuzzTestShareGroupDescribeCoordinatorSuccessForwardedThrottled
+)
+
+# handleShareFetchRequest fuzz targets (HandleShareFetchRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+SHARE_FETCH_TESTS=(
+    fuzzTestShareFetchUnsupportedVersionKRaft
+    fuzzTestShareFetchUnsupportedVersionZk
+    fuzzTestShareFetchUnsupportedThrottled
+    fuzzTestShareFetchUnsupportedForwarded
+)
+
+# handleShareAcknowledgeRequest fuzz targets (HandleShareAcknowledgeRequestFuzzTest,
+# maxDuration = 10s each, matching KafkaApisTest.FUZZ_DURATION)
+SHARE_ACKNOWLEDGE_TESTS=(
+    fuzzTestShareAcknowledgeKRaftUnsupportedVersion
+    fuzzTestShareAcknowledgeZkUnsupportedVersion
+    fuzzTestShareAcknowledgeVerifiedUnsupportedVersionResponse
+    fuzzTestShareAcknowledgeThrottledResponse
+    fuzzTestShareAcknowledgeForwardedInnerRequest
+)
+
 mkdir -p "$JACOCO_DIR"
 
 run_one() {
@@ -785,6 +893,27 @@ if [[ "$FUZZ_SUITE" == "all" ]]; then
     for t in "${TOPIC_METADATA_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleTopicMetadataRequestFuzzTest" "$t"
     done
+    for t in "${GET_TELEMETRY_SUBSCRIPTIONS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleGetTelemetrySubscriptionsRequestFuzzTest" "$t"
+    done
+    for t in "${PUSH_TELEMETRY_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandlePushTelemetryRequestFuzzTest" "$t"
+    done
+    for t in "${LIST_CLIENT_METRICS_RESOURCES_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleListClientMetricsResourcesRequestFuzzTest" "$t"
+    done
+    for t in "${SHARE_GROUP_HEARTBEAT_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleShareGroupHeartbeatRequestFuzzTest" "$t"
+    done
+    for t in "${SHARE_GROUP_DESCRIBE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleShareGroupDescribeRequestFuzzTest" "$t"
+    done
+    for t in "${SHARE_FETCH_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleShareFetchRequestFuzzTest" "$t"
+    done
+    for t in "${SHARE_ACKNOWLEDGE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleShareAcknowledgeRequestFuzzTest" "$t"
+    done
 elif [[ "$FUZZ_SUITE" == "offset-fetch" ]]; then
     for t in "${OFFSET_FETCH_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleOffsetFetchRequestFuzzTest" "$t"
@@ -833,6 +962,34 @@ elif [[ "$FUZZ_SUITE" == "delete-groups" ]]; then
     for t in "${DELETE_GROUPS_TESTS[@]}"; do
         run_one "unit.kafka.server.fuzz.HandleDeleteGroupsRequestFuzzTest" "$t"
     done
+elif [[ "$FUZZ_SUITE" == "get-telemetry-subscriptions" ]]; then
+    for t in "${GET_TELEMETRY_SUBSCRIPTIONS_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleGetTelemetrySubscriptionsRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "push-telemetry" ]]; then
+    for t in "${PUSH_TELEMETRY_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandlePushTelemetryRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "list-client-metrics-resources" ]]; then
+    for t in "${LIST_CLIENT_METRICS_RESOURCES_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleListClientMetricsResourcesRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "share-group-heartbeat" ]]; then
+    for t in "${SHARE_GROUP_HEARTBEAT_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleShareGroupHeartbeatRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "share-group-describe" ]]; then
+    for t in "${SHARE_GROUP_DESCRIBE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleShareGroupDescribeRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "share-fetch" ]]; then
+    for t in "${SHARE_FETCH_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleShareFetchRequestFuzzTest" "$t"
+    done
+elif [[ "$FUZZ_SUITE" == "share-acknowledge" ]]; then
+    for t in "${SHARE_ACKNOWLEDGE_TESTS[@]}"; do
+        run_one "unit.kafka.server.fuzz.HandleShareAcknowledgeRequestFuzzTest" "$t"
+    done
 fi
 
 
@@ -877,6 +1034,13 @@ TARGETS = [
     ("KafkaApis.scala",          "handleProduceRequest",                  606, 752),
     ("KafkaApis.scala",          "handleFetchRequest",                    757, 1077),
     ("KafkaApis.scala",          "handleDescribeTopicPartitionsRequest", 1445, 1461),
+    ("KafkaApis.scala",          "handleGetTelemetrySubscriptionsRequest", 3933, 3948),
+    ("KafkaApis.scala",          "handlePushTelemetryRequest", 3950, 3965),
+    ("KafkaApis.scala",          "handleListClientMetricsResources", 3967, 3986),
+    ("KafkaApis.scala",          "handleShareGroupHeartbeat", 3988, 4010),
+    ("KafkaApis.scala",          "handleShareGroupDescribe", 4012, 4052),
+    ("KafkaApis.scala",          "handleShareFetchRequest", 4054, 4059),
+    ("KafkaApis.scala",          "handleShareAcknowledgeRequest",       4061, 4066),
     ("KafkaApis.scala",          "handleHeartbeatRequest",               1924, 1948),
     ("KafkaApis.scala",          "handleDeleteGroupsRequest",            1886, 1922),
     ("KafkaApis.scala",          "handleOffsetFetchRequest",             1466, 1630),
