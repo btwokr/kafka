@@ -1,0 +1,632 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ServerConnector.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server</a> &gt; <span class="el_source">ServerConnector.java</span></div><h1>ServerConnector.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketException;
+import java.net.SocketOption;
+import java.net.StandardSocketOptions;
+import java.nio.channels.Channel;
+import java.nio.channels.SelectableChannel;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.util.EventListener;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicReference;
+
+import org.eclipse.jetty.io.ByteBufferPool;
+import org.eclipse.jetty.io.Connection;
+import org.eclipse.jetty.io.EndPoint;
+import org.eclipse.jetty.io.ManagedSelector;
+import org.eclipse.jetty.io.SelectorManager;
+import org.eclipse.jetty.io.SocketChannelEndPoint;
+import org.eclipse.jetty.util.IO;
+import org.eclipse.jetty.util.annotation.ManagedAttribute;
+import org.eclipse.jetty.util.annotation.ManagedObject;
+import org.eclipse.jetty.util.annotation.Name;
+import org.eclipse.jetty.util.ssl.SslContextFactory;
+import org.eclipse.jetty.util.thread.Scheduler;
+
+/**
+ * This {@link Connector} implementation is the primary connector for the
+ * Jetty server over TCP/IP.  By the use of various {@link ConnectionFactory} instances it is able
+ * to accept connections for HTTP, HTTP/2 and WebSocket, either directly or over SSL.
+ * &lt;p&gt;
+ * The connector is a fully asynchronous NIO based implementation that by default will
+ * use all the commons services (eg {@link Executor}, {@link Scheduler})  of the
+ * passed {@link Server} instance, but all services may also be constructor injected
+ * into the connector so that it may operate with dedicated or otherwise shared services.
+ * &lt;/p&gt;
+ * &lt;h2&gt;Connection Factories&lt;/h2&gt;
+ * &lt;p&gt;
+ * Various convenience constructors are provided to assist with common configurations of
+ * ConnectionFactories, whose generic use is described in {@link AbstractConnector}.
+ * If no connection factories are passed, then the connector will
+ * default to use a {@link HttpConnectionFactory}.  If an non null {@link SslContextFactory}
+ * instance is passed, then this used to instantiate a {@link SslConnectionFactory} which is
+ * prepended to the other passed or default factories.
+ * &lt;/p&gt;
+ * &lt;h2&gt;Selectors&lt;/h2&gt;
+ * &lt;p&gt;
+ * The default number of selectors is equal to half of the number of processors available to the JVM,
+ * which should allow optimal performance even if all the connections used are performing
+ * significant non-blocking work in the callback tasks.
+ * &lt;/p&gt;
+ */
+@ManagedObject(&quot;HTTP connector using NIO ByteChannels and Selectors&quot;)
+public class ServerConnector extends AbstractNetworkConnector
+{
+    private final SelectorManager _manager;
+<span class="fc" id="L76">    private final AtomicReference&lt;Closeable&gt; _acceptor = new AtomicReference&lt;&gt;();</span>
+    private volatile ServerSocketChannel _acceptChannel;
+<span class="fc" id="L78">    private volatile boolean _inheritChannel = false;</span>
+<span class="fc" id="L79">    private volatile int _localPort = -1;</span>
+<span class="fc" id="L80">    private volatile int _acceptQueueSize = 0;</span>
+<span class="fc" id="L81">    private volatile boolean _reuseAddress = true;</span>
+<span class="fc" id="L82">    private volatile boolean _reusePort = false;</span>
+<span class="fc" id="L83">    private volatile boolean _acceptedTcpNoDelay = true;</span>
+<span class="fc" id="L84">    private volatile int _acceptedReceiveBufferSize = -1;</span>
+<span class="fc" id="L85">    private volatile int _acceptedSendBufferSize = -1;</span>
+
+    /**
+     * &lt;p&gt;Construct a ServerConnector with a private instance of {@link HttpConnectionFactory} as the only factory.&lt;/p&gt;
+     *
+     * @param server The {@link Server} this connector will accept connection for.
+     */
+    public ServerConnector(
+        @Name(&quot;server&quot;) Server server)
+    {
+<span class="fc" id="L95">        this(server, null, null, null, -1, -1, new HttpConnectionFactory());</span>
+<span class="fc" id="L96">    }</span>
+
+    /**
+     * &lt;p&gt;Construct a ServerConnector with a private instance of {@link HttpConnectionFactory} as the only factory.&lt;/p&gt;
+     *
+     * @param server The {@link Server} this connector will accept connection for.
+     * @param acceptors the number of acceptor threads to use, or -1 for a default value. Acceptors accept new TCP/IP connections.  If 0, then
+     * the selector threads are used to accept connections.
+     * @param selectors the number of selector threads, or &amp;lt;=0 for a default value. Selectors notice and schedule established connection that can make IO progress.
+     */
+    public ServerConnector(
+        @Name(&quot;server&quot;) Server server,
+        @Name(&quot;acceptors&quot;) int acceptors,
+        @Name(&quot;selectors&quot;) int selectors)
+    {
+<span class="nc" id="L111">        this(server, null, null, null, acceptors, selectors, new HttpConnectionFactory());</span>
+<span class="nc" id="L112">    }</span>
+
+    /**
+     * &lt;p&gt;Construct a ServerConnector with a private instance of {@link HttpConnectionFactory} as the only factory.&lt;/p&gt;
+     *
+     * @param server The {@link Server} this connector will accept connection for.
+     * @param acceptors the number of acceptor threads to use, or -1 for a default value. Acceptors accept new TCP/IP connections.  If 0, then
+     * the selector threads are used to accept connections.
+     * @param selectors the number of selector threads, or &amp;lt;=0 for a default value. Selectors notice and schedule established connection that can make IO progress.
+     * @param factories Zero or more {@link ConnectionFactory} instances used to create and configure connections.
+     */
+    public ServerConnector(
+        @Name(&quot;server&quot;) Server server,
+        @Name(&quot;acceptors&quot;) int acceptors,
+        @Name(&quot;selectors&quot;) int selectors,
+        @Name(&quot;factories&quot;) ConnectionFactory... factories)
+    {
+<span class="nc" id="L129">        this(server, null, null, null, acceptors, selectors, factories);</span>
+<span class="nc" id="L130">    }</span>
+
+    /**
+     * &lt;p&gt;Construct a Server Connector with the passed Connection factories.&lt;/p&gt;
+     *
+     * @param server The {@link Server} this connector will accept connection for.
+     * @param factories Zero or more {@link ConnectionFactory} instances used to create and configure connections.
+     */
+    public ServerConnector(
+        @Name(&quot;server&quot;) Server server,
+        @Name(&quot;factories&quot;) ConnectionFactory... factories)
+    {
+<span class="nc" id="L142">        this(server, null, null, null, -1, -1, factories);</span>
+<span class="nc" id="L143">    }</span>
+
+    /**
+     * &lt;p&gt;Construct a ServerConnector with a private instance of {@link HttpConnectionFactory} as the primary protocol&lt;/p&gt;.
+     *
+     * @param server The {@link Server} this connector will accept connection for.
+     * @param sslContextFactory If non null, then a {@link SslConnectionFactory} is instantiated and prepended to the
+     * list of HTTP Connection Factory.
+     */
+    public ServerConnector(
+        @Name(&quot;server&quot;) Server server,
+        @Name(&quot;sslContextFactory&quot;) SslContextFactory.Server sslContextFactory)
+    {
+<span class="fc" id="L156">        this(server, null, null, null, -1, -1, AbstractConnectionFactory.getFactories(sslContextFactory, new HttpConnectionFactory()));</span>
+<span class="fc" id="L157">    }</span>
+
+    /**
+     * &lt;p&gt;Construct a ServerConnector with a private instance of {@link HttpConnectionFactory} as the primary protocol&lt;/p&gt;.
+     *
+     * @param server The {@link Server} this connector will accept connection for.
+     * @param sslContextFactory If non null, then a {@link SslConnectionFactory} is instantiated and prepended to the
+     * list of HTTP Connection Factory.
+     * @param acceptors the number of acceptor threads to use, or -1 for a default value. Acceptors accept new TCP/IP connections.  If 0, then
+     * the selector threads are used to accept connections.
+     * @param selectors the number of selector threads, or &amp;lt;=0 for a default value. Selectors notice and schedule established connection that can make IO progress.
+     */
+    public ServerConnector(
+        @Name(&quot;server&quot;) Server server,
+        @Name(&quot;acceptors&quot;) int acceptors,
+        @Name(&quot;selectors&quot;) int selectors,
+        @Name(&quot;sslContextFactory&quot;) SslContextFactory.Server sslContextFactory)
+    {
+<span class="nc" id="L175">        this(server, null, null, null, acceptors, selectors, AbstractConnectionFactory.getFactories(sslContextFactory, new HttpConnectionFactory()));</span>
+<span class="nc" id="L176">    }</span>
+
+    /**
+     * @param server The {@link Server} this connector will accept connection for.
+     * @param sslContextFactory If non null, then a {@link SslConnectionFactory} is instantiated and prepended to the
+     * list of ConnectionFactories, with the first factory being the default protocol for the SslConnectionFactory.
+     * @param factories Zero or more {@link ConnectionFactory} instances used to create and configure connections.
+     */
+    public ServerConnector(
+        @Name(&quot;server&quot;) Server server,
+        @Name(&quot;sslContextFactory&quot;) SslContextFactory.Server sslContextFactory,
+        @Name(&quot;factories&quot;) ConnectionFactory... factories)
+    {
+<span class="nc" id="L189">        this(server, null, null, null, -1, -1, AbstractConnectionFactory.getFactories(sslContextFactory, factories));</span>
+<span class="nc" id="L190">    }</span>
+
+    /**
+     * @param server The server this connector will be accept connection for.
+     * @param executor An executor used to run tasks for handling requests, acceptors and selectors.
+     * If null then use the servers executor
+     * @param scheduler A scheduler used to schedule timeouts. If null then use the servers scheduler
+     * @param bufferPool A ByteBuffer pool used to allocate buffers.  If null then create a private pool with default configuration.
+     * @param acceptors the number of acceptor threads to use, or -1 for a default value. Acceptors accept new TCP/IP connections.  If 0, then
+     * the selector threads are used to accept connections.
+     * @param selectors the number of selector threads, or &amp;lt;=0 for a default value. Selectors notice and schedule established connection that can make IO progress.
+     * @param factories Zero or more {@link ConnectionFactory} instances used to create and configure connections.
+     */
+    public ServerConnector(
+        @Name(&quot;server&quot;) Server server,
+        @Name(&quot;executor&quot;) Executor executor,
+        @Name(&quot;scheduler&quot;) Scheduler scheduler,
+        @Name(&quot;bufferPool&quot;) ByteBufferPool bufferPool,
+        @Name(&quot;acceptors&quot;) int acceptors,
+        @Name(&quot;selectors&quot;) int selectors,
+        @Name(&quot;factories&quot;) ConnectionFactory... factories)
+    {
+<span class="fc" id="L212">        super(server, executor, scheduler, bufferPool, acceptors, factories);</span>
+<span class="fc" id="L213">        _manager = newSelectorManager(getExecutor(), getScheduler(), selectors);</span>
+<span class="fc" id="L214">        installBean(_manager, true);</span>
+<span class="fc" id="L215">        setAcceptorPriorityDelta(-2);</span>
+<span class="fc" id="L216">    }</span>
+
+    protected SelectorManager newSelectorManager(Executor executor, Scheduler scheduler, int selectors)
+    {
+<span class="fc" id="L220">        return new ServerConnectorManager(executor, scheduler, selectors);</span>
+    }
+
+    @Override
+    protected void doStart() throws Exception
+    {
+<span class="fc" id="L226">        addBean(_acceptChannel);</span>
+
+<span class="pc bpc" id="L228" title="1 of 2 branches missed.">        for (EventListener l : getBeans(SelectorManager.SelectorManagerListener.class))</span>
+<span class="nc" id="L229">            _manager.addEventListener(l);</span>
+
+<span class="fc" id="L231">        super.doStart();</span>
+
+<span class="pc bpc" id="L233" title="1 of 2 branches missed.">        if (getAcceptors() == 0)</span>
+        {
+<span class="nc" id="L235">            _acceptChannel.configureBlocking(false);</span>
+<span class="nc" id="L236">            _acceptor.set(_manager.acceptor(_acceptChannel));</span>
+        }
+<span class="fc" id="L238">    }</span>
+
+    @Override
+    protected void doStop() throws Exception
+    {
+<span class="fc" id="L243">        _acceptor.set(null);</span>
+
+<span class="fc" id="L245">        super.doStop();</span>
+
+<span class="fc" id="L247">        removeBean(_acceptChannel);</span>
+<span class="fc" id="L248">        _acceptChannel = null;</span>
+
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">        for (EventListener l : getBeans(EventListener.class))</span>
+        {
+<span class="nc" id="L252">            _manager.removeEventListener(l);</span>
+<span class="nc" id="L253">        }</span>
+<span class="fc" id="L254">    }</span>
+
+    @Override
+    public boolean isOpen()
+    {
+<span class="fc" id="L259">        ServerSocketChannel channel = _acceptChannel;</span>
+<span class="pc bpc" id="L260" title="2 of 4 branches missed.">        return channel != null &amp;&amp; channel.isOpen();</span>
+    }
+
+    /**
+     * @return whether this connector uses a channel inherited from the JVM.
+     * @see System#inheritedChannel()
+     */
+    public boolean isInheritChannel()
+    {
+<span class="fc" id="L269">        return _inheritChannel;</span>
+    }
+
+    /**
+     * &lt;p&gt;Sets whether this connector uses a channel inherited from the JVM.&lt;/p&gt;
+     * &lt;p&gt;If true, the connector first tries to inherit from a channel provided by the system.
+     * If there is no inherited channel available, or if the inherited channel is not usable,
+     * then it will fall back using {@link ServerSocketChannel}.&lt;/p&gt;
+     * &lt;p&gt;Use it with xinetd/inetd, to launch an instance of Jetty on demand. The port
+     * used to access pages on the Jetty instance is the same as the port used to
+     * launch Jetty.&lt;/p&gt;
+     *
+     * @param inheritChannel whether this connector uses a channel inherited from the JVM.
+     * @see ServerConnector#openAcceptChannel()
+     */
+    public void setInheritChannel(boolean inheritChannel)
+    {
+<span class="nc" id="L286">        _inheritChannel = inheritChannel;</span>
+<span class="nc" id="L287">    }</span>
+
+    /**
+     * Open the connector using the passed ServerSocketChannel.
+     * This open method can be called before starting the connector to pass it a ServerSocketChannel
+     * that will be used instead of one returned from {@link #openAcceptChannel()}
+     *
+     * @param acceptChannel the channel to use
+     * @throws IOException if the server channel is not bound
+     */
+    public void open(ServerSocketChannel acceptChannel) throws IOException
+    {
+<span class="pc bpc" id="L299" title="1 of 2 branches missed.">        if (isStarted())</span>
+<span class="nc" id="L300">            throw new IllegalStateException(getState());</span>
+<span class="fc" id="L301">        _acceptChannel = acceptChannel;</span>
+<span class="fc" id="L302">        _acceptChannel.configureBlocking(true);</span>
+<span class="fc" id="L303">        _localPort = _acceptChannel.socket().getLocalPort();</span>
+<span class="pc bpc" id="L304" title="1 of 2 branches missed.">        if (_localPort &lt;= 0)</span>
+<span class="nc" id="L305">            throw new IOException(&quot;Server channel not bound&quot;);</span>
+<span class="fc" id="L306">    }</span>
+
+    @Override
+    public void open() throws IOException
+    {
+<span class="fc bfc" id="L311" title="All 2 branches covered.">        if (_acceptChannel == null)</span>
+        {
+<span class="fc" id="L313">            open(openAcceptChannel());</span>
+<span class="fc" id="L314">            super.open();</span>
+        }
+<span class="fc" id="L316">    }</span>
+
+    /**
+     * Called by {@link #open()} to obtain the accepting channel.
+     *
+     * @return ServerSocketChannel used to accept connections.
+     * @throws IOException if unable to obtain or configure the server channel
+     */
+    protected ServerSocketChannel openAcceptChannel() throws IOException
+    {
+<span class="fc" id="L326">        ServerSocketChannel serverChannel = null;</span>
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">        if (isInheritChannel())</span>
+        {
+<span class="nc" id="L329">            Channel channel = System.inheritedChannel();</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">            if (channel instanceof ServerSocketChannel)</span>
+<span class="nc" id="L331">                serverChannel = (ServerSocketChannel)channel;</span>
+            else
+<span class="nc" id="L333">                LOG.warn(&quot;Unable to use System.inheritedChannel() [{}]. Trying a new ServerSocketChannel at {}:{}&quot;, channel, getHost(), getPort());</span>
+        }
+
+<span class="pc bpc" id="L336" title="1 of 2 branches missed.">        if (serverChannel == null)</span>
+        {
+<span class="pc bpc" id="L338" title="1 of 2 branches missed.">            InetSocketAddress bindAddress = getHost() == null ? new InetSocketAddress(getPort()) : new InetSocketAddress(getHost(), getPort());</span>
+<span class="fc" id="L339">            serverChannel = ServerSocketChannel.open();</span>
+<span class="fc" id="L340">            setSocketOption(serverChannel, StandardSocketOptions.SO_REUSEADDR, getReuseAddress());</span>
+<span class="fc" id="L341">            setSocketOption(serverChannel, StandardSocketOptions.SO_REUSEPORT, isReusePort());</span>
+            try
+            {
+<span class="fc" id="L344">                serverChannel.bind(bindAddress, getAcceptQueueSize());</span>
+            }
+<span class="nc" id="L346">            catch (Throwable e)</span>
+            {
+<span class="nc" id="L348">                IO.close(serverChannel);</span>
+<span class="nc" id="L349">                throw new IOException(&quot;Failed to bind to &quot; + bindAddress, e);</span>
+<span class="fc" id="L350">            }</span>
+        }
+
+<span class="fc" id="L353">        return serverChannel;</span>
+    }
+
+    private &lt;T&gt; void setSocketOption(ServerSocketChannel channel, SocketOption&lt;T&gt; option, T value)
+    {
+        try
+        {
+<span class="fc" id="L360">            channel.setOption(option, value);</span>
+        }
+<span class="nc" id="L362">        catch (Throwable x)</span>
+        {
+<span class="nc bnc" id="L364" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L365">                LOG.debug(&quot;Could not configure {} to {} on {}&quot;, option, value, channel, x);</span>
+<span class="fc" id="L366">        }</span>
+<span class="fc" id="L367">    }</span>
+
+    @Override
+    public void close()
+    {
+<span class="fc" id="L372">        super.close();</span>
+
+        // When acceptors == 0, we want the ServerSocketChannel
+        // to be closed by the SelectorManager when the
+        // SelectorManager is stopped (as a bean) in doStop().
+<span class="pc bpc" id="L377" title="1 of 2 branches missed.">        if (getAcceptors() &gt; 0)</span>
+<span class="fc" id="L378">            IO.close(_acceptChannel);</span>
+
+<span class="fc" id="L380">        _localPort = -2;</span>
+<span class="fc" id="L381">    }</span>
+
+    @Override
+    public void accept(int acceptorID) throws IOException
+    {
+<span class="fc" id="L386">        ServerSocketChannel serverChannel = _acceptChannel;</span>
+<span class="pc bpc" id="L387" title="2 of 4 branches missed.">        if (serverChannel != null &amp;&amp; serverChannel.isOpen())</span>
+        {
+<span class="fc" id="L389">            SocketChannel channel = serverChannel.accept();</span>
+<span class="fc" id="L390">            accepted(channel);</span>
+        }
+<span class="fc" id="L392">    }</span>
+
+    private void accepted(SocketChannel channel) throws IOException
+    {
+<span class="fc" id="L396">        channel.configureBlocking(false);</span>
+<span class="fc" id="L397">        Socket socket = channel.socket();</span>
+<span class="fc" id="L398">        configure(socket);</span>
+<span class="fc" id="L399">        _manager.accept(channel);</span>
+<span class="fc" id="L400">    }</span>
+
+    protected void configure(Socket socket)
+    {
+        try
+        {
+<span class="fc" id="L406">            socket.setTcpNoDelay(_acceptedTcpNoDelay);</span>
+<span class="pc bpc" id="L407" title="1 of 2 branches missed.">            if (_acceptedReceiveBufferSize &gt; -1)</span>
+<span class="nc" id="L408">                socket.setReceiveBufferSize(_acceptedReceiveBufferSize);</span>
+<span class="pc bpc" id="L409" title="1 of 2 branches missed.">            if (_acceptedSendBufferSize &gt; -1)</span>
+<span class="nc" id="L410">                socket.setSendBufferSize(_acceptedSendBufferSize);</span>
+        }
+<span class="nc" id="L412">        catch (SocketException e)</span>
+        {
+<span class="nc bnc" id="L414" title="All 2 branches missed.">            if (LOG.isTraceEnabled())</span>
+<span class="nc" id="L415">                LOG.trace(&quot;IGNORED&quot;, e);</span>
+<span class="fc" id="L416">        }</span>
+<span class="fc" id="L417">    }</span>
+
+    @ManagedAttribute(&quot;The Selector Manager&quot;)
+    public SelectorManager getSelectorManager()
+    {
+<span class="nc" id="L422">        return _manager;</span>
+    }
+
+    @Override
+    public Object getTransport()
+    {
+<span class="nc" id="L428">        return _acceptChannel;</span>
+    }
+
+    @Override
+    @ManagedAttribute(&quot;local port&quot;)
+    public int getLocalPort()
+    {
+<span class="fc" id="L435">        return _localPort;</span>
+    }
+
+    protected SocketChannelEndPoint newEndPoint(SocketChannel channel, ManagedSelector selectSet, SelectionKey key) throws IOException
+    {
+<span class="fc" id="L440">        SocketChannelEndPoint endpoint = new SocketChannelEndPoint(channel, selectSet, key, getScheduler());</span>
+<span class="fc" id="L441">        endpoint.setIdleTimeout(getIdleTimeout());</span>
+<span class="fc" id="L442">        return endpoint;</span>
+    }
+
+    /**
+     * @return the accept queue size
+     */
+    @ManagedAttribute(&quot;Accept Queue size&quot;)
+    public int getAcceptQueueSize()
+    {
+<span class="fc" id="L451">        return _acceptQueueSize;</span>
+    }
+
+    /**
+     * Set the accept queue size (also known as accept backlog).
+     * @param acceptQueueSize the accept queue size (also known as accept backlog)
+     */
+    public void setAcceptQueueSize(int acceptQueueSize)
+    {
+<span class="nc" id="L460">        _acceptQueueSize = acceptQueueSize;</span>
+<span class="nc" id="L461">    }</span>
+
+    /**
+     * @return whether rebinding the server socket is allowed with sockets in tear-down states
+     * @see ServerSocket#getReuseAddress()
+     */
+    @ManagedAttribute(&quot;Server Socket SO_REUSEADDR&quot;)
+    public boolean getReuseAddress()
+    {
+<span class="fc" id="L470">        return _reuseAddress;</span>
+    }
+
+    /**
+     * @param reuseAddress whether rebinding the server socket is allowed with sockets in tear-down states
+     * @see ServerSocket#setReuseAddress(boolean)
+     */
+    public void setReuseAddress(boolean reuseAddress)
+    {
+<span class="nc" id="L479">        _reuseAddress = reuseAddress;</span>
+<span class="nc" id="L480">    }</span>
+
+    /**
+     * @return whether it is allowed to bind multiple server sockets to the same host and port
+     */
+    @ManagedAttribute(&quot;Server Socket SO_REUSEPORT&quot;)
+    public boolean isReusePort()
+    {
+<span class="fc" id="L488">        return _reusePort;</span>
+    }
+
+    /**
+     * Set whether it is allowed to bind multiple server sockets to the same host and port.
+     * @param reusePort whether it is allowed to bind multiple server sockets to the same host and port
+     */
+    public void setReusePort(boolean reusePort)
+    {
+<span class="nc" id="L497">        _reusePort = reusePort;</span>
+<span class="nc" id="L498">    }</span>
+
+    /**
+     * @return whether the accepted socket gets {@link java.net.SocketOptions#TCP_NODELAY TCP_NODELAY} enabled.
+     * @see Socket#getTcpNoDelay()
+     */
+    @ManagedAttribute(&quot;Accepted Socket TCP_NODELAY&quot;)
+    public boolean getAcceptedTcpNoDelay()
+    {
+<span class="nc" id="L507">        return _acceptedTcpNoDelay;</span>
+    }
+
+    /**
+     * @param tcpNoDelay whether {@link java.net.SocketOptions#TCP_NODELAY TCP_NODELAY} gets enabled on the the accepted socket.
+     * @see Socket#setTcpNoDelay(boolean)
+     */
+    public void setAcceptedTcpNoDelay(boolean tcpNoDelay)
+    {
+<span class="nc" id="L516">        this._acceptedTcpNoDelay = tcpNoDelay;</span>
+<span class="nc" id="L517">    }</span>
+
+    /**
+     * @return the {@link java.net.SocketOptions#SO_RCVBUF SO_RCVBUF} size to set onto the accepted socket.
+     * A value of -1 indicates that it is left to its default value.
+     * @see Socket#getReceiveBufferSize()
+     */
+    @ManagedAttribute(&quot;Accepted Socket SO_RCVBUF&quot;)
+    public int getAcceptedReceiveBufferSize()
+    {
+<span class="nc" id="L527">        return _acceptedReceiveBufferSize;</span>
+    }
+
+    /**
+     * @param receiveBufferSize the {@link java.net.SocketOptions#SO_RCVBUF SO_RCVBUF} size to set onto the accepted socket.
+     * A value of -1 indicates that it is left to its default value.
+     * @see Socket#setReceiveBufferSize(int)
+     */
+    public void setAcceptedReceiveBufferSize(int receiveBufferSize)
+    {
+<span class="nc" id="L537">        this._acceptedReceiveBufferSize = receiveBufferSize;</span>
+<span class="nc" id="L538">    }</span>
+
+    /**
+     * @return the {@link java.net.SocketOptions#SO_SNDBUF SO_SNDBUF} size to set onto the accepted socket.
+     * A value of -1 indicates that it is left to its default value.
+     * @see Socket#getSendBufferSize()
+     */
+    @ManagedAttribute(&quot;Accepted Socket SO_SNDBUF&quot;)
+    public int getAcceptedSendBufferSize()
+    {
+<span class="nc" id="L548">        return _acceptedSendBufferSize;</span>
+    }
+
+    /**
+     * @param sendBufferSize the {@link java.net.SocketOptions#SO_SNDBUF SO_SNDBUF} size to set onto the accepted socket.
+     * A value of -1 indicates that it is left to its default value.
+     * @see Socket#setSendBufferSize(int)
+     */
+    public void setAcceptedSendBufferSize(int sendBufferSize)
+    {
+<span class="nc" id="L558">        this._acceptedSendBufferSize = sendBufferSize;</span>
+<span class="nc" id="L559">    }</span>
+
+    @Override
+    public void setAccepting(boolean accepting)
+    {
+<span class="nc" id="L564">        super.setAccepting(accepting);</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">        if (getAcceptors() &gt; 0)</span>
+<span class="nc" id="L566">            return;</span>
+
+        try
+        {
+<span class="nc bnc" id="L570" title="All 2 branches missed.">            if (accepting)</span>
+            {
+<span class="nc bnc" id="L572" title="All 2 branches missed.">                if (_acceptor.get() == null)</span>
+                {
+<span class="nc" id="L574">                    Closeable acceptor = _manager.acceptor(_acceptChannel);</span>
+<span class="nc bnc" id="L575" title="All 2 branches missed.">                    if (!_acceptor.compareAndSet(null, acceptor))</span>
+<span class="nc" id="L576">                        acceptor.close();</span>
+<span class="nc" id="L577">                }</span>
+            }
+            else
+            {
+<span class="nc" id="L581">                Closeable acceptor = _acceptor.get();</span>
+<span class="nc bnc" id="L582" title="All 4 branches missed.">                if (acceptor != null &amp;&amp; _acceptor.compareAndSet(acceptor, null))</span>
+<span class="nc" id="L583">                    acceptor.close();</span>
+            }
+        }
+<span class="nc" id="L586">        catch (IOException e)</span>
+        {
+<span class="nc" id="L588">            throw new RuntimeException(e);</span>
+<span class="nc" id="L589">        }</span>
+<span class="nc" id="L590">    }</span>
+
+    protected class ServerConnectorManager extends SelectorManager
+    {
+        public ServerConnectorManager(Executor executor, Scheduler scheduler, int selectors)
+<span class="fc" id="L595">        {</span>
+<span class="fc" id="L596">            super(executor, scheduler, selectors);</span>
+<span class="fc" id="L597">        }</span>
+
+        @Override
+        protected void accepted(SelectableChannel channel) throws IOException
+        {
+<span class="nc" id="L602">            ServerConnector.this.accepted((SocketChannel)channel);</span>
+<span class="nc" id="L603">        }</span>
+
+        @Override
+        protected SocketChannelEndPoint newEndPoint(SelectableChannel channel, ManagedSelector selector, SelectionKey selectionKey) throws IOException
+        {
+<span class="fc" id="L608">            return ServerConnector.this.newEndPoint((SocketChannel)channel, selector, selectionKey);</span>
+        }
+
+        @Override
+        public Connection newConnection(SelectableChannel channel, EndPoint endpoint, Object attachment) throws IOException
+        {
+<span class="fc" id="L614">            return getDefaultConnectionFactory().newConnection(ServerConnector.this, endpoint);</span>
+        }
+
+        @Override
+        protected void endPointOpened(EndPoint endpoint)
+        {
+<span class="fc" id="L620">            super.endPointOpened(endpoint);</span>
+<span class="fc" id="L621">            onEndPointOpened(endpoint);</span>
+<span class="fc" id="L622">        }</span>
+
+        @Override
+        protected void endPointClosed(EndPoint endpoint)
+        {
+<span class="fc" id="L627">            onEndPointClosed(endpoint);</span>
+<span class="fc" id="L628">            super.endPointClosed(endpoint);</span>
+<span class="fc" id="L629">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

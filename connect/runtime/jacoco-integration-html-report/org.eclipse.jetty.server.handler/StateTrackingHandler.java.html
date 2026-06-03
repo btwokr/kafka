@@ -1,0 +1,939 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StateTrackingHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server.handler</a> &gt; <span class="el_source">StateTrackingHandler.java</span></div><h1>StateTrackingHandler.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server.handler;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.EventListener;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.eclipse.jetty.server.Handler;
+import org.eclipse.jetty.server.Request;
+import org.eclipse.jetty.server.Response;
+import org.eclipse.jetty.util.Callback;
+import org.eclipse.jetty.util.annotation.ManagedAttribute;
+import org.eclipse.jetty.util.annotation.ManagedObject;
+import org.eclipse.jetty.util.component.Dumpable;
+import org.eclipse.jetty.util.component.DumpableCollection;
+import org.eclipse.jetty.util.thread.Invocable;
+import org.eclipse.jetty.util.thread.Scheduler;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+
+/**
+ * &lt;p&gt;A troubleshooting {@link Handler.Wrapper} that tracks whether
+ * {@link Handler}/{@link Request}/{@link Response} asynchronous APIs
+ * are properly used by applications.&lt;/p&gt;
+ * &lt;p&gt;The violation of these tracked APIs are reported to a {@link Listener}
+ * instance; the default listener implementation emits warning logs.&lt;/p&gt;
+ * &lt;p&gt;{@code StateTrackingHandler} can be linked in at any point in
+ * the {@code Handler} chain, and even be present in multiple instances,
+ * likely configured differently.&lt;/p&gt;
+ * &lt;p&gt;For example, to troubleshoot wrong usages of the callback passed to method
+ * {@link #handle(Request, Response, Callback)}, a {@code StateTrackingHandler}
+ * should be configured as the outermost {@code Handler}.
+ * This is because the {@code handle(...)} call propagates inwards.
+ * In this way, {@code StateTrackingHandler} can wrap the callback passed
+ * to inner {@code Handler}s and verify that it is eventually completed.&lt;/p&gt;
+ * &lt;p&gt;On the other hand, to troubleshoot custom {@code Handler} implementations
+ * that perform wrapping of {@link Response#write(boolean, ByteBuffer, Callback)},
+ * a {@code StateTrackingHandler} should be configured after the custom
+ * {@code Handler} implementation.
+ * This is because the {@code write(...)} call propagates outwards.
+ * In this way, {@code StateTrackingHandler} can wrap the {@code write(...)}
+ * call before forwarding it to outer {@code Handler}s and eventually to the
+ * Jetty implementation, and verify that it is eventually completed.&lt;/p&gt;
+ *
+ * @see Listener
+ */
+@ManagedObject
+public class StateTrackingHandler extends Handler.Wrapper
+{
+<span class="nc" id="L73">    private static final Logger LOG = LoggerFactory.getLogger(StateTrackingHandler.class);</span>
+
+<span class="nc" id="L75">    private final Map&lt;Request, StateInfo&gt; stateInfos = new ConcurrentHashMap&lt;&gt;();</span>
+    private final Listener listener;
+    private long handlerCallbackTimeout;
+    private boolean completeHandlerCallbackAtTimeout;
+    private long demandCallbackTimeout;
+    private long writeTimeout;
+    private long writeCallbackTimeout;
+
+    /**
+     * &lt;p&gt;Creates a new instance with a default {@link Listener}
+     * that logs events at warning level.&lt;/p&gt;
+     */
+    public StateTrackingHandler()
+    {
+<span class="nc" id="L89">        this(new WarnListener());</span>
+<span class="nc" id="L90">    }</span>
+
+    /**
+     * &lt;p&gt;Creates a new instance with the given {@link Listener}.&lt;/p&gt;
+     *
+     * @param listener the event listener
+     */
+    public StateTrackingHandler(Listener listener)
+<span class="nc" id="L98">    {</span>
+<span class="nc" id="L99">        this.listener = listener;</span>
+<span class="nc" id="L100">    }</span>
+
+    /**
+     * @return the timeout in ms for the completion of the {@link #handle(Request, Response, Callback)} callback
+     */
+    @ManagedAttribute(&quot;The timeout in ms for the completion of the handle() callback&quot;)
+    public long getHandlerCallbackTimeout()
+    {
+<span class="nc" id="L108">        return handlerCallbackTimeout;</span>
+    }
+
+    public void setHandlerCallbackTimeout(long timeout)
+    {
+<span class="nc" id="L113">        this.handlerCallbackTimeout = timeout;</span>
+<span class="nc" id="L114">    }</span>
+
+    /**
+     * @return whether the {@link #handle(Request, Response, Callback)} callback is completed
+     * in case the {@link #getHandlerCallbackTimeout()} expires
+     * @see #getHandlerCallbackTimeout()
+     */
+    @ManagedAttribute(&quot;Whether the handle() callback is completed in case of timeout&quot;)
+    public boolean isCompleteHandlerCallbackAtTimeout()
+    {
+<span class="nc" id="L124">        return completeHandlerCallbackAtTimeout;</span>
+    }
+
+    public void setCompleteHandlerCallbackAtTimeout(boolean completeHandlerCallbackAtTimeout)
+    {
+<span class="nc" id="L129">        this.completeHandlerCallbackAtTimeout = completeHandlerCallbackAtTimeout;</span>
+<span class="nc" id="L130">    }</span>
+
+    /**
+     * @return the timeout in ms for the execution of the demand callback passed to {@link Request#demand(Runnable)}
+     */
+    @ManagedAttribute(&quot;The timeout in ms for the execution of the demand callback&quot;)
+    public long getDemandCallbackTimeout()
+    {
+<span class="nc" id="L138">        return demandCallbackTimeout;</span>
+    }
+
+    public void setDemandCallbackTimeout(long timeout)
+    {
+<span class="nc" id="L143">        this.demandCallbackTimeout = timeout;</span>
+<span class="nc" id="L144">    }</span>
+
+    /**
+     * @return the timeout in ms for the execution of a {@link Response#write(boolean, ByteBuffer, Callback)} call
+     */
+    @ManagedAttribute(&quot;The timeout in ms for the execution of a response write&quot;)
+    public long getWriteTimeout()
+    {
+<span class="nc" id="L152">        return writeTimeout;</span>
+    }
+
+    public void setWriteTimeout(long timeout)
+    {
+<span class="nc" id="L157">        this.writeTimeout = timeout;</span>
+<span class="nc" id="L158">    }</span>
+
+    /**
+     * @return the timeout in ms for the execution of the response write callback passed to {@link Response#write(boolean, ByteBuffer, Callback)}
+     */
+    @ManagedAttribute(&quot;The timeout in ms for the execution of the response write callback&quot;)
+    public long getWriteCallbackTimeout()
+    {
+<span class="nc" id="L166">        return writeCallbackTimeout;</span>
+    }
+
+    public void setWriteCallbackTimeout(long timeout)
+    {
+<span class="nc" id="L171">        this.writeCallbackTimeout = timeout;</span>
+<span class="nc" id="L172">    }</span>
+
+    @Override
+    public boolean handle(Request originalRequest, Response originalResponse, Callback originalCallback) throws Exception
+    {
+<span class="nc" id="L177">        StateInfo stateInfo = new StateInfo(originalRequest);</span>
+<span class="nc" id="L178">        stateInfos.put(originalRequest, stateInfo);</span>
+<span class="nc" id="L179">        Request.addCompletionListener(originalRequest, x -&gt; stateInfos.remove(originalRequest));</span>
+
+<span class="nc" id="L181">        Request request = originalRequest;</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        if (demandCallbackTimeout &gt; 0)</span>
+<span class="nc" id="L183">            request = new RequestWrapper(stateInfo);</span>
+
+<span class="nc" id="L185">        Response response = originalResponse;</span>
+<span class="nc bnc" id="L186" title="All 4 branches missed.">        if (writeTimeout &gt; 0 || writeCallbackTimeout &gt; 0)</span>
+<span class="nc" id="L187">            response = new ResponseWrapper(stateInfo, originalResponse);</span>
+
+<span class="nc" id="L189">        HandlerCallback callback = new HandlerCallback(stateInfo, originalCallback);</span>
+<span class="nc" id="L190">        stateInfo.handlerCallback = callback;</span>
+
+        try
+        {
+<span class="nc" id="L194">            boolean handled = super.handle(request, response, callback);</span>
+<span class="nc" id="L195">            callback.setHandled(handled);</span>
+
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            if (!handled)</span>
+            {
+                // Check if the callback was completed.
+<span class="nc" id="L200">                ThreadInfo completionThreadInfo = callback.getCompletionThreadInfo();</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">                if (completionThreadInfo != null)</span>
+<span class="nc" id="L202">                    notifyInvalidHandlerReturnValue(stateInfo.request, completionThreadInfo);</span>
+            }
+
+<span class="nc" id="L205">            return handled;</span>
+        }
+<span class="nc" id="L207">        catch (Throwable x)</span>
+        {
+<span class="nc" id="L209">            stateInfos.remove(originalRequest);</span>
+<span class="nc" id="L210">            notifyHandlerException(stateInfo.request, x, callback.getCompletionThreadInfo());</span>
+<span class="nc" id="L211">            throw x;</span>
+        }
+    }
+
+    private void notifyInvalidHandlerReturnValue(Request request, ThreadInfo completionThreadInfo)
+    {
+        try
+        {
+<span class="nc" id="L219">            listener.onInvalidHandlerReturnValue(request, completionThreadInfo);</span>
+        }
+<span class="nc" id="L221">        catch (Throwable x)</span>
+        {
+<span class="nc" id="L223">            LOG.info(&quot;failure while notifying {}&quot;, listener, x);</span>
+<span class="nc" id="L224">        }</span>
+<span class="nc" id="L225">    }</span>
+
+    private void notifyHandlerException(Request request, Throwable failure, ThreadInfo completionThreadInfo)
+    {
+        try
+        {
+<span class="nc" id="L231">            listener.onHandlerException(request, failure, completionThreadInfo);</span>
+        }
+<span class="nc" id="L233">        catch (Throwable x)</span>
+        {
+<span class="nc" id="L235">            LOG.info(&quot;failure while notifying {}&quot;, listener, x);</span>
+<span class="nc" id="L236">        }</span>
+<span class="nc" id="L237">    }</span>
+
+    private void notifyHandlerCallbackNotCompleted(Request request, ThreadInfo handlerThreadInfo)
+    {
+        try
+        {
+<span class="nc" id="L243">            listener.onHandlerCallbackNotCompleted(request, handlerThreadInfo);</span>
+        }
+<span class="nc" id="L245">        catch (Throwable x)</span>
+        {
+<span class="nc" id="L247">            LOG.info(&quot;failure while notifying {}&quot;, listener, x);</span>
+<span class="nc" id="L248">        }</span>
+<span class="nc" id="L249">    }</span>
+
+    private void notifyDemandCallbackBlocked(Request request, ThreadInfo demandThreadInfo, ThreadInfo runThreadInfo)
+    {
+        try
+        {
+<span class="nc" id="L255">            listener.onDemandCallbackBlocked(request, demandThreadInfo, runThreadInfo);</span>
+        }
+<span class="nc" id="L257">        catch (Throwable x)</span>
+        {
+<span class="nc" id="L259">            LOG.info(&quot;failure while notifying {}&quot;, listener, x);</span>
+<span class="nc" id="L260">        }</span>
+<span class="nc" id="L261">    }</span>
+
+    private void notifyWriteBlocked(Request request, ThreadInfo writeThreadInfo, ThreadInfo writingThreadInfo)
+    {
+        try
+        {
+<span class="nc" id="L267">            listener.onWriteBlocked(request, writeThreadInfo, writingThreadInfo);</span>
+        }
+<span class="nc" id="L269">        catch (Throwable x)</span>
+        {
+<span class="nc" id="L271">            LOG.info(&quot;failure while notifying {}&quot;, listener, x);</span>
+<span class="nc" id="L272">        }</span>
+<span class="nc" id="L273">    }</span>
+
+    private void notifyWriteCallbackNotCompleted(Request request, Throwable failure, ThreadInfo writeThreadInfo)
+    {
+        try
+        {
+<span class="nc" id="L279">            listener.onWriteCallbackNotCompleted(request, failure, writeThreadInfo);</span>
+        }
+<span class="nc" id="L281">        catch (Throwable x)</span>
+        {
+<span class="nc" id="L283">            LOG.info(&quot;failure while notifying {}&quot;, listener, x);</span>
+<span class="nc" id="L284">        }</span>
+<span class="nc" id="L285">    }</span>
+
+    private void notifyWriteCallbackBlocked(Request request, Throwable writeFailure, ThreadInfo writeThreadInfo, ThreadInfo callbackThreadInfo)
+    {
+        try
+        {
+<span class="nc" id="L291">            listener.onWriteCallbackBlocked(request, writeFailure, writeThreadInfo, callbackThreadInfo);</span>
+        }
+<span class="nc" id="L293">        catch (Throwable x)</span>
+        {
+<span class="nc" id="L295">            LOG.info(&quot;failure while notifying {}&quot;, listener, x);</span>
+<span class="nc" id="L296">        }</span>
+<span class="nc" id="L297">    }</span>
+
+    @Override
+    public void dump(Appendable out, String indent) throws IOException
+    {
+<span class="nc" id="L302">        dumpObjects(out, indent, new DumpableCollection(&quot;requests&quot;, stateInfos.values()));</span>
+<span class="nc" id="L303">    }</span>
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L308">        return &quot;%s@%x&quot;.formatted(getClass().getSimpleName(), hashCode());</span>
+    }
+
+    public static class ThreadInfo
+    {
+        private final String info;
+        private final StackTraceElement[] stackFrames;
+
+        private ThreadInfo(Thread thread)
+<span class="nc" id="L317">        {</span>
+<span class="nc" id="L318">            this.info = thread.toString();</span>
+<span class="nc" id="L319">            this.stackFrames = thread.getStackTrace();</span>
+<span class="nc" id="L320">        }</span>
+
+        public String getInfo()
+        {
+<span class="nc" id="L324">            return info;</span>
+        }
+
+        public StackTraceElement[] getStackFrames()
+        {
+<span class="nc" id="L329">            return stackFrames;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L335">            return toString(&quot;&quot;);</span>
+        }
+
+        private String toString(String indent)
+        {
+<span class="nc" id="L340">            StringBuilder builder = new StringBuilder();</span>
+<span class="nc" id="L341">            builder.append(getInfo()).append(System.lineSeparator());</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            for (StackTraceElement stackFrame : getStackFrames())</span>
+            {
+<span class="nc" id="L344">                builder.append(indent).append(&quot;\tat &quot;).append(stackFrame).append(System.lineSeparator());</span>
+            }
+<span class="nc" id="L346">            return builder.toString();</span>
+        }
+    }
+
+    /**
+     * &lt;p&gt;Listener of events emitted by {@link StateTrackingHandler}.&lt;/p&gt;
+     * &lt;p&gt;The methods of this interface are named after the wrong API usages
+     * tracked by {@code StateTrackingHandler}.&lt;/p&gt;
+     */
+    public interface Listener extends EventListener
+    {
+        /**
+         * &lt;p&gt;Invoked when the {@link Handler} chain returns {@code false},
+         * but the handler callback has been completed.&lt;/p&gt;
+         * &lt;p&gt;This event is always enabled.&lt;/p&gt;
+         *
+         * @param request the current request
+         * @param completionThreadInfo the {@link ThreadInfo} of the thread that completed the handler callback
+         */
+        default void onInvalidHandlerReturnValue(Request request, ThreadInfo completionThreadInfo)
+        {
+<span class="nc" id="L367">        }</span>
+
+        /**
+         * &lt;p&gt;Invoked when the {@link Handler} chain throws an exception from
+         * the {@link Handler#handle(Request, Response, Callback)} method.&lt;/p&gt;
+         * &lt;p&gt;This event is always enabled.&lt;/p&gt;
+         *
+         * @param request the current request
+         * @param failure the exception thrown
+         * @param completionThreadInfo the {@link ThreadInfo} of the thread that completed the handler callback,
+         * or {@code null} if the handler callback has not been completed
+         */
+        default void onHandlerException(Request request, Throwable failure, ThreadInfo completionThreadInfo)
+        {
+<span class="nc" id="L381">        }</span>
+
+        /**
+         * &lt;p&gt;Invoked when the {@link Handler} callback is not completed within
+         * the timeout specified with {@link #getHandlerCallbackTimeout()}.&lt;/p&gt;
+         * &lt;p&gt;This event is enabled only when {@link #getHandlerCallbackTimeout()}
+         * is non-{@code null}.&lt;/p&gt;
+         * &lt;p&gt;When handler thread has already returned from the handler chain,
+         * the thread info parameter is {@code null}.
+         * Otherwise, the handler thread has not returned yet and may be blocked,
+         * and the thread info parameter is not {@code null}.&lt;/p&gt;
+         * &lt;p&gt;Note: when present, the thread info stack trace may not be accurate,
+         * as the thread blockage might have resolved just before the thread info
+         * was taken.&lt;/p&gt;
+         *
+         * @param request the current request
+         * @param handlerThreadInfo the handler thread info, or {@code null}
+         * if the handler thread already returned from the handler chain
+         */
+        default void onHandlerCallbackNotCompleted(Request request, ThreadInfo handlerThreadInfo)
+        {
+<span class="nc" id="L402">        }</span>
+
+        /**
+         * &lt;p&gt;Invoked when the {@link Request#demand(Runnable) request demand callback}
+         * {@code run()} method blocks for longer than the timeout specified with
+         * {@link #getDemandCallbackTimeout()}.&lt;/p&gt;
+         * &lt;p&gt;This event is enabled only when {@link #getDemandCallbackTimeout()}
+         * is non-{@code null}.&lt;/p&gt;
+         * &lt;p&gt;Note: the thread info stack trace of the thread that is running the
+         * demand callback may not be accurate, as the thread blockage might have
+         * resolved just before the thread info was taken.&lt;/p&gt;
+         *
+         * @param request the current request
+         * @param demandThreadInfo the thread info of the thread that called {@link Request#demand(Runnable)}
+         * @param runThreadInfo the thread info of the thread running the demand callback
+         */
+        default void onDemandCallbackBlocked(Request request, ThreadInfo demandThreadInfo, ThreadInfo runThreadInfo)
+        {
+<span class="nc" id="L420">        }</span>
+
+        /**
+         * &lt;p&gt;Invoked when the {@link Response#write(boolean, ByteBuffer, Callback)} call
+         * blocks for longer than the timeout specified with {@link #getWriteTimeout()}.&lt;/p&gt;
+         * &lt;p&gt;This event is enabled only when {@link #getWriteTimeout()} is non-{@code null}.&lt;/p&gt;
+         * &lt;p&gt;Note: the thread info stack trace of the thread that is writing may not be
+         * accurate, as the thread blockage might have resolved just before the thread
+         * info was taken.&lt;/p&gt;
+         *
+         * @param request the current request
+         * @param writeThreadInfo the thread info of the thread that called {@link Response#write(boolean, ByteBuffer, Callback)}
+         * @param writingThreadInfo the thread info of the thread tht is writing
+         */
+        default void onWriteBlocked(Request request, ThreadInfo writeThreadInfo, ThreadInfo writingThreadInfo)
+        {
+<span class="nc" id="L436">        }</span>
+
+        /**
+         * &lt;p&gt;Invoked when the write callback passed to {@link Response#write(boolean, ByteBuffer, Callback)}
+         * is not completed for longer than the timeout specified with {@link #getWriteTimeout()}.&lt;/p&gt;
+         * &lt;p&gt;This event is enabled only when {@link #getWriteTimeout()} is non-{@code null}.&lt;/p&gt;
+         * &lt;p&gt;Note that the write might have been fully performed, but since the callback is not
+         * completed, this case is indistinguishable from the case where the callback is not complete
+         * because the write has not been fully performed.&lt;/p&gt;
+         *
+         * @param request the current request
+         * @param writeFailure the write failure, or {@code null} if the write succeeded
+         * @param writeThreadInfo the thread info of the thread that called {@link Response#write(boolean, ByteBuffer, Callback)}
+         */
+        default void onWriteCallbackNotCompleted(Request request, Throwable writeFailure, ThreadInfo writeThreadInfo)
+        {
+<span class="nc" id="L452">        }</span>
+
+        /**
+         * &lt;p&gt;Invoked when the write callback passed to {@link Response#write(boolean, ByteBuffer, Callback)}
+         * blocks for longer than the timeout specified with {@link #getWriteCallbackTimeout()}.&lt;/p&gt;
+         * &lt;p&gt;This event is enabled only when {@link #getWriteCallbackTimeout()} is non-{@code null}.&lt;/p&gt;
+         * &lt;p&gt;Note: the thread info stack trace of the thread that is running the write callback may not be
+         * accurate, as the thread blockage might have resolved just before the thread info was taken.&lt;/p&gt;
+         *
+         * @param request the current request
+         * @param writeFailure the write failure, or {@code null} if the write succeeded
+         * @param writeThreadInfo the thread info of the thread that called {@link Response#write(boolean, ByteBuffer, Callback)}
+         * @param callbackThreadInfo the thread info of the thread invoking the write callback
+         */
+        default void onWriteCallbackBlocked(Request request, Throwable writeFailure, ThreadInfo writeThreadInfo, ThreadInfo callbackThreadInfo)
+        {
+<span class="nc" id="L468">        }</span>
+    }
+
+    private static class WarnListener implements Listener
+    {
+        @Override
+        public void onInvalidHandlerReturnValue(Request request, ThreadInfo completionThreadInfo)
+        {
+<span class="nc" id="L476">            LOG.warn(&quot;handler callback completed but false returned for: {}{}completed by: {}&quot;,</span>
+                request,
+<span class="nc" id="L478">                System.lineSeparator(),</span>
+                completionThreadInfo
+            );
+<span class="nc" id="L481">        }</span>
+
+        @Override
+        public void onHandlerException(Request request, Throwable failure, ThreadInfo completionThreadInfo)
+        {
+<span class="nc" id="L486">            String format = &quot;handler exception thrown for {}&quot;;</span>
+<span class="nc" id="L487">            List&lt;Object&gt; args = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L488">            args.add(request);</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">            if (completionThreadInfo != null)</span>
+            {
+<span class="nc" id="L491">                format += &quot;{}completed by: {}&quot;;</span>
+<span class="nc" id="L492">                args.add(System.lineSeparator());</span>
+<span class="nc" id="L493">                args.add(completionThreadInfo);</span>
+            }
+<span class="nc" id="L495">            args.add(failure);</span>
+<span class="nc" id="L496">            LOG.warn(format, args.toArray());</span>
+<span class="nc" id="L497">        }</span>
+
+        @Override
+        public void onHandlerCallbackNotCompleted(Request request, ThreadInfo handlerThreadInfo)
+        {
+<span class="nc" id="L502">            LOG.warn(&quot;handler callback not completed for: {}{}handled by: {}&quot;,</span>
+                request,
+<span class="nc" id="L504">                System.lineSeparator(),</span>
+                handlerThreadInfo
+            );
+<span class="nc" id="L507">        }</span>
+
+        @Override
+        public void onDemandCallbackBlocked(Request request, ThreadInfo demandThreadInfo, ThreadInfo runThreadInfo)
+        {
+<span class="nc" id="L512">            LOG.warn(&quot;demand callback blocked for: {}{}demanded by: {}{}possibly blocked: {}&quot;,</span>
+                request,
+<span class="nc" id="L514">                System.lineSeparator(),</span>
+                demandThreadInfo,
+<span class="nc" id="L516">                System.lineSeparator(),</span>
+                runThreadInfo
+            );
+<span class="nc" id="L519">        }</span>
+
+        @Override
+        public void onWriteBlocked(Request request, ThreadInfo writeThreadInfo, ThreadInfo writingThreadInfo)
+        {
+<span class="nc" id="L524">            LOG.warn(&quot;write blocked for: {}{}write by: {}{}possibly blocked: {}&quot;,</span>
+                request,
+<span class="nc" id="L526">                System.lineSeparator(),</span>
+                writeThreadInfo,
+<span class="nc" id="L528">                System.lineSeparator(),</span>
+                writingThreadInfo
+            );
+<span class="nc" id="L531">        }</span>
+
+        @Override
+        public void onWriteCallbackNotCompleted(Request request, Throwable writeFailure, ThreadInfo writeThreadInfo)
+        {
+<span class="nc" id="L536">            LOG.warn(&quot;write callback not completed for: {}{}write {} by: {}&quot;,</span>
+                request,
+<span class="nc" id="L538">                System.lineSeparator(),</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">                writeFailure == null ? &quot;succeeded&quot; : &quot;failed with &quot; + writeFailure,</span>
+                writeThreadInfo
+            );
+<span class="nc" id="L542">        }</span>
+
+        @Override
+        public void onWriteCallbackBlocked(Request request, Throwable writeFailure, ThreadInfo writeThreadInfo, ThreadInfo callbackThreadInfo)
+        {
+<span class="nc" id="L547">            LOG.warn(&quot;write callback blocked for: {}{}write {} by: {}{}possibly blocked: {}&quot;,</span>
+                request,
+<span class="nc" id="L549">                System.lineSeparator(),</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">                writeFailure == null ? &quot;succeeded&quot; : &quot;failed with &quot; + writeFailure,</span>
+                writeThreadInfo,
+<span class="nc" id="L552">                System.lineSeparator(),</span>
+                callbackThreadInfo
+            );
+<span class="nc" id="L555">        }</span>
+    }
+
+    private class StateInfo implements Dumpable
+    {
+<span class="nc" id="L560">        private final Queue&lt;RequestWrapper.DemandCallback&gt; demandCallbacks = new ConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="nc" id="L561">        private final Queue&lt;ResponseWrapper.WriteCallback&gt; writeCallbacks = new ConcurrentLinkedQueue&lt;&gt;();</span>
+        private final Request request;
+        private volatile HandlerCallback handlerCallback;
+
+        private StateInfo(Request request)
+<span class="nc" id="L566">        {</span>
+<span class="nc" id="L567">            this.request = request;</span>
+<span class="nc" id="L568">        }</span>
+
+        @Override
+        public void dump(Appendable out, String indent) throws IOException
+        {
+<span class="nc bnc" id="L573" title="All 2 branches missed.">            Dumpable demandDumpable = demandCallbackTimeout &gt; 0</span>
+<span class="nc" id="L574">                ? new DumpableCollection(&quot;demands&quot;, demandCallbacks)</span>
+<span class="nc" id="L575">                : (o, i) -&gt; o.append(&quot;demands not tracked\n&quot;);</span>
+
+<span class="nc bnc" id="L577" title="All 4 branches missed.">            Dumpable writeDumpable = writeTimeout &gt; 0 || writeCallbackTimeout &gt; 0</span>
+<span class="nc" id="L578">                ? new DumpableCollection(&quot;writes&quot;, writeCallbacks)</span>
+<span class="nc" id="L579">                : (o, i) -&gt; o.append(&quot;writes not tracked\n&quot;);</span>
+
+<span class="nc" id="L581">            Dumpable.dumpObjects(out, indent, request.toString(), handlerCallback, demandDumpable, writeDumpable);</span>
+<span class="nc" id="L582">        }</span>
+    }
+
+    private class HandlerCallback extends Callback.Nested implements Runnable, Dumpable
+    {
+<span class="nc" id="L587">        private final AtomicBoolean completed = new AtomicBoolean();</span>
+        private final Request request;
+        private final Scheduler.Task task;
+        private final Thread handleThread;
+        private volatile Boolean handled;
+        private volatile ThreadInfo completionThreadInfo;
+        private volatile String completion;
+
+        private HandlerCallback(StateInfo stateInfo, Callback callback)
+<span class="nc" id="L596">        {</span>
+<span class="nc" id="L597">            super(callback);</span>
+<span class="nc" id="L598">            this.request = stateInfo.request;</span>
+<span class="nc" id="L599">            long timeout = getHandlerCallbackTimeout();</span>
+<span class="nc bnc" id="L600" title="All 2 branches missed.">            this.task = timeout &gt; 0 ? request.getComponents().getScheduler().schedule(this, timeout, MILLISECONDS) : () -&gt; true;</span>
+<span class="nc" id="L601">            this.handleThread = Thread.currentThread();</span>
+<span class="nc" id="L602">        }</span>
+
+        private void setHandled(boolean handled)
+        {
+<span class="nc" id="L606">            this.handled = handled;</span>
+<span class="nc" id="L607">        }</span>
+
+        @Override
+        public void succeeded()
+        {
+<span class="nc bnc" id="L612" title="All 2 branches missed.">            if (completed(null))</span>
+<span class="nc" id="L613">                super.succeeded();</span>
+<span class="nc" id="L614">        }</span>
+
+        @Override
+        public void failed(Throwable x)
+        {
+<span class="nc bnc" id="L619" title="All 2 branches missed.">            if (completed(x))</span>
+<span class="nc" id="L620">                super.failed(x);</span>
+<span class="nc" id="L621">        }</span>
+
+        private boolean completed(Throwable failure)
+        {
+<span class="nc bnc" id="L625" title="All 2 branches missed.">            if (!completed.compareAndSet(false, true))</span>
+<span class="nc" id="L626">                return false;</span>
+
+<span class="nc" id="L628">            boolean cancelled = task.cancel();</span>
+
+<span class="nc bnc" id="L630" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L631">                LOG.debug(&quot;handler callback timeout cancelled={} for {}&quot;, cancelled, request);</span>
+
+<span class="nc bnc" id="L633" title="All 2 branches missed.">            completion = failure == null ? &quot;succeeded&quot; : &quot;failed with &quot; + failure;</span>
+<span class="nc" id="L634">            ThreadInfo threadInfo = completionThreadInfo = new ThreadInfo(Thread.currentThread());</span>
+<span class="nc bnc" id="L635" title="All 2 branches missed.">            boolean notify = handled == Boolean.FALSE;</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">            if (notify)</span>
+<span class="nc" id="L637">                notifyInvalidHandlerReturnValue(request, threadInfo);</span>
+
+<span class="nc" id="L639">            return true;</span>
+        }
+
+        private ThreadInfo getCompletionThreadInfo()
+        {
+<span class="nc" id="L644">            return completionThreadInfo;</span>
+        }
+
+        @Override
+        public void run()
+        {
+<span class="nc bnc" id="L650" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L651">                LOG.debug(&quot;handler callback not completed within {} for {}&quot;, getHandlerCallbackTimeout(), request);</span>
+
+<span class="nc" id="L653">            Boolean handled = this.handled;</span>
+
+<span class="nc" id="L655">            ThreadInfo handlerThreadInfo = null;</span>
+            // The Handler chain has not returned yet, likely the thread is blocked.
+<span class="nc bnc" id="L657" title="All 2 branches missed.">            if (handled == null)</span>
+            {
+                // The thread info of the thread that blocks.
+                // Only create it if the handler thread is blocked,
+                // otherwise we will have a stack trace possibly
+                // belonging to a different request.
+<span class="nc" id="L663">                handlerThreadInfo = new ThreadInfo(handleThread);</span>
+            }
+<span class="nc" id="L665">            notifyHandlerCallbackNotCompleted(request, handlerThreadInfo);</span>
+
+<span class="nc bnc" id="L667" title="All 2 branches missed.">            if (isCompleteHandlerCallbackAtTimeout())</span>
+<span class="nc" id="L668">                super.failed(new TimeoutException());</span>
+<span class="nc" id="L669">        }</span>
+
+        @Override
+        public void dump(Appendable out, String indent) throws IOException
+        {
+<span class="nc" id="L674">            Boolean handled = this.handled;</span>
+<span class="nc" id="L675">            ThreadInfo handleThreadInfo = null;</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">            if (handled == null)</span>
+<span class="nc" id="L677">                handleThreadInfo = new ThreadInfo(handleThread);</span>
+<span class="nc" id="L678">            String completion = this.completion;</span>
+<span class="nc" id="L679">            ThreadInfo completionThreadInfo = this.completionThreadInfo;</span>
+
+<span class="nc bnc" id="L681" title="All 2 branches missed.">            out.append(&quot;handle() result: %s\n&quot;.formatted(handled == null ? &quot;pending&quot; : handled));</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">            if (handleThreadInfo != null)</span>
+<span class="nc" id="L683">                out.append(indent).append(handleThreadInfo.toString(indent));</span>
+
+<span class="nc" id="L685">            out.append(indent).append(&quot;handler callback: %s [%s]\n&quot;.formatted(Objects.toString(completion, &quot;not completed&quot;), getCallback()));</span>
+<span class="nc bnc" id="L686" title="All 2 branches missed.">            if (completionThreadInfo != null)</span>
+<span class="nc" id="L687">                out.append(indent).append(completionThreadInfo.toString(indent));</span>
+<span class="nc" id="L688">        }</span>
+    }
+
+    private class RequestWrapper extends Request.Wrapper
+    {
+        private final StateInfo stateInfo;
+
+        private RequestWrapper(StateInfo stateInfo)
+<span class="nc" id="L696">        {</span>
+<span class="nc" id="L697">            super(stateInfo.request);</span>
+<span class="nc" id="L698">            this.stateInfo = stateInfo;</span>
+<span class="nc" id="L699">        }</span>
+
+        @Override
+        public void demand(Runnable reader)
+        {
+<span class="nc" id="L704">            DemandCallback demandCallback = new DemandCallback(reader);</span>
+<span class="nc" id="L705">            stateInfo.demandCallbacks.offer(demandCallback);</span>
+<span class="nc" id="L706">            super.demand(demandCallback);</span>
+<span class="nc" id="L707">        }</span>
+
+        private class DemandCallback implements Invocable.Task, Dumpable
+        {
+            private final Runnable callback;
+            private final ThreadInfo demandThreadInfo;
+            // Tri-state: null -&gt; no demand, thread -&gt; running demand, this -&gt; done running demand.
+            private volatile Object demandRunner;
+
+            private DemandCallback(Runnable callback)
+<span class="nc" id="L717">            {</span>
+<span class="nc" id="L718">                this.callback = callback;</span>
+<span class="nc" id="L719">                this.demandThreadInfo = new ThreadInfo(Thread.currentThread());</span>
+<span class="nc" id="L720">            }</span>
+
+            @Override
+            public void run()
+            {
+<span class="nc" id="L725">                demandRunner = Thread.currentThread();</span>
+<span class="nc" id="L726">                Scheduler.Task task = getComponents().getScheduler().schedule(this::expired, getDemandCallbackTimeout(), MILLISECONDS);</span>
+                try
+                {
+<span class="nc" id="L729">                    callback.run();</span>
+                }
+                finally
+                {
+<span class="nc" id="L733">                    demandRunner = this;</span>
+<span class="nc" id="L734">                    stateInfo.demandCallbacks.remove(this);</span>
+<span class="nc" id="L735">                    task.cancel();</span>
+                }
+<span class="nc" id="L737">            }</span>
+
+            private void expired()
+            {
+<span class="nc" id="L741">                Object demandRunner = this.demandRunner;</span>
+                // If expired() lost the race with run(), return.
+<span class="nc bnc" id="L743" title="All 2 branches missed.">                if (demandRunner == this)</span>
+<span class="nc" id="L744">                    return;</span>
+
+                // Avoid clash with Request.LOG.
+<span class="nc" id="L747">                Logger log = StateTrackingHandler.LOG;</span>
+<span class="nc bnc" id="L748" title="All 2 branches missed.">                if (log.isDebugEnabled())</span>
+<span class="nc" id="L749">                    log.debug(&quot;demand callback blocked more than {} for {}&quot;, getDemandCallbackTimeout(), getWrapped());</span>
+
+                // The thread info of the thread that blocks.
+<span class="nc" id="L752">                ThreadInfo runThreadInfo = new ThreadInfo((Thread)demandRunner);</span>
+<span class="nc" id="L753">                notifyDemandCallbackBlocked(getWrapped(), demandThreadInfo, runThreadInfo);</span>
+<span class="nc" id="L754">            }</span>
+
+            @Override
+            public void dump(Appendable out, String indent) throws IOException
+            {
+<span class="nc" id="L759">                Object demandRunner = this.demandRunner;</span>
+<span class="nc bnc" id="L760" title="All 2 branches missed.">                if (demandRunner instanceof Thread runThread)</span>
+                {
+<span class="nc" id="L762">                    out.append(&quot;demand: running [%s]\n&quot;.formatted(callback));</span>
+<span class="nc" id="L763">                    out.append(indent).append(new ThreadInfo(runThread).toString(indent));</span>
+                }
+                else
+                {
+<span class="nc bnc" id="L767" title="All 2 branches missed.">                    out.append(&quot;demand: %s [%s]\n&quot;.formatted(demandRunner == null ? &quot;pending&quot; : &quot;none&quot;, callback));</span>
+                }
+<span class="nc" id="L769">            }</span>
+
+            @Override
+            public InvocationType getInvocationType()
+            {
+<span class="nc" id="L774">                return Invocable.getInvocationType(callback);</span>
+            }
+        }
+    }
+
+    private class ResponseWrapper extends Response.Wrapper
+    {
+        private final StateInfo stateInfo;
+
+        private ResponseWrapper(StateInfo stateInfo, Response wrapped)
+<span class="nc" id="L784">        {</span>
+<span class="nc" id="L785">            super(stateInfo.request, wrapped);</span>
+<span class="nc" id="L786">            this.stateInfo = stateInfo;</span>
+<span class="nc" id="L787">        }</span>
+
+        @Override
+        public void write(boolean last, ByteBuffer byteBuffer, Callback callback)
+        {
+<span class="nc" id="L792">            WriteCallback writeCallback = new WriteCallback(callback);</span>
+<span class="nc" id="L793">            stateInfo.writeCallbacks.offer(writeCallback);</span>
+            try
+            {
+<span class="nc" id="L796">                super.write(last, byteBuffer, writeCallback);</span>
+<span class="nc" id="L797">                writeCallback.writeComplete(null);</span>
+            }
+<span class="nc" id="L799">            catch (Throwable x)</span>
+            {
+<span class="nc" id="L801">                writeCallback.writeComplete(x);</span>
+<span class="nc" id="L802">                throw x;</span>
+<span class="nc" id="L803">            }</span>
+<span class="nc" id="L804">        }</span>
+
+        private class WriteCallback extends Callback.Nested implements Dumpable
+        {
+<span class="nc" id="L808">            private final AtomicBoolean callbackCompleted = new AtomicBoolean();</span>
+            private final Thread writeThread;
+            private final ThreadInfo writeThreadInfo;
+            private final Scheduler.Task writeTask;
+            // Tri-state: null -&gt; write pending, this -&gt; write succeeded, Throwable -&gt; write failed.
+            private volatile Object writeCompleted;
+            // Tri-state: null -&gt; callback pending, thread -&gt; callback running, this -&gt; callback completed.
+            private volatile Object callbackRunner;
+
+            private WriteCallback(Callback callback)
+<span class="nc" id="L818">            {</span>
+<span class="nc" id="L819">                super(callback);</span>
+<span class="nc" id="L820">                this.writeThread = Thread.currentThread();</span>
+<span class="nc" id="L821">                this.writeThreadInfo = new ThreadInfo(writeThread);</span>
+<span class="nc" id="L822">                long writeTimeout = getWriteTimeout();</span>
+<span class="nc bnc" id="L823" title="All 2 branches missed.">                this.writeTask = writeTimeout &gt; 0 ? stateInfo.request.getComponents().getScheduler().schedule(this::writeExpired, writeTimeout, MILLISECONDS) : null;</span>
+<span class="nc" id="L824">            }</span>
+
+            private void writeComplete(Throwable failure)
+            {
+<span class="nc bnc" id="L828" title="All 2 branches missed.">                writeCompleted = failure == null ? this : failure;</span>
+<span class="nc" id="L829">            }</span>
+
+            private void writeExpired()
+            {
+<span class="nc" id="L833">                Object writeCompleted = this.writeCompleted;</span>
+
+<span class="nc" id="L835">                Request request = stateInfo.request;</span>
+
+<span class="nc bnc" id="L837" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L838">                    LOG.debug(&quot;write not completed within {} for {}&quot;, getWriteTimeout(), request);</span>
+
+<span class="nc bnc" id="L840" title="All 2 branches missed.">                if (writeCompleted == null)</span>
+<span class="nc" id="L841">                    notifyWriteBlocked(request, writeThreadInfo, new ThreadInfo(writeThread));</span>
+                else
+<span class="nc bnc" id="L843" title="All 2 branches missed.">                    notifyWriteCallbackNotCompleted(request, writeCompleted == this ? null : (Throwable)writeCompleted, writeThreadInfo);</span>
+<span class="nc" id="L844">            }</span>
+
+            @Override
+            public void succeeded()
+            {
+<span class="nc bnc" id="L849" title="All 2 branches missed.">                if (!callbackCompleted.compareAndSet(false, true))</span>
+<span class="nc" id="L850">                    return;</span>
+
+<span class="nc bnc" id="L852" title="All 2 branches missed.">                if (writeTask != null)</span>
+<span class="nc" id="L853">                    writeTask.cancel();</span>
+
+<span class="nc" id="L855">                callbackRunner = Thread.currentThread();</span>
+<span class="nc" id="L856">                long timeout = getWriteCallbackTimeout();</span>
+<span class="nc bnc" id="L857" title="All 2 branches missed.">                Scheduler.Task task = timeout &gt; 0 ? stateInfo.request.getComponents().getScheduler().schedule(() -&gt; callbackExpired(null), timeout, MILLISECONDS) : null;</span>
+                try
+                {
+<span class="nc" id="L860">                    super.succeeded();</span>
+                }
+                finally
+                {
+<span class="nc" id="L864">                    callbackRunner = this;</span>
+<span class="nc" id="L865">                    stateInfo.writeCallbacks.remove(this);</span>
+<span class="nc bnc" id="L866" title="All 2 branches missed.">                    if (task != null)</span>
+<span class="nc" id="L867">                        task.cancel();</span>
+                }
+<span class="nc" id="L869">            }</span>
+
+            @Override
+            public void failed(Throwable x)
+            {
+<span class="nc bnc" id="L874" title="All 2 branches missed.">                if (!callbackCompleted.compareAndSet(false, true))</span>
+<span class="nc" id="L875">                    return;</span>
+
+<span class="nc bnc" id="L877" title="All 2 branches missed.">                if (writeTask != null)</span>
+<span class="nc" id="L878">                    writeTask.cancel();</span>
+
+<span class="nc" id="L880">                callbackRunner = Thread.currentThread();</span>
+<span class="nc" id="L881">                long timeout = getWriteCallbackTimeout();</span>
+<span class="nc bnc" id="L882" title="All 2 branches missed.">                Scheduler.Task task = timeout &gt; 0 ? stateInfo.request.getComponents().getScheduler().schedule(() -&gt; callbackExpired(x), timeout, MILLISECONDS) : null;</span>
+                try
+                {
+<span class="nc" id="L885">                    super.failed(x);</span>
+                }
+                finally
+                {
+<span class="nc" id="L889">                    callbackRunner = this;</span>
+<span class="nc" id="L890">                    stateInfo.writeCallbacks.remove(this);</span>
+<span class="nc bnc" id="L891" title="All 2 branches missed.">                    if (task != null)</span>
+<span class="nc" id="L892">                        task.cancel();</span>
+                }
+<span class="nc" id="L894">            }</span>
+
+            private void callbackExpired(Throwable failure)
+            {
+<span class="nc" id="L898">                Object callbackRunner = this.callbackRunner;</span>
+                // Return if callbackExpired() lost the race with succeeded()/failed().
+<span class="nc bnc" id="L900" title="All 2 branches missed.">                if (callbackRunner == this)</span>
+<span class="nc" id="L901">                    return;</span>
+
+<span class="nc bnc" id="L903" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L904">                    LOG.debug(&quot;write callback not completed within {} for {}&quot;, getWriteCallbackTimeout(), getRequest());</span>
+
+                // The thread info of the thread that blocks.
+<span class="nc" id="L907">                ThreadInfo callbackThreadInfo = new ThreadInfo((Thread)callbackRunner);</span>
+<span class="nc" id="L908">                notifyWriteCallbackBlocked(getRequest(), failure, writeThreadInfo, callbackThreadInfo);</span>
+<span class="nc" id="L909">            }</span>
+
+            @Override
+            public void dump(Appendable out, String indent) throws IOException
+            {
+<span class="nc" id="L914">                Object writeCompleted = this.writeCompleted;</span>
+<span class="nc bnc" id="L915" title="All 2 branches missed.">                if (writeCompleted == null)</span>
+                {
+<span class="nc" id="L917">                    out.append(&quot;write: pending\n&quot;);</span>
+<span class="nc" id="L918">                    out.append(indent).append(new ThreadInfo(writeThread).toString(indent));</span>
+                }
+                else
+                {
+<span class="nc bnc" id="L922" title="All 2 branches missed.">                    out.append(&quot;write: %s\n&quot;.formatted(writeCompleted == this ? &quot;succeeded&quot; : &quot;failed with &quot; + writeCompleted));</span>
+                }
+
+<span class="nc" id="L925">                Object callbackRunner = this.callbackRunner;</span>
+<span class="nc bnc" id="L926" title="All 2 branches missed.">                if (callbackRunner instanceof Thread callbackThread)</span>
+                {
+<span class="nc" id="L928">                    out.append(indent).append(&quot;write callback: running [%s]\n&quot;.formatted(getCallback()));</span>
+<span class="nc" id="L929">                    out.append(indent).append(new ThreadInfo(callbackThread).toString(indent));</span>
+                }
+                else
+                {
+<span class="nc bnc" id="L933" title="All 2 branches missed.">                    out.append(indent).append(&quot;write callback: %s [%s]\n&quot;.formatted(callbackRunner == null ? &quot;pending&quot; : &quot;completed&quot;, getCallback()));</span>
+                }
+<span class="nc" id="L935">            }</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

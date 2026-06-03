@@ -1,0 +1,915 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>GzipHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server.handler.gzip</a> &gt; <span class="el_source">GzipHandler.java</span></div><h1>GzipHandler.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server.handler.gzip;
+
+import java.util.ListIterator;
+import java.util.Set;
+import java.util.zip.Deflater;
+
+import org.eclipse.jetty.http.EtagUtils;
+import org.eclipse.jetty.http.HttpField;
+import org.eclipse.jetty.http.HttpFields;
+import org.eclipse.jetty.http.HttpHeader;
+import org.eclipse.jetty.http.HttpMethod;
+import org.eclipse.jetty.http.MimeTypes;
+import org.eclipse.jetty.http.PreEncodedHttpField;
+import org.eclipse.jetty.http.pathmap.PathSpecSet;
+import org.eclipse.jetty.server.Handler;
+import org.eclipse.jetty.server.Request;
+import org.eclipse.jetty.server.Response;
+import org.eclipse.jetty.server.Server;
+import org.eclipse.jetty.util.AsciiLowerCaseSet;
+import org.eclipse.jetty.util.Callback;
+import org.eclipse.jetty.util.IncludeExclude;
+import org.eclipse.jetty.util.StringUtil;
+import org.eclipse.jetty.util.compression.DeflaterPool;
+import org.eclipse.jetty.util.compression.InflaterPool;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class GzipHandler extends Handler.Wrapper implements GzipFactory
+{
+    public static final String GZIP_HANDLER_ETAGS = &quot;o.e.j.s.h.gzip.GzipHandler.etag&quot;;
+    public static final String GZIP = &quot;gzip&quot;;
+    public static final String DEFLATE = &quot;deflate&quot;;
+    public static final int DEFAULT_MIN_GZIP_SIZE = 32;
+    public static final int BREAK_EVEN_GZIP_SIZE = 23;
+<span class="nc" id="L48">    private static final Logger LOG = LoggerFactory.getLogger(GzipHandler.class);</span>
+
+    private InflaterPool _inflaterPool;
+    private DeflaterPool _deflaterPool;
+<span class="nc" id="L52">    private int _minGzipSize = DEFAULT_MIN_GZIP_SIZE;</span>
+<span class="nc" id="L53">    private boolean _syncFlush = false;</span>
+<span class="nc" id="L54">    private int _inflateBufferSize = -1;</span>
+    // non-static, as other GzipHandler instances may have different configurations
+<span class="nc" id="L56">    private final IncludeExclude&lt;String&gt; _methods = new IncludeExclude&lt;&gt;();</span>
+<span class="nc" id="L57">    private final IncludeExclude&lt;String&gt; _inflatePaths = new IncludeExclude&lt;&gt;(PathSpecSet.class);</span>
+<span class="nc" id="L58">    private final IncludeExclude&lt;String&gt; _paths = new IncludeExclude&lt;&gt;(PathSpecSet.class);</span>
+<span class="nc" id="L59">    private final IncludeExclude&lt;String&gt; _mimeTypes = new IncludeExclude&lt;&gt;(AsciiLowerCaseSet.class);</span>
+<span class="nc" id="L60">    private HttpField _vary = new PreEncodedHttpField(HttpHeader.VARY, HttpHeader.ACCEPT_ENCODING.asString());</span>
+
+    /**
+     * Instantiates a new GzipHandler.
+     */
+    public GzipHandler()
+    {
+<span class="nc" id="L67">        this(null);</span>
+<span class="nc" id="L68">    }</span>
+
+    /**
+     * Instantiates a new GzipHandler.
+     * @param handler the handler to wrap
+     */
+    public GzipHandler(Handler handler)
+    {
+<span class="nc" id="L76">        super(handler);</span>
+<span class="nc" id="L77">        _methods.include(HttpMethod.GET.asString());</span>
+<span class="nc" id="L78">        _methods.include(HttpMethod.POST.asString());</span>
+<span class="nc bnc" id="L79" title="All 2 branches missed.">        for (String type : MimeTypes.DEFAULTS.getMimeMap().values())</span>
+        {
+<span class="nc bnc" id="L81" title="All 2 branches missed.">            if (&quot;image/svg+xml&quot;.equals(type))</span>
+<span class="nc" id="L82">                _paths.exclude(&quot;*.svgz&quot;);</span>
+<span class="nc bnc" id="L83" title="All 2 branches missed.">            else if (type.startsWith(&quot;image/&quot;) ||</span>
+<span class="nc bnc" id="L84" title="All 2 branches missed.">                type.startsWith(&quot;audio/&quot;) ||</span>
+<span class="nc bnc" id="L85" title="All 2 branches missed.">                type.startsWith(&quot;video/&quot;))</span>
+<span class="nc" id="L86">                _mimeTypes.exclude(type);</span>
+<span class="nc" id="L87">        }</span>
+
+<span class="nc" id="L89">        _mimeTypes.exclude(&quot;application/compress&quot;);</span>
+<span class="nc" id="L90">        _paths.exclude(&quot;*.z&quot;);</span>
+<span class="nc" id="L91">        _mimeTypes.exclude(&quot;application/zip&quot;);</span>
+<span class="nc" id="L92">        _paths.exclude(&quot;*.zip&quot;);</span>
+<span class="nc" id="L93">        _mimeTypes.exclude(&quot;application/x-gtar&quot;);</span>
+<span class="nc" id="L94">        _paths.exclude(&quot;*.tgz&quot;);</span>
+<span class="nc" id="L95">        _mimeTypes.exclude(&quot;application/java-archive&quot;);</span>
+<span class="nc" id="L96">        _paths.exclude(&quot;*.jar&quot;);</span>
+<span class="nc" id="L97">        _mimeTypes.exclude(&quot;application/gzip&quot;);</span>
+<span class="nc" id="L98">        _paths.exclude(&quot;*.gz&quot;, &quot;*.gzip&quot;);</span>
+<span class="nc" id="L99">        _mimeTypes.exclude(&quot;application/x-bzip2&quot;);</span>
+<span class="nc" id="L100">        _paths.exclude(&quot;*.bz2&quot;, &quot;*.bzip&quot;, &quot;*.bz&quot;);</span>
+<span class="nc" id="L101">        _mimeTypes.exclude(&quot;application/brotli&quot;);</span>
+<span class="nc" id="L102">        _paths.exclude(&quot;*.br&quot;, &quot;*.brotli&quot;);</span>
+<span class="nc" id="L103">        _mimeTypes.exclude(&quot;application/x-xz&quot;);</span>
+<span class="nc" id="L104">        _paths.exclude(&quot;*.xz&quot;);</span>
+<span class="nc" id="L105">        _mimeTypes.exclude(&quot;application/x-rar-compressed&quot;);</span>
+<span class="nc" id="L106">        _paths.exclude(&quot;*.rar&quot;);</span>
+<span class="nc" id="L107">        _mimeTypes.exclude(&quot;application/zstd&quot;);</span>
+<span class="nc" id="L108">        _paths.exclude(&quot;*.zst&quot;, &quot;*.zstd&quot;);</span>
+
+        // It is possible to use SSE with GzipHandler but you will need to set _synFlush to true which will impact performance.
+<span class="nc" id="L111">        _mimeTypes.exclude(&quot;text/event-stream&quot;);</span>
+
+<span class="nc bnc" id="L113" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L114">            LOG.debug(&quot;{} mime types {}&quot;, this, _mimeTypes);</span>
+<span class="nc" id="L115">    }</span>
+
+    @Override
+    protected void doStart() throws Exception
+    {
+<span class="nc" id="L120">        Server server = getServer();</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (_inflaterPool == null)</span>
+        {
+<span class="nc" id="L123">            _inflaterPool = InflaterPool.ensurePool(server);</span>
+<span class="nc" id="L124">            addBean(_inflaterPool);</span>
+        }
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        if (_deflaterPool == null)</span>
+        {
+<span class="nc" id="L128">            _deflaterPool = DeflaterPool.ensurePool(server);</span>
+<span class="nc" id="L129">            addBean(_deflaterPool);</span>
+        }
+
+<span class="nc" id="L132">        super.doStart();</span>
+<span class="nc" id="L133">    }</span>
+
+    @Override
+    protected void doStop() throws Exception
+    {
+<span class="nc" id="L138">        super.doStop();</span>
+
+<span class="nc" id="L140">        removeBean(_inflaterPool);</span>
+<span class="nc" id="L141">        _inflaterPool = null;</span>
+
+<span class="nc" id="L143">        removeBean(_deflaterPool);</span>
+<span class="nc" id="L144">        _deflaterPool = null;</span>
+<span class="nc" id="L145">    }</span>
+
+    /**
+     * @return The VARY field to use.
+     */
+    public HttpField getVary()
+    {
+<span class="nc" id="L152">        return _vary;</span>
+    }
+
+    /**
+     * @param vary The VARY field to use. It if is not an instance of {@link PreEncodedHttpField},
+     *             then it will be converted to one.
+     */
+    public void setVary(HttpField vary)
+    {
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        if (isRunning())</span>
+<span class="nc" id="L162">            throw new IllegalStateException(getState());</span>
+
+<span class="nc bnc" id="L164" title="All 4 branches missed.">        if (vary == null || (vary instanceof PreEncodedHttpField))</span>
+<span class="nc" id="L165">            _vary = vary;</span>
+        else
+<span class="nc" id="L167">            _vary = new PreEncodedHttpField(vary.getHeader(), vary.getName(), vary.getValue());</span>
+<span class="nc" id="L168">    }</span>
+
+    /**
+     * Add excluded to the HTTP methods filtering.
+     *
+     * @param methods The methods to exclude in compression
+     * @see #addIncludedMethods(String...)
+     */
+    public void addExcludedMethods(String... methods)
+    {
+<span class="nc bnc" id="L178" title="All 2 branches missed.">        for (String m : methods)</span>
+        {
+<span class="nc" id="L180">            _methods.exclude(m);</span>
+        }
+<span class="nc" id="L182">    }</span>
+
+    /**
+     * Adds excluded MIME types for response filtering.
+     *
+     * &lt;p&gt;
+     * &lt;em&gt;Deprecation Warning: &lt;/em&gt;
+     * For backward compatibility the MIME types parameters may be comma separated strings,
+     * but this will not be supported in future versions of Jetty.
+     * &lt;/p&gt;
+     *
+     * @param types The mime types to exclude (without charset or other parameters).
+     * @see #addIncludedMimeTypes(String...)
+     */
+    public void addExcludedMimeTypes(String... types)
+    {
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        for (String t : types)</span>
+        {
+<span class="nc" id="L200">            _mimeTypes.exclude(StringUtil.csvSplit(t));</span>
+        }
+<span class="nc" id="L202">    }</span>
+
+    /**
+     * Adds excluded Path Specs for request filtering.
+     *
+     * &lt;p&gt;
+     * There are 2 syntaxes supported, Servlet &lt;code&gt;url-pattern&lt;/code&gt; based, and
+     * Regex based.  This means that the initial characters on the path spec
+     * line are very strict, and determine the behavior of the path matching.
+     * &lt;ul&gt;
+     * &lt;li&gt;If the spec starts with &lt;code&gt;'^'&lt;/code&gt; the spec is assumed to be
+     * a regex based path spec and will match with normal Java regex rules.&lt;/li&gt;
+     * &lt;li&gt;If the spec starts with &lt;code&gt;'/'&lt;/code&gt; then spec is assumed to be
+     * a Servlet url-pattern rules path spec for either an exact match
+     * or prefix based match.&lt;/li&gt;
+     * &lt;li&gt;If the spec starts with &lt;code&gt;'*.'&lt;/code&gt; then spec is assumed to be
+     * a Servlet url-pattern rules path spec for a suffix based match.&lt;/li&gt;
+     * &lt;li&gt;All other syntaxes are unsupported&lt;/li&gt;
+     * &lt;/ul&gt;
+     * &lt;p&gt;
+     * Note: inclusion takes precedence over exclude.
+     *
+     * @param pathspecs Path specs (as per servlet spec) to exclude. If a
+     * ServletContext is available, the paths are relative to the context path,
+     * otherwise they are absolute.&lt;br&gt;
+     * For backward compatibility the pathspecs may be comma separated strings, but this
+     * will not be supported in future versions.
+     * @see #addIncludedPaths(String...)
+     */
+    public void addExcludedPaths(String... pathspecs)
+    {
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        for (String p : pathspecs)</span>
+        {
+<span class="nc" id="L235">            _paths.exclude(StringUtil.csvSplit(p));</span>
+        }
+<span class="nc" id="L237">    }</span>
+
+    /**
+     * Adds excluded Path Specs for request filtering on request inflation.
+     *
+     * &lt;p&gt;
+     * There are 2 syntaxes supported, Servlet &lt;code&gt;url-pattern&lt;/code&gt; based, and
+     * Regex based.  This means that the initial characters on the path spec
+     * line are very strict, and determine the behavior of the path matching.
+     * &lt;ul&gt;
+     * &lt;li&gt;If the spec starts with &lt;code&gt;'^'&lt;/code&gt; the spec is assumed to be
+     * a regex based path spec and will match with normal Java regex rules.&lt;/li&gt;
+     * &lt;li&gt;If the spec starts with &lt;code&gt;'/'&lt;/code&gt; then spec is assumed to be
+     * a Servlet url-pattern rules path spec for either an exact match
+     * or prefix based match.&lt;/li&gt;
+     * &lt;li&gt;If the spec starts with &lt;code&gt;'*.'&lt;/code&gt; then spec is assumed to be
+     * a Servlet url-pattern rules path spec for a suffix based match.&lt;/li&gt;
+     * &lt;li&gt;All other syntaxes are unsupported&lt;/li&gt;
+     * &lt;/ul&gt;
+     * &lt;p&gt;
+     * Note: inclusion takes precedence over exclude.
+     *
+     * @param pathspecs Path specs (as per servlet spec) to exclude. If a
+     * ServletContext is available, the paths are relative to the context path,
+     * otherwise they are absolute.&lt;br&gt;
+     * For backward compatibility the pathspecs may be comma separated strings, but this
+     * will not be supported in future versions.
+     * @see #addIncludedInflationPaths(String...)
+     */
+    public void addExcludedInflationPaths(String... pathspecs)
+    {
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        for (String p : pathspecs)</span>
+        {
+<span class="nc" id="L270">            _inflatePaths.exclude(StringUtil.csvSplit(p));</span>
+        }
+<span class="nc" id="L272">    }</span>
+
+    /**
+     * Adds included HTTP Methods (eg: POST, PATCH, DELETE) for filtering.
+     *
+     * @param methods The HTTP methods to include in compression.
+     * @see #addExcludedMethods(String...)
+     */
+    public void addIncludedMethods(String... methods)
+    {
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        for (String m : methods)</span>
+        {
+<span class="nc" id="L284">            _methods.include(m);</span>
+        }
+<span class="nc" id="L286">    }</span>
+
+    /**
+     * Is the {@link Deflater} running {@link Deflater#SYNC_FLUSH} or not.
+     *
+     * @return True if {@link Deflater#SYNC_FLUSH} is used, else {@link Deflater#NO_FLUSH}
+     * @see #setSyncFlush(boolean)
+     */
+    public boolean isSyncFlush()
+    {
+<span class="nc" id="L296">        return _syncFlush;</span>
+    }
+
+    /**
+     * Set the {@link Deflater} flush mode to use.  {@link Deflater#SYNC_FLUSH}
+     * should be used if the application wishes to stream the data, but this may
+     * hurt compression performance.
+     *
+     * @param syncFlush True if {@link Deflater#SYNC_FLUSH} is used, else {@link Deflater#NO_FLUSH}
+     * @see #isSyncFlush()
+     */
+    public void setSyncFlush(boolean syncFlush)
+    {
+<span class="nc" id="L309">        _syncFlush = syncFlush;</span>
+<span class="nc" id="L310">    }</span>
+
+    /**
+     * Add included MIME types for response filtering
+     *
+     * @param types The mime types to include (without charset or other parameters)
+     * For backward compatibility the mimetypes may be comma separated strings, but this
+     * will not be supported in future versions.
+     * @see #addExcludedMimeTypes(String...)
+     */
+    public void addIncludedMimeTypes(String... types)
+    {
+<span class="nc bnc" id="L322" title="All 2 branches missed.">        for (String t : types)</span>
+        {
+<span class="nc" id="L324">            _mimeTypes.include(StringUtil.csvSplit(t));</span>
+        }
+<span class="nc" id="L326">    }</span>
+
+    /**
+     * Add included Path Specs for filtering.
+     *
+     * &lt;p&gt;
+     * There are 2 syntaxes supported, Servlet &lt;code&gt;url-pattern&lt;/code&gt; based, and
+     * Regex based.  This means that the initial characters on the path spec
+     * line are very strict, and determine the behavior of the path matching.
+     * &lt;ul&gt;
+     * &lt;li&gt;If the spec starts with &lt;code&gt;'^'&lt;/code&gt; the spec is assumed to be
+     * a regex based path spec and will match with normal Java regex rules.&lt;/li&gt;
+     * &lt;li&gt;If the spec starts with &lt;code&gt;'/'&lt;/code&gt; then spec is assumed to be
+     * a Servlet url-pattern rules path spec for either an exact match
+     * or prefix based match.&lt;/li&gt;
+     * &lt;li&gt;If the spec starts with &lt;code&gt;'*.'&lt;/code&gt; then spec is assumed to be
+     * a Servlet url-pattern rules path spec for a suffix based match.&lt;/li&gt;
+     * &lt;li&gt;All other syntaxes are unsupported&lt;/li&gt;
+     * &lt;/ul&gt;
+     * &lt;p&gt;
+     * Note: inclusion takes precedence over exclusion.
+     *
+     * @param pathspecs Path specs (as per servlet spec) to include. If a
+     * ServletContext is available, the paths are relative to the context path,
+     * otherwise they are absolute
+     */
+    public void addIncludedPaths(String... pathspecs)
+    {
+<span class="nc bnc" id="L354" title="All 2 branches missed.">        for (String p : pathspecs)</span>
+        {
+<span class="nc" id="L356">            _paths.include(StringUtil.csvSplit(p));</span>
+        }
+<span class="nc" id="L358">    }</span>
+
+    /**
+     * Add included Path Specs for filtering on request inflation.
+     *
+     * &lt;p&gt;
+     * There are 2 syntaxes supported, Servlet &lt;code&gt;url-pattern&lt;/code&gt; based, and
+     * Regex based.  This means that the initial characters on the path spec
+     * line are very strict, and determine the behavior of the path matching.
+     * &lt;ul&gt;
+     * &lt;li&gt;If the spec starts with &lt;code&gt;'^'&lt;/code&gt; the spec is assumed to be
+     * a regex based path spec and will match with normal Java regex rules.&lt;/li&gt;
+     * &lt;li&gt;If the spec starts with &lt;code&gt;'/'&lt;/code&gt; then spec is assumed to be
+     * a Servlet url-pattern rules path spec for either an exact match
+     * or prefix based match.&lt;/li&gt;
+     * &lt;li&gt;If the spec starts with &lt;code&gt;'*.'&lt;/code&gt; then spec is assumed to be
+     * a Servlet url-pattern rules path spec for a suffix based match.&lt;/li&gt;
+     * &lt;li&gt;All other syntaxes are unsupported&lt;/li&gt;
+     * &lt;/ul&gt;
+     * &lt;p&gt;
+     * Note: inclusion takes precedence over exclusion.
+     *
+     * @param pathspecs Path specs (as per servlet spec) to include. If a
+     * ServletContext is available, the paths are relative to the context path,
+     * otherwise they are absolute
+     */
+    public void addIncludedInflationPaths(String... pathspecs)
+    {
+<span class="nc bnc" id="L386" title="All 2 branches missed.">        for (String p : pathspecs)</span>
+        {
+<span class="nc" id="L388">            _inflatePaths.include(StringUtil.csvSplit(p));</span>
+        }
+<span class="nc" id="L390">    }</span>
+
+    @Override
+    public DeflaterPool.Entry getDeflaterEntry(Request request, long contentLength)
+    {
+<span class="nc bnc" id="L395" title="All 4 branches missed.">        if (contentLength &gt;= 0 &amp;&amp; contentLength &lt; _minGzipSize)</span>
+        {
+<span class="nc bnc" id="L397" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L398">                LOG.debug(&quot;{} excluded minGzipSize {}&quot;, this, request);</span>
+<span class="nc" id="L399">            return null;</span>
+        }
+
+        // check the accept encoding header
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        if (!request.getHeaders().contains(HttpHeader.ACCEPT_ENCODING, &quot;gzip&quot;))</span>
+        {
+<span class="nc bnc" id="L405" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L406">                LOG.debug(&quot;{} excluded not gzip accept {}&quot;, this, request);</span>
+<span class="nc" id="L407">            return null;</span>
+        }
+
+<span class="nc" id="L410">        return _deflaterPool.acquire();</span>
+    }
+
+    /**
+     * Get the current filter list of excluded HTTP methods
+     *
+     * @return the filter list of excluded HTTP methods
+     * @see #getIncludedMethods()
+     */
+    public String[] getExcludedMethods()
+    {
+<span class="nc" id="L421">        Set&lt;String&gt; excluded = _methods.getExcluded();</span>
+<span class="nc" id="L422">        return excluded.toArray(new String[0]);</span>
+    }
+
+    /**
+     * Get the current filter list of excluded MIME types
+     *
+     * @return the filter list of excluded MIME types
+     * @see #getIncludedMimeTypes()
+     */
+    public String[] getExcludedMimeTypes()
+    {
+<span class="nc" id="L433">        Set&lt;String&gt; excluded = _mimeTypes.getExcluded();</span>
+<span class="nc" id="L434">        return excluded.toArray(new String[0]);</span>
+    }
+
+    /**
+     * Get the current filter list of excluded Path Specs
+     *
+     * @return the filter list of excluded Path Specs
+     * @see #getIncludedPaths()
+     */
+    public String[] getExcludedPaths()
+    {
+<span class="nc" id="L445">        Set&lt;String&gt; excluded = _paths.getExcluded();</span>
+<span class="nc" id="L446">        return excluded.toArray(new String[0]);</span>
+    }
+
+    /**
+     * Get the current filter list of excluded Path Specs for request inflation.
+     *
+     * @return the filter list of excluded Path Specs
+     * @see #getIncludedInflationPaths()
+     */
+    public String[] getExcludedInflationPaths()
+    {
+<span class="nc" id="L457">        Set&lt;String&gt; excluded = _inflatePaths.getExcluded();</span>
+<span class="nc" id="L458">        return excluded.toArray(new String[0]);</span>
+    }
+
+    /**
+     * Get the current filter list of included HTTP Methods
+     *
+     * @return the filter list of included HTTP methods
+     * @see #getExcludedMethods()
+     */
+    public String[] getIncludedMethods()
+    {
+<span class="nc" id="L469">        Set&lt;String&gt; includes = _methods.getIncluded();</span>
+<span class="nc" id="L470">        return includes.toArray(new String[0]);</span>
+    }
+
+    /**
+     * Get the current filter list of included MIME types
+     *
+     * @return the filter list of included MIME types
+     * @see #getExcludedMimeTypes()
+     */
+    public String[] getIncludedMimeTypes()
+    {
+<span class="nc" id="L481">        Set&lt;String&gt; includes = _mimeTypes.getIncluded();</span>
+<span class="nc" id="L482">        return includes.toArray(new String[0]);</span>
+    }
+
+    /**
+     * Get the current filter list of included Path Specs
+     *
+     * @return the filter list of included Path Specs
+     * @see #getExcludedPaths()
+     */
+    public String[] getIncludedPaths()
+    {
+<span class="nc" id="L493">        Set&lt;String&gt; includes = _paths.getIncluded();</span>
+<span class="nc" id="L494">        return includes.toArray(new String[0]);</span>
+    }
+
+    /**
+     * Get the current filter list of included Path Specs for request inflation.
+     *
+     * @return the filter list of included Path Specs
+     * @see #getExcludedInflationPaths()
+     */
+    public String[] getIncludedInflationPaths()
+    {
+<span class="nc" id="L505">        Set&lt;String&gt; includes = _inflatePaths.getIncluded();</span>
+<span class="nc" id="L506">        return includes.toArray(new String[0]);</span>
+    }
+
+    /**
+     * Get the minimum size, in bytes, that a response {@code Content-Length} must be
+     * before compression will trigger.
+     *
+     * @return minimum response size (in bytes) that triggers compression
+     * @see #setMinGzipSize(int)
+     */
+    public int getMinGzipSize()
+    {
+<span class="nc" id="L518">        return _minGzipSize;</span>
+    }
+
+    /**
+     * Get the size (in bytes) of the {@link java.util.zip.Inflater} buffer used to inflate
+     * compressed requests.
+     *
+     * @return size in bytes of the buffer, or 0 for no inflation.
+     */
+    public int getInflateBufferSize()
+    {
+<span class="nc" id="L529">        return _inflateBufferSize;</span>
+    }
+
+    /**
+     * Set the size (in bytes) of the {@link java.util.zip.Inflater} buffer used to inflate comrpessed requests.
+     *
+     * @param size size in bytes of the buffer, or 0 for no inflation.
+     */
+    public void setInflateBufferSize(int size)
+    {
+<span class="nc" id="L539">        _inflateBufferSize = size;</span>
+<span class="nc" id="L540">    }</span>
+
+    @Override
+    public boolean handle(Request request, Response response, Callback callback) throws Exception
+    {
+<span class="nc bnc" id="L545" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L546">            LOG.debug(&quot;{} handle {}&quot;, this, request);</span>
+
+<span class="nc" id="L548">        Handler next = getHandler();</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">        if (next == null)</span>
+<span class="nc" id="L550">            return false;</span>
+
+        // Are we already being gzipped?
+<span class="nc bnc" id="L553" title="All 2 branches missed.">        if (Request.as(request, GzipRequest.class) != null)</span>
+<span class="nc" id="L554">            return next.handle(request, response, callback);</span>
+
+<span class="nc" id="L556">        String pathInContext = Request.getPathInContext(request);</span>
+<span class="nc bnc" id="L557" title="All 4 branches missed.">        boolean tryInflate = getInflateBufferSize() &gt;= 0 &amp;&amp; isPathInflatable(pathInContext);</span>
+<span class="nc bnc" id="L558" title="All 6 branches missed.">        boolean tryDeflate = _methods.test(request.getMethod()) &amp;&amp; isPathDeflatable(pathInContext) &amp;&amp; isMimeTypeDeflatable(request.getContext().getMimeTypes(), pathInContext);</span>
+
+        // Can we skip looking at the request and wrapping request or response?
+<span class="nc bnc" id="L561" title="All 4 branches missed.">        if (!tryInflate &amp;&amp; !tryDeflate)</span>
+            // No need for a Vary header, as we will never deflate
+<span class="nc" id="L563">            return next.handle(request, response, callback);</span>
+
+        // Look for inflate and deflate headers
+<span class="nc" id="L566">        HttpFields fields = request.getHeaders();</span>
+<span class="nc" id="L567">        boolean inflatable = false;</span>
+<span class="nc" id="L568">        boolean deflatable = false;</span>
+<span class="nc" id="L569">        boolean etagMatches = false;</span>
+<span class="nc" id="L570">        boolean seenContentEncoding = false;</span>
+<span class="nc bnc" id="L571" title="All 2 branches missed.">        for (ListIterator&lt;HttpField&gt; i = fields.listIterator(fields.size()); i.hasPrevious();)</span>
+        {
+<span class="nc" id="L573">            HttpField field = i.previous();</span>
+<span class="nc" id="L574">            HttpHeader header = field.getHeader();</span>
+<span class="nc bnc" id="L575" title="All 2 branches missed.">            if (header == null)</span>
+<span class="nc" id="L576">                continue;</span>
+<span class="nc bnc" id="L577" title="All 4 branches missed.">            switch (header)</span>
+            {
+                case CONTENT_ENCODING -&gt;
+                {
+<span class="nc bnc" id="L581" title="All 4 branches missed.">                    inflatable |= !seenContentEncoding &amp;&amp; field.containsLast(&quot;gzip&quot;);</span>
+<span class="nc" id="L582">                    seenContentEncoding = true;</span>
+<span class="nc" id="L583">                }</span>
+<span class="nc" id="L584">                case ACCEPT_ENCODING -&gt; deflatable = field.contains(&quot;gzip&quot;);</span>
+<span class="nc" id="L585">                case IF_MATCH, IF_NONE_MATCH -&gt; etagMatches |= field.getValue().contains(EtagUtils.ETAG_SEPARATOR);</span>
+            }
+<span class="nc" id="L587">        }</span>
+
+        // We need to wrap the request IFF we are inflating or have seen etags with compression separators
+<span class="nc bnc" id="L590" title="All 6 branches missed.">        if (inflatable &amp;&amp; tryInflate || etagMatches)</span>
+        {
+            // Wrap the request to update the fields and do any inflation
+<span class="nc bnc" id="L593" title="All 4 branches missed.">            GzipRequest gzipRequest = new GzipRequest(request, _inflaterPool, inflatable &amp;&amp; tryInflate ? getInflateBufferSize() : -1);</span>
+<span class="nc" id="L594">            request = gzipRequest;</span>
+<span class="nc" id="L595">            callback = Callback.from(callback, gzipRequest::destroy);</span>
+        }
+
+<span class="nc bnc" id="L598" title="All 4 branches missed.">        if (tryDeflate &amp;&amp; _vary != null)</span>
+        {
+            // The response may vary based on the presence or lack of Accept-Encoding.
+<span class="nc" id="L601">            response.getHeaders().ensureField(_vary);</span>
+        }
+
+        // Wrap the response and callback IFF we can be deflated and will try to deflate
+<span class="nc bnc" id="L605" title="All 4 branches missed.">        if (deflatable &amp;&amp; tryDeflate)</span>
+        {
+<span class="nc" id="L607">            GzipResponseAndCallback gzipResponseAndCallback = new GzipResponseAndCallback(this, request, response, callback);</span>
+<span class="nc" id="L608">            response = gzipResponseAndCallback;</span>
+<span class="nc" id="L609">            callback = gzipResponseAndCallback;</span>
+        }
+
+        // Call handle() with the possibly wrapped request, response and callback
+<span class="nc bnc" id="L613" title="All 2 branches missed.">        if (next.handle(request, response, callback))</span>
+<span class="nc" id="L614">            return true;</span>
+
+        // If the request was not handled, destroy GzipRequest.
+<span class="nc bnc" id="L617" title="All 2 branches missed.">        if (request instanceof GzipRequest gzipRequest)</span>
+<span class="nc" id="L618">            gzipRequest.destroy();</span>
+
+<span class="nc" id="L620">        return false;</span>
+    }
+
+    protected boolean isMimeTypeDeflatable(MimeTypes mimeTypes, String requestURI)
+    {
+        // Exclude non-compressible mime-types known from URI extension
+<span class="nc" id="L626">        String mimeType = mimeTypes.getMimeByExtension(requestURI);</span>
+<span class="nc bnc" id="L627" title="All 2 branches missed.">        if (mimeType != null)</span>
+        {
+<span class="nc" id="L629">            mimeType = HttpField.getValueParameters(mimeType, null);</span>
+<span class="nc" id="L630">            return isMimeTypeDeflatable(mimeType);</span>
+        }
+<span class="nc" id="L632">        return true;</span>
+    }
+
+    /**
+     * Test if the provided MIME type is allowed based on the MIME type filters.
+     *
+     * @param mimetype the MIME type to test
+     * @return true if allowed, false otherwise
+     */
+    @Override
+    public boolean isMimeTypeDeflatable(String mimetype)
+    {
+<span class="nc" id="L644">        return _mimeTypes.test(mimetype);</span>
+    }
+
+    /**
+     * Test if the provided Request URI is allowed based on the Path Specs filters.
+     *
+     * @param requestURI the request uri
+     * @return whether compressing is allowed for the given the path
+     */
+    protected boolean isPathDeflatable(String requestURI)
+    {
+<span class="nc bnc" id="L655" title="All 2 branches missed.">        if (requestURI == null)</span>
+<span class="nc" id="L656">            return true;</span>
+
+<span class="nc" id="L658">        return _paths.test(requestURI);</span>
+    }
+
+    /**
+     * Test if the provided Request URI is allowed to be inflated based on the Path Specs filters.
+     *
+     * @param pathInContext the request path in context
+     * @return whether decompressing is allowed for the given the path.
+     */
+    protected boolean isPathInflatable(String pathInContext)
+    {
+<span class="nc bnc" id="L669" title="All 2 branches missed.">        if (pathInContext == null)</span>
+<span class="nc" id="L670">            return true;</span>
+
+<span class="nc" id="L672">        return _inflatePaths.test(pathInContext);</span>
+    }
+
+    /**
+     * Set the excluded filter list of HTTP methods (replacing any previously set)
+     *
+     * @param methods the HTTP methods to exclude
+     * @see #setIncludedMethods(String...)
+     */
+    public void setExcludedMethods(String... methods)
+    {
+<span class="nc" id="L683">        _methods.getExcluded().clear();</span>
+<span class="nc" id="L684">        _methods.exclude(methods);</span>
+<span class="nc" id="L685">    }</span>
+
+    /**
+     * Set the excluded filter list of MIME types (replacing any previously set)
+     *
+     * @param types The mime types to exclude (without charset or other parameters)
+     * @see #setIncludedMimeTypes(String...)
+     */
+    public void setExcludedMimeTypes(String... types)
+    {
+<span class="nc" id="L695">        _mimeTypes.getExcluded().clear();</span>
+<span class="nc" id="L696">        _mimeTypes.exclude(types);</span>
+<span class="nc" id="L697">    }</span>
+
+    /**
+     * Set the excluded filter list of MIME types (replacing any previously set)
+     *
+     * @param csvTypes The list of mime types to exclude (without charset or other parameters), CSV format
+     * @see #setIncludedMimeTypesList(String)
+     */
+    public void setExcludedMimeTypesList(String csvTypes)
+    {
+<span class="nc" id="L707">        setExcludedMimeTypes(StringUtil.csvSplit(csvTypes));</span>
+<span class="nc" id="L708">    }</span>
+
+    /**
+     * Set the excluded filter list of Path specs (replacing any previously set)
+     *
+     * @param pathspecs Path specs (as per servlet spec) to exclude. If a
+     * ServletContext is available, the paths are relative to the context path,
+     * otherwise they are absolute.
+     * @see #setIncludedPaths(String...)
+     */
+    public void setExcludedPaths(String... pathspecs)
+    {
+<span class="nc" id="L720">        _paths.getExcluded().clear();</span>
+<span class="nc" id="L721">        _paths.exclude(pathspecs);</span>
+<span class="nc" id="L722">    }</span>
+
+    /**
+     * Set the excluded filter list of Path specs (replacing any previously set)
+     *
+     * @param pathspecs Path specs (as per servlet spec) to exclude from inflation. If a
+     * ServletContext is available, the paths are relative to the context path,
+     * otherwise they are absolute.
+     * @see #setIncludedInflatePaths(String...)
+     */
+    public void setExcludedInflatePaths(String... pathspecs)
+    {
+<span class="nc" id="L734">        _inflatePaths.getExcluded().clear();</span>
+<span class="nc" id="L735">        _inflatePaths.exclude(pathspecs);</span>
+<span class="nc" id="L736">    }</span>
+
+    /**
+     * Set the included filter list of HTTP methods (replacing any previously set)
+     *
+     * @param methods The methods to include in compression
+     * @see #setExcludedMethods(String...)
+     */
+    public void setIncludedMethods(String... methods)
+    {
+<span class="nc" id="L746">        _methods.getIncluded().clear();</span>
+<span class="nc" id="L747">        _methods.include(methods);</span>
+<span class="nc" id="L748">    }</span>
+
+    /**
+     * Set the included filter list of MIME types (replacing any previously set)
+     *
+     * @param types The mime types to include (without charset or other parameters)
+     * @see #setExcludedMimeTypes(String...)
+     */
+    public void setIncludedMimeTypes(String... types)
+    {
+<span class="nc" id="L758">        _mimeTypes.getIncluded().clear();</span>
+<span class="nc" id="L759">        _mimeTypes.include(types);</span>
+<span class="nc" id="L760">    }</span>
+
+    /**
+     * Set the included filter list of MIME types (replacing any previously set)
+     *
+     * @param csvTypes The list of mime types to include (without charset or other parameters), CSV format
+     * @see #setExcludedMimeTypesList(String)
+     */
+    public void setIncludedMimeTypesList(String csvTypes)
+    {
+<span class="nc" id="L770">        setIncludedMimeTypes(StringUtil.csvSplit(csvTypes));</span>
+<span class="nc" id="L771">    }</span>
+
+    /**
+     * Set the included filter list of Path specs (replacing any previously set)
+     *
+     * @param pathspecs Path specs (as per servlet spec) to include. If a
+     * ServletContext is available, the paths are relative to the context path,
+     * otherwise they are absolute
+     * @see #setExcludedPaths(String...)
+     */
+    public void setIncludedPaths(String... pathspecs)
+    {
+<span class="nc" id="L783">        _paths.getIncluded().clear();</span>
+<span class="nc" id="L784">        _paths.include(pathspecs);</span>
+<span class="nc" id="L785">    }</span>
+
+    /**
+     * Set the included filter list of Path specs (replacing any previously set)
+     *
+     * @param pathspecs Path specs (as per servlet spec) to include for inflation. If a
+     * ServletContext is available, the paths are relative to the context path,
+     * otherwise they are absolute
+     * @see #setExcludedInflatePaths(String...)
+     */
+    public void setIncludedInflatePaths(String... pathspecs)
+    {
+<span class="nc" id="L797">        _inflatePaths.getIncluded().clear();</span>
+<span class="nc" id="L798">        _inflatePaths.include(pathspecs);</span>
+<span class="nc" id="L799">    }</span>
+
+    /**
+     * Set the minimum response size to trigger dynamic compression.
+     * &lt;p&gt;
+     *     Sizes below {@link #BREAK_EVEN_GZIP_SIZE} will result a compressed response that is larger than the
+     *     original data.
+     * &lt;/p&gt;
+     *
+     * @param minGzipSize minimum response size in bytes (not allowed to be lower then {@link #BREAK_EVEN_GZIP_SIZE})
+     */
+    public void setMinGzipSize(int minGzipSize)
+    {
+<span class="nc bnc" id="L812" title="All 2 branches missed.">        if (minGzipSize &lt; BREAK_EVEN_GZIP_SIZE)</span>
+<span class="nc" id="L813">            LOG.warn(&quot;minGzipSize of {} is inefficient for short content, break even is size {}&quot;, minGzipSize, BREAK_EVEN_GZIP_SIZE);</span>
+<span class="nc" id="L814">        _minGzipSize = Math.max(0, minGzipSize);</span>
+<span class="nc" id="L815">    }</span>
+
+    /**
+     * Set the included filter list of HTTP Methods (replacing any previously set)
+     *
+     * @param csvMethods the list of methods, CSV format
+     * @see #setExcludedMethodList(String)
+     */
+    public void setIncludedMethodList(String csvMethods)
+    {
+<span class="nc" id="L825">        setIncludedMethods(StringUtil.csvSplit(csvMethods));</span>
+<span class="nc" id="L826">    }</span>
+
+    /**
+     * Get the included filter list of HTTP methods in CSV format
+     *
+     * @return the included filter list of HTTP methods in CSV format
+     * @see #getExcludedMethodList()
+     */
+    public String getIncludedMethodList()
+    {
+<span class="nc" id="L836">        return String.join(&quot;,&quot;, getIncludedMethods());</span>
+    }
+
+    /**
+     * Set the excluded filter list of HTTP Methods (replacing any previously set)
+     *
+     * @param csvMethods the list of methods, CSV format
+     * @see #setIncludedMethodList(String)
+     */
+    public void setExcludedMethodList(String csvMethods)
+    {
+<span class="nc" id="L847">        setExcludedMethods(StringUtil.csvSplit(csvMethods));</span>
+<span class="nc" id="L848">    }</span>
+
+    /**
+     * Get the excluded filter list of HTTP methods in CSV format
+     *
+     * @return the excluded filter list of HTTP methods in CSV format
+     * @see #getIncludedMethodList()
+     */
+    public String getExcludedMethodList()
+    {
+<span class="nc" id="L858">        return String.join(&quot;,&quot;, getExcludedMethods());</span>
+    }
+
+    /**
+     * Get the DeflaterPool being used. The default value of this is null before starting, but after starting if it is null
+     * it will be set to the default DeflaterPool which is stored as a bean on the server.
+     * @return the DeflaterPool being used.
+     */
+    public DeflaterPool getDeflaterPool()
+    {
+<span class="nc" id="L868">        return _deflaterPool;</span>
+    }
+
+    /**
+     * Get the InflaterPool being used. The default value of this is null before starting, but after starting if it is null
+     * it will be set to the default InflaterPool which is stored as a bean on the server.
+     * @return the DeflaterPool being used.
+     */
+    public InflaterPool getInflaterPool()
+    {
+<span class="nc" id="L878">        return _inflaterPool;</span>
+    }
+
+    /**
+     * Set the DeflaterPool to be used. This should be called before starting.
+     * If this value is null when starting the default pool will be used from the server.
+     * @param deflaterPool the DeflaterPool to use.
+     */
+    public void setDeflaterPool(DeflaterPool deflaterPool)
+    {
+<span class="nc bnc" id="L888" title="All 2 branches missed.">        if (isStarted())</span>
+<span class="nc" id="L889">            throw new IllegalStateException(getState());</span>
+
+<span class="nc" id="L891">        updateBean(_deflaterPool, deflaterPool);</span>
+<span class="nc" id="L892">        _deflaterPool = deflaterPool;</span>
+<span class="nc" id="L893">    }</span>
+
+    /**
+     * Set the InflaterPool to be used. This should be called before starting.
+     * If this value is null when starting the default pool will be used from the server.
+     * @param inflaterPool the InflaterPool to use.
+     */
+    public void setInflaterPool(InflaterPool inflaterPool)
+    {
+<span class="nc bnc" id="L902" title="All 2 branches missed.">        if (isStarted())</span>
+<span class="nc" id="L903">            throw new IllegalStateException(getState());</span>
+
+<span class="nc" id="L905">        updateBean(_inflaterPool, inflaterPool);</span>
+<span class="nc" id="L906">        _inflaterPool = inflaterPool;</span>
+<span class="nc" id="L907">    }</span>
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L912">        return String.format(&quot;%s@%x{%s,min=%s,inflate=%s}&quot;, getClass().getSimpleName(), hashCode(), getState(), _minGzipSize, _inflateBufferSize);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

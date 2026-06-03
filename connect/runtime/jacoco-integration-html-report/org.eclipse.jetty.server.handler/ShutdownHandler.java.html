@@ -1,0 +1,229 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ShutdownHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server.handler</a> &gt; <span class="el_source">ShutdownHandler.java</span></div><h1>ShutdownHandler.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server.handler;
+
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.util.concurrent.CompletableFuture;
+
+import org.eclipse.jetty.http.HttpHeader;
+import org.eclipse.jetty.http.HttpStatus;
+import org.eclipse.jetty.io.Content;
+import org.eclipse.jetty.server.Handler;
+import org.eclipse.jetty.server.Request;
+import org.eclipse.jetty.server.Response;
+import org.eclipse.jetty.util.Callback;
+import org.eclipse.jetty.util.Fields;
+import org.eclipse.jetty.util.StringUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * &lt;p&gt;
+ * A {@link Handler} that initiates a Shutdown of the Jetty Server it belongs to.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * Used to trigger shutdown of a Jetty Server instance
+ * &lt;ul&gt;
+ *    &lt;li&gt;If {@code exitJvm} is set to true a hard {@link System#exit(int)} call will be performed.&lt;/li&gt;
+ * &lt;/ul&gt;
+ *
+ * Server Setup Example:
+ *
+ * &lt;pre&gt;{@code
+ * Server server = new Server(8080);
+ * String shutdownToken = &quot;secret password&quot;;
+ * boolean exitJvm = false;
+ * ShutdownHandler shutdown = new ShutdownHandler(shutdownToken, exitJvm));
+ * shutdown.setHandler(someOtherHandler);
+ * server.setHandler(someOtherHandlers);
+ * server.start();
+ * }&lt;/pre&gt;
+ *
+ * Client Triggering Example
+ *
+ * &lt;pre&gt;{@code
+ * public static void attemptShutdown(int port, String shutdownToken) {
+ *   try {
+ *     String encodedToken = URLEncoder.encode(shutdownToken);
+ *     URI uri = URI.create(&quot;http://localhost:%d/shutdown?token=%s&quot;.formatted(port, shutdownCookie));
+ *     HttpClient httpClient = HttpClient.newBuilder().build();
+ *     HttpRequest httpRequest = HttpRequest.newBuilder(shutdownURI)
+ *         .POST(HttpRequest.BodyPublishers.noBody())
+ *         .build();
+ *     HttpResponse&lt;String&gt; httpResponse = httpClient.send(httpRequest,
+ *         HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+ *     Assertions.assertEquals(200, httpResponse.statusCode());
+ *     System.out.println(httpResponse.body());
+ *     logger.info(&quot;Shutting down &quot; + uri + &quot;: &quot; + httpResponse.body());
+ *   } catch (IOException | InterruptedException e) {
+ *     logger.debug(&quot;Shutdown Handler not available&quot;);
+ *     // Okay - the server is not running
+ *     throw new RuntimeException(e);
+ *   }
+ * }
+ * }&lt;/pre&gt;
+ */
+public class ShutdownHandler extends Handler.Wrapper
+{
+<span class="nc" id="L81">    private static final Logger LOG = LoggerFactory.getLogger(ShutdownHandler.class);</span>
+
+    private final String _shutdownPath;
+    private final String _shutdownToken;
+<span class="nc" id="L85">    private boolean _exitJvm = false;</span>
+
+    /**
+     * Creates a Handler that lets the server be shut down remotely (but only from localhost).
+     *
+     * @param shutdownToken a secret password to avoid unauthorized shutdown attempts
+     */
+    public ShutdownHandler(String shutdownToken)
+    {
+<span class="nc" id="L94">        this(null, null, shutdownToken, false);</span>
+<span class="nc" id="L95">    }</span>
+
+    /**
+     * Creates a Handler that lets the server be shut down remotely (but only from localhost).
+     *
+     * @param shutdownToken a secret password to avoid unauthorized shutdown attempts
+     * @param exitJVM If true, when the shutdown is executed, the handler class System.exit()
+     */
+    public ShutdownHandler(String shutdownToken, boolean exitJVM)
+    {
+<span class="nc" id="L105">        this(null, null, shutdownToken, exitJVM);</span>
+<span class="nc" id="L106">    }</span>
+
+    /**
+     * Creates a Handler that lets the server be shut down remotely (but only from localhost).
+     *
+     * @param handler the handler to wrap
+     * @param shutdownPath the path to respond to shutdown requests against (default is &quot;{@code /shutdown}&quot;)
+     * @param shutdownToken a secret password to avoid unauthorized shutdown attempts
+     * @param exitJVM If true, when the shutdown is executed, the handler class System.exit()
+     */
+    public ShutdownHandler(Handler handler, String shutdownPath, String shutdownToken, boolean exitJVM)
+    {
+<span class="nc" id="L118">        super(handler);</span>
+<span class="nc bnc" id="L119" title="All 2 branches missed.">        this._shutdownPath = StringUtil.isBlank(shutdownPath) ? &quot;/shutdown&quot; : shutdownPath;</span>
+<span class="nc" id="L120">        this._shutdownToken = shutdownToken;</span>
+<span class="nc" id="L121">        this._exitJvm = exitJVM;</span>
+<span class="nc" id="L122">    }</span>
+
+    @Override
+    public boolean handle(Request request, Response response, Callback callback) throws Exception
+    {
+<span class="nc" id="L127">        String fullPath = request.getHttpURI().getCanonicalPath();</span>
+<span class="nc" id="L128">        ContextHandler contextHandler = ContextHandler.getContextHandler(request);</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        if (contextHandler != null)</span>
+        {
+            // We are operating in a context, so use it
+<span class="nc" id="L132">            String pathInContext = contextHandler.getContext().getPathInContext(fullPath);</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">            if (!pathInContext.startsWith(this._shutdownPath))</span>
+            {
+<span class="nc" id="L135">                return super.handle(request, response, callback);</span>
+            }
+<span class="nc" id="L137">        }</span>
+        else
+        {
+            // We are standalone
+<span class="nc bnc" id="L141" title="All 2 branches missed.">            if (!fullPath.startsWith(this._shutdownPath))</span>
+            {
+<span class="nc" id="L143">                return super.handle(request, response, callback);</span>
+            }
+        }
+
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        if (!request.getMethod().equals(&quot;POST&quot;))</span>
+        {
+<span class="nc" id="L149">            Response.writeError(request, response, callback, HttpStatus.BAD_REQUEST_400);</span>
+<span class="nc" id="L150">            return true;</span>
+        }
+
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        if (!hasCorrectSecurityToken(request))</span>
+        {
+<span class="nc" id="L155">            LOG.warn(&quot;Unauthorized tokenless shutdown attempt from {}&quot;, request.getConnectionMetaData().getRemoteSocketAddress());</span>
+<span class="nc" id="L156">            Response.writeError(request, response, callback, HttpStatus.UNAUTHORIZED_401);</span>
+<span class="nc" id="L157">            return true;</span>
+        }
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if (!requestFromLocalhost(request))</span>
+        {
+<span class="nc" id="L161">            LOG.warn(&quot;Unauthorized non-loopback shutdown attempt from {}&quot;, request.getConnectionMetaData().getRemoteSocketAddress());</span>
+<span class="nc" id="L162">            Response.writeError(request, response, callback, HttpStatus.UNAUTHORIZED_401);</span>
+<span class="nc" id="L163">            return true;</span>
+        }
+
+<span class="nc" id="L166">        LOG.info(&quot;Shutting down by request from {}&quot;, request.getConnectionMetaData().getRemoteSocketAddress());</span>
+        // Establish callback to trigger server shutdown when write of response is complete
+<span class="nc" id="L168">        Callback triggerShutdownCallback = Callback.from(() -&gt;</span>
+        {
+<span class="nc" id="L170">            CompletableFuture.runAsync(this::shutdownServer);</span>
+<span class="nc" id="L171">        });</span>
+<span class="nc" id="L172">        response.getHeaders().put(HttpHeader.CONTENT_TYPE, &quot;text/plain, charset=utf-8&quot;);</span>
+<span class="nc" id="L173">        String message = &quot;Shutdown triggered&quot;;</span>
+<span class="nc" id="L174">        Content.Sink.write(response, true, message, triggerShutdownCallback);</span>
+<span class="nc" id="L175">        return true;</span>
+    }
+
+    private boolean requestFromLocalhost(Request request)
+    {
+<span class="nc" id="L180">        SocketAddress socketAddress = request.getConnectionMetaData().getRemoteSocketAddress();</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        if (socketAddress == null)</span>
+<span class="nc" id="L182">            return false;</span>
+
+<span class="nc bnc" id="L184" title="All 2 branches missed.">        if (socketAddress instanceof InetSocketAddress addr)</span>
+<span class="nc" id="L185">            return addr.getAddress().isLoopbackAddress();</span>
+
+<span class="nc" id="L187">        return false;</span>
+    }
+
+    private boolean hasCorrectSecurityToken(Request request)
+    {
+<span class="nc" id="L192">        Fields fields = Request.extractQueryParameters(request);</span>
+<span class="nc" id="L193">        String tok = fields.getValue(&quot;token&quot;);</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L195">            LOG.debug(&quot;Token: {}&quot;, tok);</span>
+<span class="nc" id="L196">        return _shutdownToken.equals(tok);</span>
+    }
+
+    private void shutdownServer()
+    {
+        try
+        {
+            // Let server stop normally.
+            // Order of stop is controlled by server.
+            // Graceful stop can even be configured at the Server level
+<span class="nc" id="L206">            getServer().stop();</span>
+        }
+<span class="nc" id="L208">        catch (Exception e)</span>
+        {
+<span class="nc" id="L210">            LOG.warn(&quot;Unable to stop server&quot;, e);</span>
+<span class="nc" id="L211">        }</span>
+
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        if (_exitJvm)</span>
+        {
+<span class="nc" id="L215">            System.exit(0);</span>
+        }
+<span class="nc" id="L217">    }</span>
+
+    public void setExitJvm(boolean exitJvm)
+    {
+<span class="nc" id="L221">        this._exitJvm = exitJvm;</span>
+<span class="nc" id="L222">    }</span>
+
+    public boolean isExitJvm()
+    {
+<span class="nc" id="L226">        return _exitJvm;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

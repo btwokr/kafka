@@ -1,0 +1,508 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>QoSHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server.handler</a> &gt; <span class="el_source">QoSHandler.java</span></div><h1>QoSHandler.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server.handler;
+
+import java.time.Duration;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import org.eclipse.jetty.http.HttpStatus;
+import org.eclipse.jetty.io.CyclicTimeouts;
+import org.eclipse.jetty.server.Handler;
+import org.eclipse.jetty.server.Request;
+import org.eclipse.jetty.server.Response;
+import org.eclipse.jetty.util.Callback;
+import org.eclipse.jetty.util.ProcessorUtils;
+import org.eclipse.jetty.util.annotation.ManagedAttribute;
+import org.eclipse.jetty.util.annotation.ManagedObject;
+import org.eclipse.jetty.util.thread.Scheduler;
+import org.eclipse.jetty.util.thread.ThreadPool;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * &lt;p&gt;A quality of service {@link Handler} that {@link ConditionalHandler conditionally}
+ * limits the number of concurrent requests, to provide more predictable
+ * end-user experience in case descendant {@link Handler}s have limited
+ * capacity.&lt;/p&gt;
+ * &lt;p&gt;This {@code Handler} limits the number of concurrent requests
+ * to the number configured via {@link #setMaxRequestCount(int)}.
+ * If more requests are received, they are suspended (that is, not
+ * forwarded to the child {@code Handler}) and stored in a priority
+ * queue.&lt;/p&gt;
+ * &lt;p&gt;The maximum number of suspended request can be set with
+ * {@link #setMaxSuspendedRequestCount(int)} to avoid out of memory errors.
+ * When this limit is reached, the request will fail fast
+ * with status code {@code 503} (not available).&lt;/p&gt;
+ * &lt;p&gt;Priorities are determined via {@link #getPriority(Request)},
+ * that should return values between {@code 0} (the lowest priority)
+ * and positive numbers, typically in the range {@code 0-10}.&lt;/p&gt;
+ * &lt;p&gt;When a request that is being processed completes, the suspended
+ * request that current has the highest priority is resumed.&lt;/p&gt;
+ * &lt;p&gt;This {@link Handler} is ideal to avoid contending on slow/limited
+ * resources such as a JDBC connection pool, avoiding the situation
+ * where all server threads blocked contending on the limited
+ * resource, therefore leaving threads free to process other
+ * requests that do not require access to the limited resource.&lt;/p&gt;
+ * &lt;p&gt;Requests are resumed in priority order, so that when the
+ * server is under load, and there are many requests suspended to
+ * be processed, high priority request are processed first.
+ * For example, load balancer &quot;ping&quot; requests may have the highest
+ * priority, followed by requests performed by admin users, etc.
+ * so that regardless of the load, &quot;ping&quot; and &quot;admin&quot; requests will
+ * always be able to access the web application.&lt;/p&gt;
+ */
+@ManagedObject
+public class QoSHandler extends ConditionalHandler.Abstract
+{
+<span class="nc" id="L79">    private static final Logger LOG = LoggerFactory.getLogger(QoSHandler.class);</span>
+<span class="nc" id="L80">    private static final String EXPIRED_ATTRIBUTE_NAME = QoSHandler.class.getName() + &quot;.expired&quot;;</span>
+
+<span class="nc" id="L82">    private final ReadWriteLock lock = new ReentrantReadWriteLock();</span>
+<span class="nc" id="L83">    private final AtomicInteger state = new AtomicInteger();</span>
+<span class="nc" id="L84">    private final Map&lt;Integer, Queue&lt;Entry&gt;&gt; queues = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L85">    private final Set&lt;Integer&gt; priorities = new ConcurrentSkipListSet&lt;&gt;(Comparator.reverseOrder());</span>
+    private CyclicTimeouts&lt;Entry&gt; timeouts;
+    private int maxRequests;
+<span class="nc" id="L88">    private int maxSuspendedRequests = 1024;</span>
+<span class="nc" id="L89">    private Duration maxSuspend = Duration.ZERO;</span>
+
+    public QoSHandler()
+    {
+<span class="nc" id="L93">        this(null);</span>
+<span class="nc" id="L94">    }</span>
+
+    public QoSHandler(Handler handler)
+    {
+<span class="nc" id="L98">        super(false, handler);</span>
+<span class="nc" id="L99">    }</span>
+
+    /**
+     * @return the max number of concurrent requests
+     */
+    @ManagedAttribute(value = &quot;The maximum number of concurrent requests&quot;, readonly = true)
+    public int getMaxRequestCount()
+    {
+<span class="nc" id="L107">        return maxRequests;</span>
+    }
+
+    /**
+     * &lt;p&gt;Sets the max number of concurrent requests.&lt;/p&gt;
+     * &lt;p&gt;A negative or zero value indicates to calculate
+     * a value based on heuristics, drawn from the number
+     * the size of the server thread pool and/or the number
+     * of CPU cores.&lt;/p&gt;
+     *
+     * @param maxRequests the max number of concurrent requests
+     */
+    public void setMaxRequestCount(int maxRequests)
+    {
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (isStarted())</span>
+<span class="nc" id="L122">            throw new IllegalStateException(&quot;Cannot change maxRequests: &quot; + this);</span>
+<span class="nc" id="L123">        this.maxRequests = maxRequests;</span>
+<span class="nc" id="L124">    }</span>
+
+    /**
+     * @return the max number of suspended requests
+     */
+    @ManagedAttribute(value = &quot;The maximum number of suspended requests&quot;, readonly = true)
+    public int getMaxSuspendedRequestCount()
+    {
+<span class="nc" id="L132">        return maxSuspendedRequests;</span>
+    }
+
+    /**
+     * &lt;p&gt;Sets the max number of suspended requests.&lt;/p&gt;
+     * &lt;p&gt;Once the max suspended request limit is reached,
+     * the request is failed with a HTTP status of
+     * {@code 503 Service unavailable}.&lt;/p&gt;
+     * &lt;p&gt;A negative value indicate an unlimited number
+     * of suspended requests.&lt;/p&gt;
+     *
+     * @param maxSuspendedRequests the max number of suspended requests
+     */
+    public void setMaxSuspendedRequestCount(int maxSuspendedRequests)
+    {
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        if (isStarted())</span>
+<span class="nc" id="L148">            throw new IllegalStateException(&quot;Cannot change maxSuspendedRequests: &quot; + this);</span>
+<span class="nc" id="L149">        this.maxSuspendedRequests = maxSuspendedRequests;</span>
+<span class="nc" id="L150">    }</span>
+
+    /**
+     * Get the max duration of time a request may stay suspended.
+     * @return the max duration of time a request may stay suspended
+     */
+    public Duration getMaxSuspend()
+    {
+<span class="nc" id="L158">        return maxSuspend;</span>
+    }
+
+    /**
+     * &lt;p&gt;Sets the max duration of time a request may stay suspended.&lt;/p&gt;
+     * &lt;p&gt;Once the duration expires, the request is failed with an HTTP
+     * status of {@code 503 Service Unavailable}.&lt;/p&gt;
+     * &lt;p&gt;{@link Duration#ZERO} means that the request may stay suspended forever.&lt;/p&gt;
+     *
+     * @param maxSuspend the max duration of time a request may stay suspended
+     */
+    public void setMaxSuspend(Duration maxSuspend)
+    {
+<span class="nc bnc" id="L171" title="All 2 branches missed.">        if (maxSuspend.isNegative())</span>
+<span class="nc" id="L172">            throw new IllegalArgumentException(&quot;Invalid maxSuspend duration&quot;);</span>
+<span class="nc" id="L173">        this.maxSuspend = maxSuspend;</span>
+<span class="nc" id="L174">    }</span>
+
+    @ManagedAttribute(&quot;The number of suspended requests&quot;)
+    public int getSuspendedRequestCount()
+    {
+<span class="nc" id="L179">        int permits = state.get();</span>
+<span class="nc" id="L180">        return Math.max(0, -permits);</span>
+    }
+
+    @Override
+    protected void doStart() throws Exception
+    {
+<span class="nc" id="L186">        timeouts = new Timeouts(getServer().getScheduler());</span>
+<span class="nc" id="L187">        addBean(timeouts);</span>
+
+<span class="nc" id="L189">        int maxRequests = getMaxRequestCount();</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (maxRequests &lt;= 0)</span>
+        {
+<span class="nc" id="L192">            ThreadPool threadPool = getServer().getThreadPool();</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            if (threadPool instanceof ThreadPool.SizedThreadPool sized)</span>
+<span class="nc" id="L194">                maxRequests = sized.getMaxThreads() / 2;</span>
+            else
+<span class="nc" id="L196">                maxRequests = ProcessorUtils.availableProcessors();</span>
+<span class="nc" id="L197">            setMaxRequestCount(maxRequests);</span>
+        }
+<span class="nc" id="L199">        state.set(maxRequests);</span>
+
+<span class="nc bnc" id="L201" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L202">            LOG.debug(&quot;{} initialized maxRequests={}&quot;, this, maxRequests);</span>
+
+<span class="nc" id="L204">        super.doStart();</span>
+<span class="nc" id="L205">    }</span>
+
+    @Override
+    protected void doStop() throws Exception
+    {
+<span class="nc" id="L210">        super.doStop();</span>
+<span class="nc" id="L211">        removeBean(timeouts);</span>
+<span class="nc" id="L212">        timeouts.destroy();</span>
+<span class="nc" id="L213">    }</span>
+
+    @Override
+    public boolean onConditionsMet(Request request, Response response, Callback callback) throws Exception
+    {
+<span class="nc" id="L218">        return process(request, response, callback);</span>
+    }
+
+    private boolean process(Request request, Response response, Callback callback) throws Exception
+    {
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L224">            LOG.debug(&quot;{} processing {}&quot;, this, request);</span>
+
+<span class="nc" id="L226">        boolean expired = false;</span>
+<span class="nc" id="L227">        boolean tooManyRequests = false;</span>
+
+        // The read lock allows concurrency with resume(),
+        // which is the common case, but not with expire().
+<span class="nc" id="L231">        lock.readLock().lock();</span>
+        try
+        {
+<span class="nc" id="L234">            int permits = state.decrementAndGet();</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">            if (permits &lt; 0)</span>
+            {
+<span class="nc" id="L237">                int maxSuspended = getMaxSuspendedRequestCount();</span>
+<span class="nc bnc" id="L238" title="All 4 branches missed.">                if (maxSuspended &gt;= 0 &amp;&amp; Math.abs(permits) &gt; maxSuspended)</span>
+                {
+                    // Reached the limit of suspended requests,
+                    // complete the request with 503 unavailable.
+<span class="nc" id="L242">                    state.incrementAndGet();</span>
+<span class="nc" id="L243">                    tooManyRequests = true;</span>
+                }
+<span class="nc bnc" id="L245" title="All 2 branches missed.">                else if (request.getAttribute(EXPIRED_ATTRIBUTE_NAME) == null)</span>
+                {
+                    // Cover this race condition:
+                    // T1 in this method may find no permits, so it will suspend the request.
+                    // T2 in resume() finds no suspended request yet and increments the permits.
+                    // T1 suspends the request, despite permits are available.
+                    // This is avoided in resume() using a spin loop to wait for the request to be suspended.
+                    // See correspondent state machine logic in resume() and expire().
+<span class="nc" id="L253">                    suspend(request, response, callback);</span>
+<span class="nc" id="L254">                    return true;</span>
+                }
+                else
+                {
+                    // This is a request that was suspended, it expired, and was re-handled.
+                    // Do not suspend it again, just complete it with 503 unavailable.
+<span class="nc" id="L260">                    state.incrementAndGet();</span>
+<span class="nc" id="L261">                    expired = true;</span>
+                }
+            }
+        }
+        finally
+        {
+<span class="nc" id="L267">            lock.readLock().unlock();</span>
+        }
+
+<span class="nc bnc" id="L270" title="All 4 branches missed.">        if (expired || tooManyRequests)</span>
+        {
+<span class="nc" id="L272">            notAvailable(response, callback);</span>
+<span class="nc" id="L273">            return true;</span>
+        }
+
+<span class="nc" id="L276">        return handleWithPermit(request, response, callback);</span>
+    }
+
+    @Override
+    protected boolean onConditionsNotMet(Request request, Response response, Callback callback) throws Exception
+    {
+<span class="nc" id="L282">        return nextHandler(request, response, callback);</span>
+    }
+
+    private void notAvailable(Response response, Callback callback)
+    {
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L288">            LOG.debug(&quot;{} rejecting {}&quot;, this, response.getRequest());</span>
+<span class="nc" id="L289">        response.setStatus(HttpStatus.SERVICE_UNAVAILABLE_503);</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">        if (response.isCommitted())</span>
+<span class="nc" id="L291">            callback.failed(new IllegalStateException(&quot;Response already committed&quot;));</span>
+        else
+<span class="nc" id="L293">            response.write(true, null, callback);</span>
+<span class="nc" id="L294">    }</span>
+
+    /**
+     * &lt;p&gt;Returns the priority of the given suspended request,
+     * a value greater than or equal to {@code 0}.&lt;/p&gt;
+     * &lt;p&gt;Priority {@code 0} is the lowest priority.&lt;/p&gt;
+     * &lt;p&gt;The set of returned priorities should be stable over
+     * time, typically constrained in the range {@code 0-10}.&lt;/p&gt;
+     *
+     * @param request the suspended request to compute the priority for
+     * @return the priority of the given suspended request, a value {@code &gt;= 0}
+     */
+    protected int getPriority(Request request)
+    {
+<span class="nc" id="L308">        return 0;</span>
+    }
+
+    /**
+     * &lt;p&gt;Fails the given suspended request/response with the given error code and failure.&lt;/p&gt;
+     * &lt;p&gt;This method is called only for suspended requests, in case of timeout while suspended,
+     * or in case of failure when trying to handle a resumed request.&lt;/p&gt;
+     *
+     * @param request the request to fail
+     * @param response the response to fail
+     * @param callback the callback to complete
+     * @param status the failure status code
+     * @param failure the failure
+     */
+    protected void failSuspended(Request request, Response response, Callback callback, int status, Throwable failure)
+    {
+<span class="nc" id="L324">        Response.writeError(request, response, callback, status, null, failure);</span>
+<span class="nc" id="L325">    }</span>
+
+    private boolean handleWithPermit(Request request, Response response, Callback callback) throws Exception
+    {
+<span class="nc bnc" id="L329" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L330">            LOG.debug(&quot;{} forwarding {}&quot;, this, request);</span>
+<span class="nc" id="L331">        Request.addCompletionListener(request, this::resume);</span>
+<span class="nc" id="L332">        return nextHandler(request, response, callback);</span>
+    }
+
+    private void suspend(Request request, Response response, Callback callback)
+    {
+<span class="nc" id="L337">        int priority = Math.max(0, getPriority(request));</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L339">            LOG.debug(&quot;{} suspending priority={} {}&quot;, this, priority, request);</span>
+<span class="nc" id="L340">        Entry entry = new Entry(request, response, callback, priority);</span>
+<span class="nc" id="L341">        queues.compute(priority, (k, v) -&gt;</span>
+        {
+<span class="nc bnc" id="L343" title="All 2 branches missed.">            if (v == null)</span>
+            {
+<span class="nc" id="L345">                priorities.add(priority);</span>
+<span class="nc" id="L346">                v = new ConcurrentLinkedQueue&lt;&gt;();</span>
+            }
+<span class="nc" id="L348">            v.offer(entry);</span>
+<span class="nc" id="L349">            return v;</span>
+        });
+<span class="nc" id="L351">        timeouts.schedule(entry);</span>
+<span class="nc" id="L352">    }</span>
+
+    private void resume(Throwable x)
+    {
+        // Allows concurrency with process(), but not with expire().
+<span class="nc" id="L357">        lock.readLock().lock();</span>
+        try
+        {
+            // See correspondent state machine logic in process() and expire().
+<span class="nc" id="L361">            int permits = state.incrementAndGet();</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">            if (permits &gt; 0)</span>
+            {
+<span class="nc bnc" id="L364" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L365">                    LOG.debug(&quot;{} no suspended requests to resume&quot;, this, x);</span>
+<span class="nc" id="L366">                return;</span>
+            }
+
+            while (true)
+            {
+<span class="nc bnc" id="L371" title="All 2 branches missed.">                if (resumeSuspended())</span>
+<span class="nc" id="L372">                    return;</span>
+
+                // Found no suspended requests yet, but there will be.
+                // This covers the small race window in process(), where
+                // the state is updated and then the request suspended.
+<span class="nc" id="L377">                Thread.onSpinWait();</span>
+            }
+        }
+        finally
+        {
+<span class="nc" id="L382">            lock.readLock().unlock();</span>
+        }
+    }
+
+    private boolean resumeSuspended()
+    {
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        for (Integer priority : priorities)</span>
+        {
+<span class="nc" id="L390">            Queue&lt;Entry&gt; queue = queues.get(priority);</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">            if (queue == null)</span>
+<span class="nc" id="L392">                return false;</span>
+<span class="nc" id="L393">            Entry entry = queue.poll();</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">            if (entry != null)</span>
+            {
+<span class="nc bnc" id="L396" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L397">                    LOG.debug(&quot;{} resuming {}&quot;, this, entry.request);</span>
+                // Always dispatch to avoid StackOverflowError.
+<span class="nc" id="L399">                execute(entry.request, entry);</span>
+<span class="nc" id="L400">                return true;</span>
+            }
+<span class="nc" id="L402">        }</span>
+<span class="nc" id="L403">        return false;</span>
+    }
+
+    private void execute(Request request, Runnable task)
+    {
+<span class="nc" id="L408">        request.getComponents().getExecutor().execute(task);</span>
+<span class="nc" id="L409">    }</span>
+
+    private class Entry implements CyclicTimeouts.Expirable, Runnable
+    {
+        private final Request request;
+        private final Response response;
+        private final Callback callback;
+        private final int priority;
+        private final long expireNanoTime;
+
+        private Entry(Request request, Response response, Callback callback, int priority)
+<span class="nc" id="L420">        {</span>
+<span class="nc" id="L421">            this.request = request;</span>
+<span class="nc" id="L422">            this.response = response;</span>
+<span class="nc" id="L423">            this.callback = callback;</span>
+<span class="nc" id="L424">            this.priority = priority;</span>
+<span class="nc" id="L425">            this.expireNanoTime = CyclicTimeouts.Expirable.calcExpireNanoTime(getMaxSuspend().toMillis());</span>
+<span class="nc" id="L426">        }</span>
+
+        @Override
+        public long getExpireNanoTime()
+        {
+<span class="nc" id="L431">            return expireNanoTime;</span>
+        }
+
+        private void expire()
+        {
+            boolean removed;
+            // It should be rare that requests expire.
+            // Grab the write lock to atomically operate on the queue and
+            // the state, avoiding concurrency with process() and resume().
+<span class="nc" id="L440">            lock.writeLock().lock();</span>
+            try
+            {
+                // The request timed out, therefore it was not handled.
+<span class="nc" id="L444">                removed = queues.get(priority).remove(this);</span>
+                // The remove() may fail to a concurrent resume().
+<span class="nc bnc" id="L446" title="All 2 branches missed.">                if (removed)</span>
+                {
+                    // See correspondent state machine logic in process() and resume().
+<span class="nc" id="L449">                    state.incrementAndGet();</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L451">                        LOG.debug(&quot;{} timeout {}&quot;, QoSHandler.this, request);</span>
+<span class="nc" id="L452">                    request.setAttribute(EXPIRED_ATTRIBUTE_NAME, true);</span>
+                }
+            }
+            finally
+            {
+<span class="nc" id="L457">                lock.writeLock().unlock();</span>
+            }
+
+<span class="nc bnc" id="L460" title="All 2 branches missed.">            if (removed)</span>
+<span class="nc" id="L461">                execute(request, () -&gt; failSuspended(request, response, callback, HttpStatus.SERVICE_UNAVAILABLE_503, new TimeoutException()));</span>
+<span class="nc" id="L462">        }</span>
+
+        @Override
+        public void run()
+        {
+            try
+            {
+<span class="nc" id="L469">                boolean handled = handleWithPermit(request, response, callback);</span>
+<span class="nc bnc" id="L470" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L471">                    LOG.debug(&quot;{} handled={} {}&quot;, QoSHandler.this, handled, request);</span>
+<span class="nc bnc" id="L472" title="All 2 branches missed.">                if (!handled)</span>
+<span class="nc" id="L473">                    failSuspended(request, response, callback, HttpStatus.NOT_FOUND_404, null);</span>
+            }
+<span class="nc" id="L475">            catch (Throwable x)</span>
+            {
+<span class="nc bnc" id="L477" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L478">                    LOG.debug(&quot;{} failed {}&quot;, QoSHandler.this, request, x);</span>
+<span class="nc" id="L479">                failSuspended(request, response, callback, HttpStatus.INTERNAL_SERVER_ERROR_500, x);</span>
+<span class="nc" id="L480">            }</span>
+<span class="nc" id="L481">        }</span>
+    }
+
+    private class Timeouts extends CyclicTimeouts&lt;Entry&gt;
+    {
+        private Timeouts(Scheduler scheduler)
+<span class="nc" id="L487">        {</span>
+<span class="nc" id="L488">            super(scheduler);</span>
+<span class="nc" id="L489">        }</span>
+
+        @Override
+        protected Iterator&lt;Entry&gt; iterator()
+        {
+            // Use Java streams as this is called infrequently.
+<span class="nc" id="L495">            return queues.values().stream()</span>
+<span class="nc" id="L496">                .flatMap(Queue::stream)</span>
+<span class="nc" id="L497">                .iterator();</span>
+        }
+
+        @Override
+        protected boolean onExpired(Entry entry)
+        {
+<span class="nc" id="L503">            entry.expire();</span>
+<span class="nc" id="L504">            return false;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

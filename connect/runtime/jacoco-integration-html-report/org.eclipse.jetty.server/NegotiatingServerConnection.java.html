@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>NegotiatingServerConnection.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server</a> &gt; <span class="el_source">NegotiatingServerConnection.java</span></div><h1>NegotiatingServerConnection.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server;
+
+import java.io.IOException;
+import java.util.List;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLEngineResult;
+
+import org.eclipse.jetty.io.AbstractConnection;
+import org.eclipse.jetty.io.Connection;
+import org.eclipse.jetty.io.EndPoint;
+import org.eclipse.jetty.util.BufferUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public abstract class NegotiatingServerConnection extends AbstractConnection
+{
+<span class="nc" id="L30">    private static final Logger LOG = LoggerFactory.getLogger(NegotiatingServerConnection.class);</span>
+
+    public interface CipherDiscriminator
+    {
+        boolean isAcceptable(String protocol, String tlsProtocol, String tlsCipher);
+    }
+
+    private final Connector connector;
+    private final SSLEngine engine;
+    private final List&lt;String&gt; protocols;
+    private final String defaultProtocol;
+    private String protocol; // No need to be volatile: it is modified and read by the same thread
+
+    protected NegotiatingServerConnection(Connector connector, EndPoint endPoint, SSLEngine engine, List&lt;String&gt; protocols, String defaultProtocol)
+    {
+<span class="nc" id="L45">        super(endPoint, connector.getExecutor());</span>
+<span class="nc" id="L46">        this.connector = connector;</span>
+<span class="nc" id="L47">        this.protocols = protocols;</span>
+<span class="nc" id="L48">        this.defaultProtocol = defaultProtocol;</span>
+<span class="nc" id="L49">        this.engine = engine;</span>
+<span class="nc" id="L50">    }</span>
+
+    public List&lt;String&gt; getProtocols()
+    {
+<span class="nc" id="L54">        return protocols;</span>
+    }
+
+    public String getDefaultProtocol()
+    {
+<span class="nc" id="L59">        return defaultProtocol;</span>
+    }
+
+    public Connector getConnector()
+    {
+<span class="nc" id="L64">        return connector;</span>
+    }
+
+    public SSLEngine getSSLEngine()
+    {
+<span class="nc" id="L69">        return engine;</span>
+    }
+
+    public String getProtocol()
+    {
+<span class="nc" id="L74">        return protocol;</span>
+    }
+
+    protected void setProtocol(String protocol)
+    {
+<span class="nc" id="L79">        this.protocol = protocol;</span>
+<span class="nc" id="L80">    }</span>
+
+    @Override
+    public void onOpen()
+    {
+<span class="nc" id="L85">        super.onOpen();</span>
+<span class="nc" id="L86">        fillInterested();</span>
+<span class="nc" id="L87">    }</span>
+
+    @Override
+    public void onFillable()
+    {
+<span class="nc" id="L92">        int filled = fill();</span>
+
+<span class="nc bnc" id="L94" title="All 2 branches missed.">        if (filled == 0)</span>
+        {
+<span class="nc bnc" id="L96" title="All 2 branches missed.">            if (protocol == null)</span>
+            {
+<span class="nc bnc" id="L98" title="All 2 branches missed.">                if (engine.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING)</span>
+                {
+                    // Here the SSL handshake is finished, but the protocol has not been negotiated.
+<span class="nc bnc" id="L101" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L102">                        LOG.debug(&quot;{} could not negotiate protocol, SSLEngine: {}&quot;, this, engine);</span>
+<span class="nc" id="L103">                    close();</span>
+                }
+                else
+                {
+                    // Here the SSL handshake is not finished yet but we filled 0 bytes,
+                    // so we need to read more.
+<span class="nc" id="L109">                    fillInterested();</span>
+                }
+            }
+            else
+            {
+<span class="nc" id="L114">                ConnectionFactory connectionFactory = connector.getConnectionFactory(protocol);</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">                if (connectionFactory == null)</span>
+                {
+<span class="nc" id="L117">                    LOG.info(&quot;{} application selected protocol '{}', but no correspondent {} has been configured&quot;,</span>
+<span class="nc" id="L118">                        this, protocol, ConnectionFactory.class.getName());</span>
+<span class="nc" id="L119">                    close();</span>
+                }
+                else
+                {
+<span class="nc" id="L123">                    EndPoint endPoint = getEndPoint();</span>
+<span class="nc" id="L124">                    Connection newConnection = connectionFactory.newConnection(connector, endPoint);</span>
+<span class="nc" id="L125">                    endPoint.upgrade(newConnection);</span>
+                }
+<span class="nc" id="L127">            }</span>
+        }
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        else if (filled &lt; 0)</span>
+        {
+            // Something went bad, we need to close.
+<span class="nc bnc" id="L132" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L133">                LOG.debug(&quot;{} detected close on client side&quot;, this);</span>
+<span class="nc" id="L134">            close();</span>
+        }
+        else
+        {
+            // Must never happen, since we fill using an empty buffer
+<span class="nc" id="L139">            throw new IllegalStateException();</span>
+        }
+<span class="nc" id="L141">    }</span>
+
+    private int fill()
+    {
+        try
+        {
+<span class="nc" id="L147">            return getEndPoint().fill(BufferUtil.EMPTY_BUFFER);</span>
+        }
+<span class="nc" id="L149">        catch (IOException x)</span>
+        {
+<span class="nc bnc" id="L151" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L152">                LOG.debug(&quot;Unable to fill from endpoint {}&quot;, getEndPoint(), x);</span>
+<span class="nc" id="L153">            close();</span>
+<span class="nc" id="L154">            return -1;</span>
+        }
+    }
+
+    @Override
+    public void close()
+    {
+        // Gentler close for SSL.
+<span class="nc" id="L162">        getEndPoint().shutdownOutput();</span>
+<span class="nc" id="L163">        super.close();</span>
+<span class="nc" id="L164">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

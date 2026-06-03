@@ -1,0 +1,981 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Server.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server</a> &gt; <span class="el_source">Server.java</span></div><h1>Server.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+
+import org.eclipse.jetty.http.DateGenerator;
+import org.eclipse.jetty.http.HttpField;
+import org.eclipse.jetty.http.HttpHeader;
+import org.eclipse.jetty.http.MimeTypes;
+import org.eclipse.jetty.io.ArrayByteBufferPool;
+import org.eclipse.jetty.io.ByteBufferPool;
+import org.eclipse.jetty.io.Connection;
+import org.eclipse.jetty.server.handler.ContextHandler;
+import org.eclipse.jetty.server.handler.ErrorHandler;
+import org.eclipse.jetty.server.internal.ResponseHttpFields;
+import org.eclipse.jetty.util.Attributes;
+import org.eclipse.jetty.util.Callback;
+import org.eclipse.jetty.util.DecoratedObjectFactory;
+import org.eclipse.jetty.util.ExceptionUtil;
+import org.eclipse.jetty.util.IO;
+import org.eclipse.jetty.util.Jetty;
+import org.eclipse.jetty.util.NanoTime;
+import org.eclipse.jetty.util.Uptime;
+import org.eclipse.jetty.util.annotation.ManagedAttribute;
+import org.eclipse.jetty.util.annotation.ManagedObject;
+import org.eclipse.jetty.util.annotation.Name;
+import org.eclipse.jetty.util.component.AttributeContainerMap;
+import org.eclipse.jetty.util.component.ClassLoaderDump;
+import org.eclipse.jetty.util.component.DumpableAttributes;
+import org.eclipse.jetty.util.component.DumpableCollection;
+import org.eclipse.jetty.util.component.DumpableMap;
+import org.eclipse.jetty.util.component.Environment;
+import org.eclipse.jetty.util.component.Graceful;
+import org.eclipse.jetty.util.component.LifeCycle;
+import org.eclipse.jetty.util.resource.FileSystemPool;
+import org.eclipse.jetty.util.resource.Resource;
+import org.eclipse.jetty.util.resource.ResourceFactory;
+import org.eclipse.jetty.util.thread.AutoLock;
+import org.eclipse.jetty.util.thread.Invocable;
+import org.eclipse.jetty.util.thread.QueuedThreadPool;
+import org.eclipse.jetty.util.thread.ScheduledExecutorScheduler;
+import org.eclipse.jetty.util.thread.Scheduler;
+import org.eclipse.jetty.util.thread.ShutdownThread;
+import org.eclipse.jetty.util.thread.ThreadPool;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+@ManagedObject
+public class Server extends Handler.Wrapper implements Attributes
+{
+<span class="fc" id="L77">    private static final Logger LOG = LoggerFactory.getLogger(Server.class);</span>
+<span class="fc" id="L78">    private static final String __serverInfo = &quot;jetty/&quot; + Server.getVersion();</span>
+
+<span class="fc" id="L80">    private final AttributeContainerMap _attributes = new AttributeContainerMap();</span>
+    private final ThreadPool _threadPool;
+    private final Scheduler _scheduler;
+    private final ByteBufferPool _bufferPool;
+<span class="fc" id="L84">    private final List&lt;Connector&gt; _connectors = new CopyOnWriteArrayList&lt;&gt;();</span>
+<span class="fc" id="L85">    private final Context _serverContext = new ServerContext();</span>
+<span class="fc" id="L86">    private final AutoLock _dateLock = new AutoLock();</span>
+<span class="fc" id="L87">    private final MimeTypes.Mutable _mimeTypes = new MimeTypes.Mutable();</span>
+<span class="fc" id="L88">    private String _serverInfo = __serverInfo;</span>
+<span class="fc" id="L89">    private boolean _openEarly = true;</span>
+    private boolean _stopAtShutdown;
+    private boolean _dumpAfterStart;
+    private boolean _dumpBeforeStop;
+    private Handler _defaultHandler;
+    private Request.Handler _errorHandler;
+    private RequestLog _requestLog;
+    private boolean _dryRun;
+    private volatile DateField _dateField;
+    private long _stopTimeout;
+<span class="fc" id="L99">    private InvocationType _invocationType = InvocationType.NON_BLOCKING;</span>
+    private File _tempDirectory;
+
+    public Server()
+    {
+<span class="fc" id="L104">        this((ThreadPool)null);</span>
+<span class="fc" id="L105">    }</span>
+
+    /**
+     * Convenience constructor
+     * Creates server and a {@link ServerConnector} at the passed port.
+     *
+     * @param port The port of a network HTTP connector (or 0 for a randomly allocated port).
+     * @see NetworkConnector#getLocalPort()
+     */
+    public Server(@Name(&quot;port&quot;) int port)
+    {
+<span class="nc" id="L116">        this((ThreadPool)null);</span>
+<span class="nc" id="L117">        ServerConnector connector = new ServerConnector(this);</span>
+<span class="nc" id="L118">        connector.setPort(port);</span>
+<span class="nc" id="L119">        addConnector(connector);</span>
+<span class="nc" id="L120">        installBean(_attributes);</span>
+<span class="nc" id="L121">    }</span>
+
+    /**
+     * Convenience constructor
+     * &lt;p&gt;
+     * Creates server and a {@link ServerConnector} at the passed address.
+     *
+     * @param addr the inet socket address to create the connector from
+     */
+    public Server(@Name(&quot;address&quot;) InetSocketAddress addr)
+    {
+<span class="nc" id="L132">        this((ThreadPool)null);</span>
+<span class="nc" id="L133">        ServerConnector connector = new ServerConnector(this);</span>
+<span class="nc" id="L134">        connector.setHost(addr.getHostName());</span>
+<span class="nc" id="L135">        connector.setPort(addr.getPort());</span>
+<span class="nc" id="L136">        addConnector(connector);</span>
+<span class="nc" id="L137">    }</span>
+
+    public Server(@Name(&quot;threadPool&quot;) ThreadPool pool)
+    {
+<span class="fc" id="L141">        this(pool, null, null);</span>
+<span class="fc" id="L142">        installBean(new DumpableMap(&quot;System Properties&quot;, System.getProperties()));</span>
+<span class="fc" id="L143">    }</span>
+
+    public Server(@Name(&quot;threadPool&quot;) ThreadPool threadPool, @Name(&quot;scheduler&quot;) Scheduler scheduler, @Name(&quot;bufferPool&quot;) ByteBufferPool bufferPool)
+<span class="fc" id="L146">    {</span>
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">        _threadPool = threadPool != null ? threadPool : new QueuedThreadPool();</span>
+<span class="fc" id="L148">        installBean(_threadPool);</span>
+<span class="pc bpc" id="L149" title="1 of 2 branches missed.">        _scheduler = scheduler != null ? scheduler : new ScheduledExecutorScheduler();</span>
+<span class="fc" id="L150">        installBean(_scheduler);</span>
+<span class="pc bpc" id="L151" title="1 of 2 branches missed.">        _bufferPool = bufferPool != null ? bufferPool : new ArrayByteBufferPool();</span>
+<span class="fc" id="L152">        installBean(_bufferPool);</span>
+<span class="fc" id="L153">        setServer(this);</span>
+<span class="fc" id="L154">        installBean(FileSystemPool.INSTANCE, false);</span>
+<span class="fc" id="L155">    }</span>
+
+    public Handler getDefaultHandler()
+    {
+<span class="fc" id="L159">        return _defaultHandler;</span>
+    }
+
+    /**
+     * @param defaultHandler The handler to use if no other handler is set or has handled the request. This handler should
+     *                       always accept the request, even if only to send a 404.
+     */
+    public void setDefaultHandler(Handler defaultHandler)
+    {
+<span class="nc bnc" id="L168" title="All 4 branches missed.">        if (!isDynamic() &amp;&amp; isStarted())</span>
+<span class="nc" id="L169">            throw new IllegalStateException(getState());</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        if (defaultHandler != null)</span>
+<span class="nc" id="L171">            defaultHandler.setServer(this);</span>
+<span class="nc" id="L172">        Handler old = _defaultHandler;</span>
+<span class="nc" id="L173">        _defaultHandler = defaultHandler;</span>
+<span class="nc" id="L174">        updateBean(old, defaultHandler);</span>
+<span class="nc" id="L175">    }</span>
+
+    @Override
+    public boolean handle(Request request, Response response, Callback callback) throws Exception
+    {
+        // Handle either with normal handler or default handler
+<span class="fc" id="L181">        Handler next = getHandler();</span>
+<span class="pc bpc" id="L182" title="6 of 8 branches missed.">        return next != null &amp;&amp; next.handle(request, response, callback) || _defaultHandler != null &amp;&amp; _defaultHandler.handle(request, response, callback);</span>
+    }
+
+    public String getServerInfo()
+    {
+<span class="nc" id="L187">        return _serverInfo;</span>
+    }
+
+    /**
+     * &lt;p&gt;Convenience method to call {@link #setTempDirectory(File)} from a String representation
+     * of the temporary directory.&lt;/p&gt;
+     * @param temp A string representation of the temporary directory.
+     * @see #setTempDirectory(File)
+     */
+    public void setTempDirectory(String temp)
+    {
+<span class="nc" id="L198">        setTempDirectory(new File(temp));</span>
+<span class="nc" id="L199">    }</span>
+
+    /**
+     * &lt;p&gt;Set the temporary directory returned by {@link Context#getTempDirectory()} for the root
+     * {@link Context} returned {@link #getContext()}. If not set explicitly here, then the root
+     * {@link Context#getTempDirectory()} will return either the directory found at
+     * {@code new File(IO.asFile(System.getProperty(&quot;jetty.base&quot;)), &quot;work&quot;)} if it exists,
+     * else the JVMs temporary directory as {@code IO.asFile(System.getProperty(&quot;java.io.tmpdir&quot;))}.
+     * @param temp A directory that must exist and be writable or null to get the default.
+     */
+    public void setTempDirectory(File temp)
+    {
+<span class="nc bnc" id="L211" title="All 2 branches missed.">        if (isStarted())</span>
+<span class="nc" id="L212">            throw new IllegalStateException(getState());</span>
+<span class="nc bnc" id="L213" title="All 4 branches missed.">        if (temp != null &amp;&amp; !temp.exists())</span>
+<span class="nc" id="L214">            throw new IllegalArgumentException(&quot;Does not exist: &quot; + temp);</span>
+<span class="nc bnc" id="L215" title="All 4 branches missed.">        if (temp != null &amp;&amp; !temp.canWrite())</span>
+<span class="nc" id="L216">            throw new IllegalArgumentException(&quot;Cannot write: &quot; + temp);</span>
+<span class="nc" id="L217">        _tempDirectory = temp;</span>
+<span class="nc" id="L218">    }</span>
+
+    /**
+     * @return The server temporary directory if set, else null. To always obtain a non-null
+     * temporary directory use {@link Context#getTempDirectory()} on {@link #getContext()}.
+     * @see #getContext()
+     * @see Context#getTempDirectory()
+     */
+    @ManagedAttribute(value = &quot;The server temporary directory&quot;, readonly = true)
+    public File getTempDirectory()
+    {
+<span class="nc" id="L229">        return _tempDirectory;</span>
+    }
+
+    public void setServerInfo(String serverInfo)
+    {
+<span class="nc" id="L234">        _serverInfo = serverInfo;</span>
+<span class="nc" id="L235">    }</span>
+
+    /**
+     * Get the {@link Context} associated with all {@link Request}s prior to being handled by a
+     * {@link ContextHandler}. A {@code Server}'s {@link Context}:
+     * &lt;ul&gt;
+     *     &lt;li&gt;has a {@code null} {@link Context#getContextPath() context path}&lt;/li&gt;
+     *     &lt;li&gt;returns the {@link ClassLoader} that loaded the {@link Server} from {@link Context#getClassLoader()}.&lt;/li&gt;
+     *     &lt;li&gt;is an {@link java.util.concurrent.Executor} that delegates to the {@link Server#getThreadPool() Server ThreadPool}&lt;/li&gt;
+     *     &lt;li&gt;is a {@link org.eclipse.jetty.util.Decorator} using the {@link DecoratedObjectFactory} found
+     *     as a {@link #getBean(Class) bean} of the {@link Server}&lt;/li&gt;
+     *     &lt;li&gt;has the same {@link #getTempDirectory() temporary director} of the {@link Server#getTempDirectory() server}&lt;/li&gt;
+     * &lt;/ul&gt;
+     */
+    public Context getContext()
+    {
+<span class="fc" id="L251">        return _serverContext;</span>
+    }
+
+    public MimeTypes.Mutable getMimeTypes()
+    {
+<span class="fc" id="L256">        return _mimeTypes;</span>
+    }
+
+    @Override
+    public InvocationType getInvocationType()
+    {
+<span class="pc bpc" id="L262" title="1 of 2 branches missed.">        if (isDynamic())</span>
+<span class="nc" id="L263">            return InvocationType.BLOCKING;</span>
+
+        // Return cached type to avoid a full handler tree walk.
+<span class="fc bfc" id="L266" title="All 2 branches covered.">        if (isStarted())</span>
+<span class="fc" id="L267">            return _invocationType;</span>
+
+<span class="fc" id="L269">        InvocationType type = InvocationType.NON_BLOCKING;</span>
+<span class="fc" id="L270">        Handler handler = getHandler();</span>
+<span class="pc bpc" id="L271" title="1 of 2 branches missed.">        if (handler != null)</span>
+<span class="fc" id="L272">            type = Invocable.combine(type, handler.getInvocationType());</span>
+<span class="fc" id="L273">        handler = getDefaultHandler();</span>
+<span class="pc bpc" id="L274" title="1 of 2 branches missed.">        if (handler != null)</span>
+<span class="nc" id="L275">            type = Invocable.combine(type, handler.getInvocationType());</span>
+
+<span class="fc" id="L277">        return type;</span>
+    }
+
+    public boolean isOpenEarly()
+    {
+<span class="nc" id="L282">        return _openEarly;</span>
+    }
+
+    /**
+     * Allows to disable early opening of network sockets. Network sockets are opened early by default.
+     * @param openEarly If {@code openEarly} is {@code true} (default), network sockets are opened before
+     * starting other components. If {@code openEarly} is {@code false}, network connectors open sockets
+     * when they're started.
+     */
+    public void setOpenEarly(boolean openEarly)
+    {
+<span class="nc" id="L293">        _openEarly = openEarly;</span>
+<span class="nc" id="L294">    }</span>
+
+    public boolean isDryRun()
+    {
+<span class="nc" id="L298">        return _dryRun;</span>
+    }
+
+    public void setDryRun(boolean dryRun)
+    {
+<span class="nc" id="L303">        _dryRun = dryRun;</span>
+<span class="nc" id="L304">    }</span>
+
+    public RequestLog getRequestLog()
+    {
+<span class="fc" id="L308">        return _requestLog;</span>
+    }
+
+    public Request.Handler getErrorHandler()
+    {
+<span class="fc" id="L313">        return _errorHandler;</span>
+    }
+
+    public void setRequestLog(RequestLog requestLog)
+    {
+<span class="fc" id="L318">        updateBean(_requestLog, requestLog);</span>
+<span class="fc" id="L319">        _requestLog = requestLog;</span>
+<span class="fc" id="L320">    }</span>
+
+    public void setErrorHandler(Request.Handler errorHandler)
+    {
+<span class="pc bpc" id="L324" title="1 of 2 branches missed.">        if (errorHandler instanceof Handler handler)</span>
+<span class="nc" id="L325">            handler.setServer(this);</span>
+<span class="fc" id="L326">        updateBean(_errorHandler, errorHandler);</span>
+<span class="fc" id="L327">        _errorHandler = errorHandler;</span>
+<span class="fc" id="L328">    }</span>
+
+    @ManagedAttribute(&quot;The version of this server&quot;)
+    public static String getVersion()
+    {
+<span class="fc" id="L333">        return Jetty.VERSION;</span>
+    }
+
+    public void setStopTimeout(long stopTimeout)
+    {
+<span class="fc" id="L338">        _stopTimeout = stopTimeout;</span>
+<span class="fc" id="L339">    }</span>
+
+    public long getStopTimeout()
+    {
+<span class="fc" id="L343">        return _stopTimeout;</span>
+    }
+
+    public boolean getStopAtShutdown()
+    {
+<span class="fc" id="L348">        return _stopAtShutdown;</span>
+    }
+
+    /**
+     * Set stop server at shutdown behaviour.
+     *
+     * @param stop If true, this server instance will be explicitly stopped when the
+     * JVM is shutdown. Otherwise the JVM is stopped with the server running.
+     * @see Runtime#addShutdownHook(Thread)
+     * @see ShutdownThread
+     */
+    public void setStopAtShutdown(boolean stop)
+    {
+        //if we now want to stop
+<span class="pc bpc" id="L362" title="1 of 2 branches missed.">        if (stop)</span>
+        {
+            //and we weren't stopping before
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">            if (!_stopAtShutdown)</span>
+            {
+                //only register to stop if we're already started (otherwise we'll do it in doStart())
+<span class="pc bpc" id="L368" title="1 of 2 branches missed.">                if (isStarted())</span>
+<span class="nc" id="L369">                    ShutdownThread.register(this);</span>
+            }
+        }
+        else
+<span class="nc" id="L373">            ShutdownThread.deregister(this);</span>
+
+<span class="fc" id="L375">        _stopAtShutdown = stop;</span>
+<span class="fc" id="L376">    }</span>
+
+    /**
+     * @return Returns the connectors.
+     */
+    @ManagedAttribute(value = &quot;connectors for this server&quot;, readonly = true)
+    public Connector[] getConnectors()
+    {
+<span class="fc" id="L384">        List&lt;Connector&gt; connectors = new ArrayList&lt;&gt;(_connectors);</span>
+<span class="fc" id="L385">        return connectors.toArray(new Connector[0]);</span>
+    }
+
+    public void addConnector(Connector connector)
+    {
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        if (connector.getServer() != this)</span>
+<span class="nc" id="L391">            throw new IllegalArgumentException(&quot;Connector &quot; + connector +</span>
+<span class="nc" id="L392">                &quot; cannot be shared among server &quot; + connector.getServer() + &quot; and server &quot; + this);</span>
+<span class="nc" id="L393">        _connectors.add(connector);</span>
+<span class="nc" id="L394">        addBean(connector);</span>
+<span class="nc" id="L395">    }</span>
+
+    /**
+     * Convenience method which calls {@link #getConnectors()} and {@link #setConnectors(Connector[])} to
+     * remove a connector.
+     *
+     * @param connector The connector to remove.
+     */
+    public void removeConnector(Connector connector)
+    {
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        if (_connectors.remove(connector))</span>
+<span class="nc" id="L406">            removeBean(connector);</span>
+<span class="nc" id="L407">    }</span>
+
+    /**
+     * Set the connectors for this server.
+     * Each connector has this server set as it's ThreadPool and its Handler.
+     *
+     * @param connectors The connectors to set.
+     */
+    public void setConnectors(Connector[] connectors)
+    {
+<span class="pc bpc" id="L417" title="1 of 2 branches missed.">        if (connectors != null)</span>
+        {
+<span class="fc bfc" id="L419" title="All 2 branches covered.">            for (Connector connector : connectors)</span>
+            {
+<span class="pc bpc" id="L421" title="1 of 2 branches missed.">                if (connector.getServer() != this)</span>
+<span class="nc" id="L422">                    throw new IllegalArgumentException(&quot;Connector &quot; + connector +</span>
+<span class="nc" id="L423">                        &quot; cannot be shared among server &quot; + connector.getServer() + &quot; and server &quot; + this);</span>
+            }
+        }
+
+<span class="fc" id="L427">        Connector[] oldConnectors = getConnectors();</span>
+<span class="fc" id="L428">        updateBeans(oldConnectors, connectors);</span>
+<span class="fc" id="L429">        _connectors.removeAll(Arrays.asList(oldConnectors));</span>
+<span class="pc bpc" id="L430" title="1 of 2 branches missed.">        if (connectors != null)</span>
+<span class="fc" id="L431">            _connectors.addAll(Arrays.asList(connectors));</span>
+<span class="fc" id="L432">    }</span>
+
+    /**
+     * Add a bean to all connectors on the server.
+     * If the bean is an instance of {@link Connection.Listener} it will also be
+     * registered as a listener on all connections accepted by the connectors.
+     * @param bean the bean to be added.
+     */
+    public void addBeanToAllConnectors(Object bean)
+    {
+<span class="nc bnc" id="L442" title="All 2 branches missed.">        for (Connector connector : getConnectors())</span>
+        {
+<span class="nc" id="L444">            connector.addBean(bean);</span>
+        }
+<span class="nc" id="L446">    }</span>
+
+    /**
+     * @return Returns the threadPool.
+     */
+    @ManagedAttribute(&quot;The server Thread pool&quot;)
+    public ThreadPool getThreadPool()
+    {
+<span class="fc" id="L454">        return _threadPool;</span>
+    }
+
+    @ManagedAttribute(&quot;The server Scheduler&quot;)
+    public Scheduler getScheduler()
+    {
+<span class="fc" id="L460">        return _scheduler;</span>
+    }
+
+    @ManagedAttribute(&quot;The server ByteBuffer pool&quot;)
+    public ByteBufferPool getByteBufferPool()
+    {
+<span class="fc" id="L466">        return _bufferPool;</span>
+    }
+
+    /**
+     * @return true if {@link #dumpStdErr()} is called after starting
+     */
+    @ManagedAttribute(&quot;Whether to dump the server to stderr after start&quot;)
+    public boolean isDumpAfterStart()
+    {
+<span class="fc" id="L475">        return _dumpAfterStart;</span>
+    }
+
+    /**
+     * Set true if {@link #dumpStdErr()} is called after starting.
+     * @param dumpAfterStart true if {@link #dumpStdErr()} is called after starting
+     */
+    public void setDumpAfterStart(boolean dumpAfterStart)
+    {
+<span class="nc" id="L484">        _dumpAfterStart = dumpAfterStart;</span>
+<span class="nc" id="L485">    }</span>
+
+    /**
+     * @return true if {@link #dumpStdErr()} is called before stopping
+     */
+    @ManagedAttribute(&quot;Whether to dump the server to stderr before stop&quot;)
+    public boolean isDumpBeforeStop()
+    {
+<span class="fc" id="L493">        return _dumpBeforeStop;</span>
+    }
+
+    /**
+     * Set true if {@link #dumpStdErr()} is called before stopping.
+     * @param dumpBeforeStop true if {@link #dumpStdErr()} is called before stopping
+     */
+    public void setDumpBeforeStop(boolean dumpBeforeStop)
+    {
+<span class="nc" id="L502">        _dumpBeforeStop = dumpBeforeStop;</span>
+<span class="nc" id="L503">    }</span>
+
+    /**
+     * @return A {@link HttpField} instance efficiently recording the current time to a second resolution,
+     * that cannot be cleared from a {@link ResponseHttpFields} instance.
+     * @see ResponseHttpFields.PersistentPreEncodedHttpField
+     */
+    public HttpField getDateField()
+    {
+<span class="fc" id="L512">        long now = System.currentTimeMillis();</span>
+<span class="fc" id="L513">        long seconds = now / 1000;</span>
+<span class="fc" id="L514">        DateField df = _dateField;</span>
+
+<span class="fc bfc" id="L516" title="All 4 branches covered.">        if (df == null || df._seconds != seconds)</span>
+        {
+<span class="fc" id="L518">            try (AutoLock ignore = _dateLock.lock())</span>
+            {
+<span class="fc" id="L520">                df = _dateField;</span>
+<span class="pc bpc" id="L521" title="1 of 4 branches missed.">                if (df == null || df._seconds != seconds)</span>
+                {
+<span class="fc" id="L523">                    HttpField field = new ResponseHttpFields.PersistentPreEncodedHttpField(HttpHeader.DATE, DateGenerator.formatDate(now));</span>
+<span class="fc" id="L524">                    _dateField = new DateField(seconds, field);</span>
+<span class="fc" id="L525">                    return field;</span>
+                }
+<span class="pc bpc" id="L527" title="1 of 2 branches missed.">            }</span>
+        }
+<span class="fc" id="L529">        return df._dateField;</span>
+    }
+
+    @Override
+    protected void doStart() throws Exception
+    {
+        try
+        {
+            //If the Server should be stopped when the jvm exits, register
+            //with the shutdown handler thread.
+<span class="pc bpc" id="L539" title="1 of 2 branches missed.">            if (getStopAtShutdown())</span>
+<span class="fc" id="L540">                ShutdownThread.register(this);</span>
+
+            //Register the Server with the handler thread for receiving
+            //remote stop commands
+<span class="fc" id="L544">            ShutdownMonitor.register(this);</span>
+
+            //Start a thread waiting to receive &quot;stop&quot; commands.
+<span class="fc" id="L547">            ShutdownMonitor.getInstance().start(); // initialize</span>
+
+<span class="pc bpc" id="L549" title="1 of 2 branches missed.">            if (_errorHandler == null)</span>
+<span class="fc" id="L550">                setErrorHandler(new DynamicErrorHandler());</span>
+
+<span class="fc" id="L552">            String gitHash = Jetty.GIT_HASH;</span>
+<span class="fc" id="L553">            String timestamp = Jetty.BUILD_TIMESTAMP;</span>
+
+<span class="fc" id="L555">            LOG.info(&quot;jetty-{}; built: {}; git: {}; jvm {}&quot;, getVersion(), timestamp, gitHash, System.getProperty(&quot;java.runtime.version&quot;, System.getProperty(&quot;java.version&quot;)));</span>
+<span class="pc bpc" id="L556" title="1 of 2 branches missed.">            if (!Jetty.STABLE)</span>
+            {
+<span class="nc" id="L558">                LOG.warn(&quot;THIS IS NOT A STABLE RELEASE! DO NOT USE IN PRODUCTION!&quot;);</span>
+<span class="nc" id="L559">                LOG.warn(&quot;Download a stable release from https://jetty.org/download.html&quot;);</span>
+            }
+
+<span class="fc" id="L562">            final ExceptionUtil.MultiException multiException = new ExceptionUtil.MultiException();</span>
+
+            // Open network connector to ensure ports are available
+<span class="pc bpc" id="L565" title="2 of 4 branches missed.">            if (!_dryRun &amp;&amp; _openEarly)</span>
+            {
+<span class="fc" id="L567">                _connectors.stream().filter(NetworkConnector.class::isInstance).map(NetworkConnector.class::cast).forEach(connector -&gt;</span>
+                {
+                    try
+                    {
+<span class="fc" id="L571">                        connector.open();</span>
+                    }
+<span class="nc" id="L573">                    catch (Throwable th)</span>
+                    {
+<span class="nc" id="L575">                        multiException.add(th);</span>
+<span class="fc" id="L576">                    }</span>
+<span class="fc" id="L577">                });</span>
+                // Throw now if verified start sequence and there was an open exception
+<span class="fc" id="L579">                multiException.ifExceptionThrow();</span>
+            }
+
+            // Start the server and components, but not connectors!
+            // #start(LifeCycle) is overridden so that connectors are not started
+<span class="fc" id="L584">            super.doStart();</span>
+
+            // Cache the invocation type to avoid runtime walk of handler tree
+            // Handlers must check they don't change the InvocationType of a started server
+<span class="fc" id="L588">            _invocationType = getInvocationType();</span>
+
+<span class="pc bpc" id="L590" title="1 of 2 branches missed.">            if (_dryRun)</span>
+            {
+<span class="nc" id="L592">                LOG.info(String.format(&quot;Started(dry run) %s @%dms&quot;, this, Uptime.getUptime()));</span>
+<span class="nc" id="L593">                throw new StopException();</span>
+            }
+
+            // start connectors
+<span class="fc bfc" id="L597" title="All 2 branches covered.">            for (Connector connector : _connectors)</span>
+            {
+                try
+                {
+<span class="fc" id="L601">                    connector.start();</span>
+                }
+<span class="nc" id="L603">                catch (Throwable e)</span>
+                {
+<span class="nc" id="L605">                    multiException.add(e);</span>
+                    // stop any started connectors
+<span class="nc" id="L607">                    _connectors.stream().filter(LifeCycle::isRunning).map(Object.class::cast).forEach(LifeCycle::stop);</span>
+<span class="fc" id="L608">                }</span>
+<span class="fc" id="L609">            }</span>
+
+<span class="fc" id="L611">            multiException.ifExceptionThrow();</span>
+<span class="fc" id="L612">            LOG.info(String.format(&quot;Started %s @%dms&quot;, this, Uptime.getUptime()));</span>
+        }
+<span class="nc" id="L614">        catch (Throwable th)</span>
+        {
+            // Close any connectors that were opened
+<span class="nc" id="L617">            _connectors.stream().filter(NetworkConnector.class::isInstance).map(NetworkConnector.class::cast).forEach(nc -&gt;</span>
+            {
+                try
+                {
+<span class="nc" id="L621">                    nc.close();</span>
+                }
+<span class="nc" id="L623">                catch (Throwable th2)</span>
+                {
+<span class="nc bnc" id="L625" title="All 2 branches missed.">                    if (th != th2)</span>
+<span class="nc" id="L626">                        th.addSuppressed(th2);</span>
+<span class="nc" id="L627">                }</span>
+<span class="nc" id="L628">            });</span>
+<span class="nc" id="L629">            throw th;</span>
+        }
+        finally
+        {
+<span class="pc bpc" id="L633" title="5 of 6 branches missed.">            if (isDumpAfterStart() &amp;&amp; !(_dryRun &amp;&amp; isDumpBeforeStop()))</span>
+<span class="nc" id="L634">                dumpStdErr();</span>
+        }
+<span class="fc" id="L636">    }</span>
+
+    @Override
+    protected void start(LifeCycle l) throws Exception
+    {
+        // start connectors last
+<span class="fc bfc" id="L642" title="All 2 branches covered.">        if (!(l instanceof Connector))</span>
+<span class="fc" id="L643">            super.start(l);</span>
+<span class="fc" id="L644">    }</span>
+
+    @Override
+    protected void doStop() throws Exception
+    {
+<span class="pc bpc" id="L649" title="1 of 2 branches missed.">        if (isDumpBeforeStop())</span>
+<span class="nc" id="L650">            dumpStdErr();</span>
+
+<span class="fc" id="L652">        LOG.info(String.format(&quot;Stopped %s&quot;, this));</span>
+<span class="pc bpc" id="L653" title="1 of 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L654">            LOG.debug(&quot;doStop {}&quot;, this);</span>
+
+<span class="fc" id="L656">        Throwable multiException = null;</span>
+
+<span class="pc bpc" id="L658" title="1 of 2 branches missed.">        if (getStopTimeout() &gt; 0)</span>
+        {
+<span class="fc" id="L660">            long end = NanoTime.now() + TimeUnit.MILLISECONDS.toNanos(getStopTimeout());</span>
+            try
+            {
+<span class="fc" id="L663">                Graceful.shutdown(this).get(getStopTimeout(), TimeUnit.MILLISECONDS);</span>
+            }
+<span class="nc" id="L665">            catch (Throwable e)</span>
+            {
+<span class="nc" id="L667">                multiException = ExceptionUtil.combine(multiException, e);</span>
+<span class="fc" id="L668">            }</span>
+<span class="fc" id="L669">            QueuedThreadPool qtp = getBean(QueuedThreadPool.class);</span>
+<span class="pc bpc" id="L670" title="1 of 2 branches missed.">            if (qtp != null)</span>
+<span class="fc" id="L671">                qtp.setStopTimeout(Math.max(1000L, NanoTime.millisUntil(end)));</span>
+        }
+
+        // Now stop the connectors (this will close existing connections)
+<span class="fc bfc" id="L675" title="All 2 branches covered.">        for (Connector connector : _connectors)</span>
+        {
+            try
+            {
+<span class="fc" id="L679">                connector.stop();</span>
+            }
+<span class="nc" id="L681">            catch (Throwable e)</span>
+            {
+<span class="nc" id="L683">                multiException = ExceptionUtil.combine(multiException, e);</span>
+<span class="fc" id="L684">            }</span>
+<span class="fc" id="L685">        }</span>
+
+        // And finally stop everything else
+        try
+        {
+<span class="fc" id="L690">            super.doStop();</span>
+        }
+<span class="nc" id="L692">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L694">            multiException = ExceptionUtil.combine(multiException, e);</span>
+<span class="fc" id="L695">        }</span>
+
+<span class="pc bpc" id="L697" title="1 of 2 branches missed.">        if (getErrorHandler() instanceof DynamicErrorHandler)</span>
+<span class="fc" id="L698">            setErrorHandler(null);</span>
+
+<span class="pc bpc" id="L700" title="1 of 2 branches missed.">        if (getStopAtShutdown())</span>
+<span class="fc" id="L701">            ShutdownThread.deregister(this);</span>
+
+        //Unregister the Server with the handler thread for receiving
+        //remote stop commands as we are stopped already
+<span class="fc" id="L705">        ShutdownMonitor.deregister(this);</span>
+
+<span class="fc" id="L707">        ExceptionUtil.ifExceptionThrow(multiException);</span>
+<span class="fc" id="L708">    }</span>
+
+    public void join() throws InterruptedException
+    {
+<span class="fc" id="L712">        getThreadPool().join();</span>
+<span class="fc" id="L713">    }</span>
+
+    @Override
+    public Object setAttribute(String name, Object attribute)
+    {
+<span class="nc" id="L718">        return _attributes.setAttribute(name, attribute);</span>
+    }
+
+    @Override
+    public Object removeAttribute(String name)
+    {
+<span class="nc" id="L724">        return _attributes.removeAttribute(name);</span>
+    }
+
+    @Override
+    public Object getAttribute(String name)
+    {
+<span class="nc" id="L730">        return _attributes.getAttribute(name);</span>
+    }
+
+    @Override
+    public Set&lt;String&gt; getAttributeNameSet()
+    {
+<span class="nc" id="L736">        return _attributes.getAttributeNameSet();</span>
+    }
+
+    @Override
+    public void clearAttributes()
+    {
+<span class="nc" id="L742">        _attributes.clearAttributes();</span>
+<span class="nc" id="L743">    }</span>
+
+    /**
+     * @return The URI of the first {@link NetworkConnector} and first {@link ContextHandler}, or null
+     */
+    public URI getURI()
+    {
+<span class="fc" id="L750">        NetworkConnector connector = null;</span>
+<span class="pc bpc" id="L751" title="1 of 2 branches missed.">        for (Connector c : _connectors)</span>
+        {
+<span class="pc bpc" id="L753" title="1 of 2 branches missed.">            if (c instanceof NetworkConnector)</span>
+            {
+<span class="fc" id="L755">                connector = (NetworkConnector)c;</span>
+<span class="fc" id="L756">                break;</span>
+            }
+<span class="nc" id="L758">        }</span>
+
+<span class="pc bpc" id="L760" title="1 of 2 branches missed.">        if (connector == null)</span>
+<span class="nc" id="L761">            return null;</span>
+
+<span class="fc" id="L763">        ContextHandler context = getDescendant(ContextHandler.class);</span>
+
+        try
+        {
+<span class="fc" id="L767">            String protocol = connector.getDefaultConnectionFactory().getProtocol();</span>
+<span class="fc" id="L768">            String scheme = &quot;http&quot;;</span>
+<span class="pc bpc" id="L769" title="1 of 4 branches missed.">            if (protocol.startsWith(&quot;SSL-&quot;) || protocol.equals(&quot;SSL&quot;))</span>
+<span class="fc" id="L770">                scheme = &quot;https&quot;;</span>
+
+<span class="fc" id="L772">            String host = connector.getHost();</span>
+<span class="pc bpc" id="L773" title="1 of 2 branches missed.">            if (host == null)</span>
+<span class="nc" id="L774">                host = InetAddress.getLocalHost().getHostAddress();</span>
+<span class="fc" id="L775">            int port = connector.getLocalPort();</span>
+
+<span class="fc" id="L777">            String path = &quot;/&quot;;</span>
+<span class="fc bfc" id="L778" title="All 2 branches covered.">            if (context != null)</span>
+            {
+<span class="fc" id="L780">                Optional&lt;String&gt; vhost = context.getVirtualHosts().stream()</span>
+<span class="pc bnc" id="L781" title="All 4 branches missed.">                    .filter(h -&gt; !h.startsWith(&quot;*.&quot;) &amp;&amp; !h.startsWith(&quot;@&quot;))</span>
+<span class="fc" id="L782">                    .findFirst();</span>
+<span class="pc bpc" id="L783" title="1 of 2 branches missed.">                if (vhost.isPresent())</span>
+                {
+<span class="nc" id="L785">                    host = vhost.get();</span>
+<span class="nc" id="L786">                    int at = host.indexOf('@');</span>
+<span class="nc bnc" id="L787" title="All 2 branches missed.">                    if (at &gt; 0)</span>
+<span class="nc" id="L788">                        host = host.substring(0, at);</span>
+                }
+
+<span class="fc" id="L791">                path = context.getContextPath();</span>
+            }
+<span class="fc" id="L793">            return new URI(scheme, null, host, port, path, null, null);</span>
+        }
+<span class="nc" id="L795">        catch (Exception e)</span>
+        {
+<span class="nc" id="L797">            LOG.warn(&quot;Unable to build server URI&quot;, e);</span>
+<span class="nc" id="L798">            return null;</span>
+        }
+    }
+
+    @Override
+    public Server getServer()
+    {
+<span class="fc" id="L805">        return this;</span>
+    }
+
+    /**
+     * Get the Default CSS
+     *
+     * @return the default CSS
+     */
+    public Resource getDefaultStyleSheet()
+    {
+<span class="nc" id="L815">        return newResource(&quot;/org/eclipse/jetty/server/jetty-dir.css&quot;);</span>
+    }
+
+    /**
+     * Get the default Favicon
+     *
+     * @return the default Favicon
+     */
+    public Resource getDefaultFavicon()
+    {
+<span class="nc" id="L825">        return newResource(&quot;/org/eclipse/jetty/server/favicon.ico&quot;);</span>
+    }
+
+    /**
+     * Create a new Resource representing a resources that is managed by the Server.
+     *
+     * @param name the name of the resource (relative to `/org/eclipse/jetty/server/`)
+     * @return the Resource found, or null if not found.
+     */
+    private Resource newResource(String name)
+    {
+<span class="nc" id="L836">        URL url = getClass().getResource(name);</span>
+<span class="nc bnc" id="L837" title="All 2 branches missed.">        if (url == null)</span>
+<span class="nc" id="L838">            throw new IllegalStateException(&quot;Missing server resource: &quot; + name);</span>
+<span class="nc" id="L839">        return ResourceFactory.root().newMemoryResource(url);</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="fc" id="L845">        return String.format(&quot;%s[%s,sto=%d]&quot;, super.toString(), getVersion(), getStopTimeout());</span>
+    }
+
+    @Override
+    public void dump(Appendable out, String indent) throws IOException
+    {
+<span class="nc" id="L851">        dumpObjects(out, indent,</span>
+<span class="nc" id="L852">            new ClassLoaderDump(this.getClass().getClassLoader()),</span>
+<span class="nc" id="L853">            new DumpableCollection(&quot;environments&quot;, Environment.getAll()),</span>
+            new DumpableAttributes(&quot;attributes&quot;, _attributes),
+            FileSystemPool.INSTANCE);
+<span class="nc" id="L856">    }</span>
+
+    public static void main(String... args)
+    {
+<span class="nc" id="L860">        System.err.println(getVersion());</span>
+<span class="nc" id="L861">    }</span>
+
+    private static class DateField
+    {
+        final long _seconds;
+        final HttpField _dateField;
+
+        public DateField(long seconds, HttpField dateField)
+        {
+<span class="fc" id="L870">            super();</span>
+<span class="fc" id="L871">            _seconds = seconds;</span>
+<span class="fc" id="L872">            _dateField = dateField;</span>
+<span class="fc" id="L873">        }</span>
+    }
+
+    private static class DynamicErrorHandler extends ErrorHandler {}
+
+    class ServerContext extends Attributes.Wrapper implements Context
+    {
+<span class="fc" id="L880">        private final File jettyBase = IO.asFile(System.getProperty(&quot;jetty.base&quot;));</span>
+<span class="pc bpc" id="L881" title="5 of 6 branches missed.">        private final File workDir = jettyBase != null &amp;&amp; jettyBase.isDirectory() &amp;&amp; jettyBase.canWrite() ? new File(jettyBase, &quot;work&quot;) : null;</span>
+<span class="pc bpc" id="L882" title="5 of 6 branches missed.">        private final File tempDir = workDir != null &amp;&amp; workDir.isDirectory() &amp;&amp; workDir.canWrite() ? workDir : IO.asFile(System.getProperty(&quot;java.io.tmpdir&quot;));</span>
+
+        private ServerContext()
+<span class="fc" id="L885">        {</span>
+<span class="fc" id="L886">            super(Server.this);</span>
+<span class="fc" id="L887">        }</span>
+
+        @Override
+        public String getContextPath()
+        {
+<span class="nc" id="L892">            return null;</span>
+        }
+
+        @Override
+        public MimeTypes getMimeTypes()
+        {
+<span class="nc" id="L898">            return _mimeTypes;</span>
+        }
+
+        @Override
+        public ClassLoader getClassLoader()
+        {
+<span class="nc" id="L904">            return Server.class.getClassLoader();</span>
+        }
+
+        @Override
+        public Resource getBaseResource()
+        {
+<span class="nc" id="L910">            return null;</span>
+        }
+
+        @Override
+        public List&lt;String&gt; getVirtualHosts()
+        {
+<span class="nc" id="L916">            return Collections.emptyList();</span>
+        }
+
+        @Override
+        public void run(Runnable runnable)
+        {
+<span class="nc" id="L922">            runnable.run();</span>
+<span class="nc" id="L923">        }</span>
+
+        @Override
+        public void run(Runnable runnable, Request request)
+        {
+<span class="nc" id="L928">            runnable.run();</span>
+<span class="nc" id="L929">        }</span>
+
+        @Override
+        public void execute(Runnable runnable)
+        {
+<span class="nc" id="L934">            getThreadPool().execute(runnable);</span>
+<span class="nc" id="L935">        }</span>
+
+        @Override
+        public Request.Handler getErrorHandler()
+        {
+<span class="nc" id="L940">            return Server.this.getErrorHandler();</span>
+        }
+
+        @Override
+        public &lt;T&gt; T decorate(T o)
+        {
+            // TODO cache factory lookup?
+<span class="nc" id="L947">            DecoratedObjectFactory factory = Server.this.getBean(DecoratedObjectFactory.class);</span>
+<span class="nc bnc" id="L948" title="All 2 branches missed.">            if (factory != null)</span>
+<span class="nc" id="L949">                return factory.decorate(o);</span>
+<span class="nc" id="L950">            return o;</span>
+        }
+
+        @Override
+        public void destroy(Object o)
+        {
+            // TODO cache factory lookup?
+<span class="nc" id="L957">            DecoratedObjectFactory factory = Server.this.getBean(DecoratedObjectFactory.class);</span>
+<span class="nc bnc" id="L958" title="All 2 branches missed.">            if (factory != null)</span>
+<span class="nc" id="L959">                factory.destroy(o);</span>
+<span class="nc" id="L960">        }</span>
+
+        @Override
+        public String getPathInContext(String canonicallyEncodedPath)
+        {
+<span class="fc" id="L965">            return canonicallyEncodedPath;</span>
+        }
+
+        @Override
+        public File getTempDirectory()
+        {
+<span class="nc" id="L971">            return Objects.requireNonNullElse(Server.this.getTempDirectory(), tempDir);</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L977">            return &quot;ServerContext@%x&quot;.formatted(Server.this.hashCode());</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

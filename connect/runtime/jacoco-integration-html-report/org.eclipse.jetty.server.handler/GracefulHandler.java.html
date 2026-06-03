@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>GracefulHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server.handler</a> &gt; <span class="el_source">GracefulHandler.java</span></div><h1>GracefulHandler.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server.handler;
+
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
+
+import org.eclipse.jetty.http.HttpStatus;
+import org.eclipse.jetty.server.Handler;
+import org.eclipse.jetty.server.HttpStream;
+import org.eclipse.jetty.server.Request;
+import org.eclipse.jetty.server.Response;
+import org.eclipse.jetty.util.Callback;
+import org.eclipse.jetty.util.CountingCallback;
+import org.eclipse.jetty.util.annotation.ManagedAttribute;
+import org.eclipse.jetty.util.component.Graceful;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Handler to track active requests and allow them to gracefully complete.
+ */
+public class GracefulHandler extends Handler.Wrapper implements Graceful
+{
+<span class="nc" id="L37">    private static final Logger LOG = LoggerFactory.getLogger(GracefulHandler.class);</span>
+
+<span class="nc" id="L39">    private final AtomicLong _requests = new AtomicLong();</span>
+<span class="nc" id="L40">    private final AtomicLong _streamWrappers = new AtomicLong();</span>
+    private final Shutdown _shutdown;
+
+    public GracefulHandler()
+    {
+<span class="nc" id="L45">        this(null);</span>
+<span class="nc" id="L46">    }</span>
+
+    public GracefulHandler(Handler handler)
+    {
+<span class="nc" id="L50">        super(handler);</span>
+<span class="nc" id="L51">        _shutdown = new Shutdown(this)</span>
+<span class="nc" id="L52">        {</span>
+            @Override
+            public boolean isShutdownDone()
+            {
+<span class="nc" id="L56">                long requestCount = getCurrentRequestCount();</span>
+<span class="nc" id="L57">                long streamWrapperCount = getCurrentStreamWrapperCount();</span>
+<span class="nc bnc" id="L58" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L59">                    LOG.debug(&quot;isShutdownDone: requestCount {} streamWrapperCount {}&quot;, requestCount, streamWrapperCount);</span>
+<span class="nc bnc" id="L60" title="All 4 branches missed.">                return requestCount == 0L &amp;&amp; streamWrapperCount == 0L;</span>
+            }
+        };
+<span class="nc" id="L63">    }</span>
+
+    @ManagedAttribute(&quot;number of requests being currently handled&quot;)
+    public long getCurrentRequestCount()
+    {
+<span class="nc" id="L68">        return _requests.longValue();</span>
+    }
+
+    @ManagedAttribute(&quot;number of stream wrappers currently pending&quot;)
+    public long getCurrentStreamWrapperCount()
+    {
+<span class="nc" id="L74">        return _streamWrappers.longValue();</span>
+    }
+
+    /**
+     * Flag indicating that Graceful shutdown has been initiated.
+     *
+     * @return whether the graceful shutdown has been initiated
+     * @see Graceful
+     */
+    @Override
+    public boolean isShutdown()
+    {
+<span class="nc" id="L86">        return _shutdown.isShutdown();</span>
+    }
+
+    @Override
+    public boolean handle(Request request, Response response, Callback callback) throws Exception
+    {
+<span class="nc" id="L92">        request = new ShutdownTrackingRequest(request);</span>
+<span class="nc" id="L93">        Handler handler = getHandler();</span>
+<span class="nc bnc" id="L94" title="All 4 branches missed.">        if (handler == null || !isStarted())</span>
+        {
+            // Nothing to do here, skip it
+<span class="nc" id="L97">            return false;</span>
+        }
+
+        // Increment the counter before the test for isShutdown(), to avoid race conditions.
+<span class="nc" id="L101">        ShutdownTrackingCallback shutdownCallback = new ShutdownTrackingCallback(request, response, callback);</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">        if (isShutdown())</span>
+        {
+<span class="nc bnc" id="L104" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L105">                LOG.debug(&quot;Service Unavailable: {}&quot;, request.getHttpURI());</span>
+<span class="nc" id="L106">            Response.writeError(request, response, shutdownCallback, HttpStatus.SERVICE_UNAVAILABLE_503);</span>
+<span class="nc" id="L107">            return true;</span>
+        }
+
+        try
+        {
+<span class="nc" id="L112">            boolean handled = super.handle(request, response, shutdownCallback);</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">            if (!handled)</span>
+<span class="nc" id="L114">                shutdownCallback.completed();</span>
+<span class="nc" id="L115">            return handled;</span>
+        }
+<span class="nc" id="L117">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L119">            Response.writeError(request, response, shutdownCallback, t);</span>
+<span class="nc" id="L120">            return true;</span>
+        }
+        finally
+        {
+<span class="nc bnc" id="L124" title="All 2 branches missed.">            if (isShutdown())</span>
+<span class="nc" id="L125">                _shutdown.check();</span>
+        }
+    }
+
+    @Override
+    protected void doStart() throws Exception
+    {
+        // Reset _shutdown in doStart instead of doStop so that the isShutdown() == true state is preserved while stopped.
+<span class="nc" id="L133">        _shutdown.cancel();</span>
+<span class="nc" id="L134">        super.doStart();</span>
+<span class="nc" id="L135">    }</span>
+
+    @Override
+    public CompletableFuture&lt;Void&gt; shutdown()
+    {
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L141">            LOG.debug(&quot;Shutdown requested&quot;);</span>
+<span class="nc" id="L142">        return _shutdown.shutdown();</span>
+    }
+
+    private class ShutdownTrackingCallback extends CountingCallback
+    {
+        final Request request;
+        final Response response;
+
+        public ShutdownTrackingCallback(Request request, Response response, Callback callback)
+<span class="nc" id="L151">        {</span>
+<span class="nc" id="L152">            super(callback, 1);</span>
+<span class="nc" id="L153">            this.request = request;</span>
+<span class="nc" id="L154">            this.response = response;</span>
+<span class="nc" id="L155">            _requests.incrementAndGet();</span>
+<span class="nc" id="L156">        }</span>
+
+        @Override
+        public void completed()
+        {
+<span class="nc" id="L161">            _requests.decrementAndGet();</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            if (isShutdown())</span>
+<span class="nc" id="L163">                _shutdown.check();</span>
+<span class="nc" id="L164">        }</span>
+    }
+
+    private class ShutdownTrackingRequest extends Request.Wrapper
+    {
+        public ShutdownTrackingRequest(Request wrapped)
+<span class="nc" id="L170">        {</span>
+<span class="nc" id="L171">            super(wrapped);</span>
+<span class="nc" id="L172">        }</span>
+
+        @Override
+        public void addHttpStreamWrapper(Function&lt;HttpStream, HttpStream&gt; wrapper)
+        {
+<span class="nc" id="L177">            super.addHttpStreamWrapper(httpStream -&gt;</span>
+            {
+<span class="nc" id="L179">                HttpStream wrapped = wrapper.apply(httpStream);</span>
+<span class="nc" id="L180">                _streamWrappers.incrementAndGet();</span>
+<span class="nc" id="L181">                return new HttpStream.Wrapper(wrapped)</span>
+<span class="nc" id="L182">                {</span>
+                    @Override
+                    public void succeeded()
+                    {
+                        try
+                        {
+<span class="nc" id="L188">                            super.succeeded();</span>
+                        }
+                        finally
+                        {
+<span class="nc" id="L192">                            onCompletion(null);</span>
+                        }
+<span class="nc" id="L194">                    }</span>
+
+                    @Override
+                    public void failed(Throwable x)
+                    {
+                        try
+                        {
+<span class="nc" id="L201">                            super.failed(x);</span>
+                        }
+                        finally
+                        {
+<span class="nc" id="L205">                            onCompletion(x);</span>
+                        }
+<span class="nc" id="L207">                    }</span>
+
+                    private void onCompletion(Throwable x)
+                    {
+<span class="nc" id="L211">                        _streamWrappers.decrementAndGet();</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">                        if (isShutdown())</span>
+<span class="nc" id="L213">                            _shutdown.check();</span>
+<span class="nc" id="L214">                    }</span>
+                };
+            });
+<span class="nc" id="L217">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

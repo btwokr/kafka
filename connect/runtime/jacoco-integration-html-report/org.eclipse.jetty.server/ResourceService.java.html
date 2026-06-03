@@ -1,0 +1,927 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ResourceService.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server</a> &gt; <span class="el_source">ResourceService.java</span></div><h1>ResourceService.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.eclipse.jetty.http.ByteRange;
+import org.eclipse.jetty.http.CompressedContentFormat;
+import org.eclipse.jetty.http.EtagUtils;
+import org.eclipse.jetty.http.HttpDateTime;
+import org.eclipse.jetty.http.HttpField;
+import org.eclipse.jetty.http.HttpFields;
+import org.eclipse.jetty.http.HttpHeader;
+import org.eclipse.jetty.http.HttpStatus;
+import org.eclipse.jetty.http.HttpURI;
+import org.eclipse.jetty.http.MultiPart;
+import org.eclipse.jetty.http.MultiPartByteRanges;
+import org.eclipse.jetty.http.PreEncodedHttpField;
+import org.eclipse.jetty.http.QuotedCSV;
+import org.eclipse.jetty.http.QuotedQualityCSV;
+import org.eclipse.jetty.http.content.HttpContent;
+import org.eclipse.jetty.http.content.PreCompressedHttpContent;
+import org.eclipse.jetty.io.Content;
+import org.eclipse.jetty.io.IOResources;
+import org.eclipse.jetty.server.handler.ContextHandler;
+import org.eclipse.jetty.util.Callback;
+import org.eclipse.jetty.util.URIUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Resource service, used by DefaultServlet and ResourceHandler
+ */
+public class ResourceService
+{
+<span class="nc" id="L59">    private static final Logger LOG = LoggerFactory.getLogger(ResourceService.class);</span>
+    private static final int NO_CONTENT_LENGTH = -1;
+    private static final int USE_KNOWN_CONTENT_LENGTH = -2;
+<span class="nc" id="L62">    private static final EnumSet&lt;HttpHeader&gt; CONTENT_HEADERS = EnumSet.of(</span>
+        HttpHeader.LAST_MODIFIED,
+        HttpHeader.CONTENT_LENGTH,
+        HttpHeader.CONTENT_TYPE
+    );
+<span class="nc" id="L67">    private static final PreEncodedHttpField ACCEPT_RANGES_BYTES = new PreEncodedHttpField(HttpHeader.ACCEPT_RANGES, &quot;bytes&quot;);</span>
+
+<span class="nc" id="L69">    private final List&lt;CompressedContentFormat&gt; _precompressedFormats = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L70">    private final Map&lt;String, List&lt;String&gt;&gt; _preferredEncodingOrderCache = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="nc" id="L71">    private final List&lt;String&gt; _preferredEncodingOrder = new ArrayList&lt;&gt;();</span>
+    private WelcomeFactory _welcomeFactory;
+<span class="nc" id="L73">    private WelcomeMode _welcomeMode = WelcomeMode.SERVE;</span>
+<span class="nc" id="L74">    private boolean _etags = false;</span>
+    private List&lt;String&gt; _gzipEquivalentFileExtensions;
+    private HttpContent.Factory _contentFactory;
+<span class="nc" id="L77">    private int _encodingCacheSize = 100;</span>
+<span class="nc" id="L78">    private boolean _dirAllowed = true;</span>
+<span class="nc" id="L79">    private boolean _acceptRanges = true;</span>
+    private HttpField _cacheControl;
+
+    public ResourceService()
+<span class="nc" id="L83">    {</span>
+<span class="nc" id="L84">    }</span>
+
+    public HttpContent getContent(String path, Request request) throws IOException
+    {
+<span class="nc bnc" id="L88" title="All 2 branches missed.">        HttpContent content = _contentFactory.getContent(path == null ? &quot;&quot; : path);</span>
+<span class="nc bnc" id="L89" title="All 2 branches missed.">        if (content != null)</span>
+        {
+<span class="nc" id="L91">            AliasCheck aliasCheck = ContextHandler.getContextHandler(request);</span>
+<span class="nc bnc" id="L92" title="All 4 branches missed.">            if (aliasCheck != null &amp;&amp; !aliasCheck.checkAlias(path, content.getResource()))</span>
+<span class="nc" id="L93">                return null;</span>
+
+<span class="nc bnc" id="L95" title="All 2 branches missed.">            Collection&lt;CompressedContentFormat&gt; compressedContentFormats = (content.getPreCompressedContentFormats() == null)</span>
+<span class="nc" id="L96">                ? _precompressedFormats : content.getPreCompressedContentFormats();</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">            if (!compressedContentFormats.isEmpty())</span>
+            {
+<span class="nc" id="L99">                List&lt;String&gt; preferredEncodingOrder = getPreferredEncodingOrder(request);</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">                if (!preferredEncodingOrder.isEmpty())</span>
+                {
+<span class="nc bnc" id="L102" title="All 2 branches missed.">                    for (String encoding : preferredEncodingOrder)</span>
+                    {
+<span class="nc" id="L104">                        CompressedContentFormat contentFormat = isEncodingAvailable(encoding, compressedContentFormats);</span>
+<span class="nc bnc" id="L105" title="All 2 branches missed.">                        if (contentFormat == null)</span>
+<span class="nc" id="L106">                            continue;</span>
+
+<span class="nc" id="L108">                        HttpContent preCompressedContent = _contentFactory.getContent(path + contentFormat.getExtension());</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">                        if (preCompressedContent == null)</span>
+<span class="nc" id="L110">                            continue;</span>
+
+<span class="nc bnc" id="L112" title="All 4 branches missed.">                        if (aliasCheck != null &amp;&amp; !aliasCheck.checkAlias(path, preCompressedContent.getResource()))</span>
+<span class="nc" id="L113">                            continue;</span>
+
+<span class="nc" id="L115">                        return new PreCompressedHttpContent(content, preCompressedContent, contentFormat);</span>
+                    }
+                }
+            }
+        }
+
+<span class="nc" id="L121">        return content;</span>
+    }
+
+    public HttpContent.Factory getHttpContentFactory()
+    {
+<span class="nc" id="L126">        return _contentFactory;</span>
+    }
+
+    public void setHttpContentFactory(HttpContent.Factory contentFactory)
+    {
+<span class="nc" id="L131">        _contentFactory = contentFactory;</span>
+<span class="nc" id="L132">    }</span>
+
+    /**
+     * Get the cacheControl header to set on all static content..
+     * @return the cacheControl header to set on all static content.
+     */
+    public String getCacheControl()
+    {
+<span class="nc" id="L140">        return _cacheControl.getValue();</span>
+    }
+
+    /**
+     * @return file extensions that signify that a file is gzip compressed. Eg &quot;.svgz&quot;
+     */
+    public List&lt;String&gt; getGzipEquivalentFileExtensions()
+    {
+<span class="nc" id="L148">        return _gzipEquivalentFileExtensions;</span>
+    }
+
+    public void doGet(Request request, Response response, Callback callback, HttpContent content)
+    {
+<span class="nc" id="L153">        String pathInContext = Request.getPathInContext(request);</span>
+
+        // Is this a Range request?
+<span class="nc" id="L156">        List&lt;String&gt; reqRanges = request.getHeaders().getValuesList(HttpHeader.RANGE.asString());</span>
+<span class="nc bnc" id="L157" title="All 4 branches missed.">        if (!_acceptRanges &amp;&amp; !reqRanges.isEmpty())</span>
+        {
+<span class="nc" id="L159">            reqRanges = List.of();</span>
+<span class="nc" id="L160">            response.getHeaders().add(HttpHeader.ACCEPT_RANGES.asString(), &quot;none&quot;);</span>
+        }
+
+<span class="nc" id="L163">        boolean endsWithSlash = pathInContext.endsWith(&quot;/&quot;);</span>
+
+<span class="nc bnc" id="L165" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+        {
+<span class="nc" id="L167">            LOG.debug(&quot;.doGet(req={}, resp={}, callback={}, content={}) pathInContext={}, reqRanges={}, endsWithSlash={}&quot;,</span>
+<span class="nc" id="L168">                request, response, callback, content, pathInContext, reqRanges, endsWithSlash);</span>
+        }
+
+        try
+        {
+            // Directory?
+<span class="nc bnc" id="L174" title="All 2 branches missed.">            if (content.getResource().isDirectory())</span>
+            {
+<span class="nc" id="L176">                sendWelcome(content, pathInContext, endsWithSlash, request, response, callback);</span>
+<span class="nc" id="L177">                return;</span>
+            }
+
+            // Strip slash?
+<span class="nc bnc" id="L181" title="All 4 branches missed.">            if (endsWithSlash &amp;&amp; pathInContext.length() &gt; 1)</span>
+            {
+                // TODO need helper code to edit URIs
+<span class="nc" id="L184">                String q = request.getHttpURI().getQuery();</span>
+<span class="nc" id="L185">                pathInContext = pathInContext.substring(0, pathInContext.length() - 1);</span>
+<span class="nc bnc" id="L186" title="All 4 branches missed.">                if (q != null &amp;&amp; q.length() != 0)</span>
+<span class="nc" id="L187">                    pathInContext += &quot;?&quot; + q;</span>
+<span class="nc" id="L188">                sendRedirect(request, response, callback, URIUtil.addPaths(request.getContext().getContextPath(), pathInContext));</span>
+<span class="nc" id="L189">                return;</span>
+            }
+
+            // Conditional response?
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            if (passConditionalHeaders(request, response, content, callback))</span>
+<span class="nc" id="L194">                return;</span>
+
+<span class="nc bnc" id="L196" title="All 4 branches missed.">            if (content.getPreCompressedContentFormats() == null || !content.getPreCompressedContentFormats().isEmpty())</span>
+<span class="nc" id="L197">                response.getHeaders().put(HttpHeader.VARY, HttpHeader.ACCEPT_ENCODING.asString());</span>
+
+<span class="nc" id="L199">            HttpField contentEncoding = content.getContentEncoding();</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">            if (contentEncoding != null)</span>
+<span class="nc" id="L201">                response.getHeaders().put(contentEncoding);</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">            else if (isImplicitlyGzippedContent(pathInContext))</span>
+<span class="nc" id="L203">                response.getHeaders().put(HttpHeader.CONTENT_ENCODING, &quot;gzip&quot;);</span>
+
+            // Send the data
+<span class="nc" id="L206">            sendData(request, response, callback, content, reqRanges);</span>
+        }
+<span class="nc" id="L208">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L210">            LOG.warn(&quot;Failed to serve resource: {}&quot;, pathInContext, t);</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">            if (!response.isCommitted())</span>
+<span class="nc" id="L212">                writeHttpError(request, response, callback, t);</span>
+            else
+<span class="nc" id="L214">                callback.failed(t);</span>
+<span class="nc" id="L215">        }</span>
+<span class="nc" id="L216">    }</span>
+
+    protected void writeHttpError(Request request, Response response, Callback callback, int status)
+    {
+<span class="nc" id="L220">        Response.writeError(request, response, callback, status);</span>
+<span class="nc" id="L221">    }</span>
+
+    protected void writeHttpError(Request request, Response response, Callback callback, Throwable cause)
+    {
+<span class="nc" id="L225">        Response.writeError(request, response, callback, cause);</span>
+<span class="nc" id="L226">    }</span>
+
+    protected void writeHttpError(Request request, Response response, Callback callback, int status, String msg, Throwable cause)
+    {
+<span class="nc" id="L230">        Response.writeError(request, response, callback, status, msg, cause);</span>
+<span class="nc" id="L231">    }</span>
+
+    protected void sendRedirect(Request request, Response response, Callback callback, String target)
+    {
+<span class="nc bnc" id="L235" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+        {
+<span class="nc" id="L237">            LOG.debug(&quot;sendRedirect(req={}, resp={}, callback={}, target={})&quot;,</span>
+                request, response, callback, target);
+        }
+
+<span class="nc" id="L241">        Response.sendRedirect(request, response, callback, target);</span>
+<span class="nc" id="L242">    }</span>
+
+    private List&lt;String&gt; getPreferredEncodingOrder(Request request)
+    {
+<span class="nc" id="L246">        Enumeration&lt;String&gt; headers = request.getHeaders().getValues(HttpHeader.ACCEPT_ENCODING.asString());</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        if (!headers.hasMoreElements())</span>
+<span class="nc" id="L248">            return Collections.emptyList();</span>
+
+<span class="nc" id="L250">        String key = headers.nextElement();</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        if (headers.hasMoreElements())</span>
+        {
+<span class="nc" id="L253">            StringBuilder sb = new StringBuilder(key.length() * 2);</span>
+            do
+            {
+<span class="nc" id="L256">                sb.append(',').append(headers.nextElement());</span>
+            }
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            while (headers.hasMoreElements());</span>
+<span class="nc" id="L259">            key = sb.toString();</span>
+        }
+
+<span class="nc" id="L262">        List&lt;String&gt; values = _preferredEncodingOrderCache.get(key);</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        if (values == null)</span>
+        {
+<span class="nc" id="L265">            QuotedQualityCSV encodingQualityCSV = new QuotedQualityCSV(_preferredEncodingOrder);</span>
+<span class="nc" id="L266">            encodingQualityCSV.addValue(key);</span>
+<span class="nc" id="L267">            values = encodingQualityCSV.getValues();</span>
+
+            // keep cache size in check even if we get strange/malicious input
+<span class="nc bnc" id="L270" title="All 2 branches missed.">            if (_preferredEncodingOrderCache.size() &gt; _encodingCacheSize)</span>
+<span class="nc" id="L271">                _preferredEncodingOrderCache.clear();</span>
+
+<span class="nc" id="L273">            _preferredEncodingOrderCache.put(key, values);</span>
+        }
+
+<span class="nc" id="L276">        return values;</span>
+    }
+
+    private boolean isImplicitlyGzippedContent(String path)
+    {
+<span class="nc bnc" id="L281" title="All 4 branches missed.">        if (path == null || _gzipEquivalentFileExtensions == null)</span>
+<span class="nc" id="L282">            return false;</span>
+
+<span class="nc bnc" id="L284" title="All 2 branches missed.">        for (String suffix : _gzipEquivalentFileExtensions)</span>
+        {
+<span class="nc bnc" id="L286" title="All 2 branches missed.">            if (path.endsWith(suffix))</span>
+<span class="nc" id="L287">                return true;</span>
+<span class="nc" id="L288">        }</span>
+<span class="nc" id="L289">        return false;</span>
+    }
+
+    private CompressedContentFormat isEncodingAvailable(String encoding, Collection&lt;CompressedContentFormat&gt; availableFormats)
+    {
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        if (availableFormats.isEmpty())</span>
+<span class="nc" id="L295">            return null;</span>
+
+<span class="nc bnc" id="L297" title="All 2 branches missed.">        for (CompressedContentFormat format : availableFormats)</span>
+        {
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            if (format.getEncoding().equals(encoding))</span>
+<span class="nc" id="L300">                return format;</span>
+<span class="nc" id="L301">        }</span>
+
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        if (&quot;*&quot;.equals(encoding))</span>
+<span class="nc" id="L304">            return availableFormats.iterator().next();</span>
+<span class="nc" id="L305">        return null;</span>
+    }
+
+    /**
+     * @return true if the request was processed, false otherwise.
+     */
+    protected boolean passConditionalHeaders(Request request, Response response, HttpContent content, Callback callback) throws IOException
+    {
+        try
+        {
+<span class="nc" id="L315">            String ifm = null;</span>
+<span class="nc" id="L316">            String ifnm = null;</span>
+<span class="nc" id="L317">            String ifms = null;</span>
+<span class="nc" id="L318">            String ifums = null;</span>
+
+            // Find multiple fields by iteration as an optimization
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            for (HttpField field : request.getHeaders())</span>
+            {
+<span class="nc bnc" id="L323" title="All 2 branches missed.">                if (field.getHeader() != null)</span>
+                {
+<span class="nc bnc" id="L325" title="All 5 branches missed.">                    switch (field.getHeader())</span>
+                    {
+<span class="nc" id="L327">                        case IF_MATCH -&gt; ifm = field.getValue();</span>
+<span class="nc" id="L328">                        case IF_NONE_MATCH -&gt; ifnm = field.getValue();</span>
+<span class="nc" id="L329">                        case IF_MODIFIED_SINCE -&gt; ifms = field.getValue();</span>
+<span class="nc" id="L330">                        case IF_UNMODIFIED_SINCE -&gt; ifums = field.getValue();</span>
+                        default -&gt;
+                        {
+                        }
+                    }
+                }
+<span class="nc" id="L336">            }</span>
+
+<span class="nc bnc" id="L338" title="All 2 branches missed.">            if (_etags)</span>
+            {
+<span class="nc" id="L340">                String etag = content.getETagValue();</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">                if (etag != null)</span>
+                {
+                    // TODO: this is a hack to get the etag of the non-preCompressed version.
+<span class="nc" id="L344">                    etag = EtagUtils.rewriteWithSuffix(content.getETagValue(), &quot;&quot;);</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">                    if (ifm != null)</span>
+                    {
+<span class="nc" id="L347">                        String matched = matchesEtag(etag, ifm);</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">                        if (matched == null)</span>
+                        {
+<span class="nc" id="L350">                            writeHttpError(request, response, callback, HttpStatus.PRECONDITION_FAILED_412);</span>
+<span class="nc" id="L351">                            return true;</span>
+                        }
+                    }
+
+<span class="nc bnc" id="L355" title="All 2 branches missed.">                    if (ifnm != null)</span>
+                    {
+<span class="nc" id="L357">                        String matched = matchesEtag(etag, ifnm);</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                        if (matched != null)</span>
+                        {
+<span class="nc" id="L360">                            response.getHeaders().put(HttpHeader.ETAG, matched);</span>
+<span class="nc" id="L361">                            putNotModifiedHeaders(response, content);</span>
+<span class="nc" id="L362">                            writeHttpError(request, response, callback, HttpStatus.NOT_MODIFIED_304);</span>
+<span class="nc" id="L363">                            return true;</span>
+                        }
+
+                        // If etag requires content to be served, then do not check if-modified-since
+<span class="nc" id="L367">                        return false;</span>
+                    }
+                }
+            }
+
+            // Handle if modified since
+<span class="nc bnc" id="L373" title="All 4 branches missed.">            if (ifms != null &amp;&amp; ifnm == null)</span>
+            {
+                //Get jetty's Response impl
+<span class="nc" id="L376">                String mdlm = content.getLastModifiedValue();</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">                if (ifms.equals(mdlm))</span>
+                {
+<span class="nc" id="L379">                    putNotModifiedHeaders(response, content);</span>
+<span class="nc" id="L380">                    writeHttpError(request, response, callback, HttpStatus.NOT_MODIFIED_304);</span>
+<span class="nc" id="L381">                    return true;</span>
+                }
+
+<span class="nc" id="L384">                long ifmsl = HttpDateTime.parseToEpoch(ifms);</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">                if (ifmsl != -1)</span>
+                {
+<span class="nc" id="L387">                    long lm = content.getResource().lastModified().toEpochMilli();</span>
+<span class="nc bnc" id="L388" title="All 4 branches missed.">                    if (lm != -1 &amp;&amp; lm / 1000 &lt;= ifmsl / 1000)</span>
+                    {
+<span class="nc" id="L390">                        putNotModifiedHeaders(response, content);</span>
+<span class="nc" id="L391">                        writeHttpError(request, response, callback, HttpStatus.NOT_MODIFIED_304);</span>
+<span class="nc" id="L392">                        return true;</span>
+                    }
+                }
+            }
+
+            // Parse the if[un]modified dates and compare to resource
+<span class="nc bnc" id="L398" title="All 4 branches missed.">            if (ifums != null &amp;&amp; ifm == null)</span>
+            {
+<span class="nc" id="L400">                long ifumsl = HttpDateTime.parseToEpoch(ifums);</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">                if (ifumsl != -1)</span>
+                {
+<span class="nc" id="L403">                    long lm = content.getResource().lastModified().toEpochMilli();</span>
+<span class="nc bnc" id="L404" title="All 4 branches missed.">                    if (lm != -1 &amp;&amp; lm / 1000 &gt; ifumsl / 1000)</span>
+                    {
+<span class="nc" id="L406">                        writeHttpError(request, response, callback, HttpStatus.PRECONDITION_FAILED_412);</span>
+<span class="nc" id="L407">                        return true;</span>
+                    }
+                }
+            }
+        }
+<span class="nc" id="L412">        catch (IllegalArgumentException iae)</span>
+        {
+<span class="nc bnc" id="L414" title="All 2 branches missed.">            if (!response.isCommitted())</span>
+<span class="nc" id="L415">                writeHttpError(request, response, callback, HttpStatus.BAD_REQUEST_400, null, iae);</span>
+<span class="nc" id="L416">            throw iae;</span>
+<span class="nc" id="L417">        }</span>
+
+<span class="nc" id="L419">        return false;</span>
+    }
+
+    /**
+     * Find a matches between a Content ETag and a Request Field ETag reference.
+     * @param contentETag the content etag to match against (can be null)
+     * @param requestEtag the request etag (can be null, a single entry, or even a CSV list)
+     * @return the matched etag, or null if no matches.
+     */
+    private String matchesEtag(String contentETag, String requestEtag)
+    {
+<span class="nc bnc" id="L430" title="All 4 branches missed.">        if (contentETag == null || requestEtag == null)</span>
+        {
+<span class="nc" id="L432">            return null;</span>
+        }
+
+        // Per https://www.rfc-editor.org/rfc/rfc9110#section-8.8.3
+        // An Etag header field value can contain a &quot;,&quot; (comma) within itself.
+        //   If-Match: W/&quot;abc,xyz&quot;, &quot;123456&quot;
+        // This means we have to parse with QuotedCSV all the time, as we cannot just
+        // test for the existence of a &quot;,&quot; (comma) in the value to know if it's delimited or not
+<span class="nc" id="L440">        QuotedCSV quoted = new QuotedCSV(true, requestEtag);</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">        for (String tag : quoted)</span>
+        {
+<span class="nc bnc" id="L443" title="All 2 branches missed.">            if (EtagUtils.matches(contentETag, tag))</span>
+            {
+<span class="nc" id="L445">                return tag;</span>
+            }
+<span class="nc" id="L447">        }</span>
+
+        // no matches
+<span class="nc" id="L450">        return null;</span>
+    }
+
+    protected void sendWelcome(HttpContent content, String pathInContext, boolean endsWithSlash, Request request, Response response, Callback callback) throws Exception
+    {
+<span class="nc bnc" id="L455" title="All 2 branches missed.">        if (!Objects.requireNonNull(content).getResource().isDirectory())</span>
+<span class="nc" id="L456">            throw new IllegalArgumentException(&quot;content must be a directory&quot;);</span>
+
+<span class="nc bnc" id="L458" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L459">            LOG.debug(&quot;sendWelcome(content={}, pathInContext={}, endsWithSlash={}, req={}, resp={}, callback={})&quot;,</span>
+<span class="nc" id="L460">                content, pathInContext, endsWithSlash, request, response, callback);</span>
+
+        // Redirect to directory
+<span class="nc bnc" id="L463" title="All 2 branches missed.">        if (!endsWithSlash)</span>
+        {
+<span class="nc" id="L465">            HttpURI.Mutable uri = HttpURI.build(request.getHttpURI());</span>
+<span class="nc bnc" id="L466" title="All 2 branches missed.">            if (!uri.getCanonicalPath().endsWith(&quot;/&quot;))</span>
+            {
+<span class="nc" id="L468">                uri.path(uri.getCanonicalPath() + &quot;/&quot;);</span>
+<span class="nc" id="L469">                response.getHeaders().put(HttpFields.CONTENT_LENGTH_0);</span>
+<span class="nc" id="L470">                sendRedirect(request, response, callback, uri.getPathQuery());</span>
+<span class="nc" id="L471">                return;</span>
+            }
+        }
+
+        // process optional Welcome behaviors
+<span class="nc bnc" id="L476" title="All 2 branches missed.">        if (welcome(content, request, response, callback))</span>
+<span class="nc" id="L477">            return;</span>
+
+<span class="nc bnc" id="L479" title="All 2 branches missed.">        if (!passConditionalHeaders(request, response, content, callback))</span>
+<span class="nc" id="L480">            sendDirectory(request, response, content, callback, pathInContext);</span>
+<span class="nc" id="L481">    }</span>
+
+    /**
+     * &lt;p&gt;How welcome targets should be processed.&lt;/p&gt;
+     */
+<span class="nc" id="L486">    public enum WelcomeMode</span>
+    {
+        /**
+         * The welcome target is used as the location for a redirect response,
+         * sent by {@link #redirectWelcome(Request, Response, Callback, String)}.
+         */
+<span class="nc" id="L492">        REDIRECT,</span>
+        /**
+         * The welcome target is served by
+         * {@link #serveWelcome(Request, Response, Callback, String)}.
+         */
+<span class="nc" id="L497">        SERVE,</span>
+        /**
+         * The welcome target is re-handled by
+         * {@link #rehandleWelcome(Request, Response, Callback, String)}.
+         */
+<span class="nc" id="L502">        REHANDLE</span>
+    }
+
+    /**
+     * &lt;p&gt;A welcome target paired with how to process it.&lt;/p&gt;
+     *
+     * @param target the welcome target
+     * @param mode the welcome mode
+     */
+<span class="nc" id="L511">    public record WelcomeAction(String target, WelcomeMode mode)</span>
+    {
+    }
+
+    private boolean welcome(HttpContent content, Request request, Response response, Callback callback) throws Exception
+    {
+<span class="nc" id="L517">        WelcomeAction welcomeAction = processWelcome(content, request);</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L519">            LOG.debug(&quot;welcome(req={}, rsp={}, cbk={}) welcomeAction={}&quot;, request, response, callback, welcomeAction);</span>
+
+<span class="nc bnc" id="L521" title="All 2 branches missed.">        if (welcomeAction == null)</span>
+<span class="nc" id="L522">            return false;</span>
+
+<span class="nc" id="L524">        handleWelcomeAction(request, response, callback, welcomeAction);</span>
+<span class="nc" id="L525">        return true;</span>
+    }
+
+    protected void handleWelcomeAction(Request request, Response response, Callback callback, WelcomeAction welcomeAction) throws Exception
+    {
+<span class="nc bnc" id="L530" title="All 4 branches missed.">        switch (welcomeAction.mode)</span>
+        {
+<span class="nc" id="L532">            case REDIRECT -&gt; redirectWelcome(request, response, callback, welcomeAction.target);</span>
+            case SERVE -&gt;
+                // TODO : check conditional headers.
+<span class="nc" id="L535">                serveWelcome(request, response, callback, welcomeAction.target);</span>
+<span class="nc" id="L536">            case REHANDLE -&gt; rehandleWelcome(request, response, callback, welcomeAction.target);</span>
+        }
+<span class="nc" id="L538">    }</span>
+
+    /**
+     * &lt;p&gt;Redirects to the given welcome target.&lt;/p&gt;
+     * &lt;p&gt;Implementations should use HTTP redirect APIs to generate
+     * a redirect response whose location is the welcome target.&lt;/p&gt;
+     *
+     * @param request the request to redirect
+     * @param response the response
+     * @param callback the callback to complete
+     * @param welcomeTarget the welcome target to redirect to
+     * @throws Exception if the redirection fails
+     */
+    protected void redirectWelcome(Request request, Response response, Callback callback, String welcomeTarget) throws Exception
+    {
+<span class="nc" id="L553">        response.getHeaders().put(HttpFields.CONTENT_LENGTH_0);</span>
+<span class="nc" id="L554">        sendRedirect(request, response, callback, welcomeTarget);</span>
+<span class="nc" id="L555">    }</span>
+
+    /**
+     * &lt;p&gt;Serves the given welcome target.&lt;/p&gt;
+     * &lt;p&gt;Implementations should write the welcome
+     * target bytes over the network to the client.&lt;/p&gt;
+     *
+     * @param request the request
+     * @param response the response
+     * @param callback the callback to complete
+     * @param welcomeTarget the welcome target to serve
+     * @throws Exception if serving the welcome target fails
+     */
+    protected void serveWelcome(Request request, Response response, Callback callback, String welcomeTarget) throws Exception
+    {
+<span class="nc" id="L570">        HttpContent c = _contentFactory.getContent(welcomeTarget);</span>
+<span class="nc" id="L571">        sendData(request, response, callback, c, List.of());</span>
+<span class="nc" id="L572">    }</span>
+
+    /**
+     * &lt;p&gt;Rehandles the given welcome target.&lt;/p&gt;
+     * &lt;p&gt;Implementations should call {@link Handler#handle(Request, Response, Callback)}
+     * on a {@code Handler} that may handle the welcome target
+     * differently from the original request.&lt;/p&gt;
+     * &lt;p&gt;For example, a request for {@code /ctx/} may be rewritten
+     * as {@code /ctx/index.jsp} and rehandled from the {@code Server}.
+     * In this example, the rehandling of {@code /ctx/index.jsp} may
+     * trigger a different code path so that the rewritten request
+     * is handled by a different {@code Handler}, in this example
+     * one that knows how to handle JSP resources.&lt;/p&gt;
+     *
+     * @param request the request
+     * @param response the response
+     * @param callback the callback to complete
+     * @param welcomeTarget the welcome target to rehandle to
+     * @throws Exception if the rehandling fails
+     */
+    protected void rehandleWelcome(Request request, Response response, Callback callback, String welcomeTarget) throws Exception
+    {
+<span class="nc" id="L594">        Response.writeError(request, response, callback, HttpStatus.INTERNAL_SERVER_ERROR_500);</span>
+<span class="nc" id="L595">    }</span>
+
+    private WelcomeAction processWelcome(HttpContent content, Request request) throws IOException
+    {
+<span class="nc" id="L599">        String welcomeTarget = getWelcomeFactory().getWelcomeTarget(content, request);</span>
+<span class="nc bnc" id="L600" title="All 2 branches missed.">        if (welcomeTarget == null)</span>
+<span class="nc" id="L601">            return null;</span>
+
+<span class="nc" id="L603">        String contextPath = request.getContext().getContextPath();</span>
+<span class="nc" id="L604">        WelcomeMode welcomeMode = getWelcomeMode();</span>
+
+<span class="nc bnc" id="L606" title="All 2 branches missed.">        welcomeTarget = switch (welcomeMode)</span>
+        {
+<span class="nc" id="L608">            case REDIRECT, REHANDLE -&gt; HttpURI.build(request.getHttpURI())</span>
+<span class="nc" id="L609">                .path(URIUtil.addPaths(contextPath, welcomeTarget))</span>
+<span class="nc" id="L610">                .getPathQuery();</span>
+<span class="nc" id="L611">            case SERVE -&gt; welcomeTarget;</span>
+        };
+
+<span class="nc bnc" id="L614" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L615">            LOG.debug(&quot;welcome {} {}&quot;, welcomeMode, welcomeTarget);</span>
+
+<span class="nc" id="L617">        return new WelcomeAction(welcomeTarget, welcomeMode);</span>
+    }
+
+    private void sendDirectory(Request request, Response response, HttpContent httpContent, Callback callback, String pathInContext)
+    {
+<span class="nc bnc" id="L622" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+        {
+<span class="nc" id="L624">            LOG.debug(&quot;sendDirectory(req={}, resp={}, content={}, callback={}, pathInContext={})&quot;,</span>
+                request, response, httpContent, callback, pathInContext);
+        }
+<span class="nc bnc" id="L627" title="All 2 branches missed.">        if (!_dirAllowed)</span>
+        {
+<span class="nc" id="L629">            writeHttpError(request, response, callback, HttpStatus.FORBIDDEN_403);</span>
+<span class="nc" id="L630">            return;</span>
+        }
+
+<span class="nc" id="L633">        String base = URIUtil.addEncodedPaths(request.getHttpURI().getPath(), &quot;/&quot;);</span>
+<span class="nc bnc" id="L634" title="All 2 branches missed.">        String listing = ResourceListing.getAsXHTML(httpContent.getResource(), base, pathInContext.length() &gt; 1, request.getHttpURI().getQuery());</span>
+<span class="nc bnc" id="L635" title="All 2 branches missed.">        if (listing == null)</span>
+        {
+<span class="nc" id="L637">            writeHttpError(request, response, callback, HttpStatus.FORBIDDEN_403);</span>
+<span class="nc" id="L638">            return;</span>
+        }
+
+<span class="nc" id="L641">        String characterEncoding = httpContent.getCharacterEncoding();</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        Charset charset = characterEncoding == null ? StandardCharsets.UTF_8 : Charset.forName(characterEncoding);</span>
+<span class="nc" id="L643">        byte[] data = listing.getBytes(charset);</span>
+<span class="nc" id="L644">        response.getHeaders().put(HttpHeader.CONTENT_TYPE, &quot;text/html;charset=&quot; + charset.name());</span>
+<span class="nc" id="L645">        response.getHeaders().put(HttpHeader.CONTENT_LENGTH, data.length);</span>
+<span class="nc" id="L646">        response.write(true, ByteBuffer.wrap(data), callback);</span>
+<span class="nc" id="L647">    }</span>
+
+    private void sendData(Request request, Response response, Callback callback, HttpContent content, List&lt;String&gt; reqRanges) throws IOException
+    {
+<span class="nc bnc" id="L651" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+        {
+<span class="nc" id="L653">            LOG.debug(&quot;sendData(req={}, resp={}, callback={}) content={}, reqRanges={})&quot;,</span>
+                request, response, callback, content, reqRanges);
+        }
+
+<span class="nc" id="L657">        long contentLength = content.getContentLengthValue();</span>
+<span class="nc" id="L658">        callback = Callback.from(callback, content::release);</span>
+
+<span class="nc bnc" id="L660" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L661">            LOG.debug(String.format(&quot;sendData content=%s&quot;, content));</span>
+
+<span class="nc bnc" id="L663" title="All 2 branches missed.">        if (reqRanges.isEmpty())</span>
+        {
+            // If there are no ranges, send the entire content.
+<span class="nc bnc" id="L666" title="All 2 branches missed.">            if (contentLength &gt;= 0)</span>
+<span class="nc" id="L667">                putHeaders(response, content, USE_KNOWN_CONTENT_LENGTH);</span>
+            else
+<span class="nc" id="L669">                putHeaders(response, content, NO_CONTENT_LENGTH);</span>
+<span class="nc" id="L670">            writeHttpContent(request, response, callback, content);</span>
+<span class="nc" id="L671">            return;</span>
+        }
+
+        // Parse the satisfiable ranges.
+<span class="nc" id="L675">        List&lt;ByteRange&gt; ranges = ByteRange.parse(reqRanges, contentLength);</span>
+
+        // If there are no satisfiable ranges, send a 416 response.
+<span class="nc bnc" id="L678" title="All 2 branches missed.">        if (ranges.isEmpty())</span>
+        {
+<span class="nc" id="L680">            response.getHeaders().put(HttpHeader.CONTENT_RANGE, ByteRange.toNonSatisfiableHeaderValue(contentLength));</span>
+<span class="nc" id="L681">            Response.writeError(request, response, callback, HttpStatus.RANGE_NOT_SATISFIABLE_416);</span>
+<span class="nc" id="L682">            return;</span>
+        }
+
+        // If there is only a single valid range, send that range with a 206 response.
+<span class="nc bnc" id="L686" title="All 2 branches missed.">        if (ranges.size() == 1)</span>
+        {
+<span class="nc" id="L688">            ByteRange range = ranges.get(0);</span>
+<span class="nc" id="L689">            putHeaders(response, content, range.getLength());</span>
+<span class="nc" id="L690">            response.setStatus(HttpStatus.PARTIAL_CONTENT_206);</span>
+<span class="nc" id="L691">            response.getHeaders().put(HttpHeader.CONTENT_RANGE, range.toHeaderValue(contentLength));</span>
+
+            // TODO use a buffer pool
+<span class="nc" id="L694">            IOResources.copy(content.getResource(), response, null, 0, false, range.first(), range.getLength(), callback);</span>
+<span class="nc" id="L695">            return;</span>
+        }
+
+        // There are multiple non-overlapping ranges, send a multipart/byteranges 206 response.
+<span class="nc" id="L699">        response.setStatus(HttpStatus.PARTIAL_CONTENT_206);</span>
+<span class="nc" id="L700">        String contentType = &quot;multipart/byteranges; boundary=&quot;;</span>
+<span class="nc" id="L701">        String boundary = MultiPart.generateBoundary(null, 24);</span>
+<span class="nc" id="L702">        MultiPartByteRanges.ContentSource byteRanges = new MultiPartByteRanges.ContentSource(boundary);</span>
+<span class="nc" id="L703">        ranges.forEach(range -&gt; byteRanges.addPart(new MultiPartByteRanges.Part(content.getContentTypeValue(), content.getResource(), range, contentLength, request.getComponents().getByteBufferPool()))); // TODO use a sized pool</span>
+<span class="nc" id="L704">        byteRanges.close();</span>
+<span class="nc" id="L705">        long partsContentLength = byteRanges.getLength();</span>
+<span class="nc" id="L706">        putHeaders(response, content, partsContentLength);</span>
+<span class="nc" id="L707">        response.getHeaders().put(HttpHeader.CONTENT_TYPE, contentType + boundary);</span>
+<span class="nc" id="L708">        Content.copy(byteRanges, response, callback);</span>
+<span class="nc" id="L709">    }</span>
+
+    protected void writeHttpContent(Request request, Response response, Callback callback, HttpContent content)
+    {
+        try
+        {
+<span class="nc" id="L715">            ByteBuffer buffer = content.getByteBuffer(); // this buffer is going to be consumed by response.write()</span>
+<span class="nc bnc" id="L716" title="All 2 branches missed.">            if (buffer != null)</span>
+            {
+<span class="nc" id="L718">                response.write(true, buffer, callback);</span>
+            }
+            else
+            {
+<span class="nc" id="L722">                IOResources.copy(</span>
+<span class="nc" id="L723">                    content.getResource(),</span>
+<span class="nc" id="L724">                    response, request.getComponents().getByteBufferPool(),</span>
+<span class="nc" id="L725">                    request.getConnectionMetaData().getHttpConfiguration().getOutputBufferSize(),</span>
+<span class="nc" id="L726">                    request.getConnectionMetaData().getHttpConfiguration().isUseOutputDirectByteBuffers(),</span>
+                    callback);
+            }
+        }
+<span class="nc" id="L730">        catch (Throwable x)</span>
+        {
+<span class="nc" id="L732">            content.release();</span>
+<span class="nc" id="L733">            callback.failed(x);</span>
+<span class="nc" id="L734">        }</span>
+<span class="nc" id="L735">    }</span>
+
+    protected void putHeaders(Response response, HttpContent content, long contentLength)
+    {
+<span class="nc" id="L739">        HttpFields.Mutable headers = response.getHeaders();</span>
+
+        // Existing etags have priority over content etags (often set by compression handler)
+<span class="nc bnc" id="L742" title="All 4 branches missed.">        if (_etags &amp;&amp; !headers.contains(HttpHeader.ETAG))</span>
+        {
+<span class="nc" id="L744">            HttpField et = content.getETag();</span>
+<span class="nc bnc" id="L745" title="All 2 branches missed.">            if (et != null)</span>
+<span class="nc" id="L746">                headers.add(et);</span>
+        }
+
+        // Existing content encoding is kept only if not set for content.
+<span class="nc" id="L750">        HttpField ce = content.getContentEncoding();</span>
+<span class="nc bnc" id="L751" title="All 2 branches missed.">        if (ce != null)</span>
+<span class="nc" id="L752">            headers.put(ce);</span>
+
+        // Remove content headers and re-add if we have them
+<span class="nc" id="L755">        headers.remove(CONTENT_HEADERS);</span>
+<span class="nc" id="L756">        HttpField lm = content.getLastModified();</span>
+<span class="nc bnc" id="L757" title="All 2 branches missed.">        if (lm != null)</span>
+<span class="nc" id="L758">            headers.add(lm);</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">        if (contentLength == USE_KNOWN_CONTENT_LENGTH)</span>
+<span class="nc" id="L760">            headers.add(content.getContentLength());</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">        else if (contentLength &gt; NO_CONTENT_LENGTH)</span>
+<span class="nc" id="L762">            headers.add(HttpHeader.CONTENT_LENGTH, contentLength);</span>
+<span class="nc" id="L763">        HttpField ct = content.getContentType();</span>
+<span class="nc bnc" id="L764" title="All 2 branches missed.">        if (ct != null)</span>
+<span class="nc" id="L765">            headers.add(ct);</span>
+
+<span class="nc" id="L767">        putHeaders(response);</span>
+<span class="nc" id="L768">    }</span>
+
+    protected void putNotModifiedHeaders(Response response, HttpContent content)
+    {
+<span class="nc" id="L772">        HttpFields.Mutable headers = response.getHeaders();</span>
+        // send only lastModified, as it is too difficult to determine the etag with compression
+<span class="nc" id="L774">        HttpField lm = content.getLastModified();</span>
+<span class="nc bnc" id="L775" title="All 2 branches missed.">        if (lm != null)</span>
+<span class="nc" id="L776">            headers.put(lm);</span>
+
+<span class="nc" id="L778">        putHeaders(response);</span>
+<span class="nc" id="L779">    }</span>
+
+    protected void putHeaders(Response response)
+    {
+<span class="nc" id="L783">        HttpFields.Mutable headers = response.getHeaders();</span>
+<span class="nc bnc" id="L784" title="All 4 branches missed.">        if (_acceptRanges &amp;&amp; !headers.contains(HttpHeader.ACCEPT_RANGES))</span>
+<span class="nc" id="L785">            headers.add(ACCEPT_RANGES_BYTES);</span>
+<span class="nc bnc" id="L786" title="All 4 branches missed.">        if (_cacheControl != null &amp;&amp; !headers.contains(HttpHeader.CACHE_CONTROL))</span>
+<span class="nc" id="L787">            headers.add(_cacheControl);</span>
+<span class="nc" id="L788">    }</span>
+
+    /**
+     * @return If true, range requests and responses are supported
+     */
+    public boolean isAcceptRanges()
+    {
+<span class="nc" id="L795">        return _acceptRanges;</span>
+    }
+
+    /**
+     * @return If true, directory listings are returned if no welcome target is found. Else 403 Forbidden.
+     */
+    public boolean isDirAllowed()
+    {
+<span class="nc" id="L803">        return _dirAllowed;</span>
+    }
+
+    /**
+     * @return True if ETag processing is done
+     */
+    public boolean isEtags()
+    {
+<span class="nc" id="L811">        return _etags;</span>
+    }
+
+    /**
+     * @return Precompressed resources formats that can be used to serve compressed variant of resources.
+     */
+    public List&lt;CompressedContentFormat&gt; getPrecompressedFormats()
+    {
+<span class="nc" id="L819">        return _precompressedFormats;</span>
+    }
+
+    public WelcomeMode getWelcomeMode()
+    {
+<span class="nc" id="L824">        return _welcomeMode;</span>
+    }
+
+    public WelcomeFactory getWelcomeFactory()
+    {
+<span class="nc" id="L829">        return _welcomeFactory;</span>
+    }
+
+    /**
+     * @param acceptRanges If true, range requests and responses are supported
+     */
+    public void setAcceptRanges(boolean acceptRanges)
+    {
+<span class="nc" id="L837">        _acceptRanges = acceptRanges;</span>
+<span class="nc" id="L838">    }</span>
+
+    /**
+     * Set the cacheControl header to set on all static content..
+     * @param cacheControl the cacheControl header to set on all static content.
+     */
+    public void setCacheControl(String cacheControl)
+    {
+<span class="nc" id="L846">        _cacheControl = new PreEncodedHttpField(HttpHeader.CACHE_CONTROL, cacheControl);</span>
+<span class="nc" id="L847">    }</span>
+
+    /**
+     * @param dirAllowed If true, directory listings are returned if no welcome target is found. Else 403 Forbidden.
+     */
+    public void setDirAllowed(boolean dirAllowed)
+    {
+<span class="nc" id="L854">        _dirAllowed = dirAllowed;</span>
+<span class="nc" id="L855">    }</span>
+
+    /**
+     * @param etags True if ETag processing is done
+     */
+    public void setEtags(boolean etags)
+    {
+<span class="nc" id="L862">        _etags = etags;</span>
+<span class="nc" id="L863">    }</span>
+
+    /**
+     * Set file extensions that signify that a file is gzip compressed. Eg &quot;.svgz&quot;.
+     * @param gzipEquivalentFileExtensions file extensions that signify that a file is gzip compressed. Eg &quot;.svgz&quot;
+     */
+    public void setGzipEquivalentFileExtensions(List&lt;String&gt; gzipEquivalentFileExtensions)
+    {
+<span class="nc" id="L871">        _gzipEquivalentFileExtensions = gzipEquivalentFileExtensions;</span>
+<span class="nc" id="L872">    }</span>
+
+    /**
+     * @param precompressedFormats The list of precompresed formats to serve in encoded format if matching resource found.
+     * For example serve gzip encoded file if &quot;.gz&quot; suffixed resource is found.
+     */
+    public void setPrecompressedFormats(List&lt;CompressedContentFormat&gt; precompressedFormats)
+    {
+<span class="nc" id="L880">        _precompressedFormats.clear();</span>
+<span class="nc" id="L881">        _precompressedFormats.addAll(precompressedFormats);</span>
+        // TODO: this preferred encoding order should be a separate configurable
+<span class="nc" id="L883">        _preferredEncodingOrder.clear();</span>
+<span class="nc" id="L884">        _preferredEncodingOrder.addAll(_precompressedFormats.stream().map(CompressedContentFormat::getEncoding).toList());</span>
+<span class="nc" id="L885">    }</span>
+
+    public void setEncodingCacheSize(int encodingCacheSize)
+    {
+<span class="nc" id="L889">        _encodingCacheSize = encodingCacheSize;</span>
+<span class="nc bnc" id="L890" title="All 2 branches missed.">        if (encodingCacheSize &gt; _preferredEncodingOrderCache.size())</span>
+<span class="nc" id="L891">            _preferredEncodingOrderCache.clear();</span>
+<span class="nc" id="L892">    }</span>
+
+    public int getEncodingCacheSize()
+    {
+<span class="nc" id="L896">        return _encodingCacheSize;</span>
+    }
+
+    public void setWelcomeMode(WelcomeMode welcomeMode)
+    {
+<span class="nc" id="L901">        _welcomeMode = Objects.requireNonNull(welcomeMode);</span>
+<span class="nc" id="L902">    }</span>
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L907">        return String.format(&quot;%s@%x(contentFactory=%s, dirAllowed=%b, welcomeMode=%s)&quot;, this.getClass().getName(), this.hashCode(), this._contentFactory, this._dirAllowed, this._welcomeMode);</span>
+    }
+
+    public void setWelcomeFactory(WelcomeFactory welcomeFactory)
+    {
+<span class="nc" id="L912">        _welcomeFactory = welcomeFactory;</span>
+<span class="nc" id="L913">    }</span>
+
+    public interface WelcomeFactory
+    {
+        /**
+         * Finds a matching welcome target for the request.
+         *
+         * @param request the request to use to determine the matching welcome target
+         * @return The URI path of the matching welcome target in context or null
+         * if no welcome target was found
+         */
+        String getWelcomeTarget(HttpContent content, Request request) throws IOException;
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

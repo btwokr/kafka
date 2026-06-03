@@ -1,0 +1,270 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AcceptRateLimit.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server</a> &gt; <span class="el_source">AcceptRateLimit.java</span></div><h1>AcceptRateLimit.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server;
+
+import java.nio.channels.SelectableChannel;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import org.eclipse.jetty.io.SelectorManager;
+import org.eclipse.jetty.util.annotation.ManagedAttribute;
+import org.eclipse.jetty.util.annotation.ManagedObject;
+import org.eclipse.jetty.util.annotation.ManagedOperation;
+import org.eclipse.jetty.util.annotation.Name;
+import org.eclipse.jetty.util.component.AbstractLifeCycle;
+import org.eclipse.jetty.util.component.Container;
+import org.eclipse.jetty.util.statistic.RateStatistic;
+import org.eclipse.jetty.util.thread.AutoLock;
+import org.eclipse.jetty.util.thread.Scheduler;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * &lt;p&gt;A Listener that limits the rate at which new connections are accepted&lt;/p&gt;
+ * &lt;p&gt;
+ * If the limits are exceeded, accepting is suspended until the rate is again below
+ * the limit, so incoming connections are held in the operating system accept
+ * queue (no syn ack sent), where they may either timeout or wait for the server
+ * to resume accepting.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * It can be applied to an entire server or to a specific connector by adding it
+ * via {@link Container#addBean(Object)}
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * &lt;b&gt;Usage:&lt;/b&gt;
+ * &lt;/p&gt;
+ * &lt;pre&gt;
+ *   Server server = new Server();
+ *   server.addBean(new AcceptLimit(100,5,TimeUnit.SECONDS,server));
+ *   ...
+ *   server.start();
+ * &lt;/pre&gt;
+ *
+ * @see SelectorManager.AcceptListener
+ */
+@ManagedObject
+public class AcceptRateLimit extends AbstractLifeCycle implements SelectorManager.AcceptListener, Runnable
+{
+<span class="nc" id="L61">    private static final Logger LOG = LoggerFactory.getLogger(AcceptRateLimit.class);</span>
+
+<span class="nc" id="L63">    private final AutoLock _lock = new AutoLock();</span>
+    private final Server _server;
+<span class="nc" id="L65">    private final List&lt;AbstractConnector&gt; _connectors = new ArrayList&lt;&gt;();</span>
+    private final Rate _rate;
+    private final int _acceptRateLimit;
+    private boolean _limiting;
+    private Scheduler.Task _task;
+
+    public AcceptRateLimit(@Name(&quot;acceptRateLimit&quot;) int acceptRateLimit, @Name(&quot;period&quot;) long period, @Name(&quot;units&quot;) TimeUnit units, @Name(&quot;server&quot;) Server server)
+<span class="nc" id="L72">    {</span>
+<span class="nc" id="L73">        _server = server;</span>
+<span class="nc" id="L74">        _acceptRateLimit = acceptRateLimit;</span>
+<span class="nc" id="L75">        _rate = new Rate(period, units);</span>
+<span class="nc" id="L76">    }</span>
+
+    public AcceptRateLimit(@Name(&quot;limit&quot;) int limit, @Name(&quot;period&quot;) long period, @Name(&quot;units&quot;) TimeUnit units, @Name(&quot;connectors&quot;) Connector... connectors)
+    {
+<span class="nc" id="L80">        this(limit, period, units, (Server)null);</span>
+<span class="nc bnc" id="L81" title="All 2 branches missed.">        for (Connector c : connectors)</span>
+        {
+<span class="nc bnc" id="L83" title="All 2 branches missed.">            if (c instanceof AbstractConnector)</span>
+<span class="nc" id="L84">                _connectors.add((AbstractConnector)c);</span>
+            else
+<span class="nc" id="L86">                LOG.warn(&quot;Connector {} is not an AbstractConnector. Connections not limited&quot;, c);</span>
+        }
+<span class="nc" id="L88">    }</span>
+
+    @ManagedAttribute(&quot;The accept rate limit&quot;)
+    public int getAcceptRateLimit()
+    {
+<span class="nc" id="L93">        return _acceptRateLimit;</span>
+    }
+
+    @ManagedAttribute(&quot;The accept rate period&quot;)
+    public long getPeriod()
+    {
+<span class="nc" id="L99">        return _rate.getPeriod();</span>
+    }
+
+    @ManagedAttribute(&quot;The accept rate period units&quot;)
+    public TimeUnit getUnits()
+    {
+<span class="nc" id="L105">        return _rate.getUnits();</span>
+    }
+
+    @ManagedAttribute(&quot;The current accept rate&quot;)
+    public int getRate()
+    {
+<span class="nc" id="L111">        return _rate.getRate();</span>
+    }
+
+    @ManagedAttribute(&quot;The maximum accept rate achieved&quot;)
+    public long getMaxRate()
+    {
+<span class="nc" id="L117">        return _rate.getMax();</span>
+    }
+
+    @ManagedOperation(value = &quot;Resets the accept rate&quot;, impact = &quot;ACTION&quot;)
+    public void reset()
+    {
+<span class="nc" id="L123">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="nc" id="L125">            _rate.reset();</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">            if (_limiting)</span>
+            {
+<span class="nc" id="L128">                _limiting = false;</span>
+<span class="nc" id="L129">                unlimit();</span>
+            }
+        }
+<span class="nc" id="L132">    }</span>
+
+    protected void age(long period, TimeUnit units)
+    {
+<span class="nc" id="L136">        _rate.age(period, units);</span>
+<span class="nc" id="L137">    }</span>
+
+    @Override
+    protected void doStart() throws Exception
+    {
+<span class="nc" id="L142">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="nc bnc" id="L144" title="All 2 branches missed.">            if (_server != null)</span>
+            {
+<span class="nc bnc" id="L146" title="All 2 branches missed.">                for (Connector c : _server.getConnectors())</span>
+                {
+<span class="nc bnc" id="L148" title="All 2 branches missed.">                    if (c instanceof AbstractConnector)</span>
+<span class="nc" id="L149">                        _connectors.add((AbstractConnector)c);</span>
+                    else
+<span class="nc" id="L151">                        LOG.warn(&quot;Connector {} is not an AbstractConnector. Connections not limited&quot;, c);</span>
+                }
+            }
+
+<span class="nc bnc" id="L155" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L156">                LOG.debug(&quot;AcceptLimit accept&lt;{} rate&lt;{} in {}&quot;, _acceptRateLimit, _rate, _connectors);</span>
+
+<span class="nc bnc" id="L158" title="All 2 branches missed.">            for (AbstractConnector c : _connectors)</span>
+            {
+<span class="nc" id="L160">                c.addBean(this);</span>
+<span class="nc" id="L161">            }</span>
+        }
+<span class="nc" id="L163">    }</span>
+
+    @Override
+    protected void doStop() throws Exception
+    {
+<span class="nc" id="L168">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="nc bnc" id="L170" title="All 2 branches missed.">            if (_task != null)</span>
+<span class="nc" id="L171">                _task.cancel();</span>
+<span class="nc" id="L172">            _task = null;</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">            for (AbstractConnector c : _connectors)</span>
+            {
+<span class="nc" id="L175">                c.removeBean(this);</span>
+<span class="nc" id="L176">            }</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">            if (_server != null)</span>
+<span class="nc" id="L178">                _connectors.clear();</span>
+<span class="nc" id="L179">            _limiting = false;</span>
+        }
+<span class="nc" id="L181">    }</span>
+
+    protected void limit()
+    {
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        for (AbstractConnector c : _connectors)</span>
+        {
+<span class="nc" id="L187">            c.setAccepting(false);</span>
+<span class="nc" id="L188">        }</span>
+<span class="nc" id="L189">        schedule();</span>
+<span class="nc" id="L190">    }</span>
+
+    protected void unlimit()
+    {
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        for (AbstractConnector c : _connectors)</span>
+        {
+<span class="nc" id="L196">            c.setAccepting(true);</span>
+<span class="nc" id="L197">        }</span>
+<span class="nc" id="L198">    }</span>
+
+    @Override
+    public void onAccepting(SelectableChannel channel)
+    {
+<span class="nc" id="L203">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="nc" id="L205">            int rate = _rate.record();</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L207">                LOG.debug(&quot;onAccepting rate {}/{} for {} {}&quot;, rate, _acceptRateLimit, _rate, channel);</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">            if (rate &gt; _acceptRateLimit)</span>
+            {
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                if (!_limiting)</span>
+                {
+<span class="nc" id="L212">                    _limiting = true;</span>
+
+<span class="nc" id="L214">                    LOG.warn(&quot;AcceptLimit rate exceeded {}&gt;{} on {}&quot;, rate, _acceptRateLimit, _connectors);</span>
+<span class="nc" id="L215">                    limit();</span>
+                }
+            }
+        }
+<span class="nc" id="L219">    }</span>
+
+    private void schedule()
+    {
+<span class="nc" id="L223">        long oldest = _rate.getOldest(TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L224">        long period = TimeUnit.MILLISECONDS.convert(_rate.getPeriod(), _rate.getUnits());</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        long delay = period - (oldest &gt; 0 ? oldest : 0);</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">        if (delay &lt; 0)</span>
+<span class="nc" id="L227">            delay = 0;</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L229">            LOG.debug(&quot;schedule {} {}&quot;, delay, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L230">        _task = _connectors.get(0).getScheduler().schedule(this, delay, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L231">    }</span>
+
+    @Override
+    public void run()
+    {
+<span class="nc" id="L236">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="nc" id="L238">            _task = null;</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">            if (!isRunning())</span>
+<span class="nc" id="L240">                return;</span>
+<span class="nc" id="L241">            int rate = _rate.getRate();</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">            if (rate &gt; _acceptRateLimit)</span>
+            {
+<span class="nc" id="L244">                schedule();</span>
+<span class="nc" id="L245">                return;</span>
+            }
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            if (_limiting)</span>
+            {
+<span class="nc" id="L249">                _limiting = false;</span>
+<span class="nc" id="L250">                LOG.warn(&quot;AcceptLimit rate OK {}&lt;={} on {}&quot;, rate, _acceptRateLimit, _connectors);</span>
+<span class="nc" id="L251">                unlimit();</span>
+            }
+<span class="nc bnc" id="L253" title="All 4 branches missed.">        }</span>
+<span class="nc" id="L254">    }</span>
+
+    private static final class Rate extends RateStatistic
+    {
+        private Rate(long period, TimeUnit units)
+        {
+<span class="nc" id="L260">            super(period, units);</span>
+<span class="nc" id="L261">        }</span>
+
+        @Override
+        protected void age(long period, TimeUnit units)
+        {
+<span class="nc" id="L266">            super.age(period, units);</span>
+<span class="nc" id="L267">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

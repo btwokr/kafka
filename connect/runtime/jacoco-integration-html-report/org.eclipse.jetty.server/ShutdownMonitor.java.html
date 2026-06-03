@@ -1,0 +1,482 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ShutdownMonitor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server</a> &gt; <span class="el_source">ShutdownMonitor.java</span></div><h1>ShutdownMonitor.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server;
+
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.LineNumberReader;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+
+import org.eclipse.jetty.util.IO;
+import org.eclipse.jetty.util.component.Destroyable;
+import org.eclipse.jetty.util.component.LifeCycle;
+import org.eclipse.jetty.util.thread.AutoLock;
+import org.eclipse.jetty.util.thread.ShutdownThread;
+
+/**
+ * Shutdown/Stop Monitor thread.
+ * &lt;p&gt;
+ * This thread listens on the host/port specified by the STOP.HOST/STOP.PORT
+ * system parameter (defaults to 127.0.0.1/-1 for not listening) for request
+ * authenticated with the key given by the STOP.KEY system parameter
+ * for admin requests.
+ * &lt;p&gt;
+ * If the stop port is set to zero, then a random port is assigned and the
+ * port number is printed to stdout.
+ * &lt;p&gt;
+ * Commands &quot;stop&quot; and &quot;status&quot; are currently supported.
+ */
+public class ShutdownMonitor
+{
+    // Implementation of safe lazy init, using Initialization on Demand Holder technique.
+    private static class Holder
+    {
+<span class="fc" id="L57">        static ShutdownMonitor instance = new ShutdownMonitor();</span>
+    }
+
+    public static ShutdownMonitor getInstance()
+    {
+<span class="fc" id="L62">        return Holder.instance;</span>
+    }
+
+    protected static void reset()
+    {
+<span class="nc" id="L67">        Holder.instance = new ShutdownMonitor();</span>
+<span class="nc" id="L68">    }</span>
+
+    public static void register(LifeCycle... lifeCycles)
+    {
+<span class="fc" id="L72">        getInstance().addLifeCycles(lifeCycles);</span>
+<span class="fc" id="L73">    }</span>
+
+    public static void deregister(LifeCycle lifeCycle)
+    {
+<span class="fc" id="L77">        getInstance().removeLifeCycle(lifeCycle);</span>
+<span class="fc" id="L78">    }</span>
+
+    public static boolean isRegistered(LifeCycle lifeCycle)
+    {
+<span class="nc" id="L82">        return getInstance().containsLifeCycle(lifeCycle);</span>
+    }
+
+<span class="fc" id="L85">    private final AutoLock.WithCondition _lock = new AutoLock.WithCondition();</span>
+<span class="fc" id="L86">    private final Set&lt;LifeCycle&gt; _lifeCycles = new LinkedHashSet&lt;&gt;();</span>
+    private boolean debug;
+    private final String host;
+    private int port;
+    private String key;
+<span class="fc" id="L91">    private boolean exitVm = true;</span>
+    private boolean alive;
+
+    /**
+     * Creates a ShutdownMonitor using configuration from the System properties.
+     * &lt;p&gt;
+     * &lt;code&gt;STOP.PORT&lt;/code&gt; = the port to listen on (empty, null, or values less than 0 disable the stop ability)&lt;br&gt;
+     * &lt;code&gt;STOP.KEY&lt;/code&gt; = the magic key/passphrase to allow the stop&lt;br&gt;
+     * &lt;p&gt;
+     * Note: server socket will only listen on localhost, and a successful stop will issue a System.exit() call.
+     */
+    private ShutdownMonitor()
+<span class="fc" id="L103">    {</span>
+<span class="pc bpc" id="L104" title="1 of 2 branches missed.">        this.debug = System.getProperty(&quot;DEBUG&quot;) != null;</span>
+<span class="fc" id="L105">        this.host = System.getProperty(&quot;STOP.HOST&quot;, &quot;127.0.0.1&quot;);</span>
+<span class="fc" id="L106">        this.port = Integer.getInteger(&quot;STOP.PORT&quot;, -1);</span>
+<span class="fc" id="L107">        this.key = System.getProperty(&quot;STOP.KEY&quot;, null);</span>
+        //only change the default exitVm setting if STOP.EXIT is explicitly set
+<span class="fc" id="L109">        this.exitVm = Boolean.valueOf(System.getProperty(&quot;STOP.EXIT&quot;, &quot;true&quot;));</span>
+<span class="fc" id="L110">    }</span>
+
+    private void addLifeCycles(LifeCycle... lifeCycles)
+    {
+<span class="fc" id="L114">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="fc" id="L116">            _lifeCycles.addAll(Arrays.asList(lifeCycles));</span>
+        }
+<span class="fc" id="L118">    }</span>
+
+    private void removeLifeCycle(LifeCycle lifeCycle)
+    {
+<span class="fc" id="L122">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="fc" id="L124">            _lifeCycles.remove(lifeCycle);</span>
+        }
+<span class="fc" id="L126">    }</span>
+
+    private boolean containsLifeCycle(LifeCycle lifeCycle)
+    {
+<span class="nc" id="L130">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="nc" id="L132">            return _lifeCycles.contains(lifeCycle);</span>
+        }
+    }
+
+    private void debug(String format, Object... args)
+    {
+<span class="pc bpc" id="L138" title="1 of 2 branches missed.">        if (debug)</span>
+<span class="nc" id="L139">            System.err.printf(&quot;[ShutdownMonitor] &quot; + format + &quot;%n&quot;, args);</span>
+<span class="fc" id="L140">    }</span>
+
+    private void debug(Throwable t)
+    {
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        if (debug)</span>
+<span class="nc" id="L145">            t.printStackTrace(System.err);</span>
+<span class="nc" id="L146">    }</span>
+
+    public String getKey()
+    {
+<span class="nc" id="L150">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="nc" id="L152">            return key;</span>
+        }
+    }
+
+    public int getPort()
+    {
+<span class="fc" id="L158">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="fc" id="L160">            return port;</span>
+        }
+    }
+
+    public boolean isExitVm()
+    {
+<span class="nc" id="L166">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="nc" id="L168">            return exitVm;</span>
+        }
+    }
+
+    public void setDebug(boolean flag)
+    {
+<span class="nc" id="L174">        this.debug = flag;</span>
+<span class="nc" id="L175">    }</span>
+
+    /**
+     * Set true to exit the VM on shutdown.
+     * @param exitVm true to exit the VM on shutdown
+     */
+    public void setExitVm(boolean exitVm)
+    {
+<span class="nc" id="L183">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="nc bnc" id="L185" title="All 2 branches missed.">            if (alive)</span>
+<span class="nc" id="L186">                throw new IllegalStateException(&quot;ShutdownMonitor already started&quot;);</span>
+<span class="nc" id="L187">            this.exitVm = exitVm;</span>
+        }
+<span class="nc" id="L189">    }</span>
+
+    public void setKey(String key)
+    {
+<span class="nc" id="L193">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="nc bnc" id="L195" title="All 2 branches missed.">            if (alive)</span>
+<span class="nc" id="L196">                throw new IllegalStateException(&quot;ShutdownMonitor already started&quot;);</span>
+<span class="nc" id="L197">            this.key = key;</span>
+        }
+<span class="nc" id="L199">    }</span>
+
+    public void setPort(int port)
+    {
+<span class="nc" id="L203">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="nc bnc" id="L205" title="All 2 branches missed.">            if (alive)</span>
+<span class="nc" id="L206">                throw new IllegalStateException(&quot;ShutdownMonitor already started&quot;);</span>
+<span class="nc" id="L207">            this.port = port;</span>
+        }
+<span class="nc" id="L209">    }</span>
+
+    public void start() throws Exception
+    {
+<span class="fc" id="L213">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="pc bpc" id="L215" title="1 of 2 branches missed.">            if (alive)</span>
+            {
+<span class="nc" id="L217">                debug(&quot;Already started&quot;);</span>
+<span class="nc" id="L218">                return; // cannot start it again</span>
+            }
+<span class="fc" id="L220">            ServerSocket serverSocket = listen();</span>
+<span class="pc bpc" id="L221" title="1 of 2 branches missed.">            if (serverSocket != null)</span>
+            {
+<span class="nc" id="L223">                alive = true;</span>
+<span class="nc" id="L224">                Thread thread = new Thread(new ShutdownMonitorRunnable(serverSocket));</span>
+<span class="nc" id="L225">                thread.setDaemon(true);</span>
+<span class="nc" id="L226">                thread.setName(&quot;ShutdownMonitor&quot;);</span>
+<span class="nc" id="L227">                thread.start();</span>
+            }
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        }</span>
+<span class="fc" id="L230">    }</span>
+
+    private void stop()
+    {
+<span class="nc" id="L234">        try (AutoLock.WithCondition l = _lock.lock())</span>
+        {
+<span class="nc" id="L236">            alive = false;</span>
+<span class="nc" id="L237">            l.signalAll();</span>
+        }
+<span class="nc" id="L239">    }</span>
+
+    // For test purposes only.
+    public void await() throws InterruptedException
+    {
+<span class="nc" id="L244">        try (AutoLock.WithCondition l = _lock.lock())</span>
+        {
+<span class="nc bnc" id="L246" title="All 2 branches missed.">            while (alive)</span>
+            {
+<span class="nc" id="L248">                l.await();</span>
+            }
+        }
+<span class="nc" id="L251">    }</span>
+
+    // For test purposes only.
+    protected boolean await(long time, TimeUnit unit) throws InterruptedException
+    {
+<span class="nc" id="L256">        try (AutoLock.WithCondition l = _lock.lock())</span>
+        {
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (alive)</span>
+<span class="nc" id="L259">                return l.await(time, unit);</span>
+            else
+<span class="nc" id="L261">                return true;</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        }</span>
+    }
+
+    protected boolean isAlive()
+    {
+<span class="nc" id="L267">        try (AutoLock l = _lock.lock())</span>
+        {
+<span class="nc" id="L269">            return alive;</span>
+        }
+    }
+
+    private ServerSocket listen()
+    {
+<span class="fc" id="L275">        int port = getPort();</span>
+<span class="pc bpc" id="L276" title="1 of 2 branches missed.">        if (port &lt; 0)</span>
+        {
+<span class="fc" id="L278">            debug(&quot;Not enabled (port &lt; 0): %d&quot;, port);</span>
+<span class="fc" id="L279">            return null;</span>
+        }
+
+<span class="nc" id="L282">        String key = getKey();</span>
+        try
+        {
+<span class="nc" id="L285">            ServerSocket serverSocket = new ServerSocket();</span>
+            try
+            {
+<span class="nc" id="L288">                serverSocket.setReuseAddress(true);</span>
+<span class="nc" id="L289">                serverSocket.bind(new InetSocketAddress(InetAddress.getByName(host), port));</span>
+            }
+<span class="nc" id="L291">            catch (Throwable e)</span>
+            {
+<span class="nc" id="L293">                IO.close(serverSocket);</span>
+<span class="nc" id="L294">                throw e;</span>
+<span class="nc" id="L295">            }</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">            if (port == 0)</span>
+            {
+<span class="nc" id="L298">                port = serverSocket.getLocalPort();</span>
+<span class="nc" id="L299">                System.out.printf(&quot;STOP.PORT=%d%n&quot;, port);</span>
+<span class="nc" id="L300">                setPort(port);</span>
+            }
+
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            if (key == null)</span>
+            {
+<span class="nc" id="L305">                key = Long.toString((long)(Long.MAX_VALUE * Math.random() + this.hashCode() + System.currentTimeMillis()), 36);</span>
+<span class="nc" id="L306">                System.out.printf(&quot;STOP.KEY=%s%n&quot;, key);</span>
+<span class="nc" id="L307">                setKey(key);</span>
+            }
+
+<span class="nc" id="L310">            return serverSocket;</span>
+        }
+<span class="nc" id="L312">        catch (Throwable x)</span>
+        {
+<span class="nc" id="L314">            debug(x);</span>
+<span class="nc" id="L315">            System.err.println(&quot;Error binding ShutdownMonitor to port &quot; + port + &quot;: &quot; + x.toString());</span>
+<span class="nc" id="L316">            return null;</span>
+        }
+        finally
+        {
+            // establish the port and key that are in use
+<span class="nc" id="L321">            debug(&quot;STOP.PORT=%d&quot;, port);</span>
+<span class="nc" id="L322">            debug(&quot;STOP.KEY=%s&quot;, key);</span>
+            //also show if we're exiting the jvm or not
+<span class="nc" id="L324">            debug(&quot;STOP.EXIT=%b&quot;, exitVm);</span>
+        }
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L331">        return String.format(&quot;%s[port=%d,alive=%b]&quot;, this.getClass().getName(), getPort(), isAlive());</span>
+    }
+
+    /**
+     * Thread for listening to STOP.PORT for command to stop Jetty.
+     * If ShutdownMonitor.exitVm is true, then System.exit will also be
+     * called after the stop.
+     */
+    private class ShutdownMonitorRunnable implements Runnable
+    {
+        private final ServerSocket serverSocket;
+
+        private ShutdownMonitorRunnable(ServerSocket serverSocket)
+<span class="nc" id="L344">        {</span>
+<span class="nc" id="L345">            this.serverSocket = serverSocket;</span>
+<span class="nc" id="L346">        }</span>
+
+        @Override
+        public void run()
+        {
+<span class="nc" id="L351">            debug(&quot;Started&quot;);</span>
+            try
+            {
+<span class="nc" id="L354">                String key = getKey();</span>
+                while (true)
+                {
+<span class="nc" id="L357">                    try (Socket socket = serverSocket.accept())</span>
+                    {
+<span class="nc" id="L359">                        LineNumberReader reader = new LineNumberReader(new InputStreamReader(socket.getInputStream()));</span>
+<span class="nc" id="L360">                        String receivedKey = reader.readLine();</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">                        if (!key.equals(receivedKey))</span>
+                        {
+<span class="nc" id="L363">                            debug(&quot;Ignoring command with incorrect key: %s&quot;, receivedKey);</span>
+<span class="nc" id="L364">                            continue;</span>
+                        }
+
+<span class="nc" id="L367">                        String cmd = reader.readLine();</span>
+<span class="nc" id="L368">                        debug(&quot;command=%s&quot;, cmd);</span>
+<span class="nc" id="L369">                        OutputStream out = socket.getOutputStream();</span>
+<span class="nc" id="L370">                        boolean exitVm = isExitVm();</span>
+
+<span class="nc bnc" id="L372" title="All 2 branches missed.">                        if (&quot;stop&quot;.equalsIgnoreCase(cmd)) //historic, for backward compatibility</span>
+                        {
+                            //Stop the lifecycles, only if they are registered with the ShutdownThread, only destroying if vm is exiting
+<span class="nc" id="L375">                            debug(&quot;Performing stop command&quot;);</span>
+<span class="nc" id="L376">                            stopLifeCycles(ShutdownThread::isRegistered, exitVm);</span>
+
+                            // Reply to client
+<span class="nc" id="L379">                            debug(&quot;Informing client that we are stopped&quot;);</span>
+<span class="nc" id="L380">                            informClient(out, &quot;Stopped\r\n&quot;);</span>
+
+<span class="nc bnc" id="L382" title="All 2 branches missed.">                            if (!exitVm)</span>
+<span class="nc" id="L383">                                break;</span>
+
+                            // Kill JVM
+<span class="nc" id="L386">                            debug(&quot;Killing JVM&quot;);</span>
+<span class="nc" id="L387">                            System.exit(0);</span>
+                        }
+<span class="nc bnc" id="L389" title="All 2 branches missed.">                        else if (&quot;forcestop&quot;.equalsIgnoreCase(cmd))</span>
+                        {
+<span class="nc" id="L391">                            debug(&quot;Performing forced stop command&quot;);</span>
+<span class="nc" id="L392">                            stopLifeCycles(l -&gt; true, exitVm);</span>
+
+                            // Reply to client
+<span class="nc" id="L395">                            debug(&quot;Informing client that we are stopped&quot;);</span>
+<span class="nc" id="L396">                            informClient(out, &quot;Stopped\r\n&quot;);</span>
+
+<span class="nc bnc" id="L398" title="All 2 branches missed.">                            if (!exitVm)</span>
+<span class="nc" id="L399">                                break;</span>
+
+                            // Kill JVM
+<span class="nc" id="L402">                            debug(&quot;Killing JVM&quot;);</span>
+<span class="nc" id="L403">                            System.exit(0);</span>
+                        }
+<span class="nc bnc" id="L405" title="All 2 branches missed.">                        else if (&quot;stopexit&quot;.equalsIgnoreCase(cmd))</span>
+                        {
+<span class="nc" id="L407">                            debug(&quot;Performing stop and exit commands&quot;);</span>
+<span class="nc" id="L408">                            stopLifeCycles(ShutdownThread::isRegistered, true);</span>
+
+                            // Reply to client
+<span class="nc" id="L411">                            debug(&quot;Informing client that we are stopped&quot;);</span>
+<span class="nc" id="L412">                            informClient(out, &quot;Stopped\r\n&quot;);</span>
+
+<span class="nc" id="L414">                            debug(&quot;Killing JVM&quot;);</span>
+<span class="nc" id="L415">                            System.exit(0);</span>
+                        }
+<span class="nc bnc" id="L417" title="All 2 branches missed.">                        else if (&quot;exit&quot;.equalsIgnoreCase(cmd))</span>
+                        {
+<span class="nc" id="L419">                            debug(&quot;Killing JVM&quot;);</span>
+<span class="nc" id="L420">                            System.exit(0);</span>
+                        }
+<span class="nc bnc" id="L422" title="All 2 branches missed.">                        else if (&quot;status&quot;.equalsIgnoreCase(cmd))</span>
+                        {
+                            // Reply to client
+<span class="nc" id="L425">                            informClient(out, &quot;OK\r\n&quot;);</span>
+                        }
+<span class="nc bnc" id="L427" title="All 2 branches missed.">                        else if (&quot;pid&quot;.equalsIgnoreCase(cmd))</span>
+                        {
+<span class="nc" id="L429">                            informClient(out, Long.toString(ProcessHandle.current().pid()));</span>
+                        }
+<span class="nc bnc" id="L431" title="All 6 branches missed.">                    }</span>
+<span class="nc" id="L432">                    catch (Throwable x)</span>
+                    {
+<span class="nc" id="L434">                        debug(x);</span>
+<span class="nc" id="L435">                    }</span>
+                }
+            }
+<span class="nc" id="L438">            catch (Throwable x)</span>
+            {
+<span class="nc" id="L440">                debug(x);</span>
+            }
+            finally
+            {
+<span class="nc" id="L444">                IO.close(serverSocket);</span>
+<span class="nc" id="L445">                stop();</span>
+<span class="nc" id="L446">                debug(&quot;Stopped&quot;);</span>
+            }
+<span class="nc" id="L448">        }</span>
+
+        private void informClient(OutputStream out, String message) throws IOException
+        {
+<span class="nc" id="L452">            out.write(message.getBytes(StandardCharsets.UTF_8));</span>
+<span class="nc" id="L453">            out.flush();</span>
+<span class="nc" id="L454">        }</span>
+
+        private void stopLifeCycles(Predicate&lt;LifeCycle&gt; predicate, boolean destroy)
+        {
+            List&lt;LifeCycle&gt; lifeCycles;
+<span class="nc" id="L459">            try (AutoLock l = _lock.lock())</span>
+            {
+<span class="nc" id="L461">                lifeCycles = new ArrayList&lt;&gt;(_lifeCycles);</span>
+            }
+
+<span class="nc bnc" id="L464" title="All 2 branches missed.">            for (LifeCycle l : lifeCycles)</span>
+            {
+                try
+                {
+<span class="nc bnc" id="L468" title="All 4 branches missed.">                    if (l.isStarted() &amp;&amp; predicate.test(l))</span>
+<span class="nc" id="L469">                        l.stop();</span>
+
+<span class="nc bnc" id="L471" title="All 4 branches missed.">                    if ((l instanceof Destroyable) &amp;&amp; destroy)</span>
+<span class="nc" id="L472">                        ((Destroyable)l).destroy();</span>
+                }
+<span class="nc" id="L474">                catch (Throwable x)</span>
+                {
+<span class="nc" id="L476">                    debug(x);</span>
+<span class="nc" id="L477">                }</span>
+<span class="nc" id="L478">            }</span>
+<span class="nc" id="L479">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

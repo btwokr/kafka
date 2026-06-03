@@ -1,0 +1,1739 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ContextHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server.handler</a> &gt; <span class="el_source">ContextHandler.java</span></div><h1>ContextHandler.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server.handler;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.net.URLClassLoader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.EventListener;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+import org.eclipse.jetty.http.HttpField;
+import org.eclipse.jetty.http.HttpHeader;
+import org.eclipse.jetty.http.HttpStatus;
+import org.eclipse.jetty.http.MimeTypes;
+import org.eclipse.jetty.server.AliasCheck;
+import org.eclipse.jetty.server.Connector;
+import org.eclipse.jetty.server.Context;
+import org.eclipse.jetty.server.Handler;
+import org.eclipse.jetty.server.NetworkConnector;
+import org.eclipse.jetty.server.Request;
+import org.eclipse.jetty.server.Response;
+import org.eclipse.jetty.server.Server;
+import org.eclipse.jetty.server.SymlinkAllowedResourceAliasChecker;
+import org.eclipse.jetty.util.Attributes;
+import org.eclipse.jetty.util.Callback;
+import org.eclipse.jetty.util.DecoratedObjectFactory;
+import org.eclipse.jetty.util.IO;
+import org.eclipse.jetty.util.Index;
+import org.eclipse.jetty.util.StringUtil;
+import org.eclipse.jetty.util.TypeUtil;
+import org.eclipse.jetty.util.URIUtil;
+import org.eclipse.jetty.util.annotation.ManagedAttribute;
+import org.eclipse.jetty.util.annotation.ManagedObject;
+import org.eclipse.jetty.util.component.ClassLoaderDump;
+import org.eclipse.jetty.util.component.DumpableAttributes;
+import org.eclipse.jetty.util.component.LifeCycle;
+import org.eclipse.jetty.util.resource.MountedPathResource;
+import org.eclipse.jetty.util.resource.Resource;
+import org.eclipse.jetty.util.resource.ResourceFactory;
+import org.eclipse.jetty.util.resource.Resources;
+import org.eclipse.jetty.util.thread.Invocable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * A {@link Handler} that scopes a request to a specific {@link Context}.
+ */
+@ManagedObject
+public class ContextHandler extends Handler.Wrapper implements Attributes, AliasCheck
+{
+<span class="fc" id="L77">    private static final Logger LOG = LoggerFactory.getLogger(ContextHandler.class);</span>
+<span class="fc" id="L78">    private static final ThreadLocal&lt;Context&gt; CURRENT_CONTEXT = new ThreadLocal&lt;&gt;();</span>
+
+    public static final String MANAGED_ATTRIBUTES = &quot;org.eclipse.jetty.server.context.ManagedAttributes&quot;;
+
+    /**
+     * The attribute name that is set as a {@link Request} attribute to indicate the request is a cross context
+     * dispatch.  The value can be set to a ServletDispatcher type if the target is known to be a servlet context.
+     */
+    public static final String CROSS_CONTEXT_ATTRIBUTE = &quot;org.eclipse.jetty.CrossContextDispatch&quot;;
+
+    /**
+     * Get the current Context if any.
+     *
+     * @return The {@link Context} from a {@link ContextHandler};
+     *         or null if the current {@link Thread} is not scoped to a {@link ContextHandler}.
+     */
+    public static Context getCurrentContext()
+    {
+<span class="fc" id="L96">        return CURRENT_CONTEXT.get();</span>
+    }
+
+    /**
+     * Get the current Context if any, or else server context if any.
+     * @param server The server.
+     * @return The {@link Context} from a {@link ContextHandler};
+     *         or {@link Server#getContext()} if the current {@link Thread} is not scoped to a {@link ContextHandler}.
+     */
+    public static Context getCurrentContext(Server server)
+    {
+<span class="fc" id="L107">        Context context = CURRENT_CONTEXT.get();</span>
+<span class="pc bpc" id="L108" title="3 of 4 branches missed.">        return context == null ? (server == null ? null : server.getContext()) : context;</span>
+    }
+
+    // Do not remove, invoked via reflection.
+    public static ContextHandler getCurrentContextHandler()
+    {
+<span class="nc" id="L114">        Context context = getCurrentContext();</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">        return (context instanceof ScopedContext scopedContext) ? scopedContext.getContextHandler() : null;</span>
+    }
+
+    public static ContextHandler getContextHandler(Request request)
+    {
+<span class="nc" id="L120">        ContextRequest contextRequest = Request.asInContext(request, ContextRequest.class);</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (contextRequest == null)</span>
+<span class="nc" id="L122">            return null;</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        return contextRequest.getContext() instanceof ScopedContext scoped ? scoped.getContextHandler() : null;</span>
+    }
+
+    /*
+     * The context (specifically it's attributes and mimeTypes) are not implemented as a layer over
+     * the server context, as  this handler's context replaces the context in the request, it does not
+     * wrap it. This is so that any cross context dispatch does not inherit attributes and types from
+     * the dispatching context.
+     */
+    private final ScopedContext _context;
+<span class="fc" id="L133">    private final Attributes _persistentAttributes = new Mapped();</span>
+<span class="fc" id="L134">    private final MimeTypes.Wrapper _mimeTypes = new MimeTypes.Wrapper();</span>
+<span class="fc" id="L135">    private final List&lt;ContextScopeListener&gt; _contextListeners = new CopyOnWriteArrayList&lt;&gt;();</span>
+<span class="fc" id="L136">    private final List&lt;VHost&gt; _vhosts = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L137">    private final AtomicBoolean _enterScopeSetClassloaderFailed = new AtomicBoolean();</span>
+
+    private String _displayName;
+<span class="fc" id="L140">    private String _contextPath = &quot;/&quot;;</span>
+<span class="fc" id="L141">    private boolean _rootContext = true;</span>
+    private Resource _baseResource;
+    private ClassLoader _classLoader;
+    private Request.Handler _errorHandler;
+    private boolean _allowNullPathInContext;
+<span class="fc" id="L146">    private Index&lt;ProtectedTargetType&gt; _protectedTargets = Index.empty(false);</span>
+<span class="fc" id="L147">    private final List&lt;AliasCheck&gt; _aliasChecks = new CopyOnWriteArrayList&lt;&gt;();</span>
+    private File _tempDirectory;
+<span class="fc" id="L149">    private boolean _tempDirectoryPersisted = false;</span>
+<span class="fc" id="L150">    private boolean _tempDirectoryCreated = false;</span>
+<span class="fc" id="L151">    private boolean _createdTempDirectoryName = false;</span>
+<span class="fc" id="L152">    private boolean _crossContextDispatchSupported = false;</span>
+
+<span class="fc" id="L154">    public enum Availability</span>
+    {
+<span class="fc" id="L156">        STOPPED,        // stopped and can't be made unavailable nor shutdown</span>
+<span class="fc" id="L157">        STARTING,       // starting inside doStart. It may go to any of the next states.</span>
+<span class="fc" id="L158">        AVAILABLE,      // running normally</span>
+<span class="fc" id="L159">        UNAVAILABLE,    // Either a startup error or explicit call to setAvailable(false)</span>
+    }
+
+    /**
+     * The type of protected target match
+     * @see #_protectedTargets
+     */
+<span class="nc" id="L166">    private enum ProtectedTargetType</span>
+    {
+<span class="nc" id="L168">        EXACT,</span>
+<span class="nc" id="L169">        PREFIX</span>
+    }
+
+<span class="fc" id="L172">    private final AtomicReference&lt;Availability&gt; _availability = new AtomicReference&lt;&gt;(Availability.STOPPED);</span>
+
+    public ContextHandler()
+    {
+<span class="fc" id="L176">        this(null, null);</span>
+<span class="fc" id="L177">    }</span>
+
+    public ContextHandler(Handler handler)
+    {
+<span class="nc" id="L181">        this(handler, null);</span>
+<span class="nc" id="L182">    }</span>
+
+    public ContextHandler(String contextPath)
+    {
+<span class="nc" id="L186">        this(null, contextPath);</span>
+<span class="nc" id="L187">    }</span>
+
+    public ContextHandler(Handler handler, String contextPath)
+    {
+<span class="fc" id="L191">        super(handler);</span>
+<span class="fc" id="L192">        _context = newContext();</span>
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">        if (contextPath != null)</span>
+<span class="nc" id="L194">            setContextPath(contextPath);</span>
+
+<span class="pc bpc" id="L196" title="1 of 2 branches missed.">        if (File.separatorChar == '/')</span>
+<span class="fc" id="L197">            addAliasCheck(new SymlinkAllowedResourceAliasChecker(this));</span>
+
+        // If the current classloader (or the one that loaded this class) is different
+        // from the Server classloader, then use that as the initial classloader for the context.
+<span class="fc" id="L201">        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();</span>
+<span class="pc bpc" id="L202" title="1 of 2 branches missed.">        if (classLoader == null)</span>
+<span class="nc" id="L203">            classLoader = this.getClass().getClassLoader();</span>
+<span class="fc bfc" id="L204" title="All 2 branches covered.">        if (classLoader != Server.class.getClassLoader())</span>
+<span class="fc" id="L205">            _classLoader = classLoader;</span>
+<span class="fc" id="L206">    }</span>
+
+    @Override
+    public void setServer(Server server)
+    {
+<span class="fc" id="L211">        super.setServer(server);</span>
+<span class="fc" id="L212">        _mimeTypes.setWrapped(server.getMimeTypes());</span>
+<span class="fc" id="L213">    }</span>
+    
+    protected ScopedContext newContext()
+    {
+<span class="nc" id="L217">        return new ScopedContext();</span>
+    }
+
+    /**
+     * @return The temporary directory configured for the context, or null if none configured.
+     * @see Context#getTempDirectory()
+     */
+    @ManagedAttribute(value = &quot;temporary directory location&quot;, readonly = true)
+    public File getTempDirectory()
+    {
+<span class="fc" id="L227">        return _tempDirectory;</span>
+    }
+
+    /**
+     * &lt;p&gt;Set the temporary directory returned by {@link ScopedContext#getTempDirectory()}.  If not set here,
+     * then the {@link Server#getTempDirectory()} is returned by {@link ScopedContext#getTempDirectory()}.&lt;/p&gt;
+     * &lt;p&gt;If {@link #isTempDirectoryPersistent()} is true, the directory set here is used directly but may
+     * be created if it does not exist. If {@link #isTempDirectoryPersistent()} is false, then any {@code File} set
+     * here will be deleted and recreated as a directory during {@link #start()} and will be deleted during
+     * {@link #stop()}.&lt;/p&gt;
+     * @see #setTempDirectoryPersistent(boolean)
+     * @param tempDirectory A directory. If it does not exist, it must be able to be created during start.
+     */
+    public void setTempDirectory(File tempDirectory)
+    {
+<span class="nc bnc" id="L242" title="All 2 branches missed.">        if (isStarted())</span>
+<span class="nc" id="L243">            throw new IllegalStateException(&quot;Started&quot;);</span>
+
+<span class="nc" id="L245">        File oldTempDirectory = _tempDirectory;</span>
+
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        if (tempDirectory != null)</span>
+        {
+            try
+            {
+<span class="nc" id="L251">                tempDirectory = new File(tempDirectory.getCanonicalPath());</span>
+            }
+<span class="nc" id="L253">            catch (IOException e)</span>
+            {
+<span class="nc" id="L255">                LOG.warn(&quot;Unable to find canonical path for {}&quot;, tempDirectory, e);</span>
+<span class="nc" id="L256">            }</span>
+        }
+
+<span class="nc bnc" id="L259" title="All 2 branches missed.">        if (oldTempDirectory != null)</span>
+        {
+            try
+            {
+                //if we had made up the name of the tmp directory previously, delete it if the new name is different
+<span class="nc bnc" id="L264" title="All 6 branches missed.">                if (_createdTempDirectoryName &amp;&amp; (tempDirectory == null || (!Files.isSameFile(oldTempDirectory.toPath(), tempDirectory.toPath()))))</span>
+<span class="nc" id="L265">                    IO.delete(oldTempDirectory);</span>
+            }
+<span class="nc" id="L267">            catch (Exception e)</span>
+            {
+<span class="nc bnc" id="L269" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L270">                    LOG.debug(&quot;Unable to delete old temp directory {}&quot;, oldTempDirectory, e);</span>
+<span class="nc" id="L271">            }</span>
+        }
+<span class="nc" id="L273">        _tempDirectory = tempDirectory;</span>
+<span class="nc" id="L274">         _createdTempDirectoryName = false;</span>
+<span class="nc" id="L275">    }</span>
+
+    /**
+     * &lt;p&gt;Set if the temp directory for this context will be kept over a stop and start cycle.&lt;/p&gt;
+     *
+     * @see #setTempDirectory(File)
+     * @param persist true to persist the temp directory on shutdown / exit of the context
+     */
+    public void setTempDirectoryPersistent(boolean persist)
+    {
+<span class="nc" id="L285">        _tempDirectoryPersisted = persist;</span>
+<span class="nc" id="L286">    }</span>
+
+    /**
+     * @return true if tmp directory will persist between startups of the context
+     */
+    public boolean isTempDirectoryPersistent()
+    {
+<span class="nc" id="L293">        return _tempDirectoryPersisted;</span>
+    }
+
+    /**
+     * @return A mutable MimeTypes that wraps the {@link Server#getMimeTypes()}
+     *         once {@link ContextHandler#setServer(Server)} has been called.
+     * @see MimeTypes.Wrapper
+     */
+    public MimeTypes.Mutable getMimeTypes()
+    {
+<span class="nc" id="L303">        return _mimeTypes;</span>
+    }
+
+    @Override
+    public void dump(Appendable out, String indent) throws IOException
+    {
+<span class="nc" id="L309">        dumpObjects(out, indent,</span>
+<span class="nc" id="L310">            new ClassLoaderDump(getClassLoader()),</span>
+            new DumpableAttributes(&quot;handler attributes&quot;, _persistentAttributes),
+            new DumpableAttributes(&quot;attributes&quot;, _context));
+<span class="nc" id="L313">    }</span>
+
+    @ManagedAttribute(value = &quot;Context&quot;)
+    public ScopedContext getContext()
+    {
+<span class="fc" id="L318">        return _context;</span>
+    }
+
+    /**
+     * @return the allowNullPathInfo true if /context is not redirected to /context/
+     */
+    @ManagedAttribute(&quot;Checks if the /context is not redirected to /context/&quot;)
+    public boolean getAllowNullPathInContext()
+    {
+<span class="nc" id="L327">        return _allowNullPathInContext;</span>
+    }
+
+    /**
+     * Set true if /context is not redirected to /context/.
+     * @param allowNullPathInContext true if /context is not redirected to /context/
+     */
+    public void setAllowNullPathInContext(boolean allowNullPathInContext)
+    {
+<span class="nc" id="L336">        _allowNullPathInContext = allowNullPathInContext;</span>
+<span class="nc" id="L337">    }</span>
+
+    /**
+     * Set the virtual hosts for the context. Only requests that have a matching host header or fully qualified URL will be passed to that context with a
+     * virtual host name. A context with no virtual host names or a null virtual host name is available to all requests that are not served by a context with a
+     * matching virtual host name.
+     *
+     * @param vhosts List of virtual hosts that this context responds to. A null/empty list means any hostname is acceptable. Host names may be String
+     * representation of IP addresses. Host names may start with {@code &quot;*.&quot;} to wildcard one level of names. Hosts and wildcard hosts may be followed with
+     * {@code &quot;@connectorname&quot;} (eg: {@code &quot;*.example.org@connectorname&quot;}), in which case they will match only if the {@link Connector#getName()}
+     * for the request also matches. If an entry is just {@code &quot;@connectorname&quot;} it will match any host if that connector was used.
+     */
+    public void setVirtualHosts(List&lt;String&gt; vhosts)
+    {
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (isRunning())</span>
+<span class="nc" id="L352">            throw new IllegalStateException(getState());</span>
+<span class="nc" id="L353">        _vhosts.clear();</span>
+<span class="nc bnc" id="L354" title="All 4 branches missed.">        if (vhosts != null &amp;&amp; !vhosts.isEmpty())</span>
+        {
+<span class="nc bnc" id="L356" title="All 2 branches missed.">            for (String vhost : vhosts)</span>
+            {
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                if (vhost == null)</span>
+<span class="nc" id="L359">                    continue;</span>
+<span class="nc" id="L360">                _vhosts.add(new VHost(vhost));</span>
+<span class="nc" id="L361">            }</span>
+        }
+<span class="nc" id="L363">    }</span>
+
+    /**
+     * Either set virtual hosts or add to an existing set of virtual hosts.
+     *
+     * @param virtualHosts Array of virtual hosts that this context responds to. A null/empty array means any hostname is acceptable. Host names may be String
+     * representation of IP addresses. Host names may start with '*.' to wildcard one level of names. Hosts and wildcard hosts may be followed with
+     * {@code &quot;@connectorname&quot;}, in which case they will match only if the {@link Connector#getName()} for the request also matches. If an entry is just
+     * {@code &quot;@connectorname&quot;} it will match any host if that connector was used.  Note - In previous versions if one or more connectorname only entries existed
+     * and none of the connectors matched the handler would not match regardless of any hostname entries.  If there is one or more connectorname only
+     * entries and one or more host only entries but no hostname and connector entries we assume the old behavior and will log a warning.  The warning
+     * can be removed by removing the host entries that were previously being ignored, or modifying to include a hostname and connectorname entry.
+     */
+    public void addVirtualHosts(String... virtualHosts)
+    {
+<span class="nc bnc" id="L378" title="All 4 branches missed.">        if (virtualHosts == null || virtualHosts.length == 0) // since this is add, we don't null the old ones</span>
+<span class="nc" id="L379">            return;</span>
+
+<span class="nc" id="L381">        List&lt;String&gt; vhosts = new ArrayList&lt;&gt;(getVirtualHosts());</span>
+<span class="nc" id="L382">        vhosts.addAll(Arrays.asList(virtualHosts));</span>
+<span class="nc" id="L383">        setVirtualHosts(vhosts);</span>
+<span class="nc" id="L384">    }</span>
+
+    /**
+     * Removes an array of virtual host entries, if this removes all entries the _vhosts will be set to null
+     *
+     * @param virtualHosts Array of virtual hosts that this context responds to. A null/empty array means any hostname is acceptable. Host names may be String
+     * representation of IP addresses. Host names may start with '*.' to wildcard one level of names. Hosts and wildcard hosts may be followed with
+     * {@code &quot;@connectorname&quot;}, in which case they will match only if the {@link Connector#getName()} for the request also matches. If an entry is just
+     * {@code &quot;@connectorname&quot;} it will match any host if that connector was used.  Note - In previous versions if one or more connectorname only entries existed
+     * and none of the connectors matched the handler would not match regardless of any hostname entries.  If there is one or more connectorname only
+     * entries and one or more host only entries but no hostname and connector entries we assume the old behavior and will log a warning.  The warning
+     * can be removed by removing the host entries that were previously being ignored, or modifying to include a hostname and connectorname entry.
+     */
+    public void removeVirtualHosts(String... virtualHosts)
+    {
+<span class="nc" id="L399">        List&lt;String&gt; vhosts = new ArrayList&lt;&gt;(getVirtualHosts());</span>
+<span class="nc bnc" id="L400" title="All 6 branches missed.">        if (virtualHosts == null || virtualHosts.length == 0 || vhosts.isEmpty())</span>
+<span class="nc" id="L401">            return; // do nothing</span>
+
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        for (String vh : virtualHosts)</span>
+<span class="nc" id="L404">            _vhosts.remove(new VHost(vh));</span>
+<span class="nc" id="L405">    }</span>
+
+    /**
+     * Get the virtual hosts for the context. Only requests that have a matching host header or fully qualified URL will be passed to that context with a
+     * virtual host name. A context with no virtual host names or a null virtual host name is available to all requests that are not served by a context with a
+     * matching virtual host name.
+     *
+     * @return list of virtual hosts that this context responds to. A null/empty array means any hostname is acceptable. Host names may be String
+     * representation of IP addresses. Host names may start with '*.' to wildcard one level of names. Hosts and wildcard hosts may be followed with
+     * {@code &quot;@connectorname&quot;}, in which case they will match only if the {@link Connector#getName()} for the request also matches. If an entry is just
+     * {@code &quot;@connectorname&quot;} it will match any host if that connector was used.  Note - In previous versions if one or more connectorname only entries existed
+     * and none of the connectors matched the handler would not match regardless of any hostname entries.  If there is one or more connectorname only
+     * entries and one or more host only entries but no hostname and connector entries we assume the old behavior and will log a warning.  The warning
+     * can be removed by removing the host entries that were previously being ignored, or modifying to include a hostname and connectorname entry.
+     */
+    @ManagedAttribute(value = &quot;Virtual hosts accepted by the context&quot;, readonly = true)
+    public List&lt;String&gt; getVirtualHosts()
+    {
+<span class="fc" id="L423">        return _vhosts.stream().map(VHost::getName).collect(Collectors.toList());</span>
+    }
+
+    @Override
+    public Object getAttribute(String name)
+    {
+<span class="nc" id="L429">        return _persistentAttributes.getAttribute(name);</span>
+    }
+
+    @Override
+    public Set&lt;String&gt; getAttributeNameSet()
+    {
+<span class="nc" id="L435">        return _persistentAttributes.getAttributeNameSet();</span>
+    }
+
+    @Override
+    public Object setAttribute(String name, Object attribute)
+    {
+<span class="nc" id="L441">        return _persistentAttributes.setAttribute(name, attribute);</span>
+    }
+
+    @Override
+    public Object removeAttribute(String name)
+    {
+<span class="fc" id="L447">        return _persistentAttributes.removeAttribute(name);</span>
+    }
+
+    public ClassLoader getClassLoader()
+    {
+<span class="fc" id="L452">        return _classLoader;</span>
+    }
+
+    /**
+     * The {@link ClassLoader} to set as the {@link Thread#setContextClassLoader(ClassLoader) thread's context classloader}
+     * when the thread executing this handler enters the scope of this context.
+     * @param contextLoader the {@link ClassLoader} or {@code null} to avoid changing the thread's context classloader.
+     */
+    public void setClassLoader(ClassLoader contextLoader)
+    {
+<span class="nc bnc" id="L462" title="All 2 branches missed.">        if (isStarted())</span>
+<span class="nc" id="L463">            throw new IllegalStateException(getState());</span>
+<span class="nc" id="L464">        _classLoader = contextLoader;</span>
+<span class="nc" id="L465">    }</span>
+
+    /**
+     * Make best effort to extract a file classpath from the context classloader
+     *
+     * @return Returns the classLoader.
+     */
+    @ManagedAttribute(&quot;The file classpath&quot;)
+    public String getClassPath()
+    {
+        // TODO may need to handle one level of parent classloader for API ?
+<span class="nc bnc" id="L476" title="All 4 branches missed.">        if (_classLoader == null || !(_classLoader instanceof URLClassLoader loader))</span>
+<span class="nc" id="L477">            return null;</span>
+
+<span class="nc" id="L479">        String classpath = URIUtil.streamOf(loader)</span>
+<span class="nc" id="L480">            .map(URI::toASCIIString)</span>
+<span class="nc" id="L481">            .collect(Collectors.joining(File.pathSeparator));</span>
+<span class="nc bnc" id="L482" title="All 2 branches missed.">        if (StringUtil.isBlank(classpath))</span>
+<span class="nc" id="L483">            return null;</span>
+<span class="nc" id="L484">        return classpath;</span>
+    }
+
+    /**
+     * @return Returns the contextPath.
+     */
+    @ManagedAttribute(value = &quot;Context path of the Context&quot;)
+    public String getContextPath()
+    {
+<span class="fc" id="L493">        return _contextPath;</span>
+    }
+
+    /*
+     * @see jakarta.servlet.ServletContext#getServletContextName()
+     */
+    @ManagedAttribute(value = &quot;Display name of the Context&quot;)
+    public String getDisplayName()
+    {
+<span class="pc bpc" id="L502" title="1 of 2 branches missed.">        if (_displayName != null)</span>
+<span class="nc" id="L503">            return _displayName;</span>
+<span class="pc bpc" id="L504" title="1 of 2 branches missed.">        if (&quot;/&quot;.equals(_contextPath))</span>
+<span class="fc" id="L505">            return &quot;ROOT&quot;;</span>
+<span class="nc" id="L506">        return _contextPath;</span>
+    }
+
+    /**
+     * Get if this context support cross context dispatch, either as originator or target.
+     * @return True if this context supports cross context dispatch.
+     */
+    @ManagedAttribute(value = &quot;Cross context dispatch is support by the context&quot;)
+    public boolean isCrossContextDispatchSupported()
+    {
+<span class="fc" id="L516">        return _crossContextDispatchSupported;</span>
+    }
+
+    /**
+     * Set if this context support cross context dispatch, either as originator or target.
+     * @param crossContextDispatchSupported True if this context supports cross context dispatch.
+     */
+    public void setCrossContextDispatchSupported(boolean crossContextDispatchSupported)
+    {
+<span class="nc" id="L525">        _crossContextDispatchSupported = crossContextDispatchSupported;</span>
+<span class="nc" id="L526">    }</span>
+
+    /**
+     * If {@link #isCrossContextDispatchSupported() cross context dispatch is supported} by this context
+     * then find a context by  {@link #getContextPath() contextPath} that also supports cross context dispatch.
+     * If more than one context is found, then those with disjoint {@link #getVirtualHosts() virtual hosts} are
+     * excluded and the first remaining context returned.
+     *
+     * @param path The path that will be served by the context
+     * @return The found {@link ContextHandler} or null.
+     */
+    public ContextHandler getCrossContextHandler(String path)
+    {
+<span class="nc bnc" id="L539" title="All 2 branches missed.">        if (!isCrossContextDispatchSupported())</span>
+<span class="nc" id="L540">            return null;</span>
+
+<span class="nc" id="L542">        List&lt;ContextHandler&gt; contexts = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L543" title="All 2 branches missed.">        for (ContextHandler contextHandler : getServer().getDescendants(ContextHandler.class))</span>
+        {
+<span class="nc bnc" id="L545" title="All 4 branches missed.">            if (contextHandler == null || !contextHandler.isCrossContextDispatchSupported())</span>
+<span class="nc" id="L546">                continue;</span>
+<span class="nc" id="L547">            String contextPath = contextHandler.getContextPath();</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">            if (path.equals(contextPath) ||</span>
+<span class="nc bnc" id="L549" title="All 4 branches missed.">                (path.startsWith(contextPath) &amp;&amp; path.charAt(contextPath.length()) == '/') ||</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">                &quot;/&quot;.equals(contextPath))</span>
+<span class="nc" id="L551">                contexts.add(contextHandler);</span>
+<span class="nc" id="L552">        }</span>
+
+<span class="nc bnc" id="L554" title="All 2 branches missed.">        if (contexts.isEmpty())</span>
+<span class="nc" id="L555">            return null;</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">        if (contexts.size() == 1)</span>
+<span class="nc" id="L557">            return contexts.get(0);</span>
+
+        // Remove non-matching virtual hosts
+<span class="nc" id="L560">        List&lt;String&gt; vhosts = getVirtualHosts();</span>
+<span class="nc bnc" id="L561" title="All 4 branches missed.">        if (vhosts != null &amp;&amp; !vhosts.isEmpty())</span>
+        {
+<span class="nc bnc" id="L563" title="All 2 branches missed.">            for (ListIterator&lt;ContextHandler&gt; i = contexts.listIterator(); i.hasNext(); )</span>
+            {
+<span class="nc" id="L565">                ContextHandler ch = i.next();</span>
+
+<span class="nc" id="L567">                List&lt;String&gt; targetVhosts = ch.getVirtualHosts();</span>
+<span class="nc bnc" id="L568" title="All 6 branches missed.">                if (targetVhosts == null || targetVhosts.isEmpty() || Collections.disjoint(vhosts, targetVhosts))</span>
+<span class="nc" id="L569">                    i.remove();</span>
+<span class="nc" id="L570">            }</span>
+        }
+
+<span class="nc bnc" id="L573" title="All 2 branches missed.">        if (contexts.isEmpty())</span>
+<span class="nc" id="L574">            return null;</span>
+
+        // return the first longest
+<span class="nc" id="L577">        ContextHandler contextHandler = null;</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">        for (ContextHandler c : contexts)</span>
+        {
+<span class="nc bnc" id="L580" title="All 4 branches missed.">            if (contextHandler == null || c.getContextPath().length() &gt; contextHandler.getContextPath().length())</span>
+<span class="nc" id="L581">                contextHandler = c;</span>
+<span class="nc" id="L582">        }</span>
+<span class="nc" id="L583">        return contextHandler;</span>
+    }
+
+    /**
+     * Add a context event listeners.
+     *
+     * @param listener the event listener to add
+     * @return true if the listener was added
+     * @see ContextScopeListener
+     * @see org.eclipse.jetty.util.component.ContainerLifeCycle#addEventListener(EventListener)
+     */
+    @Override
+    public boolean addEventListener(EventListener listener)
+    {
+<span class="fc bfc" id="L597" title="All 2 branches covered.">        if (super.addEventListener(listener))</span>
+        {
+<span class="pc bpc" id="L599" title="1 of 2 branches missed.">            if (listener instanceof ContextScopeListener contextScopeListener)</span>
+            {
+<span class="nc" id="L601">                _contextListeners.add(contextScopeListener);</span>
+<span class="nc bnc" id="L602" title="All 2 branches missed.">                if (CURRENT_CONTEXT.get() != null)</span>
+<span class="nc" id="L603">                    contextScopeListener.enterScope(CURRENT_CONTEXT.get(), null);</span>
+            }
+<span class="fc" id="L605">            return true;</span>
+        }
+<span class="fc" id="L607">        return false;</span>
+    }
+
+    @Override
+    public boolean removeEventListener(EventListener listener)
+    {
+<span class="pc bpc" id="L613" title="1 of 2 branches missed.">        if (super.removeEventListener(listener))</span>
+        {
+<span class="pc bpc" id="L615" title="1 of 2 branches missed.">            if (listener instanceof ContextScopeListener contextScopeListener)</span>
+            {
+<span class="nc" id="L617">                _contextListeners.remove(contextScopeListener);</span>
+<span class="nc bnc" id="L618" title="All 2 branches missed.">                if (CURRENT_CONTEXT.get() != null)</span>
+<span class="nc" id="L619">                    contextScopeListener.exitScope(CURRENT_CONTEXT.get(), null);</span>
+            }
+<span class="fc" id="L621">            return true;</span>
+        }
+<span class="nc" id="L623">        return false;</span>
+    }
+
+    protected ClassLoader enterScope(Request contextRequest)
+    {
+<span class="fc" id="L628">        CURRENT_CONTEXT.set(_context);</span>
+
+<span class="fc" id="L630">        ClassLoader lastLoader = Thread.currentThread().getContextClassLoader();</span>
+<span class="fc bfc" id="L631" title="All 4 branches covered.">        if (_classLoader != null &amp;&amp; _classLoader != lastLoader)</span>
+        {
+            try
+            {
+<span class="fc" id="L635">                Thread.currentThread().setContextClassLoader(_classLoader);</span>
+            }
+<span class="nc" id="L637">            catch (Throwable x)</span>
+            {
+                // Log as warning the first time it happens.
+<span class="nc" id="L640">                String msg = &quot;Error setting a context classloader on thread {}&quot;;</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">                if (_enterScopeSetClassloaderFailed.compareAndSet(false, true))</span>
+<span class="nc" id="L642">                    LOG.warn(msg, Thread.currentThread(), x);</span>
+<span class="nc bnc" id="L643" title="All 2 branches missed.">                else if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L644">                    LOG.debug(msg, Thread.currentThread(), x);</span>
+<span class="fc" id="L645">            }</span>
+        }
+<span class="fc" id="L647">        notifyEnterScope(contextRequest);</span>
+<span class="fc" id="L648">        return lastLoader;</span>
+    }
+
+    /**
+     * @param request A request that is applicable to the scope, or null
+     */
+    protected void notifyEnterScope(Request request)
+    {
+<span class="pc bpc" id="L656" title="1 of 2 branches missed.">        for (ContextScopeListener listener : _contextListeners)</span>
+        {
+            try
+            {
+<span class="nc" id="L660">                listener.enterScope(_context, request);</span>
+            }
+<span class="nc" id="L662">            catch (Throwable e)</span>
+            {
+<span class="nc" id="L664">                LOG.warn(&quot;Unable to enter scope&quot;, e);</span>
+<span class="nc" id="L665">            }</span>
+<span class="nc" id="L666">        }</span>
+<span class="fc" id="L667">    }</span>
+
+    /**
+     * &lt;p&gt;Exits the scope of the {@link Context}.&lt;/p&gt;
+     *
+     * @param contextRequest the context's {@link Request}
+     * @param lastContext the previous context to restore as the current one.
+     * @param lastLoader the previous {@link Thread#getContextClassLoader() thread's context classloader} to restore
+     */
+    protected void exitScope(Request contextRequest, Context lastContext, ClassLoader lastLoader)
+    {
+<span class="fc" id="L678">        CURRENT_CONTEXT.set(lastContext);</span>
+
+<span class="fc" id="L680">        notifyExitScope(contextRequest);</span>
+<span class="fc bfc" id="L681" title="All 2 branches covered.">        if (Thread.currentThread().getContextClassLoader() != lastLoader)</span>
+<span class="fc" id="L682">            Thread.currentThread().setContextClassLoader(lastLoader);</span>
+<span class="fc" id="L683">    }</span>
+
+    /**
+     * @param request A request that is applicable to the scope, or null
+     */
+    protected void notifyExitScope(Request request)
+    {
+<span class="pc bpc" id="L690" title="1 of 2 branches missed.">        for (ListIterator&lt;ContextScopeListener&gt; i = TypeUtil.listIteratorAtEnd(_contextListeners); i.hasPrevious();)</span>
+        {
+            try
+            {
+<span class="nc" id="L694">                i.previous().exitScope(_context, request);</span>
+            }
+<span class="nc" id="L696">            catch (Throwable e)</span>
+            {
+<span class="nc" id="L698">                LOG.warn(&quot;Unable to exit scope&quot;, e);</span>
+<span class="nc" id="L699">            }</span>
+        }
+<span class="fc" id="L701">    }</span>
+
+    /**
+     * @return false if this context is unavailable (sends 503)
+     */
+    public boolean isAvailable()
+    {
+<span class="pc bpc" id="L708" title="2 of 4 branches missed.">        return _availability.get() == Availability.AVAILABLE &amp;&amp; isStarted();</span>
+    }
+
+    /**
+     * Set Available status.
+     *
+     * @param available true to set as enabled
+     */
+    public void setAvailable(boolean available)
+    {
+        // Only supported state transitions are:
+        //   UNAVAILABLE --true---&gt; AVAILABLE
+        //   STARTING -----false--&gt; UNAVAILABLE
+        //   AVAILABLE ----false--&gt; UNAVAILABLE
+<span class="nc bnc" id="L722" title="All 2 branches missed.">        if (available)</span>
+        {
+            while (true)
+            {
+<span class="nc" id="L726">                Availability availability = _availability.get();</span>
+<span class="nc bnc" id="L727" title="All 3 branches missed.">                switch (availability)</span>
+                {
+                    case AVAILABLE:
+<span class="nc" id="L730">                        break;</span>
+                    case UNAVAILABLE:
+<span class="nc bnc" id="L732" title="All 2 branches missed.">                        if (!_availability.compareAndSet(availability, Availability.AVAILABLE))</span>
+<span class="nc" id="L733">                            continue;</span>
+                        break;
+                    default:
+<span class="nc" id="L736">                        throw new IllegalStateException(availability.toString());</span>
+                }
+                break;
+            }
+        }
+        else
+        {
+            while (true)
+            {
+<span class="nc" id="L745">                Availability availability = _availability.get();</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">                switch (availability)</span>
+                {
+                    case STARTING, AVAILABLE -&gt;
+                    {
+<span class="nc bnc" id="L750" title="All 2 branches missed.">                        if (_availability.compareAndSet(availability, Availability.UNAVAILABLE))</span>
+<span class="nc" id="L751">                            return;</span>
+                    }
+                    default -&gt;
+                    {
+<span class="nc" id="L755">                        return;</span>
+                    }
+                }
+<span class="nc" id="L758">            }</span>
+        }
+<span class="nc" id="L760">    }</span>
+
+    @Override
+    protected void doStart() throws Exception
+    {
+<span class="pc bpc" id="L765" title="1 of 2 branches missed.">        if (getContextPath() == null)</span>
+<span class="nc" id="L766">            throw new IllegalStateException(&quot;Null contextPath&quot;);</span>
+
+<span class="fc" id="L768">        Resource baseResource = getBaseResource();</span>
+<span class="pc bpc" id="L769" title="1 of 2 branches missed.">        if (baseResource != null)</span>
+        {
+<span class="nc bnc" id="L771" title="All 2 branches missed.">            if (!Resources.isReadable(baseResource))</span>
+<span class="nc" id="L772">                throw new IllegalArgumentException(&quot;Base Resource is not valid: &quot; + baseResource);</span>
+<span class="nc bnc" id="L773" title="All 2 branches missed.">            if (baseResource.isAlias())</span>
+            {
+<span class="nc" id="L775">                URI realUri = baseResource.getRealURI();</span>
+<span class="nc bnc" id="L776" title="All 2 branches missed.">                if (realUri == null)</span>
+                {
+<span class="nc" id="L778">                    LOG.warn(&quot;{} Base Resource should not be an alias (100% of requests to context are subject to Security/Alias Checks): {}&quot;, getDisplayName(), baseResource);</span>
+                }
+                else
+                {
+<span class="nc" id="L782">                    LOG.info(&quot;{} Base Resource is an alias: {} -&gt; {}&quot;, getDisplayName(), baseResource, realUri.toASCIIString());</span>
+<span class="nc" id="L783">                    setAttribute(&quot;_baseResource&quot;, _baseResource);</span>
+<span class="nc" id="L784">                    _baseResource = ResourceFactory.of(this).newResource(realUri);</span>
+                }
+            }
+        }
+
+<span class="fc" id="L789">        _availability.set(Availability.STARTING);</span>
+        try
+        {
+<span class="fc" id="L792">            createTempDirectory();</span>
+<span class="fc" id="L793">            _context.call(super::doStart, null);</span>
+<span class="fc" id="L794">            _availability.compareAndSet(Availability.STARTING, Availability.AVAILABLE);</span>
+<span class="fc" id="L795">            LOG.info(&quot;Started {}&quot;, this);</span>
+        }
+        finally
+        {
+<span class="fc" id="L799">            _availability.compareAndSet(Availability.STARTING, Availability.UNAVAILABLE);</span>
+        }
+<span class="fc" id="L801">    }</span>
+
+    /**
+     * &lt;p&gt;Create the temporary directory. If the directory exists, but is not persistent, then it is
+     * first deleted and then recreated.  Once created, this method is a noop if called again before
+     * stopping the context.&lt;/p&gt;
+     */
+    protected void createTempDirectory()
+    {
+<span class="fc" id="L810">        File tempDirectory = getTempDirectory();</span>
+<span class="pc bpc" id="L811" title="3 of 4 branches missed.">        if (tempDirectory != null &amp;&amp; !_tempDirectoryCreated)</span>
+        {
+<span class="nc" id="L813">            _tempDirectoryCreated = true;</span>
+<span class="nc bnc" id="L814" title="All 2 branches missed.">            if (isTempDirectoryPersistent())</span>
+            {
+                // Create the directory if it doesn't exist
+<span class="nc bnc" id="L817" title="All 4 branches missed.">                if (!tempDirectory.exists() &amp;&amp; !tempDirectory.mkdirs())</span>
+<span class="nc" id="L818">                    throw new IllegalArgumentException(&quot;Unable to create temp dir: &quot; + tempDirectory);</span>
+            }
+            else
+            {
+                // Delete and recreate it to ensure it is empty
+<span class="nc bnc" id="L823" title="All 4 branches missed.">                if (tempDirectory.exists() &amp;&amp; !IO.delete(tempDirectory))</span>
+<span class="nc" id="L824">                    throw new IllegalArgumentException(&quot;Failed to delete temp dir: &quot; + tempDirectory);</span>
+<span class="nc bnc" id="L825" title="All 2 branches missed.">                if (!tempDirectory.mkdirs())</span>
+<span class="nc" id="L826">                    throw new IllegalArgumentException(&quot;Unable to create temp dir: &quot; + tempDirectory);</span>
+
+                // ensure it is removed on exist
+<span class="nc" id="L829">                tempDirectory.deleteOnExit();</span>
+            }
+
+            // is it usable
+<span class="nc bnc" id="L833" title="All 4 branches missed.">            if (!tempDirectory.canWrite() || !tempDirectory.isDirectory())</span>
+<span class="nc" id="L834">                throw new IllegalArgumentException(&quot;Temp dir &quot; + tempDirectory + &quot; not usable: writeable=&quot; + tempDirectory.canWrite() + &quot;, dir=&quot; + tempDirectory.isDirectory());</span>
+        }
+<span class="fc" id="L836">    }</span>
+
+    @Override
+    protected void doStop() throws Exception
+    {
+<span class="fc" id="L841">        _context.call(super::doStop, null);</span>
+<span class="fc" id="L842">        cleanupAfterStop();</span>
+<span class="fc" id="L843">        _tempDirectoryCreated = false;</span>
+<span class="pc bpc" id="L844" title="1 of 2 branches missed.">        if (removeAttribute(&quot;_baseResource&quot;) instanceof Resource baseResource)</span>
+<span class="nc" id="L845">            _baseResource = baseResource;</span>
+<span class="fc" id="L846">    }</span>
+
+    protected void cleanupAfterStop() throws Exception
+    {
+<span class="fc" id="L850">        File tempDirectory = getTempDirectory();</span>
+
+        // if we're not persisting the temp dir contents delete it
+<span class="pc bpc" id="L853" title="5 of 6 branches missed.">        if (tempDirectory != null &amp;&amp; tempDirectory.exists() &amp;&amp; !isTempDirectoryPersistent())</span>
+        {
+<span class="nc" id="L855">            IO.delete(tempDirectory);</span>
+        }
+
+        //if it was jetty that created the tmp dir, it can be reset, otherwise we need to retain the name
+<span class="pc bpc" id="L859" title="1 of 2 branches missed.">        if (_createdTempDirectoryName)</span>
+        {
+<span class="nc" id="L861">            setTempDirectory(null);</span>
+<span class="nc" id="L862">            _createdTempDirectoryName = false;</span>
+        }
+<span class="fc" id="L864">    }</span>
+
+    /** Generate a reasonable name for the temp directory because one has not been
+     * explicitly configured by the user with {@link #setTempDirectory(File)}. The
+     * directory may also be created, if it is not persistent. If it is persistent
+     * it will be created as necessary by {@link #createTempDirectory()} later
+     * during the startup of the context.
+     *
+     * @throws Exception IllegalStateException if the parent tmp directory does
+     * not exist, or IOException if the child tmp directory cannot be created.
+     */
+    protected void makeTempDirectory()
+        throws Exception
+    {
+<span class="nc" id="L878">        File parent = getServer().getContext().getTempDirectory();</span>
+<span class="nc bnc" id="L879" title="All 8 branches missed.">        if (parent == null || !parent.exists() || !parent.canWrite() || !parent.isDirectory())</span>
+<span class="nc bnc" id="L880" title="All 2 branches missed.">            throw new IllegalStateException(&quot;Parent for temp dir not configured correctly: &quot; + (parent == null ? &quot;null&quot; : &quot;writeable=&quot; + parent.canWrite()));</span>
+
+<span class="nc bnc" id="L882" title="All 4 branches missed.">        boolean persistent = isTempDirectoryPersistent() || &quot;work&quot;.equals(parent.toPath().getFileName().toString());</span>
+
+        //Create a name for the temp dir
+<span class="nc" id="L885">        String temp = getCanonicalNameForTmpDir();</span>
+        File tmpDir;
+<span class="nc bnc" id="L887" title="All 2 branches missed.">        if (persistent)</span>
+        {
+            //if it is to be persisted, make sure it will be the same name
+            //by not using File.createTempFile, which appends random digits
+<span class="nc" id="L891">            tmpDir = new File(parent, temp);</span>
+        }
+        else
+        {
+            // ensure dir will always be unique by having classlib generate random path name
+<span class="nc" id="L896">            tmpDir = Files.createTempDirectory(parent.toPath(), temp).toFile();</span>
+<span class="nc" id="L897">            tmpDir.deleteOnExit();</span>
+        }
+
+<span class="nc bnc" id="L900" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L901">            LOG.debug(&quot;Set temp dir {}&quot;, tmpDir);</span>
+<span class="nc" id="L902">        setTempDirectory(tmpDir);</span>
+<span class="nc" id="L903">        setTempDirectoryPersistent(persistent);</span>
+<span class="nc" id="L904">        _createdTempDirectoryName = true;</span>
+<span class="nc" id="L905">    }</span>
+
+    /**
+     * Create a canonical name for a context temp directory.
+     * &lt;p&gt;
+     * The form of the name is:
+     *
+     * &lt;pre&gt;&quot;jetty-&quot;+host+&quot;-&quot;+port+&quot;-&quot;+resourceBase+&quot;-_&quot;+context+&quot;-&quot;+virtualhost+&quot;-&quot;+randomdigits+&quot;.dir&quot;&lt;/pre&gt;
+     *
+     * host and port uniquely identify the server
+     * context and virtual host uniquely identify the context
+     * randomdigits ensure every tmp directory is unique
+     *
+     * @return the canonical name for the context temp directory
+     */
+    protected String getCanonicalNameForTmpDir()
+    {
+<span class="nc" id="L922">        StringBuilder canonicalName = new StringBuilder();</span>
+<span class="nc" id="L923">        canonicalName.append(&quot;jetty-&quot;);</span>
+
+        //get the host and the port from the first connector
+<span class="nc" id="L926">        Server server = getServer();</span>
+<span class="nc bnc" id="L927" title="All 2 branches missed.">        if (server != null)</span>
+        {
+<span class="nc" id="L929">            Connector[] connectors = server.getConnectors();</span>
+
+<span class="nc bnc" id="L931" title="All 2 branches missed.">            if (connectors.length &gt; 0)</span>
+            {
+                //Get the host
+<span class="nc" id="L934">                String host = null;</span>
+<span class="nc" id="L935">                int port = 0;</span>
+<span class="nc bnc" id="L936" title="All 2 branches missed.">                if (connectors[0] instanceof NetworkConnector connector)</span>
+                {
+<span class="nc" id="L938">                    host = connector.getHost();</span>
+<span class="nc" id="L939">                    port = connector.getLocalPort();</span>
+<span class="nc bnc" id="L940" title="All 2 branches missed.">                    if (port &lt; 0)</span>
+<span class="nc" id="L941">                        port = connector.getPort();</span>
+                }
+<span class="nc bnc" id="L943" title="All 2 branches missed.">                if (host == null)</span>
+<span class="nc" id="L944">                    host = &quot;0.0.0.0&quot;;</span>
+<span class="nc" id="L945">                canonicalName.append(host);</span>
+<span class="nc" id="L946">                canonicalName.append(&quot;-&quot;);</span>
+<span class="nc" id="L947">                canonicalName.append(port);</span>
+<span class="nc" id="L948">                canonicalName.append(&quot;-&quot;);</span>
+            }
+        }
+
+        // Resource base
+        try
+        {
+<span class="nc" id="L955">            Resource resource = getResourceForTempDirName();</span>
+<span class="nc" id="L956">            String resourceBaseName = getBaseName(resource);</span>
+<span class="nc" id="L957">            canonicalName.append(resourceBaseName);</span>
+<span class="nc" id="L958">            canonicalName.append(&quot;-&quot;);</span>
+        }
+<span class="nc" id="L960">        catch (Exception e)</span>
+        {
+<span class="nc bnc" id="L962" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L963">                LOG.debug(&quot;Can't get resource base name&quot;, e);</span>
+
+<span class="nc" id="L965">            canonicalName.append(&quot;-&quot;); // empty resourceBaseName segment</span>
+<span class="nc" id="L966">        }</span>
+
+        //Context name
+<span class="nc" id="L969">        String contextPath = getContextPath();</span>
+<span class="nc" id="L970">        contextPath = contextPath.replace('/', '_');</span>
+<span class="nc" id="L971">        contextPath = contextPath.replace('\\', '_');</span>
+<span class="nc" id="L972">        canonicalName.append(contextPath);</span>
+
+        //Virtual host (if there is one)
+<span class="nc" id="L975">        canonicalName.append(&quot;-&quot;);</span>
+<span class="nc" id="L976">        List&lt;String&gt; vhosts = getVirtualHosts();</span>
+<span class="nc bnc" id="L977" title="All 4 branches missed.">        if (vhosts == null || vhosts.size() &lt;= 0)</span>
+<span class="nc" id="L978">            canonicalName.append(&quot;any&quot;);</span>
+        else
+<span class="nc" id="L980">            canonicalName.append(vhosts.get(0));</span>
+
+        // sanitize
+<span class="nc bnc" id="L983" title="All 2 branches missed.">        for (int i = 0; i &lt; canonicalName.length(); i++)</span>
+        {
+<span class="nc" id="L985">            char c = canonicalName.charAt(i);</span>
+<span class="nc bnc" id="L986" title="All 4 branches missed.">            if (!Character.isJavaIdentifierPart(c) &amp;&amp; &quot;-.&quot;.indexOf(c) &lt; 0)</span>
+<span class="nc" id="L987">                canonicalName.setCharAt(i, '.');</span>
+        }
+
+<span class="nc" id="L990">        canonicalName.append(&quot;-&quot;);</span>
+
+<span class="nc" id="L992">        return StringUtil.sanitizeFileSystemName(canonicalName.toString());</span>
+    }
+
+    /**
+     * @return the baseResource for the context to use in the temp dir name
+     */
+    protected Resource getResourceForTempDirName()
+    {
+<span class="nc" id="L1000">        return getBaseResource();</span>
+    }
+
+    /**
+     * @param resource the resource whose filename minus suffix to extract
+     * @return the filename of the resource without suffix
+     */
+    protected static String getBaseName(Resource resource)
+    {
+        // Use File System and File interface if present
+<span class="nc" id="L1010">        Path resourceFile = resource.getPath();</span>
+
+<span class="nc bnc" id="L1012" title="All 4 branches missed.">        if ((resourceFile != null) &amp;&amp; (resource instanceof MountedPathResource))</span>
+        {
+<span class="nc" id="L1014">            resourceFile = ((MountedPathResource)resource).getContainerPath();</span>
+        }
+
+<span class="nc bnc" id="L1017" title="All 2 branches missed.">        if (resourceFile != null)</span>
+        {
+<span class="nc" id="L1019">            Path fileName = resourceFile.getFileName();</span>
+<span class="nc bnc" id="L1020" title="All 2 branches missed.">            return fileName == null ? &quot;&quot; : fileName.toString();</span>
+        }
+
+        // Use URI itself.
+<span class="nc" id="L1024">        URI uri = resource.getURI();</span>
+<span class="nc bnc" id="L1025" title="All 2 branches missed.">        if (uri == null)</span>
+        {
+<span class="nc bnc" id="L1027" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+            {
+<span class="nc" id="L1029">                LOG.debug(&quot;Resource has no URI reference: {}&quot;, resource);</span>
+            }
+<span class="nc" id="L1031">            return &quot;&quot;;</span>
+        }
+
+<span class="nc" id="L1034">        return URIUtil.getUriLastPathSegment(uri);</span>
+    }
+
+    public boolean checkVirtualHost(Request request)
+    {
+<span class="pc bpc" id="L1039" title="1 of 2 branches missed.">        if (_vhosts.isEmpty())</span>
+<span class="fc" id="L1040">            return true;</span>
+
+<span class="nc" id="L1042">        String host = Request.getServerName(request);</span>
+<span class="nc" id="L1043">        String connectorName = request.getConnectionMetaData().getConnector().getName();</span>
+
+<span class="nc bnc" id="L1045" title="All 2 branches missed.">        for (VHost vhost : _vhosts)</span>
+        {
+<span class="nc bnc" id="L1047" title="All 2 branches missed.">            if (vhost.matches(connectorName, host))</span>
+<span class="nc" id="L1048">                return true;</span>
+<span class="nc" id="L1049">        }</span>
+<span class="nc" id="L1050">        return false;</span>
+    }
+
+    @Override
+    public void destroy()
+    {
+<span class="nc" id="L1056">        _context.run(super::destroy);</span>
+<span class="nc" id="L1057">    }</span>
+
+    @Override
+    public boolean handle(Request request, Response response, Callback callback) throws Exception
+    {
+<span class="fc" id="L1062">        Handler handler = getHandler();</span>
+<span class="pc bpc" id="L1063" title="2 of 4 branches missed.">        if (handler == null || !isStarted())</span>
+<span class="nc" id="L1064">            return false;</span>
+
+<span class="pc bpc" id="L1066" title="1 of 2 branches missed.">        if (!checkVirtualHost(request))</span>
+<span class="nc" id="L1067">            return false;</span>
+
+        // check the path matches the context path
+<span class="fc" id="L1070">        String path = request.getHttpURI().getCanonicalPath();</span>
+<span class="fc" id="L1071">        String pathInContext = _context.getPathInContext(path);</span>
+<span class="pc bpc" id="L1072" title="1 of 2 branches missed.">        if (pathInContext == null)</span>
+<span class="nc" id="L1073">            return false;</span>
+
+<span class="pc bpc" id="L1075" title="1 of 2 branches missed.">        if (!isAvailable())</span>
+        {
+<span class="nc" id="L1077">            handleUnavailable(request, response, callback);</span>
+<span class="nc" id="L1078">            return true;</span>
+        }
+
+<span class="pc bpc" id="L1081" title="3 of 4 branches missed.">        if (pathInContext.isEmpty() &amp;&amp; !getAllowNullPathInContext())</span>
+        {
+<span class="nc" id="L1083">            handleMovedPermanently(request, response, callback);</span>
+<span class="nc" id="L1084">            return true;</span>
+        }
+
+<span class="fc" id="L1087">        ContextRequest contextRequest = wrapRequest(request, response);</span>
+
+        // wrap might return null (eg ServletContextHandler could not match a servlet)
+<span class="pc bpc" id="L1090" title="1 of 2 branches missed.">        if (contextRequest == null)</span>
+<span class="nc" id="L1091">            return false;</span>
+
+<span class="pc bpc" id="L1093" title="1 of 2 branches missed.">        if (handleByContextHandler(pathInContext, contextRequest, response, callback))</span>
+<span class="nc" id="L1094">            return true;</span>
+
+        // Past this point we are calling the downstream handler in scope.
+<span class="fc" id="L1097">        Context lastContext = getCurrentContext();</span>
+<span class="fc" id="L1098">        ClassLoader lastLoader = enterScope(contextRequest);</span>
+<span class="fc" id="L1099">        ContextResponse contextResponse = wrapResponse(contextRequest, response);</span>
+        try
+        {
+<span class="fc" id="L1102">            return handler.handle(contextRequest, contextResponse, callback);</span>
+        }
+<span class="nc" id="L1104">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L1106">            Response.writeError(contextRequest, contextResponse, callback, t);</span>
+<span class="nc" id="L1107">            return true;</span>
+        }
+        finally
+        {
+            // We exit scope here, even though handle() is asynchronous,
+            // as we have wrapped all our callbacks to re-enter the scope.
+<span class="fc" id="L1113">            exitScope(contextRequest, lastContext, lastLoader);</span>
+        }
+    }
+
+    protected boolean handleByContextHandler(String pathInContext, ContextRequest request, Response response, Callback callback)
+    {
+<span class="pc bpc" id="L1119" title="1 of 2 branches missed.">        if (isProtectedTarget(pathInContext))</span>
+        {
+<span class="nc" id="L1121">            Response.writeError(request, response, callback, HttpStatus.NOT_FOUND_404, null);</span>
+<span class="nc" id="L1122">            return true;</span>
+        }
+
+<span class="fc" id="L1125">        return false;</span>
+    }
+
+    protected void handleMovedPermanently(Request request, Response response, Callback callback)
+    {
+        // TODO: should this be a fully qualified URI? (with scheme and host?)
+<span class="nc" id="L1131">        String location = _contextPath + &quot;/&quot;;</span>
+<span class="nc bnc" id="L1132" title="All 2 branches missed.">        if (request.getHttpURI().getParam() != null)</span>
+<span class="nc" id="L1133">            location += &quot;;&quot; + request.getHttpURI().getParam();</span>
+<span class="nc bnc" id="L1134" title="All 2 branches missed.">        if (request.getHttpURI().getQuery() != null)</span>
+<span class="nc" id="L1135">            location += &quot;?&quot; + request.getHttpURI().getQuery();</span>
+
+<span class="nc" id="L1137">        response.setStatus(HttpStatus.MOVED_PERMANENTLY_301);</span>
+<span class="nc" id="L1138">        response.getHeaders().add(new HttpField(HttpHeader.LOCATION, location));</span>
+<span class="nc" id="L1139">        callback.succeeded();</span>
+<span class="nc" id="L1140">    }</span>
+
+    protected void handleUnavailable(Request request, Response response, Callback callback)
+    {
+<span class="nc" id="L1144">        Response.writeError(request, response, callback, HttpStatus.SERVICE_UNAVAILABLE_503, null);</span>
+<span class="nc" id="L1145">    }</span>
+
+    /**
+     * @param contextPath The _contextPath to set.
+     */
+    public void setContextPath(String contextPath)
+    {
+<span class="pc bpc" id="L1152" title="1 of 2 branches missed.">        if (isStarted())</span>
+<span class="nc" id="L1153">            throw new IllegalStateException(getState());</span>
+<span class="fc" id="L1154">        _contextPath = URIUtil.canonicalPath(Objects.requireNonNull(contextPath));</span>
+<span class="fc" id="L1155">        _rootContext = &quot;/&quot;.equals(contextPath);</span>
+<span class="fc" id="L1156">    }</span>
+
+    /**
+     * @param servletContextName The servletContextName to set.
+     */
+    public void setDisplayName(String servletContextName)
+    {
+<span class="nc" id="L1163">        _displayName = servletContextName;</span>
+<span class="nc" id="L1164">    }</span>
+
+    /**
+     * @return Returns the base resource as a string.
+     */
+    @ManagedAttribute(value = &quot;document root for context&quot;, readonly = true)
+    public Resource getBaseResource()
+    {
+<span class="fc" id="L1172">        return _baseResource;</span>
+    }
+
+    /**
+     * &lt;p&gt;Set the base resource to serve content from for this context,
+     * which must exist and be readable when the context is started.&lt;/p&gt;
+     *
+     * @param resourceBase The base resource for the context.
+     */
+    public void setBaseResource(Resource resourceBase)
+    {
+<span class="nc bnc" id="L1183" title="All 2 branches missed.">        if (isStarted())</span>
+<span class="nc" id="L1184">            throw new IllegalStateException(getState());</span>
+
+<span class="nc" id="L1186">        _baseResource = resourceBase;</span>
+        /* Do not test if Resource is valid here, let that happen in doStart.
+         * A resource at this point in time might be invalid or doesn't exist (yet).
+         * (eg: due to stop behaviors, or Configuration.deconfigure() behaviors),
+         */
+<span class="nc" id="L1191">    }</span>
+
+    /**
+     * &lt;p&gt;Set the base resource to serve content from.&lt;/p&gt;
+     *
+     * &lt;p&gt;Note: the {@link Resource} is created from {@link ResourceFactory#of(org.eclipse.jetty.util.component.Container)}
+     * which is tied to the lifecycle of this context.&lt;/p&gt;
+     *
+     * @param path The path to create a base resource from.
+     * @see #setBaseResource(Resource)
+     */
+    public void setBaseResourceAsPath(Path path)
+    {
+<span class="nc bnc" id="L1204" title="All 2 branches missed.">        setBaseResource(path == null ? null : ResourceFactory.of(this).newResource(path));</span>
+<span class="nc" id="L1205">    }</span>
+
+    /**
+     * &lt;p&gt;Set the base resource to serve content from.&lt;/p&gt;
+     *
+     * &lt;p&gt;Note: the {@link Resource} is created from {@link ResourceFactory#of(org.eclipse.jetty.util.component.Container)}
+     * which is tied to the lifecycle of this context.&lt;/p&gt;
+     *
+     * @param base The path to create a base resource from.
+     * @see #setBaseResource(Resource)
+     */
+    public void setBaseResourceAsString(String base)
+    {
+<span class="nc bnc" id="L1218" title="All 2 branches missed.">        setBaseResource((base == null ? null : ResourceFactory.of(this).newResource(base)));</span>
+<span class="nc" id="L1219">    }</span>
+
+    /**
+     * @return Returns the errorHandler.
+     */
+    @ManagedAttribute(&quot;The error handler to use for the context&quot;)
+    public Request.Handler getErrorHandler()
+    {
+        // TODO, do we need to wrap this so that we can establish the context
+        //       Classloader?  Or will the caller already do that?
+<span class="nc" id="L1229">        return _errorHandler;</span>
+    }
+
+    /**
+     * @param errorHandler The error handler to set.
+     */
+    public void setErrorHandler(Request.Handler errorHandler)
+    {
+<span class="fc" id="L1237">        updateBean(_errorHandler, errorHandler, true);</span>
+<span class="fc" id="L1238">        _errorHandler = errorHandler;</span>
+<span class="fc" id="L1239">    }</span>
+
+    protected ContextRequest wrapRequest(Request request, Response response)
+    {
+<span class="nc" id="L1243">        return new ContextRequest(_context, request);</span>
+    }
+
+    protected ContextResponse wrapResponse(ContextRequest request, Response response)
+    {
+<span class="nc" id="L1248">        return new ContextResponse(_context, request, response);</span>
+    }
+
+    @Override
+    public void clearAttributes()
+    {
+<span class="nc" id="L1254">        _persistentAttributes.clearAttributes();</span>
+<span class="nc" id="L1255">    }</span>
+
+    /**
+     * Check the target when a target within a context is determined. If
+     * the target is protected, 404 is returned.
+     *
+     * @param target the target to test
+     * @return true if target is a protected target
+     */
+    public boolean isProtectedTarget(String target)
+    {
+<span class="pc bpc" id="L1266" title="2 of 4 branches missed.">        if (target == null || _protectedTargets.isEmpty())</span>
+<span class="fc" id="L1267">            return false;</span>
+
+<span class="nc bnc" id="L1269" title="All 2 branches missed.">        if (target.startsWith(&quot;//&quot;))</span>
+<span class="nc" id="L1270">            target = URIUtil.compactPath(target);</span>
+
+<span class="nc" id="L1272">        ProtectedTargetType type = _protectedTargets.getBest(target);</span>
+
+<span class="nc bnc" id="L1274" title="All 4 branches missed.">        return type == ProtectedTargetType.PREFIX ||</span>
+<span class="nc bnc" id="L1275" title="All 2 branches missed.">            type == ProtectedTargetType.EXACT &amp;&amp; _protectedTargets.get(target) == ProtectedTargetType.EXACT;</span>
+    }
+
+    /**
+     * @param targets Array of URL prefix. Each prefix is in the form /path and will match either /path exactly or /path/anything
+     */
+    public void setProtectedTargets(String[] targets)
+    {
+<span class="nc" id="L1283">        Index.Builder&lt;ProtectedTargetType&gt; builder = new Index.Builder&lt;&gt;();</span>
+<span class="nc bnc" id="L1284" title="All 2 branches missed.">        if (targets != null)</span>
+        {
+<span class="nc bnc" id="L1286" title="All 2 branches missed.">            for (String t : targets)</span>
+            {
+<span class="nc bnc" id="L1288" title="All 2 branches missed.">                if (!t.startsWith(&quot;/&quot;))</span>
+<span class="nc" id="L1289">                    throw new IllegalArgumentException(&quot;Bad protected target: &quot; + t);</span>
+
+<span class="nc" id="L1291">                builder.with(t, ProtectedTargetType.EXACT);</span>
+<span class="nc" id="L1292">                builder.with(t + &quot;/&quot;, ProtectedTargetType.PREFIX);</span>
+<span class="nc" id="L1293">                builder.with(t + &quot;?&quot;, ProtectedTargetType.PREFIX);</span>
+<span class="nc" id="L1294">                builder.with(t + &quot;#&quot;, ProtectedTargetType.PREFIX);</span>
+<span class="nc" id="L1295">                builder.with(t + &quot;;&quot;, ProtectedTargetType.PREFIX);</span>
+            }
+        }
+<span class="nc" id="L1298">        _protectedTargets = builder.caseSensitive(false).build();</span>
+<span class="nc" id="L1299">    }</span>
+
+    public String[] getProtectedTargets()
+    {
+<span class="nc bnc" id="L1303" title="All 2 branches missed.">        if (_protectedTargets == null)</span>
+<span class="nc" id="L1304">            return null;</span>
+
+<span class="nc" id="L1306">        return _protectedTargets.keySet().stream()</span>
+<span class="nc bnc" id="L1307" title="All 2 branches missed.">            .filter(s -&gt; _protectedTargets.get(s) == ProtectedTargetType.EXACT)</span>
+<span class="nc" id="L1308">            .toArray(String[]::new);</span>
+    }
+
+    /**
+     * Add an AliasCheck instance to possibly permit aliased resources
+     *
+     * @param check The alias checker
+     */
+    public void addAliasCheck(AliasCheck check)
+    {
+<span class="fc" id="L1318">        _aliasChecks.add(check);</span>
+<span class="pc bpc" id="L1319" title="1 of 2 branches missed.">        if (check instanceof LifeCycle)</span>
+<span class="fc" id="L1320">            addManaged((LifeCycle)check);</span>
+        else
+<span class="nc" id="L1322">            addBean(check);</span>
+<span class="fc" id="L1323">    }</span>
+
+    /**
+     * @return Immutable list of Alias checks
+     */
+    public List&lt;AliasCheck&gt; getAliasChecks()
+    {
+<span class="nc" id="L1330">        return Collections.unmodifiableList(_aliasChecks);</span>
+    }
+
+    /**
+     * Set list of AliasCheck instances.
+     * @param checks list of AliasCheck instances
+     */
+    public void setAliasChecks(List&lt;AliasCheck&gt; checks)
+    {
+<span class="nc" id="L1339">        clearAliasChecks();</span>
+<span class="nc" id="L1340">        checks.forEach(this::addAliasCheck);</span>
+<span class="nc" id="L1341">    }</span>
+
+    /**
+     * clear the list of AliasChecks
+     */
+    public void clearAliasChecks()
+    {
+<span class="nc" id="L1348">        _aliasChecks.forEach(this::removeBean);</span>
+<span class="nc" id="L1349">        _aliasChecks.clear();</span>
+<span class="nc" id="L1350">    }</span>
+
+    @Override
+    public boolean checkAlias(String pathInContext, Resource resource)
+    {
+        // Is the resource aliased?
+<span class="nc bnc" id="L1356" title="All 2 branches missed.">        if (resource.isAlias())</span>
+        {
+<span class="nc bnc" id="L1358" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L1359">                LOG.debug(&quot;Aliased resource: {} -&gt; {}&quot;, resource, resource.getRealURI());</span>
+
+            // alias checks
+<span class="nc bnc" id="L1362" title="All 2 branches missed.">            for (AliasCheck check : _aliasChecks)</span>
+            {
+<span class="nc bnc" id="L1364" title="All 2 branches missed.">                if (check.checkAlias(pathInContext, resource))</span>
+                {
+<span class="nc bnc" id="L1366" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L1367">                        LOG.debug(&quot;Aliased resource: {} approved by {}&quot;, resource, check);</span>
+<span class="nc" id="L1368">                    return true;</span>
+                }
+<span class="nc" id="L1370">            }</span>
+<span class="nc" id="L1371">            return false;</span>
+        }
+<span class="nc" id="L1373">        return true;</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="fc" id="L1379">        List&lt;String&gt; vhosts = getVirtualHosts();</span>
+<span class="fc" id="L1380">        StringBuilder b = new StringBuilder();</span>
+
+<span class="fc" id="L1382">        b.append(TypeUtil.toShortName(getClass())).append('@').append(Integer.toString(hashCode(), 16));</span>
+<span class="fc" id="L1383">        b.append('{');</span>
+<span class="pc bpc" id="L1384" title="1 of 2 branches missed.">        if (getDisplayName() != null)</span>
+<span class="fc" id="L1385">            b.append(getDisplayName()).append(',');</span>
+<span class="fc" id="L1386">        b.append(getContextPath());</span>
+<span class="fc" id="L1387">        b.append(&quot;,b=&quot;).append(getBaseResource());</span>
+<span class="fc" id="L1388">        b.append(&quot;,a=&quot;).append(_availability);</span>
+
+<span class="pc bpc" id="L1390" title="1 of 2 branches missed.">        if (!vhosts.isEmpty())</span>
+        {
+<span class="nc" id="L1392">            b.append(&quot;,vh=[&quot;);</span>
+<span class="nc" id="L1393">            b.append(String.join(&quot;,&quot;, vhosts));</span>
+<span class="nc" id="L1394">            b.append(']');</span>
+        }
+<span class="fc" id="L1396">        Handler nestedHandler = getHandler();</span>
+<span class="pc bpc" id="L1397" title="1 of 2 branches missed.">        if (nestedHandler != null)</span>
+        {
+<span class="fc" id="L1399">            b.append(&quot;,h=&quot;);</span>
+<span class="fc" id="L1400">            b.append(nestedHandler);</span>
+        }
+<span class="fc" id="L1402">        b.append('}');</span>
+
+<span class="fc" id="L1404">        return b.toString();</span>
+    }
+
+    private static String normalizeVirtualHostname(String host)
+    {
+<span class="nc bnc" id="L1409" title="All 2 branches missed.">        if (host == null)</span>
+<span class="nc" id="L1410">            return null;</span>
+        // names with trailing &quot;.&quot; are absolute and not searched for in any local resolv.conf domain
+<span class="nc bnc" id="L1412" title="All 2 branches missed.">        if (host.endsWith(&quot;.&quot;))</span>
+<span class="nc" id="L1413">            host = host.substring(0, host.length() - 1);</span>
+<span class="nc" id="L1414">        return host;</span>
+    }
+
+    public class ScopedContext extends Attributes.Layer implements Context
+    {
+        public ScopedContext()
+<span class="fc" id="L1420">        {</span>
+<span class="fc" id="L1421">            super(_persistentAttributes);</span>
+<span class="fc" id="L1422">        }</span>
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+        public &lt;H extends ContextHandler&gt; H getContextHandler()
+        {
+<span class="fc" id="L1427">            return (H)ContextHandler.this;</span>
+        }
+
+        @Override
+        public Request.Handler getErrorHandler()
+        {
+<span class="nc" id="L1433">            Request.Handler handler = ContextHandler.this.getErrorHandler();</span>
+<span class="nc bnc" id="L1434" title="All 2 branches missed.">            if (handler == null)</span>
+<span class="nc" id="L1435">                handler = getServer().getErrorHandler();</span>
+<span class="nc" id="L1436">            return handler;</span>
+        }
+
+        @Override
+        public String getContextPath()
+        {
+<span class="fc" id="L1442">            return _contextPath;</span>
+        }
+
+        @Override
+        public MimeTypes getMimeTypes()
+        {
+<span class="nc" id="L1448">            return _mimeTypes;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1454">            return &quot;%s@%x&quot;.formatted(getClass().getSimpleName(), ContextHandler.this.hashCode());</span>
+        }
+
+        @Override
+        public ClassLoader getClassLoader()
+        {
+<span class="nc" id="L1460">            return _classLoader;</span>
+        }
+
+        @Override
+        public Resource getBaseResource()
+        {
+<span class="nc" id="L1466">            return _baseResource;</span>
+        }
+
+        @Override
+        public File getTempDirectory()
+        {
+<span class="nc" id="L1472">            File tempDirectory = ContextHandler.this.getTempDirectory();</span>
+<span class="nc bnc" id="L1473" title="All 2 branches missed.">            if (tempDirectory == null)</span>
+<span class="nc" id="L1474">                tempDirectory = getServer().getContext().getTempDirectory();</span>
+<span class="nc" id="L1475">            return tempDirectory;</span>
+        }
+
+        @Override
+        public List&lt;String&gt; getVirtualHosts()
+        {
+<span class="fc" id="L1481">            return ContextHandler.this.getVirtualHosts();</span>
+        }
+
+        public void call(Invocable.Callable callable, Request request) throws Exception
+        {
+<span class="fc" id="L1486">            Context lastContext = CURRENT_CONTEXT.get();</span>
+<span class="fc bfc" id="L1487" title="All 2 branches covered.">            if (lastContext == this)</span>
+<span class="fc" id="L1488">                callable.call();</span>
+            else
+            {
+<span class="fc" id="L1491">                ClassLoader lastLoader = enterScope(request);</span>
+                try
+                {
+<span class="fc" id="L1494">                    callable.call();</span>
+                }
+                finally
+                {
+<span class="fc" id="L1498">                    exitScope(request, lastContext, lastLoader);</span>
+                }
+            }
+<span class="fc" id="L1501">        }</span>
+
+        public &lt;T&gt; boolean test(Predicate&lt;T&gt; predicate, T t, Request request)
+        {
+<span class="nc" id="L1505">            Context lastContext = CURRENT_CONTEXT.get();</span>
+<span class="nc bnc" id="L1506" title="All 2 branches missed.">            if (lastContext == this)</span>
+<span class="nc" id="L1507">                return predicate.test(t);</span>
+
+<span class="nc" id="L1509">            ClassLoader lastLoader = enterScope(request);</span>
+            try
+            {
+<span class="nc" id="L1512">                return predicate.test(t);</span>
+            }
+            finally
+            {
+<span class="nc" id="L1516">                exitScope(request, lastContext, lastLoader);</span>
+            }
+        }
+
+        public void accept(Consumer&lt;Throwable&gt; consumer, Throwable t, Request request)
+        {
+<span class="nc" id="L1522">            Context lastContext = CURRENT_CONTEXT.get();</span>
+<span class="nc bnc" id="L1523" title="All 2 branches missed.">            if (lastContext == this)</span>
+<span class="nc" id="L1524">                consumer.accept(t);</span>
+            else
+            {
+<span class="nc" id="L1527">                ClassLoader lastLoader = enterScope(request);</span>
+                try
+                {
+<span class="nc" id="L1530">                    consumer.accept(t);</span>
+                }
+                finally
+                {
+<span class="nc" id="L1534">                    exitScope(request, lastContext, lastLoader);</span>
+                }
+            }
+<span class="nc" id="L1537">        }</span>
+
+        @Override
+        public void run(Runnable runnable)
+        {
+<span class="nc" id="L1542">            run(runnable, null);</span>
+<span class="nc" id="L1543">        }</span>
+
+        public void run(Runnable runnable, Request request)
+        {
+<span class="fc" id="L1547">            Context lastContext = CURRENT_CONTEXT.get();</span>
+<span class="fc bfc" id="L1548" title="All 2 branches covered.">            if (lastContext == this)</span>
+<span class="fc" id="L1549">                runnable.run();</span>
+            else
+            {
+<span class="fc" id="L1552">                ClassLoader lastLoader = enterScope(request);</span>
+                try
+                {
+<span class="fc" id="L1555">                    runnable.run();</span>
+                }
+                finally
+                {
+<span class="fc" id="L1559">                    exitScope(request, lastContext, lastLoader);</span>
+                }
+            }
+<span class="fc" id="L1562">        }</span>
+
+        @Override
+        public void execute(Runnable runnable)
+        {
+<span class="nc" id="L1567">            execute(runnable, null);</span>
+<span class="nc" id="L1568">        }</span>
+
+        public void execute(Runnable runnable, Request request)
+        {
+<span class="nc" id="L1572">            getServer().getContext().execute(() -&gt; run(runnable, request));</span>
+<span class="nc" id="L1573">        }</span>
+
+        protected DecoratedObjectFactory getDecoratedObjectFactory()
+        {
+<span class="nc" id="L1577">            DecoratedObjectFactory factory = ContextHandler.this.getBean(DecoratedObjectFactory.class);</span>
+<span class="nc bnc" id="L1578" title="All 2 branches missed.">            if (factory != null)</span>
+<span class="nc" id="L1579">                return factory;</span>
+<span class="nc" id="L1580">            return getServer().getBean(DecoratedObjectFactory.class);</span>
+        }
+
+        @Override
+        public &lt;T&gt; T decorate(T o)
+        {
+<span class="nc" id="L1586">            DecoratedObjectFactory factory = getDecoratedObjectFactory();</span>
+<span class="nc bnc" id="L1587" title="All 2 branches missed.">            if (factory != null)</span>
+<span class="nc" id="L1588">                return factory.decorate(o);</span>
+<span class="nc" id="L1589">            return o;</span>
+        }
+
+        @Override
+        public void destroy(Object o)
+        {
+<span class="fc" id="L1595">            DecoratedObjectFactory factory = getDecoratedObjectFactory();</span>
+<span class="pc bpc" id="L1596" title="1 of 2 branches missed.">            if (factory != null)</span>
+<span class="fc" id="L1597">                factory.destroy(o);</span>
+<span class="fc" id="L1598">        }</span>
+
+        @Override
+        public String getPathInContext(String canonicallyEncodedPath)
+        {
+<span class="pc bpc" id="L1603" title="1 of 2 branches missed.">            return _rootContext ? canonicallyEncodedPath : Context.getPathInContext(_contextPath, canonicallyEncodedPath);</span>
+        }
+
+        @Override
+        public boolean isCrossContextDispatch(Request request)
+        {
+<span class="pc bpc" id="L1609" title="3 of 4 branches missed.">            return isCrossContextDispatchSupported() &amp;&amp; request.getAttribute(CROSS_CONTEXT_ATTRIBUTE) != null;</span>
+        }
+
+        @Override
+        public String getCrossContextDispatchType(Request request)
+        {
+<span class="pc bpc" id="L1615" title="1 of 2 branches missed.">            return isCrossContextDispatchSupported() ? (String)request.getAttribute(CROSS_CONTEXT_ATTRIBUTE) : null;</span>
+        }
+    }
+
+    /**
+     * Listener for all threads entering context scope, including async IO callbacks
+     */
+    public interface ContextScopeListener extends EventListener
+    {
+        /**
+         * @param context The context being entered
+         * @param request A request that is applicable to the scope, or null
+         */
+<span class="nc" id="L1628">        default void enterScope(Context context, Request request) {}</span>
+
+        /**
+         * @param context The context being exited
+         * @param request A request that is applicable to the scope, or null
+         */
+<span class="nc" id="L1634">        default void exitScope(Context context, Request request) {}</span>
+    }
+
+    private static class VHost
+    {
+        private final String _vHost;
+        private final boolean _wild;
+        private final String _vConnector;
+
+        public VHost(String vhost)
+<span class="nc" id="L1644">        {</span>
+<span class="nc" id="L1645">            boolean wild = false;</span>
+<span class="nc" id="L1646">            String connector = null;</span>
+<span class="nc" id="L1647">            int at = vhost.indexOf('@');</span>
+<span class="nc bnc" id="L1648" title="All 2 branches missed.">            if (at &gt;= 0)</span>
+            {
+<span class="nc" id="L1650">                connector = vhost.substring(at + 1);</span>
+<span class="nc" id="L1651">                vhost = vhost.substring(0, at);</span>
+            }
+
+<span class="nc bnc" id="L1654" title="All 2 branches missed.">            if (StringUtil.isBlank(vhost))</span>
+            {
+<span class="nc" id="L1656">                vhost = null;</span>
+            }
+<span class="nc bnc" id="L1658" title="All 2 branches missed.">            else if (vhost.startsWith(&quot;*.&quot;))</span>
+            {
+<span class="nc" id="L1660">                vhost = vhost.substring(1);</span>
+<span class="nc" id="L1661">                wild = true;</span>
+            }
+
+<span class="nc" id="L1664">            _vHost = normalizeVirtualHostname(vhost);</span>
+<span class="nc" id="L1665">            _wild = wild;</span>
+<span class="nc" id="L1666">            _vConnector = connector;</span>
+<span class="nc" id="L1667">        }</span>
+
+        public boolean matches(String connectorName, String host)
+        {
+            // Do we have a connector name to match
+<span class="nc bnc" id="L1672" title="All 2 branches missed.">            if (_vConnector != null)</span>
+            {
+                // then it must match
+<span class="nc bnc" id="L1675" title="All 2 branches missed.">                if (!_vConnector.equalsIgnoreCase(connectorName))</span>
+<span class="nc" id="L1676">                    return false;</span>
+
+                // if we don't also have a vhost then we are match, otherwise check the vhost as well
+<span class="nc bnc" id="L1679" title="All 2 branches missed.">                if (_vHost == null)</span>
+<span class="nc" id="L1680">                    return true;</span>
+            }
+
+            // if we have a vhost
+<span class="nc bnc" id="L1684" title="All 4 branches missed.">            if (_vHost != null &amp;&amp; host != null)</span>
+            {
+                // vHost pattern must be last or next to last if the host ends with '.' (indicates absolute DNS name)
+<span class="nc bnc" id="L1687" title="All 2 branches missed.">                int offset = host.length() - _vHost.length() - (host.charAt(host.length() - 1) == '.' ? 1 : 0);</span>
+<span class="nc bnc" id="L1688" title="All 2 branches missed.">                if (host.regionMatches(true, offset, _vHost, 0, _vHost.length()))</span>
+                {
+                    // if wild then we only match one level, so check for no more dots
+<span class="nc bnc" id="L1691" title="All 2 branches missed.">                    if (_wild)</span>
+<span class="nc bnc" id="L1692" title="All 2 branches missed.">                        return host.lastIndexOf('.', offset - 1) &lt; 0;</span>
+                    // otherwise the offset must be 0 for a complete match
+<span class="nc bnc" id="L1694" title="All 2 branches missed.">                    return offset == 0;</span>
+                }
+            }
+<span class="nc" id="L1697">            return false;</span>
+        }
+
+        String getVHost()
+        {
+<span class="nc" id="L1702">            return _vHost;</span>
+        }
+
+        String getName()
+        {
+<span class="nc bnc" id="L1707" title="All 2 branches missed.">            if (_vConnector != null)</span>
+<span class="nc" id="L1708">                return '@' + _vConnector;</span>
+            else
+<span class="nc" id="L1710">                return _vHost;</span>
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="nc" id="L1716">            return Objects.hash(_vHost, _wild, _vConnector);</span>
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+<span class="nc" id="L1722">            return o instanceof VHost vhost &amp;&amp;</span>
+<span class="nc bnc" id="L1723" title="All 2 branches missed.">                Objects.equals(_vHost, vhost._vHost) &amp;&amp;</span>
+<span class="nc bnc" id="L1724" title="All 4 branches missed.">                Objects.equals(_wild, vhost._wild) &amp;&amp;</span>
+<span class="nc bnc" id="L1725" title="All 2 branches missed.">                Objects.equals(_vConnector, vhost._vConnector);</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1731">            return &quot;VHost{&quot; +</span>
+                &quot;_vHost='&quot; + _vHost + '\'' +
+                &quot;, _wild=&quot; + _wild +
+                &quot;, _vConnector='&quot; + _vConnector + '\'' +
+                '}';
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

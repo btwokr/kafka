@@ -1,0 +1,990 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ProxyConnectionFactory.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server</a> &gt; <span class="el_source">ProxyConnectionFactory.java</span></div><h1>ProxyConnectionFactory.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server;
+
+import java.io.IOException;
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.net.UnixDomainSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.ReadPendingException;
+import java.nio.channels.WritePendingException;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+
+import org.eclipse.jetty.io.AbstractConnection;
+import org.eclipse.jetty.io.Connection;
+import org.eclipse.jetty.io.EndPoint;
+import org.eclipse.jetty.io.RetainableByteBuffer;
+import org.eclipse.jetty.util.BufferUtil;
+import org.eclipse.jetty.util.Callback;
+import org.eclipse.jetty.util.StringUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * &lt;p&gt;ConnectionFactory for the PROXY Protocol.&lt;/p&gt;
+ * &lt;p&gt;This factory can be placed in front of any other connection factory
+ * to process the proxy v1 or v2 line before the normal protocol handling&lt;/p&gt;
+ *
+ * @see &lt;a href=&quot;https://www.haproxy.org/download/2.8/doc/proxy-protocol.txt&quot;&gt;PROXY protocol&lt;/a&gt;
+ */
+public class ProxyConnectionFactory extends DetectorConnectionFactory
+{
+<span class="nc" id="L49">    private static final Logger LOG = LoggerFactory.getLogger(ProxyConnectionFactory.class);</span>
+
+    public ProxyConnectionFactory()
+    {
+<span class="nc" id="L53">        this(null);</span>
+<span class="nc" id="L54">    }</span>
+
+    public ProxyConnectionFactory(String nextProtocol)
+    {
+<span class="nc" id="L58">        super(new ProxyV1ConnectionFactory(nextProtocol), new ProxyV2ConnectionFactory(nextProtocol));</span>
+<span class="nc" id="L59">    }</span>
+
+    private static ConnectionFactory findNextConnectionFactory(String nextProtocol, Connector connector, String currentProtocol, EndPoint endp)
+    {
+<span class="nc" id="L63">        currentProtocol = &quot;[&quot; + currentProtocol + &quot;]&quot;;</span>
+<span class="nc bnc" id="L64" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L65">            LOG.debug(&quot;finding connection factory following {} for protocol {}&quot;, currentProtocol, nextProtocol);</span>
+<span class="nc" id="L66">        String nextProtocolToFind = nextProtocol;</span>
+<span class="nc bnc" id="L67" title="All 2 branches missed.">        if (nextProtocol == null)</span>
+<span class="nc" id="L68">            nextProtocolToFind = AbstractConnectionFactory.findNextProtocol(connector, currentProtocol);</span>
+<span class="nc bnc" id="L69" title="All 2 branches missed.">        if (nextProtocolToFind == null)</span>
+<span class="nc" id="L70">            throw new IllegalStateException(&quot;Cannot find protocol following '&quot; + currentProtocol + &quot;' in connector's protocol list &quot; + connector.getProtocols() + &quot; for &quot; + endp);</span>
+<span class="nc" id="L71">        ConnectionFactory connectionFactory = connector.getConnectionFactory(nextProtocolToFind);</span>
+<span class="nc bnc" id="L72" title="All 2 branches missed.">        if (connectionFactory == null)</span>
+<span class="nc" id="L73">            throw new IllegalStateException(&quot;Cannot find protocol '&quot; + nextProtocol + &quot;' in connector's protocol list &quot; + connector.getProtocols() + &quot; for &quot; + endp);</span>
+<span class="nc bnc" id="L74" title="All 2 branches missed.">        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L75">            LOG.debug(&quot;found next connection factory {} for protocol {}&quot;, connectionFactory, nextProtocol);</span>
+<span class="nc" id="L76">        return connectionFactory;</span>
+    }
+
+    public int getMaxProxyHeader()
+    {
+<span class="nc" id="L81">        ProxyV2ConnectionFactory v2 = getBean(ProxyV2ConnectionFactory.class);</span>
+<span class="nc" id="L82">        return v2.getMaxProxyHeader();</span>
+    }
+
+    public void setMaxProxyHeader(int maxProxyHeader)
+    {
+<span class="nc" id="L87">        ProxyV2ConnectionFactory v2 = getBean(ProxyV2ConnectionFactory.class);</span>
+<span class="nc" id="L88">        v2.setMaxProxyHeader(maxProxyHeader);</span>
+<span class="nc" id="L89">    }</span>
+
+    private static class ProxyV1ConnectionFactory extends AbstractConnectionFactory implements ConnectionFactory.Detecting
+    {
+<span class="nc" id="L93">        private static final byte[] SIGNATURE = &quot;PROXY&quot;.getBytes(StandardCharsets.US_ASCII);</span>
+
+        private final String _nextProtocol;
+
+        private ProxyV1ConnectionFactory(String nextProtocol)
+        {
+<span class="nc" id="L99">            super(&quot;proxy&quot;);</span>
+<span class="nc" id="L100">            this._nextProtocol = nextProtocol;</span>
+<span class="nc" id="L101">        }</span>
+
+        @Override
+        public Detection detect(ByteBuffer buffer)
+        {
+<span class="nc bnc" id="L106" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L107">                LOG.debug(&quot;Proxy v1 attempting detection with {} bytes&quot;, buffer.remaining());</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">            if (buffer.remaining() &lt; SIGNATURE.length)</span>
+            {
+<span class="nc bnc" id="L110" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L111">                    LOG.debug(&quot;Proxy v1 detection requires more bytes&quot;);</span>
+<span class="nc" id="L112">                return Detection.NEED_MORE_BYTES;</span>
+            }
+
+<span class="nc bnc" id="L115" title="All 2 branches missed.">            for (int i = 0; i &lt; SIGNATURE.length; i++)</span>
+            {
+<span class="nc" id="L117">                byte signatureByte = SIGNATURE[i];</span>
+<span class="nc" id="L118">                byte byteInBuffer = buffer.get(i);</span>
+<span class="nc bnc" id="L119" title="All 2 branches missed.">                if (byteInBuffer != signatureByte)</span>
+                {
+<span class="nc bnc" id="L121" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L122">                        LOG.debug(&quot;Proxy v1 detection unsuccessful&quot;);</span>
+<span class="nc" id="L123">                    return Detection.NOT_RECOGNIZED;</span>
+                }
+            }
+
+<span class="nc bnc" id="L127" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L128">                LOG.debug(&quot;Proxy v1 detection succeeded&quot;);</span>
+<span class="nc" id="L129">            return Detection.RECOGNIZED;</span>
+        }
+
+        @Override
+        public Connection newConnection(Connector connector, EndPoint endp)
+        {
+<span class="nc" id="L135">            ConnectionFactory nextConnectionFactory = findNextConnectionFactory(_nextProtocol, connector, getProtocol(), endp);</span>
+<span class="nc" id="L136">            return configure(new ProxyProtocolV1Connection(endp, connector, nextConnectionFactory), connector, endp);</span>
+        }
+
+        private static class ProxyProtocolV1Connection extends AbstractConnection implements Connection.UpgradeFrom, Connection.UpgradeTo
+        {
+            // 0     1 2       3       4 5 6
+            // 98765432109876543210987654321
+            // PROXY P R.R.R.R L.L.L.L R Lrn
+            private static final int CR_INDEX = 6;
+            private static final int LF_INDEX = 7;
+
+            private final Connector _connector;
+            private final ConnectionFactory _next;
+            private final RetainableByteBuffer _buffer;
+<span class="nc" id="L150">            private final StringBuilder _builder = new StringBuilder();</span>
+<span class="nc" id="L151">            private final String[] _fields = new String[6];</span>
+            private int _index;
+            private int _length;
+
+            private ProxyProtocolV1Connection(EndPoint endp, Connector connector, ConnectionFactory next)
+            {
+<span class="nc" id="L157">                super(endp, connector.getExecutor());</span>
+<span class="nc" id="L158">                _connector = connector;</span>
+<span class="nc" id="L159">                _next = next;</span>
+<span class="nc" id="L160">                _buffer = _connector.getByteBufferPool().acquire(getInputBufferSize(), true);</span>
+<span class="nc" id="L161">            }</span>
+
+            @Override
+            public void onFillable()
+            {
+<span class="nc bnc" id="L166" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L167">                    LOG.debug(&quot;Proxy v1 onFillable current index = {}&quot;, _index);</span>
+                try
+                {
+<span class="nc bnc" id="L170" title="All 2 branches missed.">                    while (_index &lt; LF_INDEX)</span>
+                    {
+                        // Read data
+<span class="nc" id="L173">                        int fill = getEndPoint().fill(_buffer.getByteBuffer());</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">                        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L175">                            LOG.debug(&quot;Proxy v1 filled buffer with {} bytes&quot;, fill);</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">                        if (fill &lt; 0)</span>
+                        {
+<span class="nc" id="L178">                            _buffer.release();</span>
+<span class="nc" id="L179">                            getEndPoint().shutdownOutput();</span>
+<span class="nc" id="L180">                            return;</span>
+                        }
+<span class="nc bnc" id="L182" title="All 2 branches missed.">                        if (fill == 0)</span>
+                        {
+<span class="nc" id="L184">                            fillInterested();</span>
+<span class="nc" id="L185">                            return;</span>
+                        }
+
+<span class="nc bnc" id="L188" title="All 2 branches missed.">                        if (parse())</span>
+<span class="nc" id="L189">                            break;</span>
+<span class="nc" id="L190">                    }</span>
+
+<span class="nc bnc" id="L192" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L193">                        LOG.debug(&quot;Proxy v1 onFillable parsing done, now upgrading&quot;);</span>
+<span class="nc" id="L194">                    upgrade();</span>
+                }
+<span class="nc" id="L196">                catch (Throwable x)</span>
+                {
+<span class="nc" id="L198">                    LOG.warn(&quot;Proxy v1 error for {} {}&quot;, getEndPoint(), x.toString());</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L200">                        LOG.warn(&quot;Proxy v1 error&quot;, x);</span>
+<span class="nc" id="L201">                    releaseAndClose();</span>
+<span class="nc" id="L202">                }</span>
+<span class="nc" id="L203">            }</span>
+
+            @Override
+            public void onOpen()
+            {
+<span class="nc" id="L208">                super.onOpen();</span>
+
+                try
+                {
+<span class="nc bnc" id="L212" title="All 2 branches missed.">                    while (_index &lt; LF_INDEX)</span>
+                    {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">                        if (!parse())</span>
+                        {
+<span class="nc bnc" id="L216" title="All 2 branches missed.">                            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L217">                                LOG.debug(&quot;Proxy v1 onOpen parsing ran out of bytes, marking as fillInterested&quot;);</span>
+<span class="nc" id="L218">                            fillInterested();</span>
+<span class="nc" id="L219">                            return;</span>
+                        }
+                    }
+
+<span class="nc bnc" id="L223" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L224">                        LOG.debug(&quot;Proxy v1 onOpen parsing done, now upgrading&quot;);</span>
+<span class="nc" id="L225">                    upgrade();</span>
+                }
+<span class="nc" id="L227">                catch (Throwable x)</span>
+                {
+<span class="nc" id="L229">                    LOG.warn(&quot;Proxy v1 error for {} {}&quot;, getEndPoint(), x.toString());</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L231">                        LOG.warn(&quot;Proxy v1 error&quot;, x);</span>
+<span class="nc" id="L232">                    releaseAndClose();</span>
+<span class="nc" id="L233">                }</span>
+<span class="nc" id="L234">            }</span>
+
+            @Override
+            public ByteBuffer onUpgradeFrom()
+            {
+<span class="nc bnc" id="L239" title="All 2 branches missed.">                if (_buffer.hasRemaining())</span>
+                {
+<span class="nc" id="L241">                    ByteBuffer unconsumed = ByteBuffer.allocateDirect(_buffer.remaining());</span>
+<span class="nc" id="L242">                    unconsumed.put(_buffer.getByteBuffer());</span>
+<span class="nc" id="L243">                    unconsumed.flip();</span>
+<span class="nc" id="L244">                    _buffer.release();</span>
+<span class="nc" id="L245">                    return unconsumed;</span>
+                }
+<span class="nc" id="L247">                _buffer.release();</span>
+<span class="nc" id="L248">                return null;</span>
+            }
+
+            @Override
+            public void onUpgradeTo(ByteBuffer buffer)
+            {
+<span class="nc bnc" id="L254" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L255">                    LOG.debug(&quot;Proxy v1 copying unconsumed buffer {}&quot;, BufferUtil.toDetailString(buffer));</span>
+<span class="nc" id="L256">                BufferUtil.append(_buffer.getByteBuffer(), buffer);</span>
+<span class="nc" id="L257">            }</span>
+
+            /**
+             * @return true when parsing is done, false when more bytes are needed.
+             */
+            private boolean parse() throws IOException
+            {
+<span class="nc bnc" id="L264" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L265">                    LOG.debug(&quot;Proxy v1 parsing {}&quot;, _buffer);</span>
+<span class="nc" id="L266">                _length += _buffer.remaining();</span>
+
+                // Parse fields
+<span class="nc bnc" id="L269" title="All 2 branches missed.">                while (_buffer.hasRemaining())</span>
+                {
+<span class="nc" id="L271">                    byte b = _buffer.getByteBuffer().get();</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">                    if (_index &lt; CR_INDEX)</span>
+                    {
+<span class="nc bnc" id="L274" title="All 4 branches missed.">                        if (b == ' ' || b == '\r')</span>
+                        {
+<span class="nc" id="L276">                            _fields[_index++] = _builder.toString();</span>
+<span class="nc" id="L277">                            _builder.setLength(0);</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">                            if (b == '\r')</span>
+<span class="nc" id="L279">                                _index = CR_INDEX;</span>
+                        }
+<span class="nc bnc" id="L281" title="All 2 branches missed.">                        else if (b &lt; ' ')</span>
+                        {
+<span class="nc" id="L283">                            throw new IOException(&quot;Proxy v1 bad character &quot; + (b &amp; 0xFF));</span>
+                        }
+                        else
+                        {
+<span class="nc" id="L287">                            _builder.append((char)b);</span>
+                        }
+                    }
+                    else
+                    {
+<span class="nc bnc" id="L292" title="All 2 branches missed.">                        if (b == '\n')</span>
+                        {
+<span class="nc" id="L294">                            _index = LF_INDEX;</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">                            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L296">                                LOG.debug(&quot;Proxy v1 parsing is done&quot;);</span>
+<span class="nc" id="L297">                            return true;</span>
+                        }
+
+<span class="nc" id="L300">                        throw new IOException(&quot;Proxy v1 bad CRLF &quot; + (b &amp; 0xFF));</span>
+                    }
+<span class="nc" id="L302">                }</span>
+
+                // Not enough bytes.
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L306">                    LOG.debug(&quot;Proxy v1 parsing requires more bytes&quot;);</span>
+<span class="nc" id="L307">                return false;</span>
+            }
+
+            private void releaseAndClose()
+            {
+<span class="nc bnc" id="L312" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L313">                    LOG.debug(&quot;Proxy v1 releasing buffer and closing&quot;);</span>
+<span class="nc" id="L314">                _buffer.release();</span>
+<span class="nc" id="L315">                close();</span>
+<span class="nc" id="L316">            }</span>
+
+            private void upgrade()
+            {
+<span class="nc" id="L320">                int proxyLineLength = _length - _buffer.remaining();</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L322">                    LOG.debug(&quot;Proxy v1 pre-upgrade packet length (including CRLF) is {}&quot;, proxyLineLength);</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">                if (proxyLineLength &gt;= 110)</span>
+                {
+<span class="nc" id="L325">                    LOG.warn(&quot;Proxy v1 PROXY line too long {} for {}&quot;, proxyLineLength, getEndPoint());</span>
+<span class="nc" id="L326">                    releaseAndClose();</span>
+<span class="nc" id="L327">                    return;</span>
+                }
+
+                // Check proxy
+<span class="nc bnc" id="L331" title="All 2 branches missed.">                if (!&quot;PROXY&quot;.equals(_fields[0]))</span>
+                {
+<span class="nc" id="L333">                    LOG.warn(&quot;Proxy v1 not PROXY protocol for {}&quot;, getEndPoint());</span>
+<span class="nc" id="L334">                    releaseAndClose();</span>
+<span class="nc" id="L335">                    return;</span>
+                }
+
+<span class="nc" id="L338">                String srcIP = _fields[2];</span>
+<span class="nc" id="L339">                String srcPort = _fields[4];</span>
+<span class="nc" id="L340">                String dstIP = _fields[3];</span>
+<span class="nc" id="L341">                String dstPort = _fields[5];</span>
+                // If UNKNOWN, we must ignore the information sent, so use the EndPoint's.
+<span class="nc" id="L343">                boolean unknown = &quot;UNKNOWN&quot;.equalsIgnoreCase(_fields[1]);</span>
+                EndPoint proxyEndPoint;
+<span class="nc bnc" id="L345" title="All 2 branches missed.">                if (unknown)</span>
+                {
+<span class="nc" id="L347">                    EndPoint endPoint = getEndPoint();</span>
+<span class="nc" id="L348">                    proxyEndPoint = new ProxyEndPoint(endPoint, endPoint.getLocalSocketAddress(), endPoint.getRemoteSocketAddress());</span>
+<span class="nc" id="L349">                }</span>
+                else
+                {
+<span class="nc" id="L352">                    SocketAddress remote = new InetSocketAddress(srcIP, Integer.parseInt(srcPort));</span>
+<span class="nc" id="L353">                    SocketAddress local = new InetSocketAddress(dstIP, Integer.parseInt(dstPort));</span>
+<span class="nc" id="L354">                    proxyEndPoint = new ProxyEndPoint(getEndPoint(), local, remote);</span>
+                }
+
+<span class="nc bnc" id="L357" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L358">                    LOG.debug(&quot;Proxy v1 next protocol '{}' for {} -&gt; {}&quot;, _next, getEndPoint(), proxyEndPoint);</span>
+
+<span class="nc" id="L360">                upgradeToConnectionFactory(_next, _connector, proxyEndPoint);</span>
+<span class="nc" id="L361">            }</span>
+        }
+    }
+
+    private static class ProxyV2ConnectionFactory extends AbstractConnectionFactory implements ConnectionFactory.Detecting
+    {
+<span class="nc" id="L367">        private enum Family</span>
+        {
+<span class="nc" id="L369">            UNSPEC, INET, INET6, UNIX</span>
+        }
+
+<span class="nc" id="L372">        private enum Transport</span>
+        {
+<span class="nc" id="L374">            UNSPEC, STREAM, DGRAM</span>
+        }
+
+<span class="nc" id="L377">        private static final byte[] SIGNATURE = new byte[]</span>
+        {
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A
+        };
+
+        private static final int PP2_TYPE_ALPN = 0x01;
+        private static final int PP2_TYPE_AUTHORITY = 0x02;
+        private static final int PP2_TYPE_CRC32C = 0x03;
+        private static final int PP2_TYPE_NOOP = 0x04;
+        private static final int PP2_TYPE_UNIQUE_ID = 0x05;
+        private static final int PP2_TYPE_SSL = 0x20;
+        private static final int PP2_SUBTYPE_SSL_VERSION = 0x21;
+        private static final int PP2_SUBTYPE_SSL_CN = 0x22;
+        private static final int PP2_SUBTYPE_SSL_CIPHER = 0x23;
+        private static final int PP2_SUBTYPE_SSL_SIG_ALG = 0x24;
+        private static final int PP2_SUBTYPE_SSL_KEY_ALG = 0x25;
+        private static final int PP2_TYPE_NETNS = 0x30;
+
+        private static final int PP2_CLIENT_SSL = 0x01;
+        private static final int PP2_CLIENT_CERT_CONN = 0x02;
+        private static final int PP2_CLIENT_CERT_SESS = 0x04;
+
+        private final String _nextProtocol;
+<span class="nc" id="L400">        private int _maxProxyHeader = 1024;</span>
+
+        private ProxyV2ConnectionFactory(String nextProtocol)
+        {
+<span class="nc" id="L404">            super(&quot;proxy&quot;);</span>
+<span class="nc" id="L405">            this._nextProtocol = nextProtocol;</span>
+<span class="nc" id="L406">        }</span>
+
+        @Override
+        public Detection detect(ByteBuffer buffer)
+        {
+<span class="nc bnc" id="L411" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L412">                LOG.debug(&quot;Proxy v2 attempting detection with {} bytes&quot;, buffer.remaining());</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">            if (buffer.remaining() &lt; SIGNATURE.length)</span>
+            {
+<span class="nc bnc" id="L415" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L416">                    LOG.debug(&quot;Proxy v2 detection requires more bytes&quot;);</span>
+<span class="nc" id="L417">                return Detection.NEED_MORE_BYTES;</span>
+            }
+
+<span class="nc bnc" id="L420" title="All 2 branches missed.">            for (int i = 0; i &lt; SIGNATURE.length; i++)</span>
+            {
+<span class="nc" id="L422">                byte signatureByte = SIGNATURE[i];</span>
+<span class="nc" id="L423">                byte byteInBuffer = buffer.get(i);</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">                if (byteInBuffer != signatureByte)</span>
+                {
+<span class="nc bnc" id="L426" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L427">                        LOG.debug(&quot;Proxy v2 detection unsuccessful&quot;);</span>
+<span class="nc" id="L428">                    return Detection.NOT_RECOGNIZED;</span>
+                }
+            }
+
+<span class="nc bnc" id="L432" title="All 2 branches missed.">            if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L433">                LOG.debug(&quot;Proxy v2 detection succeeded&quot;);</span>
+<span class="nc" id="L434">            return Detection.RECOGNIZED;</span>
+        }
+
+        public int getMaxProxyHeader()
+        {
+<span class="nc" id="L439">            return _maxProxyHeader;</span>
+        }
+
+        public void setMaxProxyHeader(int maxProxyHeader)
+        {
+<span class="nc" id="L444">            _maxProxyHeader = maxProxyHeader;</span>
+<span class="nc" id="L445">        }</span>
+
+        @Override
+        public Connection newConnection(Connector connector, EndPoint endp)
+        {
+<span class="nc" id="L450">            ConnectionFactory nextConnectionFactory = findNextConnectionFactory(_nextProtocol, connector, getProtocol(), endp);</span>
+<span class="nc" id="L451">            return configure(new ProxyProtocolV2Connection(endp, connector, nextConnectionFactory), connector, endp);</span>
+        }
+
+        private class ProxyProtocolV2Connection extends AbstractConnection implements Connection.UpgradeFrom, Connection.UpgradeTo
+        {
+            private static final int HEADER_LENGTH = 16;
+
+            private final Connector _connector;
+            private final ConnectionFactory _next;
+            private final RetainableByteBuffer _buffer;
+            private boolean _local;
+            private Family _family;
+            private int _length;
+            private boolean _headerParsed;
+
+            protected ProxyProtocolV2Connection(EndPoint endp, Connector connector, ConnectionFactory next)
+<span class="nc" id="L467">            {</span>
+<span class="nc" id="L468">                super(endp, connector.getExecutor());</span>
+<span class="nc" id="L469">                _connector = connector;</span>
+<span class="nc" id="L470">                _next = next;</span>
+<span class="nc" id="L471">                _buffer = _connector.getByteBufferPool().acquire(getInputBufferSize(), true);</span>
+<span class="nc" id="L472">            }</span>
+
+            @Override
+            public void onUpgradeTo(ByteBuffer buffer)
+            {
+<span class="nc bnc" id="L477" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L478">                    LOG.debug(&quot;Proxy v2 copying unconsumed buffer {}&quot;, BufferUtil.toDetailString(buffer));</span>
+<span class="nc" id="L479">                BufferUtil.append(_buffer.getByteBuffer(), buffer);</span>
+<span class="nc" id="L480">            }</span>
+
+            @Override
+            public void onOpen()
+            {
+<span class="nc" id="L485">                super.onOpen();</span>
+
+                try
+                {
+<span class="nc" id="L489">                    parseHeader();</span>
+<span class="nc bnc" id="L490" title="All 4 branches missed.">                    if (_headerParsed &amp;&amp; _buffer.remaining() &gt;= _length)</span>
+                    {
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L493">                            LOG.debug(&quot;Proxy v2 onOpen parsing fixed length packet part done, now upgrading&quot;);</span>
+<span class="nc" id="L494">                        parseBodyAndUpgrade();</span>
+                    }
+                    else
+                    {
+<span class="nc bnc" id="L498" title="All 2 branches missed.">                        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L499">                            LOG.debug(&quot;Proxy v2 onOpen parsing fixed length packet ran out of bytes, marking as fillInterested&quot;);</span>
+<span class="nc" id="L500">                        fillInterested();</span>
+                    }
+                }
+<span class="nc" id="L503">                catch (Exception x)</span>
+                {
+<span class="nc" id="L505">                    LOG.warn(&quot;Proxy v2 error for {} {}&quot;, getEndPoint(), x.toString());</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L507">                        LOG.warn(&quot;Proxy v2 error&quot;, x);</span>
+<span class="nc" id="L508">                    releaseAndClose();</span>
+<span class="nc" id="L509">                }</span>
+<span class="nc" id="L510">            }</span>
+
+            @Override
+            public void onFillable()
+            {
+                try
+                {
+<span class="nc bnc" id="L517" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L518">                        LOG.debug(&quot;Proxy v2 onFillable header parsed? {}&quot;, _headerParsed);</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">                    while (!_headerParsed)</span>
+                    {
+                        // Read data
+<span class="nc" id="L522">                        int fill = getEndPoint().fill(_buffer.getByteBuffer());</span>
+<span class="nc bnc" id="L523" title="All 2 branches missed.">                        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L524">                            LOG.debug(&quot;Proxy v2 filled buffer with {} bytes&quot;, fill);</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">                        if (fill &lt; 0)</span>
+                        {
+<span class="nc" id="L527">                            _buffer.release();</span>
+<span class="nc" id="L528">                            getEndPoint().shutdownOutput();</span>
+<span class="nc" id="L529">                            return;</span>
+                        }
+<span class="nc bnc" id="L531" title="All 2 branches missed.">                        if (fill == 0)</span>
+                        {
+<span class="nc" id="L533">                            fillInterested();</span>
+<span class="nc" id="L534">                            return;</span>
+                        }
+
+<span class="nc" id="L537">                        parseHeader();</span>
+<span class="nc" id="L538">                    }</span>
+
+<span class="nc bnc" id="L540" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L541">                        LOG.debug(&quot;Proxy v2 onFillable header parsed, length = {}, buffer = {}&quot;, _length, _buffer);</span>
+
+<span class="nc bnc" id="L543" title="All 2 branches missed.">                    while (_buffer.remaining() &lt; _length)</span>
+                    {
+                        // Read data
+<span class="nc" id="L546">                        int fill = getEndPoint().fill(_buffer.getByteBuffer());</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">                        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L548">                            LOG.debug(&quot;Proxy v2 filled buffer with {} bytes&quot;, fill);</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">                        if (fill &lt; 0)</span>
+                        {
+<span class="nc" id="L551">                            _buffer.release();</span>
+<span class="nc" id="L552">                            getEndPoint().shutdownOutput();</span>
+<span class="nc" id="L553">                            return;</span>
+                        }
+<span class="nc bnc" id="L555" title="All 2 branches missed.">                        if (fill == 0)</span>
+                        {
+<span class="nc" id="L557">                            fillInterested();</span>
+<span class="nc" id="L558">                            return;</span>
+                        }
+<span class="nc" id="L560">                    }</span>
+
+<span class="nc" id="L562">                    parseBodyAndUpgrade();</span>
+                }
+<span class="nc" id="L564">                catch (Throwable x)</span>
+                {
+<span class="nc" id="L566">                    LOG.warn(&quot;Proxy v2 error for {} {}&quot;, getEndPoint(), x.toString());</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L568">                        LOG.warn(&quot;Proxy v2 error&quot;, x);</span>
+<span class="nc" id="L569">                    releaseAndClose();</span>
+<span class="nc" id="L570">                }</span>
+<span class="nc" id="L571">            }</span>
+
+            @Override
+            public ByteBuffer onUpgradeFrom()
+            {
+<span class="nc bnc" id="L576" title="All 2 branches missed.">                if (_buffer.hasRemaining())</span>
+                {
+<span class="nc" id="L578">                    ByteBuffer unconsumed = ByteBuffer.allocateDirect(_buffer.remaining());</span>
+<span class="nc" id="L579">                    unconsumed.put(_buffer.getByteBuffer());</span>
+<span class="nc" id="L580">                    unconsumed.flip();</span>
+<span class="nc" id="L581">                    _buffer.release();</span>
+<span class="nc" id="L582">                    return unconsumed;</span>
+                }
+<span class="nc" id="L584">                _buffer.release();</span>
+<span class="nc" id="L585">                return null;</span>
+            }
+
+            private void parseBodyAndUpgrade() throws IOException
+            {
+<span class="nc" id="L590">                int nonProxyRemaining = _buffer.remaining() - _length;</span>
+<span class="nc bnc" id="L591" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L592">                    LOG.debug(&quot;Proxy v2 parsing body, length = {}, buffer = {}&quot;, _length, _buffer);</span>
+
+<span class="nc bnc" id="L594" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L595">                    LOG.debug(&quot;Proxy v2 body {} from {} for {}&quot;, _next, _buffer, this);</span>
+
+                // Do we need to wrap the endpoint?
+<span class="nc" id="L598">                ByteBuffer byteBuffer = _buffer.getByteBuffer();</span>
+                ProxyEndPoint proxyEndPoint;
+<span class="nc" id="L600">                EndPoint endPoint = getEndPoint();</span>
+<span class="nc bnc" id="L601" title="All 2 branches missed.">                if (_local)</span>
+                {
+<span class="nc" id="L603">                    byteBuffer.position(byteBuffer.position() + _length);</span>
+<span class="nc" id="L604">                    proxyEndPoint = new ProxyEndPoint(endPoint, endPoint.getLocalSocketAddress(), endPoint.getRemoteSocketAddress());</span>
+                }
+                else
+                {
+                    SocketAddress local;
+                    SocketAddress remote;
+<span class="nc bnc" id="L610" title="All 4 branches missed.">                    switch (_family)</span>
+                    {
+                        case INET -&gt;
+                        {
+<span class="nc" id="L614">                            byte[] addr = new byte[4];</span>
+<span class="nc" id="L615">                            byteBuffer.get(addr);</span>
+<span class="nc" id="L616">                            InetAddress srcAddr = Inet4Address.getByAddress(addr);</span>
+<span class="nc" id="L617">                            byteBuffer.get(addr);</span>
+<span class="nc" id="L618">                            InetAddress dstAddr = Inet4Address.getByAddress(addr);</span>
+<span class="nc" id="L619">                            int srcPort = byteBuffer.getChar();</span>
+<span class="nc" id="L620">                            int dstPort = byteBuffer.getChar();</span>
+<span class="nc" id="L621">                            local = new InetSocketAddress(dstAddr, dstPort);</span>
+<span class="nc" id="L622">                            remote = new InetSocketAddress(srcAddr, srcPort);</span>
+<span class="nc" id="L623">                        }</span>
+                        case INET6 -&gt;
+                        {
+<span class="nc" id="L626">                            byte[] addr = new byte[16];</span>
+<span class="nc" id="L627">                            byteBuffer.get(addr);</span>
+<span class="nc" id="L628">                            InetAddress srcAddr = Inet6Address.getByAddress(addr);</span>
+<span class="nc" id="L629">                            byteBuffer.get(addr);</span>
+<span class="nc" id="L630">                            InetAddress dstAddr = Inet6Address.getByAddress(addr);</span>
+<span class="nc" id="L631">                            int srcPort = byteBuffer.getChar();</span>
+<span class="nc" id="L632">                            int dstPort = byteBuffer.getChar();</span>
+<span class="nc" id="L633">                            local = new InetSocketAddress(dstAddr, dstPort);</span>
+<span class="nc" id="L634">                            remote = new InetSocketAddress(srcAddr, srcPort);</span>
+<span class="nc" id="L635">                        }</span>
+                        case UNIX -&gt;
+                        {
+<span class="nc" id="L638">                            byte[] addr = new byte[108];</span>
+<span class="nc" id="L639">                            byteBuffer.get(addr);</span>
+<span class="nc" id="L640">                            String src = toUnixDomainPath(addr);</span>
+<span class="nc" id="L641">                            byteBuffer.get(addr);</span>
+<span class="nc" id="L642">                            String dst = toUnixDomainPath(addr);</span>
+<span class="nc" id="L643">                            local = UnixDomainSocketAddress.of(dst);</span>
+<span class="nc" id="L644">                            remote = UnixDomainSocketAddress.of(src);</span>
+<span class="nc" id="L645">                        }</span>
+<span class="nc" id="L646">                        default -&gt; throw new IllegalStateException(&quot;Unsupported family &quot; + _family);</span>
+                    }
+
+<span class="nc" id="L649">                    int client = 0;</span>
+<span class="nc" id="L650">                    String sslCipher = null;</span>
+<span class="nc" id="L651">                    Map&lt;Integer, byte[]&gt; tlvs = null;</span>
+
+                    // Any additional info?
+<span class="nc bnc" id="L654" title="All 2 branches missed.">                    while (byteBuffer.remaining() &gt; nonProxyRemaining)</span>
+                    {
+<span class="nc" id="L656">                        int type = 0xff &amp; byteBuffer.get();</span>
+<span class="nc" id="L657">                        int length = byteBuffer.getChar();</span>
+<span class="nc" id="L658">                        byte[] value = new byte[length];</span>
+<span class="nc" id="L659">                        byteBuffer.get(value);</span>
+
+<span class="nc bnc" id="L661" title="All 2 branches missed.">                        if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L662">                            LOG.debug(String.format(&quot;Proxy v2 T=%x L=%d V=%s for %s&quot;, type, length, StringUtil.toHexString(value), this));</span>
+
+                        // PP2_TYPE_NOOP is only used for byte alignment, skip them.
+<span class="nc bnc" id="L665" title="All 2 branches missed.">                        if (type != PP2_TYPE_NOOP)</span>
+                        {
+<span class="nc bnc" id="L667" title="All 2 branches missed.">                            if (tlvs == null)</span>
+<span class="nc" id="L668">                                tlvs = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L669">                            tlvs.put(type, value);</span>
+                        }
+
+<span class="nc bnc" id="L672" title="All 2 branches missed.">                        if (type == PP2_TYPE_SSL)</span>
+                        {
+<span class="nc" id="L674">                            client = value[0] &amp; 0xFF;</span>
+<span class="nc" id="L675">                            sslCipher = null;</span>
+<span class="nc" id="L676">                            int i = 5; // Index of the first sub_tlv, after verify.</span>
+<span class="nc bnc" id="L677" title="All 2 branches missed.">                            while (i &lt; length)</span>
+                            {
+<span class="nc" id="L679">                                int subType = value[i++] &amp; 0xFF;</span>
+<span class="nc" id="L680">                                int subLength = (value[i++] &amp; 0xFF) * 256 + (value[i++] &amp; 0xFF);</span>
+<span class="nc" id="L681">                                byte[] subValue = new byte[subLength];</span>
+<span class="nc" id="L682">                                System.arraycopy(value, i, subValue, 0, subLength);</span>
+<span class="nc" id="L683">                                tlvs.put(subType, subValue);</span>
+<span class="nc" id="L684">                                i += subLength;</span>
+<span class="nc bnc" id="L685" title="All 2 branches missed.">                                if (subType == PP2_SUBTYPE_SSL_CIPHER)</span>
+<span class="nc" id="L686">                                    sslCipher = new String(subValue, StandardCharsets.US_ASCII);</span>
+<span class="nc" id="L687">                            }</span>
+                        }
+<span class="nc" id="L689">                    }</span>
+
+<span class="nc bnc" id="L691" title="All 2 branches missed.">                    proxyEndPoint = new ProxyEndPoint(endPoint, local, remote, tlvs, client == 0 ? null : EndPoint.SslSessionData.from(null, null, sslCipher, null));</span>
+
+<span class="nc bnc" id="L693" title="All 2 branches missed.">                    if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L694">                        LOG.debug(&quot;Proxy v2 {} {}&quot;, endPoint, proxyEndPoint);</span>
+                }
+
+<span class="nc bnc" id="L697" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L698">                    LOG.debug(&quot;Proxy v2 parsing dynamic packet part is now done, upgrading to {}&quot;, _nextProtocol);</span>
+<span class="nc" id="L699">                upgradeToConnectionFactory(_next, _connector, proxyEndPoint);</span>
+<span class="nc" id="L700">            }</span>
+
+            private void parseHeader() throws IOException
+            {
+<span class="nc bnc" id="L704" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L705">                    LOG.debug(&quot;Proxy v2 parsing fixed length packet part, buffer = {}&quot;, _buffer);</span>
+<span class="nc bnc" id="L706" title="All 2 branches missed.">                if (_buffer.remaining() &lt; HEADER_LENGTH)</span>
+<span class="nc" id="L707">                    return;</span>
+
+<span class="nc bnc" id="L709" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L710">                    LOG.debug(&quot;Proxy v2 header {} for {}&quot;, _buffer, this);</span>
+
+<span class="nc" id="L712">                ByteBuffer byteBuffer = _buffer.getByteBuffer();</span>
+
+                // struct proxy_hdr_v2 {
+                //     uint8_t sig[12];  /* hex 0D 0A 0D 0A 00 0D 0A 51 55 49 54 0A */
+                //     uint8_t ver_cmd;  /* protocol version and command */
+                //     uint8_t fam;      /* protocol family and address */
+                //     uint16_t len;     /* number of following bytes part of the header */
+                // };
+<span class="nc bnc" id="L720" title="All 2 branches missed.">                for (byte signatureByte : SIGNATURE)</span>
+                {
+<span class="nc bnc" id="L722" title="All 2 branches missed.">                    if (byteBuffer.get() != signatureByte)</span>
+<span class="nc" id="L723">                        throw new IOException(&quot;Proxy v2 bad PROXY signature&quot;);</span>
+                }
+
+<span class="nc" id="L726">                int versionAndCommand = 0xFF &amp; byteBuffer.get();</span>
+<span class="nc bnc" id="L727" title="All 2 branches missed.">                if ((versionAndCommand &amp; 0xF0) != 0x20)</span>
+<span class="nc" id="L728">                    throw new IOException(&quot;Proxy v2 bad PROXY version&quot;);</span>
+<span class="nc bnc" id="L729" title="All 2 branches missed.">                _local = (versionAndCommand &amp; 0xF) == 0x00;</span>
+
+<span class="nc" id="L731">                int transportAndFamily = 0xFF &amp; byteBuffer.get();</span>
+<span class="nc bnc" id="L732" title="All 5 branches missed.">                switch (transportAndFamily &gt;&gt; 4)</span>
+                {
+<span class="nc" id="L734">                    case 0 -&gt; _family = Family.UNSPEC;</span>
+<span class="nc" id="L735">                    case 1 -&gt; _family = Family.INET;</span>
+<span class="nc" id="L736">                    case 2 -&gt; _family = Family.INET6;</span>
+<span class="nc" id="L737">                    case 3 -&gt; _family = Family.UNIX;</span>
+<span class="nc" id="L738">                    default -&gt; throw new IOException(&quot;Proxy v2 bad PROXY family&quot;);</span>
+                }
+
+<span class="nc bnc" id="L741" title="All 4 branches missed.">                Transport transport = switch (transportAndFamily &amp; 0xF)</span>
+                {
+<span class="nc" id="L743">                    case 0 -&gt; Transport.UNSPEC;</span>
+<span class="nc" id="L744">                    case 1 -&gt; Transport.STREAM;</span>
+<span class="nc" id="L745">                    case 2 -&gt; Transport.DGRAM;</span>
+<span class="nc" id="L746">                    default -&gt; throw new IOException(&quot;Proxy v2 bad PROXY family&quot;);</span>
+<span class="nc" id="L747">                };</span>
+
+<span class="nc" id="L749">                _length = byteBuffer.getChar();</span>
+
+<span class="nc bnc" id="L751" title="All 6 branches missed.">                if (!_local &amp;&amp; (_family == Family.UNSPEC || transport != Transport.STREAM))</span>
+<span class="nc" id="L752">                    throw new IOException(String.format(&quot;Proxy v2 unsupported PROXY mode 0x%x,0x%x&quot;, versionAndCommand, transportAndFamily));</span>
+
+<span class="nc bnc" id="L754" title="All 2 branches missed.">                if (_length &gt; getMaxProxyHeader())</span>
+<span class="nc" id="L755">                    throw new IOException(String.format(&quot;Proxy v2 Unsupported PROXY mode 0x%x,0x%x,0x%x&quot;, versionAndCommand, transportAndFamily, _length));</span>
+
+<span class="nc bnc" id="L757" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L758">                    LOG.debug(&quot;Proxy v2 fixed length packet part is now parsed&quot;);</span>
+<span class="nc" id="L759">                _headerParsed = true;</span>
+<span class="nc" id="L760">            }</span>
+
+            private void releaseAndClose()
+            {
+<span class="nc bnc" id="L764" title="All 2 branches missed.">                if (LOG.isDebugEnabled())</span>
+<span class="nc" id="L765">                    LOG.debug(&quot;Proxy v2 releasing buffer and closing&quot;);</span>
+<span class="nc" id="L766">                _buffer.release();</span>
+<span class="nc" id="L767">                close();</span>
+<span class="nc" id="L768">            }</span>
+
+            private static String toUnixDomainPath(byte[] bytes)
+            {
+                // Unix-Domain paths are zero-terminated.
+<span class="nc" id="L773">                int i = 0;</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">                while (i &lt; bytes.length)</span>
+                {
+<span class="nc bnc" id="L776" title="All 2 branches missed.">                    if (bytes[i++] == 0)</span>
+<span class="nc" id="L777">                        break;</span>
+                }
+<span class="nc" id="L779">                return new String(bytes, 0, i, StandardCharsets.US_ASCII).trim();</span>
+            }
+        }
+    }
+
+    public static class ProxyEndPoint implements EndPoint, EndPoint.Wrapper
+    {
+        private final EndPoint _endPoint;
+        private final SocketAddress _local;
+        private final SocketAddress _remote;
+        private final Map&lt;Integer, byte[]&gt; _tlvs;
+        private final SslSessionData _sslSessionData;
+
+        public ProxyEndPoint(EndPoint endPoint, SocketAddress local, SocketAddress remote)
+        {
+<span class="nc" id="L794">            this(endPoint, local, remote, null, null);</span>
+<span class="nc" id="L795">        }</span>
+
+        public ProxyEndPoint(EndPoint endPoint, SocketAddress local, SocketAddress remote, Map&lt;Integer, byte[]&gt; tlvs, SslSessionData sslSessionData)
+<span class="nc" id="L798">        {</span>
+<span class="nc" id="L799">            _endPoint = endPoint;</span>
+<span class="nc" id="L800">            _local = local;</span>
+<span class="nc" id="L801">            _remote = remote;</span>
+<span class="nc" id="L802">            _tlvs = tlvs;</span>
+<span class="nc" id="L803">            _sslSessionData = sslSessionData;</span>
+<span class="nc" id="L804">        }</span>
+
+        @Override
+        public SslSessionData getSslSessionData()
+        {
+<span class="nc" id="L809">            return _sslSessionData;</span>
+        }
+
+        public EndPoint unwrap()
+        {
+<span class="nc" id="L814">            return _endPoint;</span>
+        }
+        
+        /**
+         * &lt;p&gt;Gets a TLV vector, see section 2.2.7 of the PROXY protocol specification.&lt;/p&gt;
+         *
+         * @param type the TLV type or subtype
+         * @return the TLV value or null if not present.
+         */
+        public byte[] getTLV(int type)
+        {
+<span class="nc bnc" id="L825" title="All 2 branches missed.">            return _tlvs != null ? _tlvs.get(type) : null;</span>
+        }
+
+        @Override
+        public void close(Throwable cause)
+        {
+<span class="nc" id="L831">            _endPoint.close(cause);</span>
+<span class="nc" id="L832">        }</span>
+
+        @Override
+        public int fill(ByteBuffer buffer) throws IOException
+        {
+<span class="nc" id="L837">            return _endPoint.fill(buffer);</span>
+        }
+
+        @Override
+        public void fillInterested(Callback callback) throws ReadPendingException
+        {
+<span class="nc" id="L843">            _endPoint.fillInterested(callback);</span>
+<span class="nc" id="L844">        }</span>
+
+        @Override
+        public boolean flush(ByteBuffer... buffer) throws IOException
+        {
+<span class="nc" id="L849">            return _endPoint.flush(buffer);</span>
+        }
+
+        @Override
+        public Connection getConnection()
+        {
+<span class="nc" id="L855">            return _endPoint.getConnection();</span>
+        }
+
+        @Override
+        public void setConnection(Connection connection)
+        {
+<span class="nc" id="L861">            _endPoint.setConnection(connection);</span>
+<span class="nc" id="L862">        }</span>
+
+        @Override
+        public long getCreatedTimeStamp()
+        {
+<span class="nc" id="L867">            return _endPoint.getCreatedTimeStamp();</span>
+        }
+
+        @Override
+        public long getIdleTimeout()
+        {
+<span class="nc" id="L873">            return _endPoint.getIdleTimeout();</span>
+        }
+
+        @Override
+        public void setIdleTimeout(long idleTimeout)
+        {
+<span class="nc" id="L879">            _endPoint.setIdleTimeout(idleTimeout);</span>
+<span class="nc" id="L880">        }</span>
+
+        @Override
+        public InetSocketAddress getLocalAddress()
+        {
+<span class="nc" id="L885">            SocketAddress local = getLocalSocketAddress();</span>
+<span class="nc bnc" id="L886" title="All 2 branches missed.">            if (local instanceof InetSocketAddress)</span>
+<span class="nc" id="L887">                return (InetSocketAddress)local;</span>
+<span class="nc" id="L888">            return null;</span>
+        }
+
+        @Override
+        public SocketAddress getLocalSocketAddress()
+        {
+<span class="nc" id="L894">            return _local;</span>
+        }
+
+        @Override
+        public InetSocketAddress getRemoteAddress()
+        {
+<span class="nc" id="L900">            SocketAddress remote = getRemoteSocketAddress();</span>
+<span class="nc bnc" id="L901" title="All 2 branches missed.">            if (remote instanceof InetSocketAddress)</span>
+<span class="nc" id="L902">                return (InetSocketAddress)remote;</span>
+<span class="nc" id="L903">            return null;</span>
+        }
+
+        @Override
+        public SocketAddress getRemoteSocketAddress()
+        {
+<span class="nc" id="L909">            return _remote;</span>
+        }
+
+        @Override
+        public Object getTransport()
+        {
+<span class="nc" id="L915">            return _endPoint.getTransport();</span>
+        }
+
+        @Override
+        public boolean isFillInterested()
+        {
+<span class="nc" id="L921">            return _endPoint.isFillInterested();</span>
+        }
+
+        @Override
+        public boolean isInputShutdown()
+        {
+<span class="nc" id="L927">            return _endPoint.isInputShutdown();</span>
+        }
+
+        @Override
+        public boolean isOpen()
+        {
+<span class="nc" id="L933">            return _endPoint.isOpen();</span>
+        }
+
+        @Override
+        public boolean isOutputShutdown()
+        {
+<span class="nc" id="L939">            return _endPoint.isOutputShutdown();</span>
+        }
+
+        @Override
+        public void onClose(Throwable cause)
+        {
+<span class="nc" id="L945">            _endPoint.onClose(cause);</span>
+<span class="nc" id="L946">        }</span>
+
+        @Override
+        public void onOpen()
+        {
+<span class="nc" id="L951">            _endPoint.onOpen();</span>
+<span class="nc" id="L952">        }</span>
+
+        @Override
+        public void shutdownOutput()
+        {
+<span class="nc" id="L957">            _endPoint.shutdownOutput();</span>
+<span class="nc" id="L958">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L963">            return String.format(&quot;%s@%x[remote=%s,local=%s,endpoint=%s]&quot;,</span>
+<span class="nc" id="L964">                getClass().getSimpleName(),</span>
+<span class="nc" id="L965">                hashCode(),</span>
+                _remote,
+                _local,
+                _endPoint);
+        }
+
+        @Override
+        public boolean tryFillInterested(Callback callback)
+        {
+<span class="nc" id="L974">            return _endPoint.tryFillInterested(callback);</span>
+        }
+
+        @Override
+        public void upgrade(Connection newConnection)
+        {
+<span class="nc" id="L980">            _endPoint.upgrade(newConnection);</span>
+<span class="nc" id="L981">        }</span>
+
+        @Override
+        public void write(Callback callback, ByteBuffer... buffers) throws WritePendingException
+        {
+<span class="nc" id="L986">            _endPoint.write(callback, buffers);</span>
+<span class="nc" id="L987">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

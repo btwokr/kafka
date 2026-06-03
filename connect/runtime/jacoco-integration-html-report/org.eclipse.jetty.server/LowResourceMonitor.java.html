@@ -1,0 +1,579 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LowResourceMonitor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (with Jetty Server)</a> &gt; <a href="index.source.html" class="el_package">org.eclipse.jetty.server</a> &gt; <span class="el_source">LowResourceMonitor.java</span></div><h1>LowResourceMonitor.java</h1><pre class="source lang-java linenums">//
+// ========================================================================
+// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License v. 2.0 which is available at
+// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+// ========================================================================
+//
+
+package org.eclipse.jetty.server;
+
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.eclipse.jetty.io.EndPoint;
+import org.eclipse.jetty.util.annotation.ManagedAttribute;
+import org.eclipse.jetty.util.annotation.ManagedObject;
+import org.eclipse.jetty.util.annotation.Name;
+import org.eclipse.jetty.util.component.ContainerLifeCycle;
+import org.eclipse.jetty.util.thread.ScheduledExecutorScheduler;
+import org.eclipse.jetty.util.thread.Scheduler;
+import org.eclipse.jetty.util.thread.ThreadPool;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * A monitor for low resources, low resources can be detected by:
+ * &lt;ul&gt;
+ * &lt;li&gt;{@link ThreadPool#isLowOnThreads()} if {@link Connector#getExecutor()} is
+ * an instance of {@link ThreadPool} and {@link #setMonitorThreads(boolean)} is true.&lt;/li&gt;
+ * &lt;li&gt;If {@link #setMaxMemory(long)} is non zero then low resources is detected if the JVMs
+ * {@link Runtime} instance has {@link Runtime#totalMemory()} minus {@link Runtime#freeMemory()}
+ * greater than {@link #getMaxMemory()}&lt;/li&gt;
+ * &lt;/ul&gt;
+ */
+@ManagedObject(&quot;Monitor for low resource conditions and activate a low resource mode if detected&quot;)
+public class LowResourceMonitor extends ContainerLifeCycle
+{
+<span class="nc" id="L49">    private static final Logger LOG = LoggerFactory.getLogger(LowResourceMonitor.class);</span>
+
+    protected final Server _server;
+    private Scheduler _scheduler;
+    private Connector[] _monitoredConnectors;
+<span class="nc" id="L54">    private Set&lt;AbstractConnector&gt; _acceptingConnectors = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L55">    private int _period = 1000;</span>
+
+<span class="nc" id="L57">    private int _lowResourcesIdleTimeout = 1000;</span>
+<span class="nc" id="L58">    private int _maxLowResourcesTime = 0;</span>
+
+<span class="nc" id="L60">    private final AtomicBoolean _low = new AtomicBoolean();</span>
+
+    private String _reasons;
+
+    private long _lowStarted;
+<span class="nc" id="L65">    private boolean _acceptingInLowResources = true;</span>
+
+<span class="nc" id="L67">    private Set&lt;LowResourceCheck&gt; _lowResourceChecks = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L69">    private final Runnable _monitor = new Runnable()</span>
+<span class="nc" id="L70">    {</span>
+        @Override
+        public void run()
+        {
+<span class="nc bnc" id="L74" title="All 2 branches missed.">            if (isRunning())</span>
+            {
+<span class="nc" id="L76">                monitor();</span>
+<span class="nc" id="L77">                _scheduler.schedule(_monitor, _period, TimeUnit.MILLISECONDS);</span>
+            }
+<span class="nc" id="L79">        }</span>
+    };
+
+    public LowResourceMonitor(@Name(&quot;server&quot;) Server server)
+<span class="nc" id="L83">    {</span>
+<span class="nc" id="L84">        _server = server;</span>
+<span class="nc" id="L85">    }</span>
+
+    @ManagedAttribute(&quot;True if low available threads status is monitored&quot;)
+    public boolean getMonitorThreads()
+    {
+<span class="nc bnc" id="L90" title="All 2 branches missed.">        return !getBeans(ConnectorsThreadPoolLowResourceCheck.class).isEmpty();</span>
+    }
+
+    /**
+     * @param monitorThreads If true, check connectors executors to see if they are
+     * {@link ThreadPool} instances that are low on threads.
+     */
+    public void setMonitorThreads(boolean monitorThreads)
+    {
+<span class="nc bnc" id="L99" title="All 2 branches missed.">        if (monitorThreads)</span>
+        {
+            // already configured?
+<span class="nc bnc" id="L102" title="All 2 branches missed.">            if (!getMonitorThreads())</span>
+<span class="nc" id="L103">                addLowResourceCheck(new ConnectorsThreadPoolLowResourceCheck());</span>
+        }
+        else
+        {
+<span class="nc" id="L107">            getBeans(ConnectorsThreadPoolLowResourceCheck.class).forEach(this::removeBean);</span>
+        }
+<span class="nc" id="L109">    }</span>
+
+    @ManagedAttribute(&quot;The reasons the monitored connectors are low on resources&quot;)
+    public String getReasons()
+    {
+<span class="nc" id="L114">        return _reasons;</span>
+    }
+
+    protected void setReasons(String reasons)
+    {
+<span class="nc" id="L119">        _reasons = reasons;</span>
+<span class="nc" id="L120">    }</span>
+
+    @ManagedAttribute(&quot;Are the monitored connectors low on resources?&quot;)
+    public boolean isLowOnResources()
+    {
+<span class="nc" id="L125">        return _low.get();</span>
+    }
+
+    protected boolean enableLowOnResources(boolean expectedValue, boolean newValue)
+    {
+<span class="nc" id="L130">        return _low.compareAndSet(expectedValue, newValue);</span>
+    }
+
+    @ManagedAttribute(&quot;The reason(s) the monitored connectors are low on resources&quot;)
+    public String getLowResourcesReasons()
+    {
+<span class="nc" id="L136">        return _reasons;</span>
+    }
+
+    protected void setLowResourcesReasons(String reasons)
+    {
+<span class="nc" id="L141">        _reasons = reasons;</span>
+<span class="nc" id="L142">    }</span>
+
+    @ManagedAttribute(&quot;Get the timestamp in ms since epoch that low resources state started&quot;)
+    public long getLowResourcesStarted()
+    {
+<span class="nc" id="L147">        return _lowStarted;</span>
+    }
+
+    public void setLowResourcesStarted(long lowStarted)
+    {
+<span class="nc" id="L152">        _lowStarted = lowStarted;</span>
+<span class="nc" id="L153">    }</span>
+
+    @ManagedAttribute(&quot;The monitored connectors. If null then all server connectors are monitored&quot;)
+    public Collection&lt;Connector&gt; getMonitoredConnectors()
+    {
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        if (_monitoredConnectors == null)</span>
+<span class="nc" id="L159">            return Collections.emptyList();</span>
+<span class="nc" id="L160">        return Arrays.asList(_monitoredConnectors);</span>
+    }
+
+    /**
+     * @param monitoredConnectors The collections of Connectors that should be monitored for low resources.
+     */
+    public void setMonitoredConnectors(Collection&lt;Connector&gt; monitoredConnectors)
+    {
+<span class="nc bnc" id="L168" title="All 4 branches missed.">        if (monitoredConnectors == null || monitoredConnectors.size() == 0)</span>
+<span class="nc" id="L169">            _monitoredConnectors = null;</span>
+        else
+<span class="nc" id="L171">            _monitoredConnectors = monitoredConnectors.toArray(new Connector[monitoredConnectors.size()]);</span>
+<span class="nc" id="L172">    }</span>
+
+    protected Connector[] getMonitoredOrServerConnectors()
+    {
+<span class="nc bnc" id="L176" title="All 4 branches missed.">        if (_monitoredConnectors != null &amp;&amp; _monitoredConnectors.length &gt; 0)</span>
+<span class="nc" id="L177">            return _monitoredConnectors;</span>
+<span class="nc" id="L178">        return _server.getConnectors();</span>
+    }
+
+    @ManagedAttribute(&quot;If false, new connections are not accepted while in low resources&quot;)
+    public boolean isAcceptingInLowResources()
+    {
+<span class="nc" id="L184">        return _acceptingInLowResources;</span>
+    }
+
+    public void setAcceptingInLowResources(boolean acceptingInLowResources)
+    {
+<span class="nc" id="L189">        _acceptingInLowResources = acceptingInLowResources;</span>
+<span class="nc" id="L190">    }</span>
+
+    @ManagedAttribute(&quot;The monitor period in ms&quot;)
+    public int getPeriod()
+    {
+<span class="nc" id="L195">        return _period;</span>
+    }
+
+    /**
+     * @param periodMS The period in ms to monitor for low resources
+     */
+    public void setPeriod(int periodMS)
+    {
+<span class="nc" id="L203">        _period = periodMS;</span>
+<span class="nc" id="L204">    }</span>
+
+    @ManagedAttribute(&quot;The idletimeout in ms to apply to all existing connections when low resources is detected&quot;)
+    public int getLowResourcesIdleTimeout()
+    {
+<span class="nc" id="L209">        return _lowResourcesIdleTimeout;</span>
+    }
+
+    /**
+     * @param lowResourcesIdleTimeoutMS The timeout in ms to apply to EndPoints when in the low resources state.
+     */
+    public void setLowResourcesIdleTimeout(int lowResourcesIdleTimeoutMS)
+    {
+<span class="nc" id="L217">        _lowResourcesIdleTimeout = lowResourcesIdleTimeoutMS;</span>
+<span class="nc" id="L218">    }</span>
+
+    @ManagedAttribute(&quot;The maximum time in ms that low resources condition can persist before lowResourcesIdleTimeout is applied to new connections as well as existing connections&quot;)
+    public int getMaxLowResourcesTime()
+    {
+<span class="nc" id="L223">        return _maxLowResourcesTime;</span>
+    }
+
+    /**
+     * @param maxLowResourcesTimeMS The time in milliseconds that a low resource state can persist before the low resource idle timeout is reapplied to all connections
+     */
+    public void setMaxLowResourcesTime(int maxLowResourcesTimeMS)
+    {
+<span class="nc" id="L231">        _maxLowResourcesTime = maxLowResourcesTimeMS;</span>
+<span class="nc" id="L232">    }</span>
+
+    @ManagedAttribute(&quot;The maximum memory (in bytes) that can be used before low resources is triggered.  Memory used is calculated as (totalMemory-freeMemory).&quot;)
+    public long getMaxMemory()
+    {
+<span class="nc" id="L237">        Collection&lt;MemoryLowResourceCheck&gt; beans = getBeans(MemoryLowResourceCheck.class);</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">        if (beans.isEmpty())</span>
+        {
+<span class="nc" id="L240">            return 0;</span>
+        }
+<span class="nc" id="L242">        return beans.stream().findFirst().get().getMaxMemory();</span>
+    }
+
+    /**
+     * @param maxMemoryBytes The maximum memory in bytes in use before low resources is triggered.
+     */
+    public void setMaxMemory(long maxMemoryBytes)
+    {
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        if (maxMemoryBytes &lt;= 0)</span>
+        {
+<span class="nc" id="L252">            return;</span>
+        }
+<span class="nc" id="L254">        Collection&lt;MemoryLowResourceCheck&gt; beans = getBeans(MemoryLowResourceCheck.class);</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if (beans.isEmpty())</span>
+<span class="nc" id="L256">            addLowResourceCheck(new MemoryLowResourceCheck(maxMemoryBytes));</span>
+        else
+<span class="nc" id="L258">            beans.forEach(lowResourceCheck -&gt; lowResourceCheck.setMaxMemory(maxMemoryBytes));</span>
+<span class="nc" id="L259">    }</span>
+
+    public Set&lt;LowResourceCheck&gt; getLowResourceChecks()
+    {
+<span class="nc" id="L263">        return _lowResourceChecks;</span>
+    }
+
+    public void setLowResourceChecks(Set&lt;LowResourceCheck&gt; lowResourceChecks)
+    {
+<span class="nc" id="L268">        updateBeans(_lowResourceChecks.toArray(), lowResourceChecks.toArray());</span>
+<span class="nc" id="L269">        this._lowResourceChecks = lowResourceChecks;</span>
+<span class="nc" id="L270">    }</span>
+
+    public void addLowResourceCheck(LowResourceCheck lowResourceCheck)
+    {
+<span class="nc" id="L274">        installBean(lowResourceCheck);</span>
+<span class="nc" id="L275">        this._lowResourceChecks.add(lowResourceCheck);</span>
+<span class="nc" id="L276">    }</span>
+
+    protected void monitor()
+    {
+
+<span class="nc" id="L281">        String reasons = null;</span>
+
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        for (LowResourceCheck lowResourceCheck : _lowResourceChecks)</span>
+        {
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            if (lowResourceCheck.isLowOnResources())</span>
+            {
+<span class="nc" id="L287">                reasons = lowResourceCheck.getReason();</span>
+<span class="nc" id="L288">                break;</span>
+            }
+<span class="nc" id="L290">        }</span>
+
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        if (reasons != null)</span>
+        {
+            // Log the reasons if there is any change in the cause
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            if (!reasons.equals(getReasons()))</span>
+            {
+<span class="nc" id="L297">                LOG.warn(&quot;Low Resources: {}&quot;, reasons);</span>
+<span class="nc" id="L298">                setReasons(reasons);</span>
+            }
+
+            // Enter low resources state?
+<span class="nc bnc" id="L302" title="All 2 branches missed.">            if (enableLowOnResources(false, true))</span>
+            {
+<span class="nc" id="L304">                setLowResourcesReasons(reasons);</span>
+<span class="nc" id="L305">                setLowResourcesStarted(System.currentTimeMillis());</span>
+<span class="nc" id="L306">                setLowResources();</span>
+            }
+
+            // Too long in low resources state?
+<span class="nc bnc" id="L310" title="All 4 branches missed.">            if (getMaxLowResourcesTime() &gt; 0 &amp;&amp; (System.currentTimeMillis() - getLowResourcesStarted()) &gt; getMaxLowResourcesTime())</span>
+<span class="nc" id="L311">                setLowResources();</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            if (enableLowOnResources(true, false))</span>
+            {
+<span class="nc" id="L317">                LOG.info(&quot;Low Resources cleared&quot;);</span>
+<span class="nc" id="L318">                setLowResourcesReasons(null);</span>
+<span class="nc" id="L319">                setLowResourcesStarted(0);</span>
+<span class="nc" id="L320">                setReasons(null);</span>
+<span class="nc" id="L321">                clearLowResources();</span>
+            }
+        }
+<span class="nc" id="L324">    }</span>
+
+    @Override
+    protected void doStart() throws Exception
+    {
+<span class="nc" id="L329">        _scheduler = _server.getScheduler();</span>
+
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        if (_scheduler == null)</span>
+        {
+<span class="nc" id="L333">            _scheduler = new LRMScheduler();</span>
+<span class="nc" id="L334">            _scheduler.start();</span>
+        }
+
+<span class="nc" id="L337">        super.doStart();</span>
+
+<span class="nc" id="L339">        _scheduler.schedule(_monitor, _period, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L340">    }</span>
+
+    @Override
+    protected void doStop() throws Exception
+    {
+<span class="nc bnc" id="L345" title="All 2 branches missed.">        if (_scheduler instanceof LRMScheduler)</span>
+<span class="nc" id="L346">            _scheduler.stop();</span>
+<span class="nc" id="L347">        super.doStop();</span>
+<span class="nc" id="L348">    }</span>
+
+    protected void setLowResources()
+    {
+<span class="nc bnc" id="L352" title="All 2 branches missed.">        for (Connector connector : getMonitoredOrServerConnectors())</span>
+        {
+<span class="nc bnc" id="L354" title="All 2 branches missed.">            if (connector instanceof AbstractConnector)</span>
+            {
+<span class="nc" id="L356">                AbstractConnector c = (AbstractConnector)connector;</span>
+<span class="nc bnc" id="L357" title="All 4 branches missed.">                if (!isAcceptingInLowResources() &amp;&amp; c.isAccepting())</span>
+                {
+<span class="nc" id="L359">                    _acceptingConnectors.add(c);</span>
+<span class="nc" id="L360">                    c.setAccepting(false);</span>
+                }
+            }
+
+<span class="nc bnc" id="L364" title="All 2 branches missed.">            for (EndPoint endPoint : connector.getConnectedEndPoints())</span>
+            {
+<span class="nc" id="L366">                endPoint.setIdleTimeout(_lowResourcesIdleTimeout);</span>
+<span class="nc" id="L367">            }</span>
+        }
+<span class="nc" id="L369">    }</span>
+
+    protected void clearLowResources()
+    {
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        for (Connector connector : getMonitoredOrServerConnectors())</span>
+        {
+<span class="nc bnc" id="L375" title="All 2 branches missed.">            for (EndPoint endPoint : connector.getConnectedEndPoints())</span>
+            {
+<span class="nc" id="L377">                endPoint.setIdleTimeout(connector.getIdleTimeout());</span>
+<span class="nc" id="L378">            }</span>
+        }
+
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        for (AbstractConnector connector : _acceptingConnectors)</span>
+        {
+<span class="nc" id="L383">            connector.setAccepting(true);</span>
+<span class="nc" id="L384">        }</span>
+<span class="nc" id="L385">        _acceptingConnectors.clear();</span>
+<span class="nc" id="L386">    }</span>
+
+    protected String low(String reasons, String newReason)
+    {
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        if (reasons == null)</span>
+<span class="nc" id="L391">            return newReason;</span>
+<span class="nc" id="L392">        return reasons + &quot;, &quot; + newReason;</span>
+    }
+
+    private static class LRMScheduler extends ScheduledExecutorScheduler
+    {
+    }
+
+    public interface LowResourceCheck
+    {
+        boolean isLowOnResources();
+
+        String getReason();
+    }
+
+    //------------------------------------------------------
+    // default implementations for backward compat
+    //------------------------------------------------------
+
+    public class MainThreadPoolLowResourceCheck implements LowResourceCheck
+    {
+        private String reason;
+
+        public MainThreadPoolLowResourceCheck()
+<span class="nc" id="L415">        {</span>
+            // no op
+<span class="nc" id="L417">        }</span>
+
+        @Override
+        public boolean isLowOnResources()
+        {
+<span class="nc" id="L422">            ThreadPool serverThreads = _server.getThreadPool();</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">            if (serverThreads.isLowOnThreads())</span>
+            {
+<span class="nc" id="L425">                reason = &quot;Server low on threads: &quot; + serverThreads;</span>
+<span class="nc" id="L426">                return true;</span>
+            }
+<span class="nc" id="L428">            return false;</span>
+        }
+
+        @Override
+        public String getReason()
+        {
+<span class="nc" id="L434">            return reason;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L440">            return &quot;Check if the server ThreadPool is lowOnThreads&quot;;</span>
+        }
+    }
+
+    public class ConnectorsThreadPoolLowResourceCheck implements LowResourceCheck
+    {
+        private String reason;
+
+        public ConnectorsThreadPoolLowResourceCheck()
+<span class="nc" id="L449">        {</span>
+            // no op
+<span class="nc" id="L451">        }</span>
+
+        @Override
+        public boolean isLowOnResources()
+        {
+<span class="nc" id="L456">            ThreadPool serverThreads = _server.getThreadPool();</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">            if (serverThreads.isLowOnThreads())</span>
+            {
+<span class="nc" id="L459">                reason = &quot;Server low on threads: &quot; + serverThreads.getThreads() + &quot;, idleThreads:&quot; + serverThreads.getIdleThreads();</span>
+<span class="nc" id="L460">                return true;</span>
+            }
+<span class="nc bnc" id="L462" title="All 2 branches missed.">            for (Connector connector : getMonitoredConnectors())</span>
+            {
+<span class="nc" id="L464">                Executor executor = connector.getExecutor();</span>
+<span class="nc bnc" id="L465" title="All 4 branches missed.">                if (executor instanceof ThreadPool &amp;&amp; executor != serverThreads)</span>
+                {
+<span class="nc" id="L467">                    ThreadPool connectorThreads = (ThreadPool)executor;</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">                    if (connectorThreads.isLowOnThreads())</span>
+                    {
+<span class="nc" id="L470">                        reason = &quot;Connector low on threads: &quot; + connectorThreads;</span>
+<span class="nc" id="L471">                        return true;</span>
+                    }
+                }
+<span class="nc" id="L474">            }</span>
+<span class="nc" id="L475">            return false;</span>
+        }
+
+        @Override
+        public String getReason()
+        {
+<span class="nc" id="L481">            return reason;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L487">            return &quot;Check if the ThreadPool from monitored connectors are lowOnThreads and if all connections number is higher than the allowed maxConnection&quot;;</span>
+        }
+    }
+
+    @ManagedObject(&quot;Check max allowed connections on connectors&quot;)
+    public class MaxConnectionsLowResourceCheck implements LowResourceCheck
+    {
+        private String reason;
+        private int maxConnections;
+
+        public MaxConnectionsLowResourceCheck(int maxConnections)
+<span class="nc" id="L498">        {</span>
+<span class="nc" id="L499">            this.maxConnections = maxConnections;</span>
+<span class="nc" id="L500">        }</span>
+
+        @Override
+        public boolean isLowOnResources()
+        {
+<span class="nc" id="L505">            int connections = 0;</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">            for (Connector connector : getMonitoredConnectors())</span>
+            {
+<span class="nc" id="L508">                connections += connector.getConnectedEndPoints().size();</span>
+<span class="nc" id="L509">            }</span>
+<span class="nc bnc" id="L510" title="All 4 branches missed.">            if (maxConnections &gt; 0 &amp;&amp; connections &gt; maxConnections)</span>
+            {
+<span class="nc" id="L512">                reason = &quot;Max Connections exceeded: &quot; + connections + &quot;&gt;&quot; + maxConnections;</span>
+<span class="nc" id="L513">                return true;</span>
+            }
+<span class="nc" id="L515">            return false;</span>
+        }
+
+        @Override
+        public String getReason()
+        {
+<span class="nc" id="L521">            return reason;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L527">            return &quot;All connections number is higher than the allowed maxConnection&quot;;</span>
+        }
+    }
+
+    public class MemoryLowResourceCheck implements LowResourceCheck
+    {
+        private String reason;
+        private long maxMemory;
+
+        public MemoryLowResourceCheck(long maxMemory)
+<span class="nc" id="L537">        {</span>
+<span class="nc" id="L538">            this.maxMemory = maxMemory;</span>
+<span class="nc" id="L539">        }</span>
+
+        @Override
+        public boolean isLowOnResources()
+        {
+<span class="nc" id="L544">            long memory = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();</span>
+<span class="nc bnc" id="L545" title="All 4 branches missed.">            if (maxMemory &gt; 0 &amp;&amp; memory &gt; maxMemory)</span>
+            {
+<span class="nc" id="L547">                reason = &quot;Max memory exceeded: &quot; + memory + &quot;&gt;&quot; + maxMemory;</span>
+<span class="nc" id="L548">                return true;</span>
+            }
+<span class="nc" id="L550">            return false;</span>
+        }
+
+        public long getMaxMemory()
+        {
+<span class="nc" id="L555">            return maxMemory;</span>
+        }
+
+        /**
+         * @param maxMemoryBytes The maximum memory in bytes in use before low resources is triggered.
+         */
+        public void setMaxMemory(long maxMemoryBytes)
+        {
+<span class="nc" id="L563">            this.maxMemory = maxMemoryBytes;</span>
+<span class="nc" id="L564">        }</span>
+
+        @Override
+        public String getReason()
+        {
+<span class="nc" id="L569">            return reason;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L575">            return &quot;Check if used memory is higher than the allowed max memory&quot;;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>
