@@ -1,0 +1,707 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaStatusBackingStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.storage</a> &gt; <span class="el_source">KafkaStatusBackingStore.java</span></div><h1>KafkaStatusBackingStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.storage;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.ThreadUtils;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaAndValue;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.runtime.AbstractStatus;
+import org.apache.kafka.connect.runtime.ConnectorStatus;
+import org.apache.kafka.connect.runtime.TaskStatus;
+import org.apache.kafka.connect.runtime.TopicStatus;
+import org.apache.kafka.connect.runtime.WorkerConfig;
+import org.apache.kafka.connect.runtime.distributed.DistributedConfig;
+import org.apache.kafka.connect.util.Callback;
+import org.apache.kafka.connect.util.ConnectUtils;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+import org.apache.kafka.connect.util.KafkaBasedLog;
+import org.apache.kafka.connect.util.Table;
+import org.apache.kafka.connect.util.TopicAdmin;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+
+/**
+ * StatusBackingStore implementation which uses a compacted topic for storage
+ * of connector and task status information. When a state change is observed,
+ * the new state is written to the compacted topic. The new state will not be
+ * visible until it has been read back from the topic.
+ * &lt;p&gt;
+ * In spite of their names, the {@link #putSafe} methods cannot guarantee the safety
+ * of the write (since Kafka itself cannot provide such guarantees currently),
+ * but it can avoid specific unsafe conditions. In particular, {@link #putSafe}
+ * allows writes in the following conditions:
+ * &lt;ol&gt;
+ *   &lt;li&gt;It is (probably) safe to overwrite the state if there is no previous
+ *   value.
+ *   &lt;li&gt;It is (probably) safe to overwrite the state if the previous value was
+ *   set by a worker with the same workerId.
+ *   &lt;li&gt;It is (probably) safe to overwrite the previous state if the current
+ *   generation is higher than the previous .
+ * &lt;/ol&gt;
+ * Basically all these conditions do is reduce the window for conflicts. They
+ * obviously cannot take into account in-flight requests.
+ *
+ */
+public class KafkaStatusBackingStore extends KafkaTopicBasedBackingStore implements StatusBackingStore {
+<span class="fc" id="L92">    private static final Logger log = LoggerFactory.getLogger(KafkaStatusBackingStore.class);</span>
+
+    public static final String TASK_STATUS_PREFIX = &quot;status-task-&quot;;
+    public static final String CONNECTOR_STATUS_PREFIX = &quot;status-connector-&quot;;
+    public static final String TOPIC_STATUS_PREFIX = &quot;status-topic-&quot;;
+    public static final String TOPIC_STATUS_SEPARATOR = &quot;:connector-&quot;;
+
+    public static final String STATE_KEY_NAME = &quot;state&quot;;
+    public static final String TRACE_KEY_NAME = &quot;trace&quot;;
+    public static final String WORKER_ID_KEY_NAME = &quot;worker_id&quot;;
+    public static final String GENERATION_KEY_NAME = &quot;generation&quot;;
+    public static final String VERSION_KEY_NAME = &quot;version&quot;;
+
+    public static final String TOPIC_STATE_KEY = &quot;topic&quot;;
+    public static final String TOPIC_NAME_KEY = &quot;name&quot;;
+    public static final String TOPIC_CONNECTOR_KEY = &quot;connector&quot;;
+    public static final String TOPIC_TASK_KEY = &quot;task&quot;;
+    public static final String TOPIC_DISCOVER_TIMESTAMP_KEY = &quot;discoverTimestamp&quot;;
+
+<span class="fc" id="L111">    private static final Schema STATUS_SCHEMA_V0 = SchemaBuilder.struct()</span>
+<span class="fc" id="L112">            .field(STATE_KEY_NAME, Schema.STRING_SCHEMA)</span>
+<span class="fc" id="L113">            .field(TRACE_KEY_NAME, SchemaBuilder.string().optional().build())</span>
+<span class="fc" id="L114">            .field(WORKER_ID_KEY_NAME, Schema.STRING_SCHEMA)</span>
+<span class="fc" id="L115">            .field(GENERATION_KEY_NAME, Schema.INT32_SCHEMA)</span>
+<span class="fc" id="L116">            .field(VERSION_KEY_NAME, Schema.OPTIONAL_STRING_SCHEMA)</span>
+<span class="fc" id="L117">            .build();</span>
+
+<span class="fc" id="L119">    private static final Schema TOPIC_STATUS_VALUE_SCHEMA_V0 = SchemaBuilder.struct()</span>
+<span class="fc" id="L120">            .field(TOPIC_NAME_KEY, Schema.STRING_SCHEMA)</span>
+<span class="fc" id="L121">            .field(TOPIC_CONNECTOR_KEY, Schema.STRING_SCHEMA)</span>
+<span class="fc" id="L122">            .field(TOPIC_TASK_KEY, Schema.INT32_SCHEMA)</span>
+<span class="fc" id="L123">            .field(TOPIC_DISCOVER_TIMESTAMP_KEY, Schema.INT64_SCHEMA)</span>
+<span class="fc" id="L124">            .build();</span>
+
+<span class="fc" id="L126">    private static final Schema TOPIC_STATUS_SCHEMA_V0 = SchemaBuilder.map(</span>
+            Schema.STRING_SCHEMA,
+            TOPIC_STATUS_VALUE_SCHEMA_V0
+<span class="fc" id="L129">    ).build();</span>
+
+    private final Time time;
+    private final Converter converter;
+    //visible for testing
+    protected final Table&lt;String, Integer, CacheEntry&lt;TaskStatus&gt;&gt; tasks;
+    protected final Map&lt;String, CacheEntry&lt;ConnectorStatus&gt;&gt; connectors;
+    protected final ConcurrentMap&lt;String, ConcurrentMap&lt;String, TopicStatus&gt;&gt; topics;
+    private final Supplier&lt;TopicAdmin&gt; topicAdminSupplier;
+    private final String clientId;
+
+    private String statusTopic;
+    private KafkaBasedLog&lt;String, byte[]&gt; kafkaLog;
+    private int generation;
+    private ExecutorService sendRetryExecutor;
+
+<span class="fc" id="L145">    public KafkaStatusBackingStore(Time time, Converter converter, Supplier&lt;TopicAdmin&gt; topicAdminSupplier, String clientIdBase) {</span>
+<span class="fc" id="L146">        this.time = time;</span>
+<span class="fc" id="L147">        this.converter = converter;</span>
+<span class="fc" id="L148">        this.tasks = new Table&lt;&gt;();</span>
+<span class="fc" id="L149">        this.connectors = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L150">        this.topics = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L151">        this.topicAdminSupplier = topicAdminSupplier;</span>
+<span class="fc" id="L152">        this.clientId = Objects.requireNonNull(clientIdBase) + &quot;statuses&quot;;</span>
+<span class="fc" id="L153">    }</span>
+
+    // visible for testing
+    KafkaStatusBackingStore(Time time, Converter converter, String statusTopic, Supplier&lt;TopicAdmin&gt; topicAdminSupplier,
+        KafkaBasedLog&lt;String, byte[]&gt; kafkaLog) {
+<span class="nc" id="L158">        this(time, converter, null, &quot;connect-distributed-&quot;);</span>
+<span class="nc" id="L159">        this.kafkaLog = kafkaLog;</span>
+<span class="nc" id="L160">        this.statusTopic = statusTopic;</span>
+<span class="nc" id="L161">        sendRetryExecutor = Executors.newSingleThreadExecutor(</span>
+<span class="nc" id="L162">                ThreadUtils.createThreadFactory(&quot;status-store-retry-&quot; + statusTopic, true));</span>
+<span class="nc" id="L163">    }</span>
+
+    @Override
+    public void configure(final WorkerConfig config) {
+<span class="fc" id="L167">        this.statusTopic = config.getString(DistributedConfig.STATUS_STORAGE_TOPIC_CONFIG);</span>
+<span class="pc bpc" id="L168" title="2 of 4 branches missed.">        if (this.statusTopic == null || this.statusTopic.trim().isEmpty())</span>
+<span class="nc" id="L169">            throw new ConfigException(&quot;Must specify topic for connector status.&quot;);</span>
+
+<span class="fc" id="L171">        sendRetryExecutor = Executors.newSingleThreadExecutor(</span>
+<span class="fc" id="L172">                ThreadUtils.createThreadFactory(&quot;status-store-retry-&quot; + statusTopic, true));</span>
+
+<span class="fc" id="L174">        String clusterId = config.kafkaClusterId();</span>
+<span class="fc" id="L175">        Map&lt;String, Object&gt; originals = config.originals();</span>
+<span class="fc" id="L176">        Map&lt;String, Object&gt; producerProps = new HashMap&lt;&gt;(originals);</span>
+<span class="fc" id="L177">        producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());</span>
+<span class="fc" id="L178">        producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());</span>
+<span class="fc" id="L179">        producerProps.put(ProducerConfig.RETRIES_CONFIG, 0); // we handle retries in this class</span>
+        // By default, Connect disables idempotent behavior for all producers, even though idempotence became
+        // default for Kafka producers. This is to ensure Connect continues to work with many Kafka broker versions, including older brokers that do not support
+        // idempotent producers or require explicit steps to enable them (e.g. adding the IDEMPOTENT_WRITE ACL to brokers older than 2.8).
+        // These settings might change when https://cwiki.apache.org/confluence/display/KAFKA/KIP-318%3A+Make+Kafka+Connect+Source+idempotent
+        // gets approved and scheduled for release.
+<span class="fc" id="L185">        producerProps.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, &quot;false&quot;); // disable idempotence since retries is force to 0</span>
+<span class="fc" id="L186">        producerProps.put(CommonClientConfigs.CLIENT_ID_CONFIG, clientId);</span>
+<span class="fc" id="L187">        ConnectUtils.addMetricsContextProperties(producerProps, config, clusterId);</span>
+
+<span class="fc" id="L189">        Map&lt;String, Object&gt; consumerProps = new HashMap&lt;&gt;(originals);</span>
+<span class="fc" id="L190">        consumerProps.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());</span>
+<span class="fc" id="L191">        consumerProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());</span>
+<span class="fc" id="L192">        consumerProps.put(CommonClientConfigs.CLIENT_ID_CONFIG, clientId);</span>
+<span class="fc" id="L193">        ConnectUtils.addMetricsContextProperties(consumerProps, config, clusterId);</span>
+
+<span class="fc" id="L195">        Map&lt;String, Object&gt; adminProps = new HashMap&lt;&gt;(originals);</span>
+<span class="fc" id="L196">        adminProps.put(CommonClientConfigs.CLIENT_ID_CONFIG, clientId);</span>
+<span class="fc" id="L197">        ConnectUtils.addMetricsContextProperties(adminProps, config, clusterId);</span>
+
+<span class="pc bpc" id="L199" title="1 of 2 branches missed.">        Map&lt;String, Object&gt; topicSettings = config instanceof DistributedConfig</span>
+<span class="fc" id="L200">                                            ? ((DistributedConfig) config).statusStorageTopicSettings()</span>
+<span class="pc" id="L201">                                            : Map.of();</span>
+<span class="fc" id="L202">        NewTopic topicDescription = TopicAdmin.defineTopic(statusTopic)</span>
+<span class="fc" id="L203">                .config(topicSettings) // first so that we override user-supplied settings as needed</span>
+<span class="fc" id="L204">                .compacted()</span>
+<span class="fc" id="L205">                .partitions(config.getInt(DistributedConfig.STATUS_STORAGE_PARTITIONS_CONFIG))</span>
+<span class="fc" id="L206">                .replicationFactor(config.getShort(DistributedConfig.STATUS_STORAGE_REPLICATION_FACTOR_CONFIG))</span>
+<span class="fc" id="L207">                .build();</span>
+
+<span class="fc" id="L209">        Callback&lt;ConsumerRecord&lt;String, byte[]&gt;&gt; readCallback = (error, record) -&gt; read(record);</span>
+<span class="fc" id="L210">        this.kafkaLog = createKafkaBasedLog(statusTopic, producerProps, consumerProps, readCallback, topicDescription, topicAdminSupplier, config, time);</span>
+<span class="fc" id="L211">    }</span>
+
+    @Override
+    public void start() {
+<span class="fc" id="L215">        kafkaLog.start();</span>
+
+        // read to the end on startup to ensure that api requests see the most recent states
+<span class="fc" id="L218">        kafkaLog.readToEnd();</span>
+<span class="fc" id="L219">    }</span>
+
+    @Override
+    public void stop() {
+        try {
+<span class="fc" id="L224">            kafkaLog.stop();</span>
+        } finally {
+<span class="fc" id="L226">            ThreadUtils.shutdownExecutorServiceQuietly(sendRetryExecutor, 10, TimeUnit.SECONDS);</span>
+        }
+<span class="fc" id="L228">    }</span>
+
+    @Override
+    public void put(final ConnectorStatus status) {
+<span class="fc" id="L232">        sendConnectorStatus(status, false);</span>
+<span class="fc" id="L233">    }</span>
+
+    @Override
+    public void putSafe(final ConnectorStatus status) {
+<span class="fc" id="L237">        sendConnectorStatus(status, true);</span>
+<span class="fc" id="L238">    }</span>
+
+    @Override
+    public void put(final TaskStatus status) {
+<span class="fc" id="L242">        sendTaskStatus(status, false);</span>
+<span class="fc" id="L243">    }</span>
+
+    @Override
+    public void putSafe(final TaskStatus status) {
+<span class="fc" id="L247">        sendTaskStatus(status, true);</span>
+<span class="fc" id="L248">    }</span>
+
+    @Override
+    public void put(final TopicStatus status) {
+<span class="fc" id="L252">        sendTopicStatus(status.connector(), status.topic(), status);</span>
+<span class="fc" id="L253">    }</span>
+
+    @Override
+    public void flush() {
+<span class="fc" id="L257">        kafkaLog.flush();</span>
+<span class="fc" id="L258">    }</span>
+
+    private void sendConnectorStatus(final ConnectorStatus status, boolean safeWrite) {
+<span class="fc" id="L261">        String connector = status.id();</span>
+<span class="fc" id="L262">        CacheEntry&lt;ConnectorStatus&gt; entry = getOrAdd(connector);</span>
+<span class="fc" id="L263">        String key = CONNECTOR_STATUS_PREFIX + connector;</span>
+<span class="fc" id="L264">        send(key, status, entry, safeWrite);</span>
+<span class="fc" id="L265">    }</span>
+
+    private void sendTaskStatus(final TaskStatus status, boolean safeWrite) {
+<span class="fc" id="L268">        ConnectorTaskId taskId = status.id();</span>
+<span class="fc" id="L269">        CacheEntry&lt;TaskStatus&gt; entry = getOrAdd(taskId);</span>
+<span class="fc" id="L270">        String key = TASK_STATUS_PREFIX + taskId.connector() + &quot;-&quot; + taskId.task();</span>
+<span class="fc" id="L271">        send(key, status, entry, safeWrite);</span>
+<span class="fc" id="L272">    }</span>
+
+    private void sendTopicStatus(final String connector, final String topic, final TopicStatus status) {
+<span class="fc" id="L275">        String key = TOPIC_STATUS_PREFIX + topic + TOPIC_STATUS_SEPARATOR + connector;</span>
+
+<span class="fc" id="L277">        final byte[] value = serializeTopicStatus(status);</span>
+
+<span class="fc" id="L279">        kafkaLog.send(key, value, new org.apache.kafka.clients.producer.Callback() {</span>
+            @Override
+            public void onCompletion(RecordMetadata metadata, Exception exception) {
+<span class="pc bpc" id="L282" title="1 of 2 branches missed.">                if (exception == null) return;</span>
+                // TODO: retry more gracefully and not forever
+<span class="nc bnc" id="L284" title="All 2 branches missed.">                if (exception instanceof RetriableException) {</span>
+<span class="nc" id="L285">                    sendRetryExecutor.submit(() -&gt; kafkaLog.send(key, value, this));</span>
+                } else {
+<span class="nc" id="L287">                    log.error(&quot;Failed to write status update&quot;, exception);</span>
+                }
+<span class="nc" id="L289">            }</span>
+        });
+<span class="fc" id="L291">    }</span>
+
+    private &lt;V extends AbstractStatus&lt;?&gt;&gt; void send(final String key,
+                                                 final V status,
+                                                 final CacheEntry&lt;V&gt; entry,
+                                                 final boolean safeWrite) {
+        final int sequence;
+<span class="fc" id="L298">        synchronized (this) {</span>
+<span class="fc" id="L299">            this.generation = status.generation();</span>
+<span class="pc bpc" id="L300" title="1 of 4 branches missed.">            if (safeWrite &amp;&amp; !entry.canWriteSafely(status))</span>
+<span class="nc" id="L301">                return;</span>
+<span class="fc" id="L302">            sequence = entry.increment();</span>
+<span class="fc" id="L303">        }</span>
+
+<span class="fc bfc" id="L305" title="All 2 branches covered.">        final byte[] value = status.state() == ConnectorStatus.State.DESTROYED ? null : serialize(status);</span>
+
+<span class="fc" id="L307">        kafkaLog.send(key, value, new org.apache.kafka.clients.producer.Callback() {</span>
+            @Override
+            public void onCompletion(RecordMetadata metadata, Exception exception) {
+<span class="pc bpc" id="L310" title="1 of 2 branches missed.">                if (exception == null) return;</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">                if (exception instanceof RetriableException) {</span>
+<span class="nc" id="L312">                    synchronized (KafkaStatusBackingStore.this) {</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                        if (entry.isDeleted()</span>
+<span class="nc bnc" id="L314" title="All 4 branches missed.">                            || status.generation() != generation</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">                            || (safeWrite &amp;&amp; !entry.canWriteSafely(status, sequence)))</span>
+<span class="nc" id="L316">                            return;</span>
+<span class="nc" id="L317">                    }</span>
+
+<span class="nc" id="L319">                    sendRetryExecutor.submit(() -&gt; kafkaLog.send(key, value, this));</span>
+                } else {
+<span class="nc" id="L321">                    log.error(&quot;Failed to write status update&quot;, exception);</span>
+                }
+<span class="nc" id="L323">            }</span>
+        });
+<span class="fc" id="L325">    }</span>
+
+    private synchronized CacheEntry&lt;ConnectorStatus&gt; getOrAdd(String connector) {
+<span class="fc" id="L328">        CacheEntry&lt;ConnectorStatus&gt; entry = connectors.get(connector);</span>
+<span class="fc bfc" id="L329" title="All 2 branches covered.">        if (entry == null) {</span>
+<span class="fc" id="L330">            entry = new CacheEntry&lt;&gt;();</span>
+<span class="fc" id="L331">            connectors.put(connector, entry);</span>
+        }
+<span class="fc" id="L333">        return entry;</span>
+    }
+
+    private synchronized void remove(String connector) {
+<span class="fc" id="L337">        CacheEntry&lt;ConnectorStatus&gt; removed = connectors.remove(connector);</span>
+<span class="pc bpc" id="L338" title="1 of 2 branches missed.">        if (removed != null)</span>
+<span class="fc" id="L339">            removed.delete();</span>
+
+<span class="fc" id="L341">        Map&lt;Integer, CacheEntry&lt;TaskStatus&gt;&gt; tasks = this.tasks.remove(connector);</span>
+<span class="pc bpc" id="L342" title="1 of 2 branches missed.">        if (tasks != null) {</span>
+<span class="fc bfc" id="L343" title="All 2 branches covered.">            for (CacheEntry&lt;TaskStatus&gt; taskEntry : tasks.values())</span>
+<span class="fc" id="L344">                taskEntry.delete();</span>
+        }
+<span class="fc" id="L346">    }</span>
+
+    private synchronized CacheEntry&lt;TaskStatus&gt; getOrAdd(ConnectorTaskId task) {
+<span class="fc" id="L349">        CacheEntry&lt;TaskStatus&gt; entry = tasks.get(task.connector(), task.task());</span>
+<span class="fc bfc" id="L350" title="All 2 branches covered.">        if (entry == null) {</span>
+<span class="fc" id="L351">            entry = new CacheEntry&lt;&gt;();</span>
+<span class="fc" id="L352">            tasks.put(task.connector(), task.task(), entry);</span>
+        }
+<span class="fc" id="L354">        return entry;</span>
+    }
+
+    private synchronized void remove(ConnectorTaskId id) {
+<span class="fc" id="L358">        CacheEntry&lt;TaskStatus&gt; removed = tasks.remove(id.connector(), id.task());</span>
+<span class="pc bpc" id="L359" title="1 of 2 branches missed.">        if (removed != null)</span>
+<span class="nc" id="L360">            removed.delete();</span>
+<span class="fc" id="L361">    }</span>
+
+    private void removeTopic(String topic, String connector) {
+<span class="fc" id="L364">        ConcurrentMap&lt;String, TopicStatus&gt; activeTopics = topics.get(connector);</span>
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">        if (activeTopics == null) {</span>
+<span class="nc" id="L366">            return;</span>
+        }
+<span class="fc" id="L368">        activeTopics.remove(topic);</span>
+<span class="fc" id="L369">    }</span>
+
+    @Override
+    public synchronized TaskStatus get(ConnectorTaskId id) {
+<span class="nc" id="L373">        CacheEntry&lt;TaskStatus&gt; entry = tasks.get(id.connector(), id.task());</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">        return entry == null ? null : entry.get();</span>
+    }
+
+    @Override
+    public synchronized ConnectorStatus get(String connector) {
+<span class="fc" id="L379">        CacheEntry&lt;ConnectorStatus&gt; entry = connectors.get(connector);</span>
+<span class="fc bfc" id="L380" title="All 2 branches covered.">        return entry == null ? null : entry.get();</span>
+    }
+
+    @Override
+    public synchronized Collection&lt;TaskStatus&gt; getAll(String connector) {
+<span class="fc" id="L385">        List&lt;TaskStatus&gt; res = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L386" title="All 2 branches covered.">        for (CacheEntry&lt;TaskStatus&gt; statusEntry : tasks.row(connector).values()) {</span>
+<span class="fc" id="L387">            TaskStatus status = statusEntry.get();</span>
+<span class="pc bpc" id="L388" title="1 of 2 branches missed.">            if (status != null)</span>
+<span class="fc" id="L389">                res.add(status);</span>
+<span class="fc" id="L390">        }</span>
+<span class="fc" id="L391">        return res;</span>
+    }
+
+    @Override
+    public TopicStatus getTopic(String connector, String topic) {
+<span class="fc" id="L396">        ConcurrentMap&lt;String, TopicStatus&gt; activeTopics = topics.get(Objects.requireNonNull(connector));</span>
+<span class="fc bfc" id="L397" title="All 2 branches covered.">        return activeTopics != null ? activeTopics.get(Objects.requireNonNull(topic)) : null;</span>
+    }
+
+    @Override
+    public Collection&lt;TopicStatus&gt; getAllTopics(String connector) {
+<span class="fc" id="L402">        ConcurrentMap&lt;String, TopicStatus&gt; activeTopics = topics.get(Objects.requireNonNull(connector));</span>
+<span class="pc bpc" id="L403" title="1 of 2 branches missed.">        return activeTopics != null</span>
+<span class="fc" id="L404">               ? Set.copyOf(Objects.requireNonNull(activeTopics.values()))</span>
+<span class="nc" id="L405">               : Set.of();</span>
+    }
+
+    @Override
+    public void deleteTopic(String connector, String topic) {
+<span class="fc" id="L410">        sendTopicStatus(Objects.requireNonNull(connector), Objects.requireNonNull(topic), null);</span>
+<span class="fc" id="L411">    }</span>
+
+    @Override
+    public synchronized Set&lt;String&gt; connectors() {
+<span class="fc" id="L415">        return new HashSet&lt;&gt;(connectors.keySet());</span>
+    }
+
+    private ConnectorStatus parseConnectorStatus(String connector, byte[] data) {
+        try {
+<span class="fc" id="L420">            SchemaAndValue schemaAndValue = converter.toConnectData(statusTopic, data);</span>
+<span class="pc bpc" id="L421" title="1 of 2 branches missed.">            if (!(schemaAndValue.value() instanceof Map)) {</span>
+<span class="nc" id="L422">                log.error(&quot;Invalid connector status type {}&quot;, schemaAndValue.value().getClass());</span>
+<span class="nc" id="L423">                return null;</span>
+            }
+
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L427">            Map&lt;String, Object&gt; statusMap = (Map&lt;String, Object&gt;) schemaAndValue.value();</span>
+<span class="fc" id="L428">            TaskStatus.State state = TaskStatus.State.valueOf((String) statusMap.get(STATE_KEY_NAME));</span>
+<span class="fc" id="L429">            String trace = (String) statusMap.get(TRACE_KEY_NAME);</span>
+<span class="fc" id="L430">            String workerUrl = (String) statusMap.get(WORKER_ID_KEY_NAME);</span>
+<span class="fc" id="L431">            int generation = ((Long) statusMap.get(GENERATION_KEY_NAME)).intValue();</span>
+<span class="fc" id="L432">            String version = (String) statusMap.get(VERSION_KEY_NAME);</span>
+<span class="fc" id="L433">            return new ConnectorStatus(connector, state, trace, workerUrl, generation, version);</span>
+<span class="nc" id="L434">        } catch (Exception e) {</span>
+<span class="nc" id="L435">            log.error(&quot;Failed to deserialize connector status&quot;, e);</span>
+<span class="nc" id="L436">            return null;</span>
+        }
+    }
+
+    private TaskStatus parseTaskStatus(ConnectorTaskId taskId, byte[] data) {
+        try {
+<span class="fc" id="L442">            SchemaAndValue schemaAndValue = converter.toConnectData(statusTopic, data);</span>
+<span class="pc bpc" id="L443" title="1 of 2 branches missed.">            if (!(schemaAndValue.value() instanceof Map)) {</span>
+<span class="nc" id="L444">                log.error(&quot;Invalid task status type {}&quot;, schemaAndValue.value().getClass());</span>
+<span class="nc" id="L445">                return null;</span>
+            }
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L448">            Map&lt;String, Object&gt; statusMap = (Map&lt;String, Object&gt;) schemaAndValue.value();</span>
+<span class="fc" id="L449">            TaskStatus.State state = TaskStatus.State.valueOf((String) statusMap.get(STATE_KEY_NAME));</span>
+<span class="fc" id="L450">            String trace = (String) statusMap.get(TRACE_KEY_NAME);</span>
+<span class="fc" id="L451">            String workerUrl = (String) statusMap.get(WORKER_ID_KEY_NAME);</span>
+<span class="fc" id="L452">            int generation = ((Long) statusMap.get(GENERATION_KEY_NAME)).intValue();</span>
+<span class="fc" id="L453">            String version = (String) statusMap.get(VERSION_KEY_NAME);</span>
+<span class="fc" id="L454">            return new TaskStatus(taskId, state, workerUrl, generation, trace, version);</span>
+<span class="nc" id="L455">        } catch (Exception e) {</span>
+<span class="nc" id="L456">            log.error(&quot;Failed to deserialize task status&quot;, e);</span>
+<span class="nc" id="L457">            return null;</span>
+        }
+    }
+
+    protected TopicStatus parseTopicStatus(byte[] data) {
+        try {
+<span class="fc" id="L463">            SchemaAndValue schemaAndValue = converter.toConnectData(statusTopic, data);</span>
+<span class="pc bpc" id="L464" title="1 of 2 branches missed.">            if (!(schemaAndValue.value() instanceof Map)) {</span>
+<span class="nc" id="L465">                log.error(&quot;Invalid topic status value {}&quot;, schemaAndValue.value());</span>
+<span class="nc" id="L466">                return null;</span>
+            }
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L469">            Object innerValue = ((Map&lt;String, Object&gt;) schemaAndValue.value()).get(TOPIC_STATE_KEY);</span>
+<span class="pc bpc" id="L470" title="1 of 2 branches missed.">            if (!(innerValue instanceof Map)) {</span>
+<span class="nc" id="L471">                log.error(&quot;Invalid topic status value {} for field {}&quot;, innerValue, TOPIC_STATE_KEY);</span>
+<span class="nc" id="L472">                return null;</span>
+            }
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L475">            Map&lt;String, Object&gt; topicStatusMetadata = (Map&lt;String, Object&gt;) innerValue;</span>
+<span class="fc" id="L476">            return new TopicStatus((String) topicStatusMetadata.get(TOPIC_NAME_KEY),</span>
+<span class="fc" id="L477">                    (String) topicStatusMetadata.get(TOPIC_CONNECTOR_KEY),</span>
+<span class="fc" id="L478">                    ((Long) topicStatusMetadata.get(TOPIC_TASK_KEY)).intValue(),</span>
+<span class="fc" id="L479">                    (long) topicStatusMetadata.get(TOPIC_DISCOVER_TIMESTAMP_KEY));</span>
+<span class="nc" id="L480">        } catch (Exception e) {</span>
+<span class="nc" id="L481">            log.error(&quot;Failed to deserialize topic status&quot;, e);</span>
+<span class="nc" id="L482">            return null;</span>
+        }
+    }
+
+    private byte[] serialize(AbstractStatus&lt;?&gt; status) {
+<span class="fc" id="L487">        Struct struct = new Struct(STATUS_SCHEMA_V0);</span>
+<span class="fc" id="L488">        struct.put(STATE_KEY_NAME, status.state().name());</span>
+<span class="pc bpc" id="L489" title="1 of 2 branches missed.">        if (status.trace() != null)</span>
+<span class="nc" id="L490">            struct.put(TRACE_KEY_NAME, status.trace());</span>
+<span class="fc" id="L491">        struct.put(WORKER_ID_KEY_NAME, status.workerId());</span>
+<span class="fc" id="L492">        struct.put(GENERATION_KEY_NAME, status.generation());</span>
+<span class="fc" id="L493">        struct.put(VERSION_KEY_NAME, status.version());</span>
+<span class="fc" id="L494">        return converter.fromConnectData(statusTopic, STATUS_SCHEMA_V0, struct);</span>
+    }
+
+    //visible for testing
+    protected byte[] serializeTopicStatus(TopicStatus status) {
+<span class="fc bfc" id="L499" title="All 2 branches covered.">        if (status == null) {</span>
+            // This should send a tombstone record that will represent delete
+<span class="fc" id="L501">            return null;</span>
+        }
+<span class="fc" id="L503">        Struct struct = new Struct(TOPIC_STATUS_VALUE_SCHEMA_V0);</span>
+<span class="fc" id="L504">        struct.put(TOPIC_NAME_KEY, status.topic());</span>
+<span class="fc" id="L505">        struct.put(TOPIC_CONNECTOR_KEY, status.connector());</span>
+<span class="fc" id="L506">        struct.put(TOPIC_TASK_KEY, status.task());</span>
+<span class="fc" id="L507">        struct.put(TOPIC_DISCOVER_TIMESTAMP_KEY, status.discoverTimestamp());</span>
+<span class="fc" id="L508">        return converter.fromConnectData(</span>
+                statusTopic,
+                TOPIC_STATUS_SCHEMA_V0,
+<span class="fc" id="L511">                Map.of(TOPIC_STATE_KEY, struct));</span>
+    }
+
+    private String parseConnectorStatusKey(String key) {
+<span class="fc" id="L515">        return key.substring(CONNECTOR_STATUS_PREFIX.length());</span>
+    }
+
+    private ConnectorTaskId parseConnectorTaskId(String key) {
+<span class="fc" id="L519">        String[] parts = key.split(&quot;-&quot;);</span>
+<span class="pc bpc" id="L520" title="1 of 2 branches missed.">        if (parts.length &lt; 4) return null;</span>
+
+        try {
+<span class="fc" id="L523">            int taskNum = Integer.parseInt(parts[parts.length - 1]);</span>
+<span class="fc" id="L524">            String connectorName = String.join(&quot;-&quot;, Arrays.copyOfRange(parts, 2, parts.length - 1));</span>
+<span class="fc" id="L525">            return new ConnectorTaskId(connectorName, taskNum);</span>
+<span class="nc" id="L526">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L527">            log.warn(&quot;Invalid task status key {}&quot;, key);</span>
+<span class="nc" id="L528">            return null;</span>
+        }
+    }
+
+    private void readConnectorStatus(String key, byte[] value) {
+<span class="fc" id="L533">        String connector = parseConnectorStatusKey(key);</span>
+<span class="pc bpc" id="L534" title="1 of 2 branches missed.">        if (connector.isEmpty()) {</span>
+<span class="nc" id="L535">            log.warn(&quot;Discarding record with invalid connector status key {}&quot;, key);</span>
+<span class="nc" id="L536">            return;</span>
+        }
+
+<span class="fc bfc" id="L539" title="All 2 branches covered.">        if (value == null) {</span>
+<span class="fc" id="L540">            log.trace(&quot;Removing status for connector {}&quot;, connector);</span>
+<span class="fc" id="L541">            remove(connector);</span>
+<span class="fc" id="L542">            return;</span>
+        }
+
+<span class="fc" id="L545">        ConnectorStatus status = parseConnectorStatus(connector, value);</span>
+<span class="pc bpc" id="L546" title="1 of 2 branches missed.">        if (status == null)</span>
+<span class="nc" id="L547">            return;</span>
+
+<span class="fc" id="L549">        synchronized (this) {</span>
+<span class="fc" id="L550">            log.trace(&quot;Received connector {} status update {}&quot;, connector, status);</span>
+<span class="fc" id="L551">            CacheEntry&lt;ConnectorStatus&gt; entry = getOrAdd(connector);</span>
+<span class="fc" id="L552">            entry.put(status);</span>
+<span class="fc" id="L553">        }</span>
+<span class="fc" id="L554">    }</span>
+
+    private void readTaskStatus(String key, byte[] value) {
+<span class="fc" id="L557">        ConnectorTaskId id = parseConnectorTaskId(key);</span>
+<span class="pc bpc" id="L558" title="1 of 2 branches missed.">        if (id == null) {</span>
+<span class="nc" id="L559">            log.warn(&quot;Discarding record with invalid task status key {}&quot;, key);</span>
+<span class="nc" id="L560">            return;</span>
+        }
+
+<span class="fc bfc" id="L563" title="All 2 branches covered.">        if (value == null) {</span>
+<span class="fc" id="L564">            log.trace(&quot;Removing task status for {}&quot;, id);</span>
+<span class="fc" id="L565">            remove(id);</span>
+<span class="fc" id="L566">            return;</span>
+        }
+
+<span class="fc" id="L569">        TaskStatus status = parseTaskStatus(id, value);</span>
+<span class="pc bpc" id="L570" title="1 of 2 branches missed.">        if (status == null) {</span>
+<span class="nc" id="L571">            log.warn(&quot;Failed to parse task status with key {}&quot;, key);</span>
+<span class="nc" id="L572">            return;</span>
+        }
+
+<span class="fc" id="L575">        synchronized (this) {</span>
+<span class="fc" id="L576">            log.trace(&quot;Received task {} status update {}&quot;, id, status);</span>
+<span class="fc" id="L577">            CacheEntry&lt;TaskStatus&gt; entry = getOrAdd(id);</span>
+
+            // During frequent rebalances, there could be a race condition because of which
+            // an UNASSIGNED state of a prior or same generation can be sent by a worker despite a
+            // RUNNING status by another worker because the first worker
+            // couldn't read the latest RUNNING status. This can lead to an inaccurate status
+            // representation even though the task might be actually running.
+            // Note that this could also mean that when a generation reset happens, and an
+            // UNASSIGNED status is sent, then it would be ignored if the current status is RUNNING
+            // at a higher generation. But since it will be followed by a RUNNING or a different
+            // status message(at the lower generation) soon after, the misrepresentation of the UNASSIGNED
+            // status would be short-lived in most cases.
+<span class="fc bfc" id="L589" title="All 2 branches covered.">            if (status.state() == TaskStatus.State.UNASSIGNED</span>
+<span class="fc bfc" id="L590" title="All 2 branches covered.">                    &amp;&amp; entry.get() != null</span>
+<span class="pc bpc" id="L591" title="1 of 2 branches missed.">                    &amp;&amp; entry.get().state() == TaskStatus.State.RUNNING</span>
+<span class="pc bpc" id="L592" title="1 of 2 branches missed.">                    &amp;&amp; entry.get().generation() &gt;= status.generation()) {</span>
+<span class="fc" id="L593">                log.trace(&quot;Ignoring stale status {} in favour of more upto date status {}&quot;, status, entry.get());</span>
+<span class="fc" id="L594">                return;</span>
+            }
+
+<span class="fc" id="L597">            entry.put(status);</span>
+<span class="fc" id="L598">        }</span>
+<span class="fc" id="L599">    }</span>
+
+    private void readTopicStatus(String key, byte[] value) {
+<span class="fc" id="L602">        int delimiterPos = key.indexOf(':');</span>
+<span class="fc" id="L603">        int beginPos = TOPIC_STATUS_PREFIX.length();</span>
+<span class="pc bpc" id="L604" title="1 of 2 branches missed.">        if (beginPos &gt; delimiterPos) {</span>
+<span class="nc" id="L605">            log.warn(&quot;Discarding record with invalid topic status key {}&quot;, key);</span>
+<span class="nc" id="L606">            return;</span>
+        }
+
+<span class="fc" id="L609">        String topic = key.substring(beginPos, delimiterPos);</span>
+<span class="pc bpc" id="L610" title="1 of 2 branches missed.">        if (topic.isEmpty()) {</span>
+<span class="nc" id="L611">            log.warn(&quot;Discarding record with invalid topic status key containing empty topic {}&quot;, key);</span>
+<span class="nc" id="L612">            return;</span>
+        }
+
+<span class="fc" id="L615">        beginPos = delimiterPos + TOPIC_STATUS_SEPARATOR.length();</span>
+<span class="fc" id="L616">        int endPos = key.length();</span>
+<span class="pc bpc" id="L617" title="1 of 2 branches missed.">        if (beginPos &gt; endPos) {</span>
+<span class="nc" id="L618">            log.warn(&quot;Discarding record with invalid topic status key {}&quot;, key);</span>
+<span class="nc" id="L619">            return;</span>
+        }
+
+<span class="fc" id="L622">        String connector = key.substring(beginPos);</span>
+<span class="pc bpc" id="L623" title="1 of 2 branches missed.">        if (connector.isEmpty()) {</span>
+<span class="nc" id="L624">            log.warn(&quot;Discarding record with invalid topic status key containing empty connector {}&quot;, key);</span>
+<span class="nc" id="L625">            return;</span>
+        }
+
+<span class="fc bfc" id="L628" title="All 2 branches covered.">        if (value == null) {</span>
+<span class="fc" id="L629">            log.trace(&quot;Removing status for topic {} and connector {}&quot;, topic, connector);</span>
+<span class="fc" id="L630">            removeTopic(topic, connector);</span>
+<span class="fc" id="L631">            return;</span>
+        }
+
+<span class="fc" id="L634">        TopicStatus status = parseTopicStatus(value);</span>
+<span class="pc bpc" id="L635" title="1 of 2 branches missed.">        if (status == null) {</span>
+<span class="nc" id="L636">            log.warn(&quot;Failed to parse topic status with key {}&quot;, key);</span>
+<span class="nc" id="L637">            return;</span>
+        }
+
+<span class="fc" id="L640">        log.trace(&quot;Received topic status update {}&quot;, status);</span>
+<span class="fc" id="L641">        topics.computeIfAbsent(connector, k -&gt; new ConcurrentHashMap&lt;&gt;())</span>
+<span class="fc" id="L642">                .put(topic, status);</span>
+<span class="fc" id="L643">    }</span>
+
+    // visible for testing
+    void read(ConsumerRecord&lt;String, byte[]&gt; record) {
+<span class="fc" id="L647">        String key = record.key();</span>
+<span class="fc bfc" id="L648" title="All 2 branches covered.">        if (key.startsWith(CONNECTOR_STATUS_PREFIX)) {</span>
+<span class="fc" id="L649">            readConnectorStatus(key, record.value());</span>
+<span class="fc bfc" id="L650" title="All 2 branches covered.">        } else if (key.startsWith(TASK_STATUS_PREFIX)) {</span>
+<span class="fc" id="L651">            readTaskStatus(key, record.value());</span>
+<span class="pc bpc" id="L652" title="1 of 2 branches missed.">        } else if (key.startsWith(TOPIC_STATUS_PREFIX)) {</span>
+<span class="fc" id="L653">            readTopicStatus(key, record.value());</span>
+        } else {
+<span class="nc" id="L655">            log.warn(&quot;Discarding record with invalid key {}&quot;, key);</span>
+        }
+<span class="fc" id="L657">    }</span>
+
+    @Override
+    protected String getTopicConfig() {
+<span class="fc" id="L661">        return DistributedConfig.STATUS_STORAGE_TOPIC_CONFIG;</span>
+    }
+
+    @Override
+    protected String getTopicPurpose() {
+<span class="fc" id="L666">        return &quot;connector and task statuses&quot;;</span>
+    }
+
+<span class="fc" id="L669">    private static class CacheEntry&lt;T extends AbstractStatus&lt;?&gt;&gt; {</span>
+<span class="fc" id="L670">        private T value = null;</span>
+<span class="fc" id="L671">        private int sequence = 0;</span>
+<span class="fc" id="L672">        private boolean deleted = false;</span>
+
+        public int increment() {
+<span class="fc" id="L675">            return ++sequence;</span>
+        }
+
+        public void put(T value) {
+<span class="fc" id="L679">            this.value = value;</span>
+<span class="fc" id="L680">        }</span>
+
+        public T get() {
+<span class="fc" id="L683">            return value;</span>
+        }
+
+        public void delete() {
+<span class="fc" id="L687">            this.deleted = true;</span>
+<span class="fc" id="L688">        }</span>
+
+        public boolean isDeleted() {
+<span class="nc" id="L691">            return deleted;</span>
+        }
+
+        public boolean canWriteSafely(T status) {
+<span class="fc bfc" id="L695" title="All 2 branches covered.">            return value == null</span>
+<span class="pc bpc" id="L696" title="1 of 2 branches missed.">                    || value.workerId().equals(status.workerId())</span>
+<span class="pc bnc" id="L697" title="All 2 branches missed.">                    || value.generation() &lt;= status.generation();</span>
+        }
+
+        public boolean canWriteSafely(T status, int sequence) {
+<span class="nc bnc" id="L701" title="All 4 branches missed.">            return canWriteSafely(status) &amp;&amp; this.sequence == sequence;</span>
+        }
+
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

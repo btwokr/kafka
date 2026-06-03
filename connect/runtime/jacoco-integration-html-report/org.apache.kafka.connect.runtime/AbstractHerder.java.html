@@ -1,0 +1,1287 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractHerder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">AbstractHerder.java</span></div><h1>AbstractHerder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.config.AbstractConfig;
+import org.apache.kafka.common.config.Config;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigDef.ConfigKey;
+import org.apache.kafka.common.config.ConfigDef.Type;
+import org.apache.kafka.common.config.ConfigTransformer;
+import org.apache.kafka.common.config.ConfigValue;
+import org.apache.kafka.common.internals.Plugin;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.connector.Connector;
+import org.apache.kafka.connect.connector.policy.ConnectorClientConfigOverridePolicy;
+import org.apache.kafka.connect.connector.policy.ConnectorClientConfigRequest;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.errors.NotFoundException;
+import org.apache.kafka.connect.runtime.isolation.LoaderSwap;
+import org.apache.kafka.connect.runtime.isolation.PluginUtils;
+import org.apache.kafka.connect.runtime.isolation.Plugins;
+import org.apache.kafka.connect.runtime.isolation.VersionedPluginLoadingException;
+import org.apache.kafka.connect.runtime.rest.entities.ActiveTopicsInfo;
+import org.apache.kafka.connect.runtime.rest.entities.ConfigInfo;
+import org.apache.kafka.connect.runtime.rest.entities.ConfigInfos;
+import org.apache.kafka.connect.runtime.rest.entities.ConfigKeyInfo;
+import org.apache.kafka.connect.runtime.rest.entities.ConfigValueInfo;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorInfo;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorOffsets;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorStateInfo;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorType;
+import org.apache.kafka.connect.runtime.rest.entities.LoggerLevel;
+import org.apache.kafka.connect.runtime.rest.entities.Message;
+import org.apache.kafka.connect.runtime.rest.errors.BadRequestException;
+import org.apache.kafka.connect.sink.SinkConnector;
+import org.apache.kafka.connect.source.SourceConnector;
+import org.apache.kafka.connect.storage.ClusterConfigState;
+import org.apache.kafka.connect.storage.ConfigBackingStore;
+import org.apache.kafka.connect.storage.Converter;
+import org.apache.kafka.connect.storage.ConverterConfig;
+import org.apache.kafka.connect.storage.ConverterType;
+import org.apache.kafka.connect.storage.HeaderConverter;
+import org.apache.kafka.connect.storage.StatusBackingStore;
+import org.apache.kafka.connect.transforms.Transformation;
+import org.apache.kafka.connect.transforms.predicates.Predicate;
+import org.apache.kafka.connect.util.Callback;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+import org.apache.kafka.connect.util.Stage;
+import org.apache.kafka.connect.util.TemporaryStage;
+
+import org.apache.maven.artifact.versioning.InvalidVersionSpecificationException;
+import org.apache.maven.artifact.versioning.VersionRange;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.connect.runtime.ConnectorConfig.CONNECTOR_CLASS_CONFIG;
+import static org.apache.kafka.connect.runtime.ConnectorConfig.CONNECTOR_VERSION;
+import static org.apache.kafka.connect.runtime.ConnectorConfig.HEADER_CONVERTER_CLASS_CONFIG;
+import static org.apache.kafka.connect.runtime.ConnectorConfig.HEADER_CONVERTER_VERSION_CONFIG;
+import static org.apache.kafka.connect.runtime.ConnectorConfig.KEY_CONVERTER_CLASS_CONFIG;
+import static org.apache.kafka.connect.runtime.ConnectorConfig.KEY_CONVERTER_VERSION_CONFIG;
+import static org.apache.kafka.connect.runtime.ConnectorConfig.VALUE_CONVERTER_CLASS_CONFIG;
+import static org.apache.kafka.connect.runtime.ConnectorConfig.VALUE_CONVERTER_VERSION_CONFIG;
+
+
+/**
+ * Abstract Herder implementation which handles connector/task lifecycle tracking. Extensions
+ * must invoke the lifecycle hooks appropriately.
+ * &lt;p&gt;
+ * This class takes the following approach for sending status updates to the backing store:
+ *
+ * &lt;ol&gt;
+ * &lt;li&gt;
+ *    When the connector or task is starting, we overwrite the previous state blindly. This ensures that
+ *    every rebalance will reset the state of tasks to the proper state. The intuition is that there should
+ *    be less chance of write conflicts when the worker has just received its assignment and is starting tasks.
+ *    In particular, this prevents us from depending on the generation absolutely. If the group disappears
+ *    and the generation is reset, then we'll overwrite the status information with the older (and larger)
+ *    generation with the updated one. The danger of this approach is that slow starting tasks may cause the
+ *    status to be overwritten after a rebalance has completed.
+ *
+ * &lt;li&gt;
+ *    If the connector or task fails or is shutdown, we use {@link StatusBackingStore#putSafe(ConnectorStatus)},
+ *    which provides a little more protection if the worker is no longer in the group (in which case the
+ *    task may have already been started on another worker). Obviously this is still racy. If the task has just
+ *    started on another worker, we may not have the updated status cached yet. In this case, we'll overwrite
+ *    the value which will cause the state to be inconsistent (most likely until the next rebalance). Until
+ *    we have proper producer groups with fenced groups, there is not much else we can do.
+ * &lt;/ol&gt;
+ */
+public abstract class AbstractHerder implements Herder, TaskStatus.Listener, ConnectorStatus.Listener {
+
+<span class="fc" id="L135">    private static final Logger log = LoggerFactory.getLogger(AbstractHerder.class);</span>
+
+    private final String workerId;
+    protected final Worker worker;
+    private final String kafkaClusterId;
+    protected final StatusBackingStore statusBackingStore;
+    protected final ConfigBackingStore configBackingStore;
+<span class="fc" id="L142">    private volatile boolean ready = false;</span>
+    private final Plugin&lt;ConnectorClientConfigOverridePolicy&gt; connectorClientConfigOverridePolicyPlugin;
+    private final ExecutorService connectorExecutor;
+    private final Time time;
+    protected final Loggers loggers;
+
+    private final CachedConnectors cachedConnectors;
+
+    public AbstractHerder(Worker worker,
+                          String workerId,
+                          String kafkaClusterId,
+                          StatusBackingStore statusBackingStore,
+                          ConfigBackingStore configBackingStore,
+                          ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
+<span class="fc" id="L156">                          Time time) {</span>
+<span class="fc" id="L157">        this.worker = worker;</span>
+<span class="fc" id="L158">        this.worker.herder = this;</span>
+<span class="fc" id="L159">        this.workerId = workerId;</span>
+<span class="fc" id="L160">        this.kafkaClusterId = kafkaClusterId;</span>
+<span class="fc" id="L161">        this.statusBackingStore = statusBackingStore;</span>
+<span class="fc" id="L162">        this.configBackingStore = configBackingStore;</span>
+<span class="fc" id="L163">        this.connectorClientConfigOverridePolicyPlugin = Plugin.wrapInstance(</span>
+                connectorClientConfigOverridePolicy,
+<span class="fc" id="L165">                worker.metrics().metrics(),</span>
+                WorkerConfig.CONNECTOR_CLIENT_POLICY_CLASS_CONFIG);
+<span class="fc" id="L167">        this.connectorExecutor = Executors.newCachedThreadPool();</span>
+<span class="fc" id="L168">        this.time = time;</span>
+<span class="fc" id="L169">        this.loggers = Loggers.newInstance(time);</span>
+<span class="fc" id="L170">        this.cachedConnectors = new CachedConnectors(worker.getPlugins());</span>
+<span class="fc" id="L171">    }</span>
+
+    @Override
+    public String kafkaClusterId() {
+<span class="fc" id="L175">        return kafkaClusterId;</span>
+    }
+
+    protected abstract int generation();
+
+    protected void startServices() {
+<span class="fc" id="L181">        this.worker.start();</span>
+<span class="fc" id="L182">        this.statusBackingStore.start();</span>
+<span class="fc" id="L183">        this.configBackingStore.start();</span>
+<span class="fc" id="L184">    }</span>
+
+    protected void stopServices() {
+<span class="fc" id="L187">        this.statusBackingStore.stop();</span>
+<span class="fc" id="L188">        this.configBackingStore.stop();</span>
+<span class="fc" id="L189">        this.worker.stop();</span>
+<span class="fc" id="L190">        this.connectorExecutor.shutdown();</span>
+<span class="fc" id="L191">        Utils.closeQuietly(this.connectorClientConfigOverridePolicyPlugin, &quot;connector client config override policy&quot;);</span>
+<span class="fc" id="L192">    }</span>
+
+    protected void ready() {
+<span class="fc" id="L195">        this.ready = true;</span>
+<span class="fc" id="L196">    }</span>
+
+    @Override
+    public boolean isReady() {
+<span class="fc" id="L200">        return ready;</span>
+    }
+
+    @Override
+    public void onStartup(String connector) {
+<span class="fc" id="L205">        statusBackingStore.put(new ConnectorStatus(connector, ConnectorStatus.State.RUNNING,</span>
+<span class="fc" id="L206">                workerId, generation(), worker.connectorVersion(connector)));</span>
+<span class="fc" id="L207">    }</span>
+
+    @Override
+    public void onStop(String connector) {
+<span class="nc" id="L211">        statusBackingStore.put(new ConnectorStatus(connector, AbstractStatus.State.STOPPED,</span>
+<span class="nc" id="L212">                workerId, generation(), worker.connectorVersion(connector)));</span>
+<span class="nc" id="L213">    }</span>
+
+    @Override
+    public void onPause(String connector) {
+<span class="nc" id="L217">        statusBackingStore.put(new ConnectorStatus(connector, ConnectorStatus.State.PAUSED,</span>
+<span class="nc" id="L218">                workerId, generation(), worker.connectorVersion(connector)));</span>
+<span class="nc" id="L219">    }</span>
+
+    @Override
+    public void onResume(String connector) {
+<span class="nc" id="L223">        statusBackingStore.put(new ConnectorStatus(connector, TaskStatus.State.RUNNING,</span>
+<span class="nc" id="L224">                workerId, generation(), worker.connectorVersion(connector)));</span>
+<span class="nc" id="L225">    }</span>
+
+    @Override
+    public void onShutdown(String connector) {
+<span class="fc" id="L229">        statusBackingStore.putSafe(new ConnectorStatus(connector, ConnectorStatus.State.UNASSIGNED,</span>
+<span class="fc" id="L230">                workerId, generation(), worker.connectorVersion(connector)));</span>
+<span class="fc" id="L231">    }</span>
+
+    @Override
+    public void onFailure(String connector, Throwable cause) {
+<span class="nc" id="L235">        statusBackingStore.putSafe(new ConnectorStatus(connector, ConnectorStatus.State.FAILED,</span>
+<span class="nc" id="L236">                trace(cause), workerId, generation(), worker.connectorVersion(connector)));</span>
+<span class="nc" id="L237">    }</span>
+
+    @Override
+    public void onStartup(ConnectorTaskId id) {
+<span class="fc" id="L241">        statusBackingStore.put(new TaskStatus(id, TaskStatus.State.RUNNING, workerId, generation(), null,</span>
+<span class="fc" id="L242">                worker.taskVersion(id)));</span>
+<span class="fc" id="L243">    }</span>
+
+    @Override
+    public void onFailure(ConnectorTaskId id, Throwable cause) {
+<span class="nc" id="L247">        statusBackingStore.putSafe(new TaskStatus(id, TaskStatus.State.FAILED, workerId, generation(), trace(cause),</span>
+<span class="nc" id="L248">                worker.taskVersion(id)));</span>
+<span class="nc" id="L249">    }</span>
+
+    @Override
+    public void onShutdown(ConnectorTaskId id) {
+<span class="fc" id="L253">        statusBackingStore.putSafe(new TaskStatus(id, TaskStatus.State.UNASSIGNED, workerId, generation(), null,</span>
+<span class="fc" id="L254">                worker.taskVersion(id)));</span>
+<span class="fc" id="L255">    }</span>
+
+    @Override
+    public void onResume(ConnectorTaskId id) {
+<span class="nc" id="L259">        statusBackingStore.put(new TaskStatus(id, TaskStatus.State.RUNNING, workerId, generation(), null,</span>
+<span class="nc" id="L260">                worker.taskVersion(id)));</span>
+<span class="nc" id="L261">    }</span>
+
+    @Override
+    public void onPause(ConnectorTaskId id) {
+<span class="nc" id="L265">        statusBackingStore.put(new TaskStatus(id, TaskStatus.State.PAUSED, workerId, generation(), null,</span>
+<span class="nc" id="L266">                worker.taskVersion(id)));</span>
+<span class="nc" id="L267">    }</span>
+
+    @Override
+    public void onDeletion(String connector) {
+<span class="fc bfc" id="L271" title="All 2 branches covered.">        for (TaskStatus status : statusBackingStore.getAll(connector))</span>
+<span class="fc" id="L272">            onDeletion(status.id());</span>
+<span class="fc" id="L273">        statusBackingStore.put(new ConnectorStatus(connector, ConnectorStatus.State.DESTROYED, workerId, generation(),</span>
+<span class="fc" id="L274">                worker.connectorVersion(connector)));</span>
+<span class="fc" id="L275">    }</span>
+
+    @Override
+    public void onDeletion(ConnectorTaskId id) {
+<span class="fc" id="L279">        statusBackingStore.put(new TaskStatus(id, TaskStatus.State.DESTROYED, workerId, generation(), null,</span>
+<span class="fc" id="L280">                worker.taskVersion(id)));</span>
+<span class="fc" id="L281">    }</span>
+
+    public void onRestart(String connector) {
+<span class="nc" id="L284">        statusBackingStore.put(new ConnectorStatus(connector, ConnectorStatus.State.RESTARTING,</span>
+<span class="nc" id="L285">                workerId, generation(), worker.connectorVersion(connector)));</span>
+<span class="nc" id="L286">    }</span>
+
+    public void onRestart(ConnectorTaskId id) {
+<span class="nc" id="L289">        statusBackingStore.put(new TaskStatus(id, TaskStatus.State.RESTARTING, workerId, generation(), null,</span>
+<span class="nc" id="L290">                worker.taskVersion(id)));</span>
+<span class="nc" id="L291">    }</span>
+
+    @Override
+    public void pauseConnector(String connector) {
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        if (!configBackingStore.contains(connector))</span>
+<span class="nc" id="L296">            throw new NotFoundException(&quot;Unknown connector &quot; + connector);</span>
+<span class="nc" id="L297">        configBackingStore.putTargetState(connector, TargetState.PAUSED);</span>
+<span class="nc" id="L298">    }</span>
+
+    @Override
+    public void resumeConnector(String connector) {
+<span class="nc bnc" id="L302" title="All 2 branches missed.">        if (!configBackingStore.contains(connector))</span>
+<span class="nc" id="L303">            throw new NotFoundException(&quot;Unknown connector &quot; + connector);</span>
+<span class="nc" id="L304">        configBackingStore.putTargetState(connector, TargetState.STARTED);</span>
+<span class="nc" id="L305">    }</span>
+
+    @Override
+    public Plugins plugins() {
+<span class="fc" id="L309">        return worker.getPlugins();</span>
+    }
+
+    /*
+     * Retrieves raw config map by connector name.
+     */
+    protected abstract Map&lt;String, String&gt; rawConfig(String connName);
+
+    @Override
+    public void connectorConfig(String connName, Callback&lt;Map&lt;String, String&gt;&gt; callback) {
+        // Subset of connectorInfo, so piggy back on that implementation
+<span class="nc" id="L320">        connectorInfo(connName, (error, result) -&gt; {</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            if (error != null)</span>
+<span class="nc" id="L322">                callback.onCompletion(error, null);</span>
+            else
+<span class="nc" id="L324">                callback.onCompletion(null, result.config());</span>
+<span class="nc" id="L325">        });</span>
+<span class="nc" id="L326">    }</span>
+
+    @Override
+    public Collection&lt;String&gt; connectors() {
+<span class="nc" id="L330">        return configBackingStore.snapshot().connectors();</span>
+    }
+
+    @Override
+    public ConnectorInfo connectorInfo(String connector) {
+<span class="nc" id="L335">        final ClusterConfigState configState = configBackingStore.snapshot();</span>
+
+<span class="nc bnc" id="L337" title="All 2 branches missed.">        if (!configState.contains(connector))</span>
+<span class="nc" id="L338">            return null;</span>
+<span class="nc" id="L339">        Map&lt;String, String&gt; config = configState.rawConnectorConfig(connector);</span>
+
+<span class="nc" id="L341">        return new ConnectorInfo(</span>
+            connector,
+            config,
+<span class="nc" id="L344">            configState.tasks(connector),</span>
+<span class="nc" id="L345">            connectorType(config)</span>
+        );
+    }
+
+    @Override
+    public ConnectorStateInfo connectorStatus(String connName) {
+<span class="fc" id="L351">        ConnectorStatus connector = statusBackingStore.get(connName);</span>
+<span class="fc bfc" id="L352" title="All 2 branches covered.">        if (connector == null)</span>
+<span class="fc" id="L353">            throw new NotFoundException(&quot;No status found for connector &quot; + connName);</span>
+
+<span class="fc" id="L355">        Collection&lt;TaskStatus&gt; tasks = statusBackingStore.getAll(connName);</span>
+
+<span class="fc" id="L357">        ConnectorStateInfo.ConnectorState connectorState = new ConnectorStateInfo.ConnectorState(</span>
+<span class="fc" id="L358">                connector.state().toString(), connector.workerId(), connector.trace(), connector.version());</span>
+<span class="fc" id="L359">        List&lt;ConnectorStateInfo.TaskState&gt; taskStates = new ArrayList&lt;&gt;();</span>
+
+<span class="fc bfc" id="L361" title="All 2 branches covered.">        for (TaskStatus status : tasks) {</span>
+<span class="fc" id="L362">            taskStates.add(new ConnectorStateInfo.TaskState(status.id().task(),</span>
+<span class="fc" id="L363">                    status.state().toString(), status.workerId(), status.trace(), status.version()));</span>
+<span class="fc" id="L364">        }</span>
+
+<span class="fc" id="L366">        Collections.sort(taskStates);</span>
+
+<span class="fc" id="L368">        Map&lt;String, String&gt; conf = rawConfig(connName);</span>
+<span class="fc" id="L369">        return new ConnectorStateInfo(connName, connectorState, taskStates, connectorType(conf));</span>
+    }
+
+    @Override
+    public ActiveTopicsInfo connectorActiveTopics(String connName) {
+<span class="nc" id="L374">        Collection&lt;String&gt; topics = statusBackingStore.getAllTopics(connName).stream()</span>
+<span class="nc" id="L375">                .map(TopicStatus::topic)</span>
+<span class="nc" id="L376">                .collect(Collectors.toList());</span>
+<span class="nc" id="L377">        return new ActiveTopicsInfo(connName, topics);</span>
+    }
+
+    @Override
+    public void resetConnectorActiveTopics(String connName) {
+<span class="fc" id="L382">        statusBackingStore.getAllTopics(connName).stream()</span>
+<span class="fc" id="L383">                .forEach(status -&gt; statusBackingStore.deleteTopic(status.connector(), status.topic()));</span>
+<span class="fc" id="L384">    }</span>
+
+    @Override
+    public StatusBackingStore statusBackingStore() {
+<span class="fc" id="L388">        return statusBackingStore;</span>
+    }
+
+    @Override
+    public ConnectorStateInfo.TaskState taskStatus(ConnectorTaskId id) {
+<span class="nc" id="L393">        TaskStatus status = statusBackingStore.get(id);</span>
+
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        if (status == null)</span>
+<span class="nc" id="L396">            throw new NotFoundException(&quot;No status found for task &quot; + id);</span>
+
+<span class="nc" id="L398">        return new ConnectorStateInfo.TaskState(id.task(), status.state().toString(),</span>
+<span class="nc" id="L399">                status.workerId(), status.trace(), status.version());</span>
+    }
+
+    @Override
+    public ConnectMetrics connectMetrics() {
+<span class="fc" id="L404">        return worker.metrics();</span>
+    }
+
+    protected Map&lt;String, ConfigValue&gt; validateSinkConnectorConfig(SinkConnector connector, ConfigDef configDef, Map&lt;String, String&gt; config) {
+<span class="fc" id="L408">        Map&lt;String, ConfigValue&gt; result = configDef.validateAll(config);</span>
+<span class="fc" id="L409">        SinkConnectorConfig.validate(config, result);</span>
+<span class="fc" id="L410">        return result;</span>
+    }
+
+    protected Map&lt;String, ConfigValue&gt; validateSourceConnectorConfig(SourceConnector connector, ConfigDef configDef, Map&lt;String, String&gt; config) {
+<span class="fc" id="L414">        return configDef.validateAll(config);</span>
+    }
+
+    /**
+     * General-purpose validation logic for converters that are configured directly
+     * in a connector config (as opposed to inherited from the worker config).
+     * @param connectorConfig the configuration for the connector; may not be null
+     * @param pluginConfigValue the {@link ConfigValue} for the converter property in the connector config;
+     *                          may be null, in which case no validation will be performed under the assumption that the
+     *                          connector will use inherit the converter settings from the worker. Some errors encountered
+     *                          during validation may be {@link ConfigValue#addErrorMessage(String) added} to this object
+     * @param pluginVersionValue the {@link ConfigValue} for the converter version property in the connector config;
+     *
+     * @param pluginInterface the interface for the plugin type
+     *                        (e.g., {@code org.apache.kafka.connect.storage.Converter.class});
+     *                        may not be null
+     * @param configDefAccessor an accessor that can be used to retrieve a {@link ConfigDef}
+     *                          from an instance of the plugin type (e.g., {@code Converter::config});
+     *                          may not be null
+     * @param pluginName a lowercase, human-readable name for the type of plugin (e.g., {@code &quot;key converter&quot;});
+     *                   may not be null
+     * @param pluginProperty the property used to define a custom class for the plugin type
+     *                       in a connector config (e.g., {@link ConnectorConfig#KEY_CONVERTER_CLASS_CONFIG});
+     *                       may not be null
+     * @param defaultProperties any default properties to include in the configuration that will be used for
+     *                          the plugin; may be null
+
+     * @return a {@link ConfigInfos} object containing validation results for the plugin in the connector config,
+     * or null if either no custom validation was performed (possibly because no custom plugin was defined in the
+     * connector config), or if custom validation failed
+
+     * @param &lt;T&gt; the plugin class to perform validation for
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;T&gt; ConfigInfos validateConverterConfig(
+            Map&lt;String, String&gt; connectorConfig,
+            ConfigValue pluginConfigValue,
+            ConfigValue pluginVersionValue,
+            Class&lt;T&gt; pluginInterface,
+            Function&lt;T, ConfigDef&gt; configDefAccessor,
+            String pluginName,
+            String pluginProperty,
+            String pluginVersionProperty,
+            Map&lt;String, String&gt; defaultProperties,
+            ClassLoader connectorLoader,
+            Function&lt;String, TemporaryStage&gt; reportStage
+    ) {
+<span class="fc" id="L461">        Objects.requireNonNull(connectorConfig);</span>
+<span class="fc" id="L462">        Objects.requireNonNull(pluginInterface);</span>
+<span class="fc" id="L463">        Objects.requireNonNull(configDefAccessor);</span>
+<span class="fc" id="L464">        Objects.requireNonNull(pluginName);</span>
+<span class="fc" id="L465">        Objects.requireNonNull(pluginProperty);</span>
+<span class="fc" id="L466">        Objects.requireNonNull(pluginVersionProperty);</span>
+
+<span class="fc" id="L468">        String pluginClass = connectorConfig.get(pluginProperty);</span>
+<span class="fc" id="L469">        String pluginVersion = connectorConfig.get(pluginVersionProperty);</span>
+
+<span class="pc bpc" id="L471" title="1 of 4 branches missed.">        if (pluginClass == null</span>
+                || pluginConfigValue == null
+<span class="pc bpc" id="L473" title="1 of 2 branches missed.">                || !pluginConfigValue.errorMessages().isEmpty()</span>
+<span class="pc bpc" id="L474" title="1 of 2 branches missed.">                || !pluginVersionValue.errorMessages().isEmpty()</span>
+        ) {
+            // Either no custom converter was specified, or one was specified but there's a problem with it.
+            // No need to proceed any further.
+<span class="fc" id="L478">            return null;</span>
+        }
+
+        T pluginInstance;
+<span class="fc" id="L482">        String stageDescription = &quot;instantiating the connector's &quot; + pluginName + &quot; for validation&quot;;</span>
+<span class="fc" id="L483">        try (TemporaryStage stage = reportStage.apply(stageDescription)) {</span>
+<span class="fc" id="L484">            VersionRange range = PluginUtils.connectorVersionRequirement(pluginVersion);</span>
+<span class="fc" id="L485">            pluginInstance = (T) plugins().newPlugin(pluginClass, range, connectorLoader);</span>
+<span class="nc" id="L486">        } catch (VersionedPluginLoadingException e) {</span>
+<span class="nc" id="L487">            log.error(&quot;Failed to load {} class {} with version {}&quot;, pluginName, pluginClass, pluginVersion, e);</span>
+<span class="nc" id="L488">            pluginConfigValue.addErrorMessage(e.getMessage());</span>
+<span class="nc" id="L489">            pluginVersionValue.addErrorMessage(e.getMessage());</span>
+<span class="nc" id="L490">            return null;</span>
+<span class="nc" id="L491">        } catch (ClassNotFoundException | RuntimeException e) {</span>
+<span class="nc" id="L492">            log.error(&quot;Failed to instantiate {} class {}; this should have been caught by prior validation logic&quot;, pluginName, pluginClass, e);</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">            pluginConfigValue.addErrorMessage(&quot;Failed to load class &quot; + pluginClass + (e.getMessage() != null ? &quot;: &quot; + e.getMessage() : &quot;&quot;));</span>
+<span class="nc" id="L494">            return null;</span>
+<span class="nc" id="L495">        } catch (InvalidVersionSpecificationException e) {</span>
+            // this should have been caught by prior validation logic
+<span class="nc" id="L497">            log.error(&quot;Invalid version range for {} class {} with version {}&quot;, pluginName, pluginClass, pluginVersion, e);</span>
+<span class="nc" id="L498">            pluginVersionValue.addErrorMessage(e.getMessage());</span>
+<span class="nc" id="L499">            return null;</span>
+<span class="fc" id="L500">        }</span>
+
+        try {
+            ConfigDef configDef;
+<span class="fc" id="L504">            stageDescription = &quot;retrieving the configuration definition from the connector's &quot; + pluginName;</span>
+<span class="fc" id="L505">            try (TemporaryStage stage = reportStage.apply(stageDescription)) {</span>
+<span class="fc" id="L506">                configDef = configDefAccessor.apply(pluginInstance);</span>
+<span class="nc" id="L507">            } catch (RuntimeException e) {</span>
+<span class="nc" id="L508">                log.error(&quot;Failed to load ConfigDef from {} of type {}&quot;, pluginName, pluginClass, e);</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">                pluginConfigValue.addErrorMessage(&quot;Failed to load ConfigDef from &quot; + pluginName + (e.getMessage() != null ? &quot;: &quot; + e.getMessage() : &quot;&quot;));</span>
+<span class="nc" id="L510">                return null;</span>
+<span class="fc" id="L511">            }</span>
+<span class="pc bpc" id="L512" title="1 of 2 branches missed.">            if (configDef == null) {</span>
+<span class="nc" id="L513">                log.warn(&quot;{}.config() has returned a null ConfigDef; no further preflight config validation for this converter will be performed&quot;, pluginClass);</span>
+                // Older versions of Connect didn't do any converter validation.
+                // Even though converters are technically required to return a non-null ConfigDef object from their config() method,
+                // we permit this case in order to avoid breaking existing converters that, despite not adhering to this requirement,
+                // can be used successfully with a connector.
+<span class="nc" id="L518">                return null;</span>
+            }
+<span class="fc" id="L520">            final String pluginPrefix = pluginProperty + &quot;.&quot;;</span>
+<span class="fc" id="L521">            Map&lt;String, String&gt; pluginConfig = Utils.entriesWithPrefix(connectorConfig, pluginPrefix);</span>
+<span class="pc bpc" id="L522" title="1 of 2 branches missed.">            if (defaultProperties != null)</span>
+<span class="fc" id="L523">                defaultProperties.forEach(pluginConfig::putIfAbsent);</span>
+
+            List&lt;ConfigValue&gt; configValues;
+<span class="fc" id="L526">            stageDescription = &quot;performing config validation for the connector's &quot; + pluginName;</span>
+<span class="fc" id="L527">            try (TemporaryStage stage = reportStage.apply(stageDescription)) {</span>
+<span class="fc" id="L528">                configValues = configDef.validate(pluginConfig);</span>
+<span class="nc" id="L529">            } catch (RuntimeException e) {</span>
+<span class="nc" id="L530">                log.error(&quot;Failed to perform config validation for {} of type {}&quot;, pluginName, pluginClass, e);</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">                pluginConfigValue.addErrorMessage(&quot;Failed to perform config validation for &quot; + pluginName + (e.getMessage() != null ? &quot;: &quot; + e.getMessage() : &quot;&quot;));</span>
+<span class="nc" id="L532">                return null;</span>
+<span class="fc" id="L533">            }</span>
+
+<span class="fc" id="L535">            return prefixedConfigInfos(configDef.configKeys(), configValues, pluginPrefix);</span>
+        } finally {
+<span class="fc" id="L537">            Utils.maybeCloseQuietly(pluginInstance, pluginName + &quot; &quot; + pluginClass);</span>
+        }
+    }
+
+    private ConfigInfos validateAllConverterConfigs(
+            Map&lt;String, String&gt; connectorProps,
+            Map&lt;String, ConfigValue&gt; validatedConnectorConfig,
+            ClassLoader connectorLoader,
+            Function&lt;String, TemporaryStage&gt; reportStage
+    ) {
+<span class="fc" id="L547">        String connType = connectorProps.get(CONNECTOR_CLASS_CONFIG);</span>
+        // do custom converter-specific validation
+<span class="fc" id="L549">        ConfigInfos headerConverterConfigInfos = validateConverterConfig(</span>
+                connectorProps,
+<span class="fc" id="L551">                validatedConnectorConfig.get(HEADER_CONVERTER_CLASS_CONFIG),</span>
+<span class="fc" id="L552">                validatedConnectorConfig.get(HEADER_CONVERTER_VERSION_CONFIG),</span>
+                HeaderConverter.class,
+                HeaderConverter::config,
+                &quot;header converter&quot;,
+                HEADER_CONVERTER_CLASS_CONFIG,
+                HEADER_CONVERTER_VERSION_CONFIG,
+<span class="fc" id="L558">                Map.of(ConverterConfig.TYPE_CONFIG, ConverterType.HEADER.getName()),</span>
+                connectorLoader,
+                reportStage
+        );
+<span class="fc" id="L562">        ConfigInfos keyConverterConfigInfos = validateConverterConfig(</span>
+                connectorProps,
+<span class="fc" id="L564">                validatedConnectorConfig.get(KEY_CONVERTER_CLASS_CONFIG),</span>
+<span class="fc" id="L565">                validatedConnectorConfig.get(KEY_CONVERTER_VERSION_CONFIG),</span>
+                Converter.class,
+                Converter::config,
+                &quot;key converter&quot;,
+                KEY_CONVERTER_CLASS_CONFIG,
+                KEY_CONVERTER_VERSION_CONFIG,
+<span class="fc" id="L571">                Map.of(ConverterConfig.TYPE_CONFIG, ConverterType.KEY.getName()),</span>
+                connectorLoader,
+                reportStage
+        );
+
+<span class="fc" id="L576">        ConfigInfos valueConverterConfigInfos = validateConverterConfig(</span>
+                connectorProps,
+<span class="fc" id="L578">                validatedConnectorConfig.get(VALUE_CONVERTER_CLASS_CONFIG),</span>
+<span class="fc" id="L579">                validatedConnectorConfig.get(VALUE_CONVERTER_VERSION_CONFIG),</span>
+                Converter.class,
+                Converter::config,
+                &quot;value converter&quot;,
+                VALUE_CONVERTER_CLASS_CONFIG,
+                VALUE_CONVERTER_VERSION_CONFIG,
+<span class="fc" id="L585">                Map.of(ConverterConfig.TYPE_CONFIG, ConverterType.VALUE.getName()),</span>
+                connectorLoader,
+                reportStage
+        );
+<span class="fc" id="L589">        return mergeConfigInfos(connType, headerConverterConfigInfos, keyConverterConfigInfos, valueConverterConfigInfos);</span>
+    }
+
+    @Override
+    public void validateConnectorConfig(Map&lt;String, String&gt; connectorProps, Callback&lt;ConfigInfos&gt; callback) {
+<span class="fc" id="L594">        validateConnectorConfig(connectorProps, callback, true);</span>
+<span class="fc" id="L595">    }</span>
+
+    @Override
+    public void validateConnectorConfig(Map&lt;String, String&gt; connectorProps, Callback&lt;ConfigInfos&gt; callback, boolean doLog) {
+<span class="fc" id="L599">        Stage waitingForThread = new Stage(</span>
+                &quot;waiting for a new thread to become available for connector validation&quot;,
+<span class="fc" id="L601">                time.milliseconds()</span>
+        );
+<span class="fc" id="L603">        callback.recordStage(waitingForThread);</span>
+<span class="fc" id="L604">        connectorExecutor.submit(() -&gt; {</span>
+<span class="fc" id="L605">            waitingForThread.complete(time.milliseconds());</span>
+            try {
+<span class="fc" id="L607">                Function&lt;String, TemporaryStage&gt; reportStage = description -&gt;</span>
+<span class="fc" id="L608">                        new TemporaryStage(description, callback, time);</span>
+<span class="fc" id="L609">                ConfigInfos result = validateConnectorConfig(connectorProps, reportStage, doLog);</span>
+<span class="fc" id="L610">                callback.onCompletion(null, result);</span>
+<span class="nc" id="L611">            } catch (Throwable t) {</span>
+<span class="nc" id="L612">                callback.onCompletion(t, null);</span>
+<span class="fc" id="L613">            }</span>
+<span class="fc" id="L614">        });</span>
+<span class="fc" id="L615">    }</span>
+
+    /**
+     * Build the {@link RestartPlan} that describes what should and should not be restarted given the restart request
+     * and the current status of the connector and task instances.
+     *
+     * @param request the restart request; may not be null
+     * @return the restart plan, or empty if this worker has no status for the connector named in the request and therefore the
+     *         connector cannot be restarted
+     */
+    public Optional&lt;RestartPlan&gt; buildRestartPlan(RestartRequest request) {
+<span class="nc" id="L626">        String connectorName = request.connectorName();</span>
+<span class="nc" id="L627">        ConnectorStatus connectorStatus = statusBackingStore.get(connectorName);</span>
+<span class="nc bnc" id="L628" title="All 2 branches missed.">        if (connectorStatus == null) {</span>
+<span class="nc" id="L629">            return Optional.empty();</span>
+        }
+
+        // If requested, mark the connector as restarting
+<span class="nc bnc" id="L633" title="All 2 branches missed.">        AbstractStatus.State connectorState = request.shouldRestartConnector(connectorStatus) ? AbstractStatus.State.RESTARTING : connectorStatus.state();</span>
+<span class="nc" id="L634">        ConnectorStateInfo.ConnectorState connectorInfoState = new ConnectorStateInfo.ConnectorState(</span>
+<span class="nc" id="L635">                connectorState.toString(),</span>
+<span class="nc" id="L636">                connectorStatus.workerId(),</span>
+<span class="nc" id="L637">                connectorStatus.trace(),</span>
+<span class="nc" id="L638">                connectorStatus.version()</span>
+        );
+
+        // Collect the task states, If requested, mark the task as restarting
+<span class="nc" id="L642">        List&lt;ConnectorStateInfo.TaskState&gt; taskStates = statusBackingStore.getAll(connectorName)</span>
+<span class="nc" id="L643">                .stream()</span>
+<span class="nc" id="L644">                .map(taskStatus -&gt; {</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">                    AbstractStatus.State taskState = request.shouldRestartTask(taskStatus) ? AbstractStatus.State.RESTARTING : taskStatus.state();</span>
+<span class="nc" id="L646">                    return new ConnectorStateInfo.TaskState(</span>
+<span class="nc" id="L647">                            taskStatus.id().task(),</span>
+<span class="nc" id="L648">                            taskState.toString(),</span>
+<span class="nc" id="L649">                            taskStatus.workerId(),</span>
+<span class="nc" id="L650">                            taskStatus.trace(),</span>
+<span class="nc" id="L651">                            taskStatus.version()</span>
+                    );
+                })
+<span class="nc" id="L654">                .collect(Collectors.toList());</span>
+        // Construct the response from the various states
+<span class="nc" id="L656">        Map&lt;String, String&gt; conf = rawConfig(connectorName);</span>
+<span class="nc" id="L657">        ConnectorStateInfo stateInfo = new ConnectorStateInfo(</span>
+                connectorName,
+                connectorInfoState,
+                taskStates,
+<span class="nc" id="L661">                connectorType(conf)</span>
+        );
+<span class="nc" id="L663">        return Optional.of(new RestartPlan(request, stateInfo));</span>
+    }
+
+    protected boolean connectorUsesConsumer(org.apache.kafka.connect.health.ConnectorType connectorType, Map&lt;String, String&gt; connProps) {
+<span class="fc bfc" id="L667" title="All 2 branches covered.">        return connectorType == org.apache.kafka.connect.health.ConnectorType.SINK;</span>
+    }
+
+    protected boolean connectorUsesAdmin(org.apache.kafka.connect.health.ConnectorType connectorType, Map&lt;String, String&gt; connProps) {
+<span class="fc bfc" id="L671" title="All 2 branches covered.">        if (connectorType == org.apache.kafka.connect.health.ConnectorType.SOURCE) {</span>
+<span class="fc" id="L672">            return SourceConnectorConfig.usesTopicCreation(connProps);</span>
+        } else {
+<span class="fc" id="L674">            return SinkConnectorConfig.hasDlqTopicConfig(connProps);</span>
+        }
+    }
+
+    protected boolean connectorUsesProducer(org.apache.kafka.connect.health.ConnectorType connectorType, Map&lt;String, String&gt; connProps) {
+<span class="fc bfc" id="L679" title="All 2 branches covered.">        return connectorType == org.apache.kafka.connect.health.ConnectorType.SOURCE</span>
+<span class="pc bpc" id="L680" title="1 of 2 branches missed.">            || SinkConnectorConfig.hasDlqTopicConfig(connProps);</span>
+    }
+
+    private ConfigInfos validateClientOverrides(
+            Map&lt;String, String&gt; connectorProps,
+            org.apache.kafka.connect.health.ConnectorType connectorType,
+            Class&lt;? extends Connector&gt; connectorClass,
+            Function&lt;String, TemporaryStage&gt; reportStage,
+            boolean doLog
+    ) {
+<span class="pc bpc" id="L690" title="2 of 4 branches missed.">        if (connectorClass == null || connectorType == null) {</span>
+<span class="nc" id="L691">            return null;</span>
+        }
+<span class="fc" id="L693">        AbstractConfig connectorConfig = new AbstractConfig(new ConfigDef(), connectorProps, doLog);</span>
+<span class="fc" id="L694">        String connName = connectorProps.get(ConnectorConfig.NAME_CONFIG);</span>
+<span class="fc" id="L695">        String connType = connectorProps.get(CONNECTOR_CLASS_CONFIG);</span>
+<span class="fc" id="L696">        ConfigInfos producerConfigInfos = null;</span>
+<span class="fc" id="L697">        ConfigInfos consumerConfigInfos = null;</span>
+<span class="fc" id="L698">        ConfigInfos adminConfigInfos = null;</span>
+<span class="fc" id="L699">        String stageDescription = null;</span>
+
+<span class="fc bfc" id="L701" title="All 2 branches covered.">        if (connectorUsesProducer(connectorType, connectorProps)) {</span>
+<span class="fc" id="L702">            stageDescription = &quot;validating producer config overrides for the connector&quot;;</span>
+<span class="fc" id="L703">            try (TemporaryStage stage = reportStage.apply(stageDescription)) {</span>
+<span class="fc" id="L704">                producerConfigInfos = validateClientOverrides(</span>
+                        connName,
+                        ConnectorConfig.CONNECTOR_CLIENT_PRODUCER_OVERRIDES_PREFIX,
+                        connectorConfig,
+<span class="fc" id="L708">                        ProducerConfig.configDef(),</span>
+                        connectorClass,
+                        connectorType,
+                        ConnectorClientConfigRequest.ClientType.PRODUCER,
+                        connectorClientConfigOverridePolicyPlugin);
+            }
+        }
+<span class="fc bfc" id="L715" title="All 2 branches covered.">        if (connectorUsesAdmin(connectorType, connectorProps)) {</span>
+<span class="fc" id="L716">            stageDescription = &quot;validating admin config overrides for the connector&quot;;</span>
+<span class="fc" id="L717">            try (TemporaryStage stage = reportStage.apply(stageDescription)) {</span>
+<span class="fc" id="L718">                adminConfigInfos = validateClientOverrides(</span>
+                        connName,
+                        ConnectorConfig.CONNECTOR_CLIENT_ADMIN_OVERRIDES_PREFIX,
+                        connectorConfig,
+<span class="fc" id="L722">                        AdminClientConfig.configDef(),</span>
+                        connectorClass,
+                        connectorType,
+                        ConnectorClientConfigRequest.ClientType.ADMIN,
+                        connectorClientConfigOverridePolicyPlugin);
+            }
+        }
+<span class="fc bfc" id="L729" title="All 2 branches covered.">        if (connectorUsesConsumer(connectorType, connectorProps)) {</span>
+<span class="fc" id="L730">            stageDescription = &quot;validating consumer config overrides for the connector&quot;;</span>
+<span class="fc" id="L731">            try (TemporaryStage stage = reportStage.apply(stageDescription)) {</span>
+<span class="fc" id="L732">                consumerConfigInfos = validateClientOverrides(</span>
+                        connName,
+                        ConnectorConfig.CONNECTOR_CLIENT_CONSUMER_OVERRIDES_PREFIX,
+                        connectorConfig,
+<span class="fc" id="L736">                        ConsumerConfig.configDef(),</span>
+                        connectorClass,
+                        connectorType,
+                        ConnectorClientConfigRequest.ClientType.CONSUMER,
+                        connectorClientConfigOverridePolicyPlugin);
+            }
+        }
+<span class="fc" id="L743">        return mergeConfigInfos(connType,</span>
+                producerConfigInfos,
+                consumerConfigInfos,
+                adminConfigInfos
+        );
+    }
+
+    private ConfigInfos validateConnectorPluginSpecifiedConfigs(
+            Map&lt;String, String&gt; connectorProps,
+            Map&lt;String, ConfigValue&gt; validatedConnectorConfig,
+            ConfigDef enrichedConfigDef,
+            Connector connector,
+            Function&lt;String, TemporaryStage&gt; reportStage
+    ) {
+<span class="fc" id="L757">        List&lt;ConfigValue&gt; configValues = new ArrayList&lt;&gt;(validatedConnectorConfig.values());</span>
+<span class="fc" id="L758">        Map&lt;String, ConfigKey&gt; configKeys = new LinkedHashMap&lt;&gt;(enrichedConfigDef.configKeys());</span>
+<span class="fc" id="L759">        Set&lt;String&gt; allGroups = new LinkedHashSet&lt;&gt;(enrichedConfigDef.groups());</span>
+
+<span class="fc" id="L761">        String connType = connectorProps.get(CONNECTOR_CLASS_CONFIG);</span>
+        // do custom connector-specific validation
+        ConfigDef configDef;
+<span class="fc" id="L764">        String stageDescription = &quot;retrieving the configuration definition from the connector&quot;;</span>
+<span class="fc" id="L765">        try (TemporaryStage stage = reportStage.apply(stageDescription)) {</span>
+<span class="fc" id="L766">            configDef = connector.config();</span>
+        }
+<span class="pc bpc" id="L768" title="1 of 2 branches missed.">        if (null == configDef) {</span>
+<span class="nc" id="L769">            throw new BadRequestException(</span>
+<span class="nc" id="L770">                    String.format(</span>
+                            &quot;%s.config() must return a ConfigDef that is not null.&quot;,
+<span class="nc" id="L772">                            connector.getClass().getName()</span>
+                    )
+            );
+        }
+
+        Config config;
+<span class="fc" id="L778">        stageDescription = &quot;performing multi-property validation for the connector&quot;;</span>
+<span class="fc" id="L779">        try (TemporaryStage stage = reportStage.apply(stageDescription)) {</span>
+<span class="fc" id="L780">            config = connector.validate(connectorProps);</span>
+        }
+<span class="pc bpc" id="L782" title="1 of 2 branches missed.">        if (null == config) {</span>
+<span class="nc" id="L783">            throw new BadRequestException(</span>
+<span class="nc" id="L784">                    String.format(</span>
+                            &quot;%s.validate() must return a Config that is not null.&quot;,
+<span class="nc" id="L786">                            connector.getClass().getName()</span>
+                    )
+            );
+        }
+<span class="fc" id="L790">        configKeys.putAll(configDef.configKeys());</span>
+<span class="fc" id="L791">        allGroups.addAll(configDef.groups());</span>
+<span class="fc" id="L792">        configValues.addAll(config.configValues());</span>
+<span class="fc" id="L793">        return generateResult(connType, configKeys, configValues, new ArrayList&lt;&gt;(allGroups));</span>
+    }
+
+    private void addNullValuedErrors(Map&lt;String, String&gt; connectorProps, Map&lt;String, ConfigValue&gt; validatedConfig) {
+<span class="fc" id="L797">        connectorProps.entrySet().stream()</span>
+<span class="pc bpc" id="L798" title="1 of 2 branches missed.">                .filter(e -&gt; e.getValue() == null)</span>
+<span class="fc" id="L799">                .map(Map.Entry::getKey)</span>
+<span class="fc" id="L800">                .forEach(prop -&gt;</span>
+<span class="nc" id="L801">                        validatedConfig.computeIfAbsent(prop, ConfigValue::new)</span>
+<span class="nc" id="L802">                                .addErrorMessage(&quot;Null value can not be supplied as the configuration value.&quot;));</span>
+<span class="fc" id="L803">    }</span>
+
+    private ConfigInfos invalidVersionedConnectorValidation(
+            Map&lt;String, String&gt; connectorProps,
+            VersionedPluginLoadingException e,
+            Function&lt;String, TemporaryStage&gt; reportStage
+    ) {
+<span class="nc" id="L810">        String connType = connectorProps.get(CONNECTOR_CLASS_CONFIG);</span>
+<span class="nc" id="L811">        ConfigDef configDef = ConnectorConfig.enrichedConfigDef(worker.getPlugins(), connType);</span>
+        Map&lt;String, ConfigValue&gt; validatedConfig;
+<span class="nc" id="L813">        try (TemporaryStage stage = reportStage.apply(&quot;validating connector configuration&quot;)) {</span>
+<span class="nc" id="L814">            validatedConfig = configDef.validateAll(connectorProps);</span>
+        }
+<span class="nc" id="L816">        validatedConfig.get(CONNECTOR_CLASS_CONFIG).addErrorMessage(e.getMessage());</span>
+<span class="nc" id="L817">        validatedConfig.get(CONNECTOR_VERSION).addErrorMessage(e.getMessage());</span>
+<span class="nc" id="L818">        validatedConfig.get(CONNECTOR_VERSION).recommendedValues(e.availableVersions().stream().map(v -&gt; (Object) v).collect(Collectors.toList()));</span>
+<span class="nc" id="L819">        addNullValuedErrors(connectorProps, validatedConfig);</span>
+<span class="nc" id="L820">        return generateResult(connType, configDef.configKeys(), new ArrayList&lt;&gt;(validatedConfig.values()), new ArrayList&lt;&gt;(configDef.groups()));</span>
+    }
+
+    ConfigInfos validateConnectorConfig(
+            Map&lt;String, String&gt; connectorProps,
+            Function&lt;String, TemporaryStage&gt; reportStage,
+            boolean doLog
+    ) {
+        String stageDescription;
+<span class="pc bpc" id="L829" title="1 of 2 branches missed.">        if (worker.configTransformer() != null) {</span>
+<span class="fc" id="L830">            stageDescription = &quot;resolving transformed configuration properties for the connector&quot;;</span>
+<span class="fc" id="L831">            try (TemporaryStage stage = reportStage.apply(stageDescription)) {</span>
+<span class="fc" id="L832">                connectorProps = worker.configTransformer().transform(connectorProps);</span>
+            }
+        }
+<span class="fc" id="L835">        String connType = connectorProps.get(CONNECTOR_CLASS_CONFIG);</span>
+<span class="pc bpc" id="L836" title="1 of 2 branches missed.">        if (connType == null) {</span>
+<span class="nc" id="L837">            throw new BadRequestException(&quot;Connector config &quot; + connectorProps + &quot; contains no connector type&quot;);</span>
+        }
+
+        VersionRange connVersion;
+        Connector connector;
+        ClassLoader connectorLoader;
+        try {
+<span class="fc" id="L844">            connVersion = PluginUtils.connectorVersionRequirement(connectorProps.get(CONNECTOR_VERSION));</span>
+<span class="fc" id="L845">            connector = cachedConnectors.getConnector(connType, connVersion);</span>
+<span class="fc" id="L846">            connectorLoader = plugins().connectorLoader(connType, connVersion);</span>
+<span class="fc" id="L847">            log.info(&quot;Validating connector {}, version {}&quot;, connType, connector.version());</span>
+<span class="nc" id="L848">        } catch (VersionedPluginLoadingException e) {</span>
+<span class="nc" id="L849">            log.warn(&quot;Failed to load connector {} with version {}, skipping additional validations (connector, converters, transformations, client overrides) &quot;,</span>
+<span class="nc" id="L850">                    connType, connectorProps.get(CONNECTOR_VERSION), e);</span>
+<span class="nc" id="L851">            return invalidVersionedConnectorValidation(connectorProps, e, reportStage);</span>
+<span class="nc" id="L852">        } catch (Exception e) {</span>
+<span class="nc" id="L853">            throw new BadRequestException(e.getMessage(), e);</span>
+<span class="fc" id="L854">        }</span>
+
+<span class="fc" id="L856">        try (LoaderSwap loaderSwap = plugins().withClassLoader(connectorLoader)) {</span>
+
+            ConfigDef enrichedConfigDef;
+            Map&lt;String, ConfigValue&gt; validatedConnectorConfig;
+            org.apache.kafka.connect.health.ConnectorType connectorType;
+<span class="fc bfc" id="L861" title="All 2 branches covered.">            if (connector instanceof SourceConnector) {</span>
+<span class="fc" id="L862">                connectorType = org.apache.kafka.connect.health.ConnectorType.SOURCE;</span>
+<span class="fc" id="L863">                enrichedConfigDef = ConnectorConfig.enrich(plugins(), SourceConnectorConfig.enrichedConfigDef(plugins(), connectorProps, worker.config()), connectorProps, false);</span>
+<span class="fc" id="L864">                stageDescription = &quot;validating source connector-specific properties for the connector&quot;;</span>
+<span class="fc" id="L865">                try (TemporaryStage stage = reportStage.apply(stageDescription)) {</span>
+<span class="fc" id="L866">                    validatedConnectorConfig = validateSourceConnectorConfig((SourceConnector) connector, enrichedConfigDef, connectorProps);</span>
+                }
+            } else {
+<span class="fc" id="L869">                connectorType = org.apache.kafka.connect.health.ConnectorType.SINK;</span>
+<span class="fc" id="L870">                enrichedConfigDef = ConnectorConfig.enrich(plugins(), SinkConnectorConfig.enrichedConfigDef(plugins(), connectorProps, worker.config()), connectorProps, false);</span>
+<span class="fc" id="L871">                stageDescription = &quot;validating sink connector-specific properties for the connector&quot;;</span>
+<span class="fc" id="L872">                try (TemporaryStage stage = reportStage.apply(stageDescription)) {</span>
+<span class="fc" id="L873">                    validatedConnectorConfig = validateSinkConnectorConfig((SinkConnector) connector, enrichedConfigDef, connectorProps);</span>
+                }
+            }
+
+<span class="fc" id="L877">            addNullValuedErrors(connectorProps, validatedConnectorConfig);</span>
+
+            // the order of operations here is important, converter validations can add error messages to the connector config
+            // which are collected and converted to ConfigInfos in validateConnectorPluginSpecifiedConfigs
+<span class="fc" id="L881">            ConfigInfos converterConfigInfo = validateAllConverterConfigs(connectorProps, validatedConnectorConfig, connectorLoader, reportStage);</span>
+<span class="fc" id="L882">            ConfigInfos clientOverrideInfo = validateClientOverrides(connectorProps, connectorType, connector.getClass(), reportStage, doLog);</span>
+<span class="fc" id="L883">            ConfigInfos connectorConfigInfo = validateConnectorPluginSpecifiedConfigs(connectorProps, validatedConnectorConfig, enrichedConfigDef, connector, reportStage);</span>
+
+<span class="fc" id="L885">            return mergeConfigInfos(connType,</span>
+                    connectorConfigInfo,
+                    clientOverrideInfo,
+                    converterConfigInfo
+            );
+        }
+    }
+
+    private static ConfigInfos mergeConfigInfos(String connType, ConfigInfos... configInfosList) {
+<span class="fc" id="L894">        int errorCount = 0;</span>
+<span class="fc" id="L895">        List&lt;ConfigInfo&gt; configInfoList = new LinkedList&lt;&gt;();</span>
+<span class="fc" id="L896">        Set&lt;String&gt; groups = new LinkedHashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L897" title="All 2 branches covered.">        for (ConfigInfos configInfos : configInfosList) {</span>
+<span class="fc bfc" id="L898" title="All 2 branches covered.">            if (configInfos != null) {</span>
+<span class="fc" id="L899">                errorCount += configInfos.errorCount();</span>
+<span class="fc" id="L900">                configInfoList.addAll(configInfos.configs());</span>
+<span class="fc" id="L901">                groups.addAll(configInfos.groups());</span>
+            }
+        }
+<span class="fc" id="L904">        return new ConfigInfos(connType, errorCount, new ArrayList&lt;&gt;(groups), configInfoList);</span>
+    }
+
+    private static ConfigInfos validateClientOverrides(String connName,
+                                                      String prefix,
+                                                      AbstractConfig connectorConfig,
+                                                      ConfigDef configDef,
+                                                      Class&lt;? extends Connector&gt; connectorClass,
+                                                      org.apache.kafka.connect.health.ConnectorType connectorType,
+                                                      ConnectorClientConfigRequest.ClientType clientType,
+                                                      Plugin&lt;ConnectorClientConfigOverridePolicy&gt; connectorClientConfigOverridePolicyPlugin) {
+<span class="fc" id="L915">        Map&lt;String, Object&gt; clientConfigs = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L916" title="1 of 2 branches missed.">        for (Map.Entry&lt;String, Object&gt; rawClientConfig : connectorConfig.originalsWithPrefix(prefix).entrySet()) {</span>
+<span class="nc" id="L917">            String configName = rawClientConfig.getKey();</span>
+<span class="nc" id="L918">            Object rawConfigValue = rawClientConfig.getValue();</span>
+<span class="nc" id="L919">            ConfigKey configKey = configDef.configKeys().get(configName);</span>
+<span class="nc bnc" id="L920" title="All 2 branches missed.">            Object parsedConfigValue = configKey != null</span>
+<span class="nc" id="L921">                ? ConfigDef.parseType(configName, rawConfigValue, configKey.type)</span>
+<span class="nc" id="L922">                : rawConfigValue;</span>
+<span class="nc" id="L923">            clientConfigs.put(configName, parsedConfigValue);</span>
+<span class="nc" id="L924">        }</span>
+<span class="fc" id="L925">        ConnectorClientConfigRequest connectorClientConfigRequest = new ConnectorClientConfigRequest(</span>
+            connName, connectorType, connectorClass, clientConfigs, clientType);
+<span class="fc" id="L927">        List&lt;ConfigValue&gt; configValues = connectorClientConfigOverridePolicyPlugin.get().validate(connectorClientConfigRequest);</span>
+
+<span class="fc" id="L929">        return prefixedConfigInfos(configDef.configKeys(), configValues, prefix);</span>
+    }
+
+    private static ConfigInfos prefixedConfigInfos(Map&lt;String, ConfigKey&gt; configKeys, List&lt;ConfigValue&gt; configValues, String prefix) {
+<span class="fc" id="L933">        int errorCount = 0;</span>
+<span class="fc" id="L934">        Set&lt;String&gt; groups = new LinkedHashSet&lt;&gt;();</span>
+<span class="fc" id="L935">        List&lt;ConfigInfo&gt; configInfos = new ArrayList&lt;&gt;();</span>
+
+<span class="pc bpc" id="L937" title="1 of 2 branches missed.">        if (configValues == null) {</span>
+<span class="nc" id="L938">            return new ConfigInfos(&quot;&quot;, 0, new ArrayList&lt;&gt;(groups), configInfos);</span>
+        }
+
+<span class="fc bfc" id="L941" title="All 2 branches covered.">        for (ConfigValue validatedConfigValue : configValues) {</span>
+<span class="fc" id="L942">            ConfigKey configKey = configKeys.get(validatedConfigValue.name());</span>
+<span class="fc" id="L943">            ConfigKeyInfo configKeyInfo = null;</span>
+<span class="pc bpc" id="L944" title="1 of 2 branches missed.">            if (configKey != null) {</span>
+<span class="pc bpc" id="L945" title="1 of 2 branches missed.">                if (configKey.group != null) {</span>
+<span class="nc" id="L946">                    groups.add(configKey.group);</span>
+                }
+<span class="fc" id="L948">                configKeyInfo = convertConfigKey(configKey, prefix);</span>
+            }
+
+<span class="fc" id="L951">            ConfigValue configValue = new ConfigValue(prefix + validatedConfigValue.name(), validatedConfigValue.value(),</span>
+<span class="fc" id="L952">                    validatedConfigValue.recommendedValues(), validatedConfigValue.errorMessages());</span>
+<span class="pc bpc" id="L953" title="1 of 2 branches missed.">            if (configValue.errorMessages().size() &gt; 0) {</span>
+<span class="nc" id="L954">                errorCount++;</span>
+            }
+<span class="pc bpc" id="L956" title="1 of 2 branches missed.">            ConfigValueInfo configValueInfo = convertConfigValue(configValue, configKey != null ? configKey.type : null);</span>
+<span class="fc" id="L957">            configInfos.add(new ConfigInfo(configKeyInfo, configValueInfo));</span>
+<span class="fc" id="L958">        }</span>
+<span class="fc" id="L959">        return new ConfigInfos(&quot;&quot;, errorCount, new ArrayList&lt;&gt;(groups), configInfos);</span>
+    }
+
+    // public for testing
+    public static ConfigInfos generateResult(String connType, Map&lt;String, ConfigKey&gt; configKeys, List&lt;ConfigValue&gt; configValues, List&lt;String&gt; groups) {
+<span class="fc" id="L964">        int errorCount = 0;</span>
+<span class="fc" id="L965">        List&lt;ConfigInfo&gt; configInfoList = new LinkedList&lt;&gt;();</span>
+
+<span class="fc" id="L967">        Map&lt;String, ConfigValue&gt; configValueMap = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L968" title="All 2 branches covered.">        for (ConfigValue configValue: configValues) {</span>
+<span class="fc" id="L969">            String configName = configValue.name();</span>
+<span class="fc" id="L970">            configValueMap.put(configName, configValue);</span>
+<span class="pc bpc" id="L971" title="1 of 2 branches missed.">            if (!configKeys.containsKey(configName)) {</span>
+<span class="nc" id="L972">                configInfoList.add(new ConfigInfo(null, convertConfigValue(configValue, null)));</span>
+<span class="nc" id="L973">                errorCount += configValue.errorMessages().size();</span>
+            }
+<span class="fc" id="L975">        }</span>
+
+<span class="fc bfc" id="L977" title="All 2 branches covered.">        for (Map.Entry&lt;String, ConfigKey&gt; entry : configKeys.entrySet()) {</span>
+<span class="fc" id="L978">            String configName = entry.getKey();</span>
+<span class="fc" id="L979">            ConfigKeyInfo configKeyInfo = convertConfigKey(entry.getValue());</span>
+<span class="fc" id="L980">            Type type = entry.getValue().type;</span>
+<span class="fc" id="L981">            ConfigValueInfo configValueInfo = null;</span>
+<span class="pc bpc" id="L982" title="1 of 2 branches missed.">            if (configValueMap.containsKey(configName)) {</span>
+<span class="fc" id="L983">                ConfigValue configValue = configValueMap.get(configName);</span>
+<span class="fc" id="L984">                configValueInfo = convertConfigValue(configValue, type);</span>
+<span class="fc" id="L985">                errorCount += configValue.errorMessages().size();</span>
+            }
+<span class="fc" id="L987">            configInfoList.add(new ConfigInfo(configKeyInfo, configValueInfo));</span>
+<span class="fc" id="L988">        }</span>
+<span class="fc" id="L989">        return new ConfigInfos(connType, errorCount, groups, configInfoList);</span>
+    }
+
+    public static ConfigKeyInfo convertConfigKey(ConfigKey configKey) {
+<span class="fc" id="L993">        return convertConfigKey(configKey, &quot;&quot;);</span>
+    }
+
+    private static ConfigKeyInfo convertConfigKey(ConfigKey configKey, String prefix) {
+<span class="fc" id="L997">        String name = prefix + configKey.name;</span>
+<span class="fc" id="L998">        Type type = configKey.type;</span>
+<span class="fc" id="L999">        String typeName = configKey.type.name();</span>
+
+<span class="fc" id="L1001">        boolean required = false;</span>
+        String defaultValue;
+<span class="fc bfc" id="L1003" title="All 2 branches covered.">        if (ConfigDef.NO_DEFAULT_VALUE.equals(configKey.defaultValue)) {</span>
+<span class="fc" id="L1004">            defaultValue = null;</span>
+<span class="fc" id="L1005">            required = true;</span>
+        } else {
+<span class="fc" id="L1007">            defaultValue = ConfigDef.convertToString(configKey.defaultValue, type);</span>
+        }
+<span class="fc" id="L1009">        String importance = configKey.importance.name();</span>
+<span class="fc" id="L1010">        String documentation = configKey.documentation;</span>
+<span class="fc" id="L1011">        String group = configKey.group;</span>
+<span class="fc" id="L1012">        int orderInGroup = configKey.orderInGroup;</span>
+<span class="fc" id="L1013">        String width = configKey.width.name();</span>
+<span class="fc" id="L1014">        String displayName = configKey.displayName;</span>
+<span class="fc" id="L1015">        List&lt;String&gt; dependents = configKey.dependents;</span>
+<span class="fc" id="L1016">        return new ConfigKeyInfo(name, typeName, required, defaultValue, importance, documentation, group, orderInGroup, width, displayName, dependents);</span>
+    }
+
+    private static ConfigValueInfo convertConfigValue(ConfigValue configValue, Type type) {
+<span class="fc" id="L1020">        String value = ConfigDef.convertToString(configValue.value(), type);</span>
+<span class="fc" id="L1021">        List&lt;String&gt; recommendedValues = new LinkedList&lt;&gt;();</span>
+
+<span class="fc bfc" id="L1023" title="All 2 branches covered.">        if (type == Type.LIST) {</span>
+<span class="pc bpc" id="L1024" title="1 of 2 branches missed.">            for (Object object: configValue.recommendedValues()) {</span>
+<span class="nc" id="L1025">                recommendedValues.add(ConfigDef.convertToString(object, Type.STRING));</span>
+<span class="pc" id="L1026">            }</span>
+        } else {
+<span class="fc bfc" id="L1028" title="All 2 branches covered.">            for (Object object : configValue.recommendedValues()) {</span>
+<span class="fc" id="L1029">                recommendedValues.add(ConfigDef.convertToString(object, type));</span>
+<span class="fc" id="L1030">            }</span>
+        }
+<span class="fc" id="L1032">        return new ConfigValueInfo(configValue.name(), value, recommendedValues, configValue.errorMessages(), configValue.visible());</span>
+    }
+
+    /**
+     * Retrieves ConnectorType for the class specified in the connector config
+     * @param connConfig the connector config, may be null
+     * @return the {@link ConnectorType} of the connector, or {@link ConnectorType#UNKNOWN} if an error occurs or the
+     * type cannot be determined
+     */
+    public ConnectorType connectorType(Map&lt;String, String&gt; connConfig) {
+<span class="pc bpc" id="L1042" title="1 of 2 branches missed.">        if (connConfig == null) {</span>
+<span class="nc" id="L1043">            return ConnectorType.UNKNOWN;</span>
+        }
+<span class="fc" id="L1045">        String connClass = connConfig.get(CONNECTOR_CLASS_CONFIG);</span>
+<span class="pc bpc" id="L1046" title="1 of 2 branches missed.">        if (connClass == null) {</span>
+<span class="nc" id="L1047">            return ConnectorType.UNKNOWN;</span>
+        }
+        try {
+<span class="fc" id="L1050">            VersionRange range = PluginUtils.connectorVersionRequirement(connConfig.get(CONNECTOR_VERSION));</span>
+<span class="fc" id="L1051">            return ConnectorType.from(cachedConnectors.getConnector(connClass, range).getClass());</span>
+<span class="nc" id="L1052">        } catch (Exception e) {</span>
+<span class="nc" id="L1053">            log.warn(&quot;Unable to retrieve connector type&quot;, e);</span>
+<span class="nc" id="L1054">            return ConnectorType.UNKNOWN;</span>
+        }
+    }
+
+    /**
+     * Checks a given {@link ConfigInfos} for validation error messages and adds an exception
+     * to the given {@link Callback} if any were found.
+     *
+     * @param configInfos configInfos to read Errors from
+     * @param callback callback to add config error exception to
+     * @return true if errors were found in the config
+     */
+    protected final boolean maybeAddConfigErrors(
+        ConfigInfos configInfos,
+        Callback&lt;Created&lt;ConnectorInfo&gt;&gt; callback
+    ) {
+<span class="fc" id="L1070">        int errors = configInfos.errorCount();</span>
+<span class="pc bpc" id="L1071" title="1 of 2 branches missed.">        boolean hasErrors = errors &gt; 0;</span>
+<span class="pc bpc" id="L1072" title="1 of 2 branches missed.">        if (hasErrors) {</span>
+<span class="nc" id="L1073">            StringBuilder messages = new StringBuilder();</span>
+<span class="nc" id="L1074">            messages.append(&quot;Connector configuration is invalid and contains the following &quot;)</span>
+<span class="nc" id="L1075">                .append(errors).append(&quot; error(s):&quot;);</span>
+<span class="nc bnc" id="L1076" title="All 2 branches missed.">            for (ConfigInfo configInfo : configInfos.configs()) {</span>
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">                for (String msg : configInfo.configValue().errors()) {</span>
+<span class="nc" id="L1078">                    messages.append('\n').append(msg);</span>
+<span class="nc" id="L1079">                }</span>
+<span class="nc" id="L1080">            }</span>
+<span class="nc" id="L1081">            callback.onCompletion(</span>
+                new BadRequestException(
+<span class="nc" id="L1083">                    messages.append(</span>
+                        &quot;\nYou can also find the above list of errors at the endpoint `/connector-plugins/{connectorType}/config/validate`&quot;
+<span class="nc" id="L1085">                    ).toString()</span>
+                ), null
+            );
+        }
+<span class="fc" id="L1089">        return hasErrors;</span>
+    }
+
+    private String trace(Throwable t) {
+<span class="nc" id="L1093">        ByteArrayOutputStream output = new ByteArrayOutputStream();</span>
+<span class="nc" id="L1094">        t.printStackTrace(new PrintStream(output, false, StandardCharsets.UTF_8));</span>
+<span class="nc" id="L1095">        return output.toString(StandardCharsets.UTF_8);</span>
+    }
+
+    /*
+     * Performs a reverse transformation on a set of task configs, by replacing values with variable references.
+     */
+    public static List&lt;Map&lt;String, String&gt;&gt; reverseTransform(String connName,
+                                                             ClusterConfigState configState,
+                                                             List&lt;Map&lt;String, String&gt;&gt; configs) {
+
+        // Find the config keys in the raw connector config that have variable references
+<span class="fc" id="L1106">        Map&lt;String, String&gt; rawConnConfig = configState.rawConnectorConfig(connName);</span>
+<span class="fc" id="L1107">        Set&lt;String&gt; connKeysWithVariableValues = keysWithVariableValues(rawConnConfig, ConfigTransformer.DEFAULT_PATTERN);</span>
+
+<span class="fc" id="L1109">        List&lt;Map&lt;String, String&gt;&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L1110" title="All 2 branches covered.">        for (Map&lt;String, String&gt; config : configs) {</span>
+<span class="fc" id="L1111">            Map&lt;String, String&gt; newConfig = new HashMap&lt;&gt;(config);</span>
+<span class="pc bpc" id="L1112" title="1 of 2 branches missed.">            for (String key : connKeysWithVariableValues) {</span>
+<span class="nc bnc" id="L1113" title="All 2 branches missed.">                if (newConfig.containsKey(key)) {</span>
+<span class="nc" id="L1114">                    newConfig.put(key, rawConnConfig.get(key));</span>
+                }
+<span class="nc" id="L1116">            }</span>
+<span class="fc" id="L1117">            result.add(newConfig);</span>
+<span class="fc" id="L1118">        }</span>
+<span class="fc" id="L1119">        return result;</span>
+    }
+
+    public static boolean taskConfigsChanged(ClusterConfigState configState, String connName, List&lt;Map&lt;String, String&gt;&gt; rawTaskProps) {
+<span class="fc" id="L1123">        int currentNumTasks = configState.taskCount(connName);</span>
+<span class="fc" id="L1124">        boolean result = false;</span>
+<span class="pc bpc" id="L1125" title="1 of 2 branches missed.">        if (rawTaskProps.size() != currentNumTasks) {</span>
+<span class="fc" id="L1126">            log.debug(&quot;Connector {} task count changed from {} to {}&quot;, connName, currentNumTasks, rawTaskProps.size());</span>
+<span class="fc" id="L1127">            result = true;</span>
+        }
+<span class="pc bpc" id="L1129" title="1 of 2 branches missed.">        if (!result) {</span>
+<span class="nc bnc" id="L1130" title="All 2 branches missed.">            for (int index = 0; index &lt; currentNumTasks; index++) {</span>
+<span class="nc" id="L1131">                ConnectorTaskId taskId = new ConnectorTaskId(connName, index);</span>
+<span class="nc bnc" id="L1132" title="All 2 branches missed.">                if (!rawTaskProps.get(index).equals(configState.rawTaskConfig(taskId))) {</span>
+<span class="nc" id="L1133">                    log.debug(&quot;Connector {} has change in configuration for task {}-{}&quot;, connName, connName, index);</span>
+<span class="nc" id="L1134">                    result = true;</span>
+                }
+            }
+        }
+<span class="pc bpc" id="L1138" title="1 of 2 branches missed.">        if (!result) {</span>
+<span class="nc" id="L1139">            Map&lt;String, String&gt; appliedConnectorConfig = configState.appliedConnectorConfig(connName);</span>
+<span class="nc" id="L1140">            Map&lt;String, String&gt; currentConnectorConfig = configState.connectorConfig(connName);</span>
+<span class="nc bnc" id="L1141" title="All 2 branches missed.">            if (!Objects.equals(appliedConnectorConfig, currentConnectorConfig)) {</span>
+<span class="nc" id="L1142">                log.debug(&quot;Forcing task restart for connector {} as its configuration appears to be updated&quot;, connName);</span>
+<span class="nc" id="L1143">                result = true;</span>
+            }
+        }
+<span class="pc bpc" id="L1146" title="1 of 2 branches missed.">        if (result) {</span>
+<span class="fc" id="L1147">            log.debug(&quot;Reconfiguring connector {}: writing new updated configurations for tasks&quot;, connName);</span>
+        } else {
+<span class="nc" id="L1149">            log.debug(&quot;Skipping reconfiguration of connector {} as generated configs appear unchanged&quot;, connName);</span>
+        }
+<span class="fc" id="L1151">        return result;</span>
+    }
+
+    // Visible for testing
+    static Set&lt;String&gt; keysWithVariableValues(Map&lt;String, String&gt; rawConfig, Pattern pattern) {
+<span class="fc" id="L1156">        Set&lt;String&gt; keys = new HashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L1157" title="All 2 branches covered.">        for (Map.Entry&lt;String, String&gt; config : rawConfig.entrySet()) {</span>
+<span class="pc bpc" id="L1158" title="1 of 2 branches missed.">            if (config.getValue() != null) {</span>
+<span class="fc" id="L1159">                Matcher matcher = pattern.matcher(config.getValue());</span>
+<span class="pc bpc" id="L1160" title="1 of 2 branches missed.">                if (matcher.find()) {</span>
+<span class="nc" id="L1161">                    keys.add(config.getKey());</span>
+                }
+            }
+<span class="fc" id="L1164">        }</span>
+<span class="fc" id="L1165">        return keys;</span>
+    }
+
+    @Override
+    public List&lt;ConfigKeyInfo&gt; connectorPluginConfig(String pluginName) {
+<span class="nc" id="L1170">        return connectorPluginConfig(pluginName, null);</span>
+    }
+
+    @Override
+    public List&lt;ConfigKeyInfo&gt; connectorPluginConfig(String pluginName, VersionRange range) {
+
+<span class="nc" id="L1176">        Plugins p = plugins();</span>
+        Class&lt;?&gt; pluginClass;
+        try {
+<span class="nc" id="L1179">            pluginClass = p.pluginClass(pluginName, range);</span>
+<span class="nc" id="L1180">        } catch (ClassNotFoundException cnfe) {</span>
+<span class="nc" id="L1181">            throw new NotFoundException(&quot;Unknown plugin &quot; + pluginName + &quot;.&quot;);</span>
+<span class="nc" id="L1182">        } catch (VersionedPluginLoadingException e) {</span>
+<span class="nc" id="L1183">            throw new BadRequestException(e.getMessage(), e);</span>
+<span class="nc" id="L1184">        }</span>
+
+<span class="nc" id="L1186">        try (LoaderSwap loaderSwap = p.withClassLoader(pluginClass.getClassLoader())) {</span>
+<span class="nc" id="L1187">            Object plugin = p.newPlugin(pluginName, range);</span>
+            // Contains definitions coming from Connect framework
+<span class="nc" id="L1189">            ConfigDef baseConfigDefs = null;</span>
+            // Contains definitions specifically declared on the plugin
+            ConfigDef pluginConfigDefs;
+<span class="nc bnc" id="L1192" title="All 2 branches missed.">            if (plugin instanceof SinkConnector) {</span>
+<span class="nc" id="L1193">                baseConfigDefs = SinkConnectorConfig.enrichedConfigDef(p, pluginName);</span>
+<span class="nc" id="L1194">                pluginConfigDefs = ((SinkConnector) plugin).config();</span>
+<span class="nc bnc" id="L1195" title="All 2 branches missed.">            } else if (plugin instanceof SourceConnector) {</span>
+<span class="nc" id="L1196">                baseConfigDefs = SourceConnectorConfig.enrichedConfigDef(p, pluginName);</span>
+<span class="nc" id="L1197">                pluginConfigDefs = ((SourceConnector) plugin).config();</span>
+<span class="nc bnc" id="L1198" title="All 2 branches missed.">            } else if (plugin instanceof Converter) {</span>
+<span class="nc" id="L1199">                pluginConfigDefs = ((Converter) plugin).config();</span>
+<span class="nc bnc" id="L1200" title="All 2 branches missed.">            } else if (plugin instanceof HeaderConverter) {</span>
+<span class="nc" id="L1201">                pluginConfigDefs = ((HeaderConverter) plugin).config();</span>
+<span class="nc bnc" id="L1202" title="All 2 branches missed.">            } else if (plugin instanceof Transformation) {</span>
+<span class="nc" id="L1203">                pluginConfigDefs = ((Transformation&lt;?&gt;) plugin).config();</span>
+<span class="nc bnc" id="L1204" title="All 2 branches missed.">            } else if (plugin instanceof Predicate) {</span>
+<span class="nc" id="L1205">                pluginConfigDefs = ((Predicate&lt;?&gt;) plugin).config();</span>
+            } else {
+<span class="nc" id="L1207">                throw new BadRequestException(&quot;Invalid plugin class &quot; + pluginName + &quot;. Valid types are sink, source, converter, header_converter, transformation, predicate.&quot;);</span>
+            }
+
+            // Track config properties by name and, if the same property is defined in multiple places,
+            // give precedence to the one defined by the plugin class
+            // Preserve the ordering of properties as they're returned from each ConfigDef
+<span class="nc" id="L1213">            Map&lt;String, ConfigKey&gt; configsMap = new LinkedHashMap&lt;&gt;(pluginConfigDefs.configKeys());</span>
+<span class="nc bnc" id="L1214" title="All 2 branches missed.">            if (baseConfigDefs != null) {</span>
+<span class="nc" id="L1215">                baseConfigDefs.configKeys().forEach(configsMap::putIfAbsent);</span>
+            }
+
+<span class="nc" id="L1218">            List&lt;ConfigKeyInfo&gt; results = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1219" title="All 2 branches missed.">            for (ConfigKey configKey : configsMap.values()) {</span>
+<span class="nc" id="L1220">                results.add(AbstractHerder.convertConfigKey(configKey));</span>
+<span class="nc" id="L1221">            }</span>
+<span class="nc" id="L1222">            return results;</span>
+<span class="nc" id="L1223">        } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L1224">            throw new ConnectException(&quot;Failed to load plugin class or one of its dependencies&quot;, e);</span>
+        }
+    }
+
+    @Override
+    public void connectorOffsets(String connName, Callback&lt;ConnectorOffsets&gt; cb) {
+<span class="nc" id="L1230">        ClusterConfigState configSnapshot = configBackingStore.snapshot();</span>
+        try {
+<span class="nc bnc" id="L1232" title="All 2 branches missed.">            if (!configSnapshot.contains(connName)) {</span>
+<span class="nc" id="L1233">                cb.onCompletion(new NotFoundException(&quot;Connector &quot; + connName + &quot; not found&quot;), null);</span>
+<span class="nc" id="L1234">                return;</span>
+            }
+            // The worker asynchronously processes the request and completes the passed callback when done
+<span class="nc" id="L1237">            worker.connectorOffsets(connName, configSnapshot.connectorConfig(connName), cb);</span>
+<span class="nc" id="L1238">        } catch (Throwable t) {</span>
+<span class="nc" id="L1239">            cb.onCompletion(t, null);</span>
+<span class="nc" id="L1240">        }</span>
+<span class="nc" id="L1241">    }</span>
+
+    @Override
+    public void alterConnectorOffsets(String connName, Map&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; offsets, Callback&lt;Message&gt; callback) {
+<span class="nc bnc" id="L1245" title="All 4 branches missed.">        if (offsets == null || offsets.isEmpty()) {</span>
+<span class="nc" id="L1246">            callback.onCompletion(new ConnectException(&quot;The offsets to be altered may not be null or empty&quot;), null);</span>
+<span class="nc" id="L1247">            return;</span>
+        }
+<span class="nc" id="L1249">        modifyConnectorOffsets(connName, offsets, callback);</span>
+<span class="nc" id="L1250">    }</span>
+
+    @Override
+    public void resetConnectorOffsets(String connName, Callback&lt;Message&gt; callback) {
+<span class="nc" id="L1254">        modifyConnectorOffsets(connName, null, callback);</span>
+<span class="nc" id="L1255">    }</span>
+
+    /**
+     * Service external requests to alter or reset connector offsets.
+     * @param connName the name of the connector whose offsets are to be modified
+     * @param offsets the offsets to be written; this should be {@code null} for offsets reset requests
+     * @param cb callback to invoke upon completion
+     */
+    protected abstract void modifyConnectorOffsets(String connName, Map&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; offsets, Callback&lt;Message&gt; cb);
+
+    @Override
+    public LoggerLevel loggerLevel(String logger) {
+<span class="nc" id="L1267">        return loggers.level(logger);</span>
+    }
+
+    @Override
+    public Map&lt;String, LoggerLevel&gt; allLoggerLevels() {
+<span class="nc" id="L1272">        return loggers.allLevels();</span>
+    }
+
+    @Override
+    public List&lt;String&gt; setWorkerLoggerLevel(String namespace, String desiredLevelStr) {
+<span class="nc" id="L1277">        String normalizedLevel = desiredLevelStr.toUpperCase(Locale.ROOT);</span>
+
+<span class="nc bnc" id="L1279" title="All 2 branches missed.">        if (!loggers.isValidLevel(normalizedLevel)) {</span>
+<span class="nc" id="L1280">            log.warn(&quot;Ignoring request to set invalid level '{}' for namespace {}&quot;, desiredLevelStr, namespace);</span>
+<span class="nc" id="L1281">            return List.of();</span>
+        }
+
+<span class="nc" id="L1284">        return loggers.setLevel(namespace, normalizedLevel);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

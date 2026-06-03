@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ShareGroupMetrics.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server.share.metrics</a> &gt; <span class="el_source">ShareGroupMetrics.java</span></div><h1>ShareGroupMetrics.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.server.share.metrics;
+
+import org.apache.kafka.clients.consumer.AcknowledgeType;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.server.metrics.KafkaMetricsGroup;
+
+import com.yammer.metrics.core.Histogram;
+import com.yammer.metrics.core.Meter;
+
+import java.util.Arrays;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+/**
+ * ShareGroupMetrics is used to track the broker-side metrics for the ShareGroup.
+ */
+public class ShareGroupMetrics implements AutoCloseable {
+
+    private static final String RECORD_ACKNOWLEDGEMENTS_PER_SEC = &quot;RecordAcknowledgementsPerSec&quot;;
+    private static final String PARTITION_LOAD_TIME_MS = &quot;PartitionLoadTimeMs&quot;;
+    private static final String TOPIC_PARTITIONS_FETCH_RATIO = &quot;RequestTopicPartitionsFetchRatio&quot;;
+    private static final String TOPIC_PARTITIONS_ACQUIRE_TIME_MS = &quot;TopicPartitionsAcquireTimeMs&quot;;
+    private static final String ACK_TYPE_TAG = &quot;ackType&quot;;
+
+    /**
+     * Metric for the rate of records acknowledged per acknowledgement type.
+     */
+    private final Map&lt;Byte, Meter&gt; recordAcknowledgementMeterMap;
+    /**
+     * Metric for the time taken to load the share partitions.
+     */
+    private final Histogram partitionLoadTimeMs;
+    /**
+     * Metric for the ratio of topic partitions fetched to the total number of topic partitions requested, per group.
+     */
+    private final Map&lt;String, Histogram&gt; topicPartitionsFetchRatio;
+    /**
+     * Metric for the time taken to acquire topic partitions for a group.
+     */
+    private final Map&lt;String, Histogram&gt; topicPartitionsAcquireTimeMs;
+
+    private final KafkaMetricsGroup metricsGroup;
+    private final Time time;
+
+<span class="fc" id="L64">    public ShareGroupMetrics(Time time) {</span>
+<span class="fc" id="L65">        this.time = time;</span>
+<span class="fc" id="L66">        this.metricsGroup = new KafkaMetricsGroup(&quot;kafka.server&quot;, &quot;ShareGroupMetrics&quot;);</span>
+<span class="fc" id="L67">        this.recordAcknowledgementMeterMap = Arrays.stream(AcknowledgeType.values()).collect(</span>
+<span class="fc" id="L68">            Collectors.toMap(</span>
+<span class="fc" id="L69">                type -&gt; type.id,</span>
+<span class="fc" id="L70">                type -&gt; metricsGroup.newMeter(</span>
+                    RECORD_ACKNOWLEDGEMENTS_PER_SEC,
+                    &quot;records&quot;,
+                    TimeUnit.SECONDS,
+<span class="fc" id="L74">                    Map.of(ACK_TYPE_TAG, capitalize(type.toString()))</span>
+                )
+            )
+        );
+<span class="fc" id="L78">        this.partitionLoadTimeMs = metricsGroup.newHistogram(PARTITION_LOAD_TIME_MS);</span>
+<span class="fc" id="L79">        this.topicPartitionsFetchRatio = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L80">        this.topicPartitionsAcquireTimeMs = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L81">    }</span>
+
+    public void recordAcknowledgement(byte ackType) {
+<span class="nc" id="L84">        recordAcknowledgement(ackType, 1);</span>
+<span class="nc" id="L85">    }</span>
+
+    public void recordAcknowledgement(byte ackType, long count) {
+        // unknown ack types (such as gaps for control records) are intentionally ignored
+<span class="nc bnc" id="L89" title="All 2 branches missed.">        if (recordAcknowledgementMeterMap.containsKey(ackType)) {</span>
+<span class="nc" id="L90">            recordAcknowledgementMeterMap.get(ackType).mark(count);</span>
+        }
+<span class="nc" id="L92">    }</span>
+
+    public void partitionLoadTime(long start) {
+<span class="nc" id="L95">        partitionLoadTimeMs.update(time.hiResClockMs() - start);</span>
+<span class="nc" id="L96">    }</span>
+
+    public void recordTopicPartitionsFetchRatio(String groupId, long value) {
+<span class="nc" id="L99">        topicPartitionsFetchRatio.computeIfAbsent(groupId,</span>
+<span class="nc" id="L100">            k -&gt; metricsGroup.newHistogram(TOPIC_PARTITIONS_FETCH_RATIO, true, Map.of(&quot;group&quot;, groupId)));</span>
+<span class="nc" id="L101">        topicPartitionsFetchRatio.get(groupId).update(value);</span>
+<span class="nc" id="L102">    }</span>
+
+    public void recordTopicPartitionsAcquireTimeMs(String groupId, long timeMs) {
+<span class="nc" id="L105">        topicPartitionsAcquireTimeMs.computeIfAbsent(groupId,</span>
+<span class="nc" id="L106">            k -&gt; metricsGroup.newHistogram(TOPIC_PARTITIONS_ACQUIRE_TIME_MS, true, Map.of(&quot;group&quot;, groupId)));</span>
+<span class="nc" id="L107">        topicPartitionsAcquireTimeMs.get(groupId).update(timeMs);</span>
+<span class="nc" id="L108">    }</span>
+
+    // Visible for testing
+    public Meter recordAcknowledgementMeter(byte ackType) {
+<span class="nc" id="L112">        return recordAcknowledgementMeterMap.get(ackType);</span>
+    }
+
+    // Visible for testing
+    public Histogram partitionLoadTimeMs() {
+<span class="nc" id="L117">        return partitionLoadTimeMs;</span>
+    }
+
+    // Visible for testing
+    public Histogram topicPartitionsFetchRatio(String groupId) {
+<span class="nc" id="L122">        return topicPartitionsFetchRatio.get(groupId);</span>
+    }
+
+    // Visible for testing
+    public Histogram topicPartitionsAcquireTimeMs(String groupId) {
+<span class="nc" id="L127">        return topicPartitionsAcquireTimeMs.get(groupId);</span>
+    }
+
+    @Override
+    public void close() throws Exception {
+<span class="fc" id="L132">        Arrays.stream(AcknowledgeType.values()).forEach(</span>
+<span class="fc" id="L133">            m -&gt; metricsGroup.removeMetric(RECORD_ACKNOWLEDGEMENTS_PER_SEC, Map.of(ACK_TYPE_TAG, m.toString())));</span>
+<span class="fc" id="L134">        metricsGroup.removeMetric(PARTITION_LOAD_TIME_MS);</span>
+<span class="pc" id="L135">        topicPartitionsFetchRatio.forEach((k, v) -&gt; metricsGroup.removeMetric(TOPIC_PARTITIONS_FETCH_RATIO, Map.of(&quot;group&quot;, k)));</span>
+<span class="pc" id="L136">        topicPartitionsAcquireTimeMs.forEach((k, v) -&gt; metricsGroup.removeMetric(TOPIC_PARTITIONS_ACQUIRE_TIME_MS, Map.of(&quot;group&quot;, k)));</span>
+<span class="fc" id="L137">    }</span>
+
+    private static String capitalize(String string) {
+<span class="pc bpc" id="L140" title="2 of 4 branches missed.">        if (string == null || string.isEmpty()) {</span>
+<span class="nc" id="L141">            return string;</span>
+        }
+<span class="fc" id="L143">        return string.substring(0, 1).toUpperCase(Locale.ROOT) + string.substring(1);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

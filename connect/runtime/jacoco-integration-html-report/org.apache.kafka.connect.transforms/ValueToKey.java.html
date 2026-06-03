@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ValueToKey.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.transforms</a> &gt; <span class="el_source">ValueToKey.java</span></div><h1>ValueToKey.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.transforms;
+
+import org.apache.kafka.common.cache.Cache;
+import org.apache.kafka.common.cache.LRUCache;
+import org.apache.kafka.common.cache.SynchronizedCache;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.utils.AppInfoParser;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.transforms.util.SimpleConfig;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.apache.kafka.connect.transforms.util.Requirements.requireMap;
+import static org.apache.kafka.connect.transforms.util.Requirements.requireStruct;
+
+<span class="fc" id="L39">public class ValueToKey&lt;R extends ConnectRecord&lt;R&gt;&gt; implements Transformation&lt;R&gt; {</span>
+
+    public static final String OVERVIEW_DOC = &quot;Replace the record key with a new key formed from a subset of fields in the record value.&quot;;
+
+    public static final String FIELDS_CONFIG = &quot;fields&quot;;
+    public static final String REPLACE_NULL_WITH_DEFAULT_CONFIG = &quot;replace.null.with.default&quot;;
+
+<span class="fc" id="L46">    public static final ConfigDef CONFIG_DEF = new ConfigDef()</span>
+<span class="fc" id="L47">            .define(FIELDS_CONFIG, ConfigDef.Type.LIST, ConfigDef.NO_DEFAULT_VALUE, ConfigDef.ValidList.anyNonDuplicateValues(false, false), ConfigDef.Importance.HIGH,</span>
+                    &quot;Field names on the record value to extract as the record key.&quot;)
+<span class="fc" id="L49">            .define(REPLACE_NULL_WITH_DEFAULT_CONFIG, ConfigDef.Type.BOOLEAN, true, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Whether to replace fields that have a default value and that are null to the default value. When set to true, the default value is used, otherwise null is used.&quot;);
+
+    private static final String PURPOSE = &quot;copying fields from value to key&quot;;
+
+    private List&lt;String&gt; fields;
+    private boolean replaceNullWithDefault;
+
+    private Cache&lt;Schema, Schema&gt; valueToKeySchemaCache;
+
+    @Override
+    public String version() {
+<span class="fc" id="L61">        return AppInfoParser.getVersion();</span>
+    }
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs) {
+<span class="nc" id="L66">        final SimpleConfig config = new SimpleConfig(CONFIG_DEF, configs);</span>
+<span class="nc" id="L67">        fields = config.getList(FIELDS_CONFIG);</span>
+<span class="nc" id="L68">        replaceNullWithDefault = config.getBoolean(REPLACE_NULL_WITH_DEFAULT_CONFIG);</span>
+<span class="nc" id="L69">        valueToKeySchemaCache = new SynchronizedCache&lt;&gt;(new LRUCache&lt;&gt;(16));</span>
+<span class="nc" id="L70">    }</span>
+
+    @Override
+    public R apply(R record) {
+<span class="nc bnc" id="L74" title="All 2 branches missed.">        if (record.valueSchema() == null) {</span>
+<span class="nc" id="L75">            return applySchemaless(record);</span>
+        } else {
+<span class="nc" id="L77">            return applyWithSchema(record);</span>
+        }
+    }
+
+    private R applySchemaless(R record) {
+<span class="nc" id="L82">        final Map&lt;String, Object&gt; value = requireMap(record.value(), PURPOSE);</span>
+<span class="nc" id="L83">        final Map&lt;String, Object&gt; key = new HashMap&lt;&gt;(fields.size());</span>
+<span class="nc bnc" id="L84" title="All 2 branches missed.">        for (String field : fields) {</span>
+<span class="nc" id="L85">            key.put(field, value.get(field));</span>
+<span class="nc" id="L86">        }</span>
+<span class="nc" id="L87">        return record.newRecord(record.topic(), record.kafkaPartition(), null, key, record.valueSchema(), record.value(), record.timestamp());</span>
+    }
+
+    private R applyWithSchema(R record) {
+<span class="nc" id="L91">        final Struct value = requireStruct(record.value(), PURPOSE);</span>
+
+<span class="nc" id="L93">        Schema keySchema = valueToKeySchemaCache.get(value.schema());</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">        if (keySchema == null) {</span>
+<span class="nc" id="L95">            final SchemaBuilder keySchemaBuilder = SchemaBuilder.struct();</span>
+<span class="nc bnc" id="L96" title="All 2 branches missed.">            for (String field : fields) {</span>
+<span class="nc" id="L97">                final Field fieldFromValue = value.schema().field(field);</span>
+<span class="nc bnc" id="L98" title="All 2 branches missed.">                if (fieldFromValue == null) {</span>
+<span class="nc" id="L99">                    throw new DataException(&quot;Field does not exist: &quot; + field);</span>
+                }
+<span class="nc" id="L101">                keySchemaBuilder.field(field, fieldFromValue.schema());</span>
+<span class="nc" id="L102">            }</span>
+<span class="nc" id="L103">            keySchema = keySchemaBuilder.build();</span>
+<span class="nc" id="L104">            valueToKeySchemaCache.put(value.schema(), keySchema);</span>
+        }
+
+<span class="nc" id="L107">        final Struct key = new Struct(keySchema);</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">        for (String field : fields) {</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">            key.put(field, replaceNullWithDefault ? value.get(field) : value.getWithoutDefault(field));</span>
+<span class="nc" id="L110">        }</span>
+
+<span class="nc" id="L112">        return record.newRecord(record.topic(), record.kafkaPartition(), keySchema, key, value.schema(), value, record.timestamp());</span>
+    }
+
+    @Override
+    public ConfigDef config() {
+<span class="nc" id="L117">        return CONFIG_DEF;</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L122">        valueToKeySchemaCache = null;</span>
+<span class="nc" id="L123">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

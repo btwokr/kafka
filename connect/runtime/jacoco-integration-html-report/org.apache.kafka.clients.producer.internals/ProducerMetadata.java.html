@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ProducerMetadata.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.producer.internals</a> &gt; <span class="el_source">ProducerMetadata.java</span></div><h1>ProducerMetadata.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.producer.internals;
+
+import org.apache.kafka.clients.Metadata;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.internals.ClusterResourceListeners;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.MetadataRequest;
+import org.apache.kafka.common.requests.MetadataResponse;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+
+public class ProducerMetadata extends Metadata {
+    // If a topic hasn't been accessed for this many milliseconds, it is removed from the cache.
+    private final long metadataIdleMs;
+
+    /* Topics with expiry time */
+<span class="fc" id="L42">    private final Map&lt;String, Long&gt; topics = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L43">    private final Set&lt;String&gt; newTopics = new HashSet&lt;&gt;();</span>
+    private final Logger log;
+    private final Time time;
+<span class="fc" id="L46">    private Map&lt;String, Errors&gt; errors = null;</span>
+
+    public ProducerMetadata(long refreshBackoffMs,
+                            long refreshBackoffMaxMs,
+                            long metadataExpireMs,
+                            long metadataIdleMs,
+                            LogContext logContext,
+                            ClusterResourceListeners clusterResourceListeners,
+                            Time time) {
+<span class="fc" id="L55">        super(refreshBackoffMs, refreshBackoffMaxMs, metadataExpireMs, logContext, clusterResourceListeners);</span>
+<span class="fc" id="L56">        this.metadataIdleMs = metadataIdleMs;</span>
+<span class="fc" id="L57">        this.log = logContext.logger(ProducerMetadata.class);</span>
+<span class="fc" id="L58">        this.time = time;</span>
+<span class="fc" id="L59">    }</span>
+
+    @Override
+    public synchronized MetadataRequest.Builder newMetadataRequestBuilder() {
+<span class="fc" id="L63">        return new MetadataRequest.Builder(new ArrayList&lt;&gt;(topics.keySet()), true);</span>
+    }
+
+    @Override
+    public synchronized MetadataRequest.Builder newMetadataRequestBuilderForNewTopics() {
+<span class="fc" id="L68">        return new MetadataRequest.Builder(new ArrayList&lt;&gt;(newTopics), true);</span>
+    }
+
+    public synchronized void add(String topic, long nowMs) {
+<span class="fc" id="L72">        Objects.requireNonNull(topic, &quot;topic cannot be null&quot;);</span>
+<span class="fc bfc" id="L73" title="All 2 branches covered.">        if (topics.put(topic, nowMs + metadataIdleMs) == null) {</span>
+<span class="fc" id="L74">            newTopics.add(topic);</span>
+<span class="fc" id="L75">            requestUpdateForNewTopics();</span>
+        }
+<span class="fc" id="L77">    }</span>
+
+    public synchronized int requestUpdateForTopic(String topic) {
+<span class="pc bpc" id="L80" title="1 of 2 branches missed.">        if (newTopics.contains(topic)) {</span>
+<span class="fc" id="L81">            return requestUpdateForNewTopics();</span>
+        } else {
+<span class="nc" id="L83">            return requestUpdate(false);</span>
+        }
+    }
+
+    // Visible for testing
+    synchronized Set&lt;String&gt; topics() {
+<span class="nc" id="L89">        return topics.keySet();</span>
+    }
+
+    // Visible for testing
+    synchronized Set&lt;String&gt; newTopics() {
+<span class="nc" id="L94">        return newTopics;</span>
+    }
+
+    public synchronized boolean containsTopic(String topic) {
+<span class="nc" id="L98">        return topics.containsKey(topic);</span>
+    }
+
+    @Override
+    public synchronized boolean retainTopic(String topic, boolean isInternal, long nowMs) {
+<span class="fc" id="L103">        Long expireMs = topics.get(topic);</span>
+<span class="pc bpc" id="L104" title="1 of 2 branches missed.">        if (expireMs == null) {</span>
+<span class="nc" id="L105">            return false;</span>
+<span class="fc bfc" id="L106" title="All 2 branches covered.">        } else if (newTopics.contains(topic)) {</span>
+<span class="fc" id="L107">            return true;</span>
+<span class="pc bpc" id="L108" title="1 of 2 branches missed.">        } else if (expireMs &lt;= nowMs) {</span>
+<span class="nc" id="L109">            log.debug(&quot;Removing unused topic {} from the metadata list, expiryMs {} now {}&quot;, topic, expireMs, nowMs);</span>
+<span class="nc" id="L110">            topics.remove(topic);</span>
+<span class="nc" id="L111">            return false;</span>
+        } else {
+<span class="fc" id="L113">            return true;</span>
+        }
+    }
+
+    /**
+     * Wait for metadata update until the current version is larger than the last version we know of
+     */
+    public synchronized void awaitUpdate(final int lastVersion, final long timeoutMs) throws InterruptedException {
+<span class="fc" id="L121">        long currentTimeMs = time.milliseconds();</span>
+<span class="fc bfc" id="L122" title="All 2 branches covered.">        long deadlineMs = currentTimeMs + timeoutMs &lt; 0 ? Long.MAX_VALUE : currentTimeMs + timeoutMs;</span>
+<span class="fc" id="L123">        time.waitObject(this, () -&gt; {</span>
+            // Throw fatal exceptions, if there are any. Recoverable topic errors will be handled by the caller.
+<span class="fc" id="L125">            maybeThrowFatalException();</span>
+<span class="pc bpc" id="L126" title="1 of 4 branches missed.">            return updateVersion() &gt; lastVersion || isClosed();</span>
+        }, deadlineMs);
+
+<span class="pc bpc" id="L129" title="1 of 2 branches missed.">        if (isClosed())</span>
+<span class="nc" id="L130">            throw new KafkaException(&quot;Requested metadata update after close&quot;);</span>
+<span class="fc" id="L131">    }</span>
+
+    @Override
+    public synchronized void update(int requestVersion, MetadataResponse response, boolean isPartialUpdate, long nowMs) {
+<span class="fc" id="L135">        super.update(requestVersion, response, isPartialUpdate, nowMs);</span>
+<span class="fc" id="L136">        errors = response.errors();</span>
+
+        // Remove all topics in the response that are in the new topic set. Note that if an error was encountered for a
+        // new topic's metadata, then any work to resolve the error will include the topic in a full metadata update.
+<span class="fc bfc" id="L140" title="All 2 branches covered.">        if (!newTopics.isEmpty()) {</span>
+<span class="fc bfc" id="L141" title="All 2 branches covered.">            for (MetadataResponse.TopicMetadata metadata : response.topicMetadata()) {</span>
+<span class="fc" id="L142">                newTopics.remove(metadata.topic());</span>
+<span class="fc" id="L143">            }</span>
+        }
+
+<span class="fc" id="L146">        notifyAll();</span>
+<span class="fc" id="L147">    }</span>
+
+    public Errors getError(final String topic) {
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        if (errors != null) {</span>
+<span class="nc" id="L151">            return errors.get(topic);</span>
+        }
+<span class="nc" id="L153">        return null;</span>
+    }
+
+    @Override
+    public synchronized void fatalError(KafkaException fatalException) {
+<span class="nc" id="L158">        super.fatalError(fatalException);</span>
+<span class="nc" id="L159">        notifyAll();</span>
+<span class="nc" id="L160">    }</span>
+
+    /**
+     * Close this instance and notify any awaiting threads.
+     */
+    @Override
+    public synchronized void close() {
+<span class="fc" id="L167">        super.close();</span>
+<span class="fc" id="L168">        notifyAll();</span>
+<span class="fc" id="L169">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

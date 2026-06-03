@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DefaultStreamsRebalanceListener.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals</a> &gt; <span class="el_source">DefaultStreamsRebalanceListener.java</span></div><h1>DefaultStreamsRebalanceListener.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals;
+
+import org.apache.kafka.clients.consumer.internals.StreamsRebalanceData;
+import org.apache.kafka.clients.consumer.internals.StreamsRebalanceListener;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.internals.metrics.RebalanceListenerMetrics;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+
+import org.slf4j.Logger;
+
+import java.util.Collection;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+public class DefaultStreamsRebalanceListener implements StreamsRebalanceListener {
+
+    private final Logger log;
+    private final Time time;
+    private final StreamsRebalanceData streamsRebalanceData;
+    private final TaskManager taskManager;
+    private final StreamThread streamThread;
+    private final Sensor tasksRevokedSensor;
+    private final Sensor tasksAssignedSensor;
+    private final Sensor tasksLostSensor;
+
+    public DefaultStreamsRebalanceListener(final Logger log,
+                                           final Time time,
+                                           final StreamsRebalanceData streamsRebalanceData,
+                                           final StreamThread streamThread,
+                                           final TaskManager taskManager,
+                                           final StreamsMetricsImpl streamsMetrics,
+<span class="nc" id="L53">                                           final String threadId) {</span>
+<span class="nc" id="L54">        this.log = log;</span>
+<span class="nc" id="L55">        this.time = time;</span>
+<span class="nc" id="L56">        this.streamsRebalanceData = streamsRebalanceData;</span>
+<span class="nc" id="L57">        this.streamThread = streamThread;</span>
+<span class="nc" id="L58">        this.taskManager = taskManager;</span>
+        
+        // Create sensors for rebalance metrics
+<span class="nc" id="L61">        this.tasksRevokedSensor = RebalanceListenerMetrics.tasksRevokedSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L62">        this.tasksAssignedSensor = RebalanceListenerMetrics.tasksAssignedSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L63">        this.tasksLostSensor = RebalanceListenerMetrics.tasksLostSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L64">    }</span>
+
+    @Override
+    public void onTasksRevoked(final Set&lt;StreamsRebalanceData.TaskId&gt; tasks) {
+<span class="nc" id="L68">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasksToRevokeWithPartitions =</span>
+<span class="nc" id="L69">            pairWithTopicPartitions(tasks.stream());</span>
+<span class="nc" id="L70">        final Set&lt;TopicPartition&gt; partitionsToRevoke = activeTasksToRevokeWithPartitions.values().stream()</span>
+<span class="nc" id="L71">            .flatMap(Collection::stream)</span>
+<span class="nc" id="L72">            .collect(Collectors.toSet());</span>
+
+<span class="nc" id="L74">        final long start = time.milliseconds();</span>
+        try {
+<span class="nc" id="L76">            log.info(&quot;Revoking active tasks {}.&quot;, tasks);</span>
+<span class="nc" id="L77">            taskManager.handleRevocation(partitionsToRevoke);</span>
+        } finally {
+<span class="nc" id="L79">            final long latency = time.milliseconds() - start;</span>
+<span class="nc" id="L80">            tasksRevokedSensor.record(latency);</span>
+<span class="nc" id="L81">            log.info(&quot;partition revocation took {} ms.&quot;, latency);</span>
+        }
+<span class="nc bnc" id="L83" title="All 2 branches missed.">        if (streamThread.state() != StreamThread.State.PENDING_SHUTDOWN) {</span>
+<span class="nc" id="L84">            streamThread.setState(StreamThread.State.PARTITIONS_REVOKED);</span>
+        }
+<span class="nc" id="L86">    }</span>
+
+    @Override
+    public void onTasksAssigned(final StreamsRebalanceData.Assignment assignment) {
+<span class="nc" id="L90">        final long start = time.milliseconds();</span>
+<span class="nc" id="L91">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasksWithPartitions =</span>
+<span class="nc" id="L92">            pairWithTopicPartitions(assignment.activeTasks().stream());</span>
+<span class="nc" id="L93">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyTasksWithPartitions =</span>
+<span class="nc" id="L94">            pairWithTopicPartitions(Stream.concat(assignment.standbyTasks().stream(), assignment.warmupTasks().stream()));</span>
+
+<span class="nc" id="L96">        log.info(&quot;Processing new assignment {} from Streams Rebalance Protocol&quot;, assignment);</span>
+
+        try {
+<span class="nc" id="L99">            streamThread.setStreamsGroupReady(assignment.isGroupReady());</span>
+<span class="nc" id="L100">            taskManager.handleAssignment(activeTasksWithPartitions, standbyTasksWithPartitions);</span>
+<span class="nc" id="L101">            streamThread.setState(StreamThread.State.PARTITIONS_ASSIGNED);</span>
+<span class="nc" id="L102">            taskManager.handleRebalanceComplete();</span>
+<span class="nc" id="L103">            streamsRebalanceData.setReconciledAssignment(assignment);</span>
+        } finally {
+<span class="nc" id="L105">            tasksAssignedSensor.record(time.milliseconds() - start);</span>
+        }
+<span class="nc" id="L107">    }</span>
+
+    @Override
+    public void onAllTasksLost() {
+<span class="nc" id="L111">        final long start = time.milliseconds();</span>
+        try {
+<span class="nc" id="L113">            taskManager.handleLostAll();</span>
+<span class="nc" id="L114">            streamsRebalanceData.setReconciledAssignment(StreamsRebalanceData.Assignment.EMPTY);</span>
+        } finally {
+<span class="nc" id="L116">            tasksLostSensor.record(time.milliseconds() - start);</span>
+        }
+<span class="nc" id="L118">    }</span>
+
+    private Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; pairWithTopicPartitions(final Stream&lt;StreamsRebalanceData.TaskId&gt; taskIdStream) {
+<span class="nc" id="L121">        return taskIdStream</span>
+<span class="nc" id="L122">            .collect(Collectors.toMap(</span>
+                this::toTaskId,
+<span class="nc" id="L124">                task -&gt; toTopicPartitions(task, streamsRebalanceData.subtopologies().get(task.subtopologyId()))</span>
+            ));
+    }
+
+    private TaskId toTaskId(final StreamsRebalanceData.TaskId task) {
+<span class="nc" id="L129">        return new TaskId(Integer.parseInt(task.subtopologyId()), task.partitionId());</span>
+    }
+
+    private Set&lt;TopicPartition&gt; toTopicPartitions(final StreamsRebalanceData.TaskId task,
+                                                  final StreamsRebalanceData.Subtopology subTopology) {
+<span class="nc" id="L134">        return</span>
+<span class="nc" id="L135">            Stream.concat(</span>
+<span class="nc" id="L136">                    subTopology.sourceTopics().stream(),</span>
+<span class="nc" id="L137">                    subTopology.repartitionSourceTopics().keySet().stream()</span>
+                )
+<span class="nc" id="L139">                .map(t -&gt; new TopicPartition(t, task.partitionId()))</span>
+<span class="nc" id="L140">                .collect(Collectors.toSet());</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

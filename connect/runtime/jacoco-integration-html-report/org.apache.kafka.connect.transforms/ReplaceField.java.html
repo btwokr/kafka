@@ -1,0 +1,254 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ReplaceField.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.transforms</a> &gt; <span class="el_source">ReplaceField.java</span></div><h1>ReplaceField.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.transforms;
+
+import org.apache.kafka.common.cache.Cache;
+import org.apache.kafka.common.cache.LRUCache;
+import org.apache.kafka.common.cache.SynchronizedCache;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.utils.AppInfoParser;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.transforms.util.SchemaUtil;
+import org.apache.kafka.connect.transforms.util.SimpleConfig;
+
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import static org.apache.kafka.connect.transforms.util.Requirements.requireMap;
+import static org.apache.kafka.connect.transforms.util.Requirements.requireStruct;
+
+<span class="fc" id="L42">public abstract class ReplaceField&lt;R extends ConnectRecord&lt;R&gt;&gt; implements Transformation&lt;R&gt; {</span>
+
+<span class="fc" id="L44">    public static final String OVERVIEW_DOC = &quot;Filter or rename fields.&quot;</span>
+<span class="fc" id="L45">            + &quot;&lt;p/&gt;Use the concrete transformation type designed for the record key (&lt;code&gt;&quot; + Key.class.getName() + &quot;&lt;/code&gt;) &quot;</span>
+<span class="fc" id="L46">            + &quot;or value (&lt;code&gt;&quot; + Value.class.getName() + &quot;&lt;/code&gt;).&quot;;</span>
+
+    interface ConfigName {
+        String EXCLUDE = &quot;exclude&quot;;
+        String INCLUDE = &quot;include&quot;;
+
+        String RENAMES = &quot;renames&quot;;
+        String REPLACE_NULL_WITH_DEFAULT_CONFIG = &quot;replace.null.with.default&quot;;
+    }
+
+<span class="fc" id="L56">    public static final ConfigDef CONFIG_DEF = new ConfigDef()</span>
+<span class="fc" id="L57">            .define(ConfigName.EXCLUDE, </span>
+                    ConfigDef.Type.LIST, 
+<span class="fc" id="L59">                    List.of(), </span>
+<span class="fc" id="L60">                    ConfigDef.ValidList.anyNonDuplicateValues(true, false), </span>
+                    ConfigDef.Importance.MEDIUM,
+                    &quot;Fields to exclude. This takes precedence over the fields to include.&quot;)
+<span class="fc" id="L63">            .define(ConfigName.INCLUDE, </span>
+                    ConfigDef.Type.LIST, 
+<span class="fc" id="L65">                    List.of(), </span>
+<span class="fc" id="L66">                    ConfigDef.ValidList.anyNonDuplicateValues(true, false),</span>
+                    ConfigDef.Importance.MEDIUM,
+                    &quot;Fields to include. If specified, only these fields will be used.&quot;)
+<span class="fc" id="L69">            .define(ConfigName.RENAMES, ConfigDef.Type.LIST, List.of(),</span>
+<span class="fc" id="L70">                ConfigDef.LambdaValidator.with(</span>
+                    (name, value) -&gt; {
+                        @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L73">                        List&lt;String&gt; valueList = (List&lt;String&gt;) value;</span>
+<span class="fc" id="L74">                        parseRenameMappings(valueList);</span>
+<span class="fc" id="L75">                    },</span>
+<span class="nc" id="L76">                    () -&gt; &quot;list of colon-delimited pairs, e.g. &lt;code&gt;foo:bar,abc:xyz&lt;/code&gt;&quot;),</span>
+                ConfigDef.Importance.MEDIUM, &quot;Field rename mappings.&quot;)
+<span class="fc" id="L78">            .define(ConfigName.REPLACE_NULL_WITH_DEFAULT_CONFIG, ConfigDef.Type.BOOLEAN, true, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Whether to replace fields that have a default value and that are null to the default value. When set to true, the default value is used, otherwise null is used.&quot;);
+
+    private static final String PURPOSE = &quot;field replacement&quot;;
+
+    private Set&lt;String&gt; exclude;
+    private Set&lt;String&gt; include;
+    private Map&lt;String, String&gt; renames;
+    private Map&lt;String, String&gt; reverseRenames;
+    private boolean replaceNullWithDefault;
+
+    private Cache&lt;Schema, Schema&gt; schemaUpdateCache;
+
+    @Override
+    public String version() {
+<span class="fc" id="L93">        return AppInfoParser.getVersion();</span>
+    }
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs) {
+<span class="nc" id="L98">        final SimpleConfig config = new SimpleConfig(CONFIG_DEF, configs);</span>
+
+<span class="nc" id="L100">        exclude = new HashSet&lt;&gt;(config.getList(ConfigName.EXCLUDE));</span>
+<span class="nc" id="L101">        include = new HashSet&lt;&gt;(config.getList(ConfigName.INCLUDE));</span>
+<span class="nc" id="L102">        renames = parseRenameMappings(config.getList(ConfigName.RENAMES));</span>
+<span class="nc" id="L103">        reverseRenames = invert(renames);</span>
+<span class="nc" id="L104">        replaceNullWithDefault = config.getBoolean(ConfigName.REPLACE_NULL_WITH_DEFAULT_CONFIG);</span>
+
+<span class="nc" id="L106">        schemaUpdateCache = new SynchronizedCache&lt;&gt;(new LRUCache&lt;&gt;(16));</span>
+<span class="nc" id="L107">    }</span>
+
+    static Map&lt;String, String&gt; parseRenameMappings(List&lt;String&gt; mappings) {
+<span class="fc" id="L110">        final Map&lt;String, String&gt; m = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L111" title="1 of 2 branches missed.">        for (String mapping : mappings) {</span>
+<span class="nc" id="L112">            final String[] parts = mapping.split(&quot;:&quot;);</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">            if (parts.length != 2) {</span>
+<span class="nc" id="L114">                throw new ConfigException(ConfigName.RENAMES, mappings, &quot;Invalid rename mapping: &quot; + mapping);</span>
+            }
+<span class="nc" id="L116">            m.put(parts[0], parts[1]);</span>
+<span class="nc" id="L117">        }</span>
+<span class="fc" id="L118">        return m;</span>
+    }
+
+    static Map&lt;String, String&gt; invert(Map&lt;String, String&gt; source) {
+<span class="nc" id="L122">        final Map&lt;String, String&gt; m = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        for (Map.Entry&lt;String, String&gt; e : source.entrySet()) {</span>
+<span class="nc" id="L124">            m.put(e.getValue(), e.getKey());</span>
+<span class="nc" id="L125">        }</span>
+<span class="nc" id="L126">        return m;</span>
+    }
+
+    boolean filter(String fieldName) {
+<span class="nc bnc" id="L130" title="All 6 branches missed.">        return !exclude.contains(fieldName) &amp;&amp; (include.isEmpty() || include.contains(fieldName));</span>
+    }
+
+    String renamed(String fieldName) {
+<span class="nc" id="L134">        final String mapping = renames.get(fieldName);</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">        return mapping == null ? fieldName : mapping;</span>
+    }
+
+    String reverseRenamed(String fieldName) {
+<span class="nc" id="L139">        final String mapping = reverseRenames.get(fieldName);</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        return mapping == null ? fieldName : mapping;</span>
+    }
+
+    @Override
+    public R apply(R record) {
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        if (operatingValue(record) == null) {</span>
+<span class="nc" id="L146">            return record;</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        } else if (operatingSchema(record) == null) {</span>
+<span class="nc" id="L148">            return applySchemaless(record);</span>
+        } else {
+<span class="nc" id="L150">            return applyWithSchema(record);</span>
+        }
+    }
+
+    private R applySchemaless(R record) {
+<span class="nc" id="L155">        final Map&lt;String, Object&gt; value = requireMap(operatingValue(record), PURPOSE);</span>
+
+<span class="nc" id="L157">        final Map&lt;String, Object&gt; updatedValue = new HashMap&lt;&gt;(value.size());</span>
+
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        for (Map.Entry&lt;String, Object&gt; e : value.entrySet()) {</span>
+<span class="nc" id="L160">            final String fieldName = e.getKey();</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">            if (filter(fieldName)) {</span>
+<span class="nc" id="L162">                final Object fieldValue = e.getValue();</span>
+<span class="nc" id="L163">                updatedValue.put(renamed(fieldName), fieldValue);</span>
+            }
+<span class="nc" id="L165">        }</span>
+
+<span class="nc" id="L167">        return newRecord(record, null, updatedValue);</span>
+    }
+
+    private R applyWithSchema(R record) {
+<span class="nc" id="L171">        final Struct value = requireStruct(operatingValue(record), PURPOSE);</span>
+
+<span class="nc" id="L173">        Schema updatedSchema = schemaUpdateCache.get(value.schema());</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        if (updatedSchema == null) {</span>
+<span class="nc" id="L175">            updatedSchema = makeUpdatedSchema(value.schema());</span>
+<span class="nc" id="L176">            schemaUpdateCache.put(value.schema(), updatedSchema);</span>
+        }
+
+<span class="nc" id="L179">        final Struct updatedValue = new Struct(updatedSchema);</span>
+
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        for (Field field : updatedSchema.fields()) {</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">            final Object fieldValue = replaceNullWithDefault ? value.get(reverseRenamed(field.name())) : value.getWithoutDefault(reverseRenamed(field.name()));</span>
+<span class="nc" id="L183">            updatedValue.put(field.name(), fieldValue);</span>
+<span class="nc" id="L184">        }</span>
+
+<span class="nc" id="L186">        return newRecord(record, updatedSchema, updatedValue);</span>
+    }
+
+    private Schema makeUpdatedSchema(Schema schema) {
+<span class="nc" id="L190">        final SchemaBuilder builder = SchemaUtil.copySchemaBasics(schema, SchemaBuilder.struct());</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        for (Field field : schema.fields()) {</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">            if (filter(field.name())) {</span>
+<span class="nc" id="L193">                builder.field(renamed(field.name()), field.schema());</span>
+            }
+<span class="nc" id="L195">        }</span>
+<span class="nc" id="L196">        return builder.build();</span>
+    }
+
+    @Override
+    public ConfigDef config() {
+<span class="nc" id="L201">        return CONFIG_DEF;</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L206">        schemaUpdateCache = null;</span>
+<span class="nc" id="L207">    }</span>
+
+    protected abstract Schema operatingSchema(R record);
+
+    protected abstract Object operatingValue(R record);
+
+    protected abstract R newRecord(R record, Schema updatedSchema, Object updatedValue);
+
+<span class="fc" id="L215">    public static class Key&lt;R extends ConnectRecord&lt;R&gt;&gt; extends ReplaceField&lt;R&gt; {</span>
+
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L219">            return record.keySchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L224">            return record.key();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue) {
+<span class="nc" id="L229">            return record.newRecord(record.topic(), record.kafkaPartition(), updatedSchema, updatedValue, record.valueSchema(), record.value(), record.timestamp());</span>
+        }
+
+    }
+
+<span class="fc" id="L234">    public static class Value&lt;R extends ConnectRecord&lt;R&gt;&gt; extends ReplaceField&lt;R&gt; {</span>
+
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L238">            return record.valueSchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L243">            return record.value();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue) {
+<span class="nc" id="L248">            return record.newRecord(record.topic(), record.kafkaPartition(), record.keySchema(), record.key(), updatedSchema, updatedValue, record.timestamp());</span>
+        }
+
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,1336 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OffsetMetadataManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.coordinator.group</a> &gt; <span class="el_source">OffsetMetadataManager.java</span></div><h1>OffsetMetadataManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.coordinator.group;
+
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.ApiException;
+import org.apache.kafka.common.errors.GroupIdNotFoundException;
+import org.apache.kafka.common.errors.StaleMemberEpochException;
+import org.apache.kafka.common.message.OffsetCommitRequestData;
+import org.apache.kafka.common.message.OffsetCommitResponseData;
+import org.apache.kafka.common.message.OffsetCommitResponseData.OffsetCommitResponsePartition;
+import org.apache.kafka.common.message.OffsetCommitResponseData.OffsetCommitResponseTopic;
+import org.apache.kafka.common.message.OffsetDeleteRequestData;
+import org.apache.kafka.common.message.OffsetDeleteResponseData;
+import org.apache.kafka.common.message.OffsetFetchRequestData;
+import org.apache.kafka.common.message.OffsetFetchResponseData;
+import org.apache.kafka.common.message.TxnOffsetCommitRequestData;
+import org.apache.kafka.common.message.TxnOffsetCommitResponseData;
+import org.apache.kafka.common.message.TxnOffsetCommitResponseData.TxnOffsetCommitResponsePartition;
+import org.apache.kafka.common.message.TxnOffsetCommitResponseData.TxnOffsetCommitResponseTopic;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.requests.OffsetCommitRequest;
+import org.apache.kafka.common.requests.TransactionResult;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorMetadataDelta;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorMetadataImage;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorResult;
+import org.apache.kafka.coordinator.group.GroupCoordinatorShard.DeletedTopic;
+import org.apache.kafka.coordinator.group.classic.ClassicGroup;
+import org.apache.kafka.coordinator.group.classic.ClassicGroupState;
+import org.apache.kafka.coordinator.group.generated.OffsetCommitKey;
+import org.apache.kafka.coordinator.group.generated.OffsetCommitValue;
+import org.apache.kafka.coordinator.group.metrics.GroupCoordinatorMetrics;
+import org.apache.kafka.coordinator.group.metrics.GroupCoordinatorMetricsShard;
+import org.apache.kafka.server.authorizer.AuthorizableRequestContext;
+import org.apache.kafka.timeline.SnapshotRegistry;
+import org.apache.kafka.timeline.TimelineHashMap;
+import org.apache.kafka.timeline.TimelineHashSet;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+
+import static org.apache.kafka.common.requests.OffsetFetchResponse.INVALID_OFFSET;
+import static org.apache.kafka.coordinator.group.metrics.GroupCoordinatorMetrics.OFFSET_DELETIONS_SENSOR_NAME;
+import static org.apache.kafka.coordinator.group.metrics.GroupCoordinatorMetrics.OFFSET_EXPIRED_SENSOR_NAME;
+
+/**
+ * The OffsetMetadataManager manages the offsets of all the groups. It basically maintains
+ * a mapping from group id to topic-partition to offset. This class has two kinds of methods:
+ * 1) The request handlers which handle the requests and generate a response and records to
+ *    mutate the hard state. Those records will be written by the runtime and applied to the
+ *    hard state via the replay methods.
+ * 2) The replay methods which apply records to the hard state. Those are used in the request
+ *    handling as well as during the initial loading of the records from the partitions.
+ */
+public class OffsetMetadataManager {
+
+<span class="fc" id="L83">    public static class Builder {</span>
+<span class="fc" id="L84">        private LogContext logContext = null;</span>
+<span class="fc" id="L85">        private SnapshotRegistry snapshotRegistry = null;</span>
+<span class="fc" id="L86">        private Time time = null;</span>
+<span class="fc" id="L87">        private GroupMetadataManager groupMetadataManager = null;</span>
+<span class="fc" id="L88">        private CoordinatorMetadataImage metadataImage = null;</span>
+<span class="fc" id="L89">        private GroupCoordinatorConfig config = null;</span>
+<span class="fc" id="L90">        private GroupCoordinatorMetricsShard metrics = null;</span>
+
+        public Builder withLogContext(LogContext logContext) {
+<span class="fc" id="L93">            this.logContext = logContext;</span>
+<span class="fc" id="L94">            return this;</span>
+        }
+
+        public Builder withSnapshotRegistry(SnapshotRegistry snapshotRegistry) {
+<span class="fc" id="L98">            this.snapshotRegistry = snapshotRegistry;</span>
+<span class="fc" id="L99">            return this;</span>
+        }
+
+        public Builder withTime(Time time) {
+<span class="fc" id="L103">            this.time = time;</span>
+<span class="fc" id="L104">            return this;</span>
+        }
+
+        public Builder withGroupMetadataManager(GroupMetadataManager groupMetadataManager) {
+<span class="fc" id="L108">            this.groupMetadataManager = groupMetadataManager;</span>
+<span class="fc" id="L109">            return this;</span>
+        }
+
+        public Builder withGroupCoordinatorConfig(GroupCoordinatorConfig config) {
+<span class="fc" id="L113">            this.config = config;</span>
+<span class="fc" id="L114">            return this;</span>
+        }
+
+        public Builder withMetadataImage(CoordinatorMetadataImage metadataImage) {
+<span class="nc" id="L118">            this.metadataImage = metadataImage;</span>
+<span class="nc" id="L119">            return this;</span>
+        }
+
+        public Builder withGroupCoordinatorMetricsShard(GroupCoordinatorMetricsShard metrics) {
+<span class="fc" id="L123">            this.metrics = metrics;</span>
+<span class="fc" id="L124">            return this;</span>
+        }
+
+        public OffsetMetadataManager build() {
+<span class="pc bpc" id="L128" title="1 of 2 branches missed.">            if (logContext == null) logContext = new LogContext();</span>
+<span class="pc bpc" id="L129" title="1 of 2 branches missed.">            if (snapshotRegistry == null) snapshotRegistry = new SnapshotRegistry(logContext);</span>
+<span class="pc bpc" id="L130" title="1 of 2 branches missed.">            if (metadataImage == null) metadataImage = CoordinatorMetadataImage.EMPTY;</span>
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">            if (time == null) time = Time.SYSTEM;</span>
+
+<span class="pc bpc" id="L133" title="1 of 2 branches missed.">            if (groupMetadataManager == null) {</span>
+<span class="nc" id="L134">                throw new IllegalArgumentException(&quot;GroupMetadataManager cannot be null&quot;);</span>
+            }
+
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">            if (metrics == null) {</span>
+<span class="nc" id="L138">                throw new IllegalArgumentException(&quot;GroupCoordinatorMetricsShard cannot be null&quot;);</span>
+            }
+
+<span class="fc" id="L141">            return new OffsetMetadataManager(</span>
+                snapshotRegistry,
+                logContext,
+                time,
+                metadataImage,
+                groupMetadataManager,
+                config,
+                metrics
+            );
+        }
+    }
+
+    /**
+     * The logger.
+     */
+    private final Logger log;
+
+    /**
+     * The snapshot registry.
+     */
+    private final SnapshotRegistry snapshotRegistry;
+
+    /**
+     * The system time.
+     */
+    private final Time time;
+
+    /**
+     * The metadata image.
+     */
+    private CoordinatorMetadataImage metadataImage;
+
+    /**
+     * The group metadata manager.
+     */
+    private final GroupMetadataManager groupMetadataManager;
+
+    /**
+     * The coordinator metrics.
+     */
+    private final GroupCoordinatorMetricsShard metrics;
+
+    /**
+     * The group coordinator config.
+     */
+    private final GroupCoordinatorConfig config;
+
+    /**
+     * The committed offsets.
+     */
+    private final Offsets offsets;
+
+    /**
+     * The pending transactional offsets keyed by producer id. This structure holds all the
+     * transactional offsets that are part of ongoing transactions. When the transaction is
+     * committed, they are transferred to `offsets`; when the transaction is aborted, they
+     * are removed.
+     */
+    private final TimelineHashMap&lt;Long, Offsets&gt; pendingTransactionalOffsets;
+
+    /**
+     * The open transactions (producer ids) by group id, topic name and partition id.
+     */
+    private final OpenTransactions openTransactions;
+
+    /**
+     * Tracks open transactions (producer ids) by group id, topic name and partition id.
+     * It is the responsibility of the caller to update {@link #pendingTransactionalOffsets}.
+     */
+    private class OpenTransactions {
+        /**
+         * The open transactions (producer ids) keyed by group id, topic name and partition id.
+         * Tracks whether partitions have any pending transactional offsets that have not been deleted.
+         *
+         * Values in each level of the map will never be empty collections.
+         */
+        private final TimelineHashMap&lt;String, TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, TimelineHashSet&lt;Long&gt;&gt;&gt;&gt; openTransactionsByGroup;
+
+<span class="fc" id="L219">        private OpenTransactions() {</span>
+<span class="fc" id="L220">            this.openTransactionsByGroup = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L221">        }</span>
+
+        /**
+         * Adds a producer id to the open transactions for the given group and topic partition.
+         *
+         * @param groupId    The group id.
+         * @param topic      The topic name.
+         * @param partition  The partition.
+         * @param producerId The producer id.
+         * @return {@code true} if the partition did not already have a pending offset from the producer id.
+         */
+        private boolean add(String groupId, String topic, int partition, long producerId) {
+<span class="nc" id="L233">            return openTransactionsByGroup</span>
+<span class="nc" id="L234">                .computeIfAbsent(groupId, __ -&gt; new TimelineHashMap&lt;&gt;(snapshotRegistry, 1))</span>
+<span class="nc" id="L235">                .computeIfAbsent(topic, __ -&gt; new TimelineHashMap&lt;&gt;(snapshotRegistry, 1))</span>
+<span class="nc" id="L236">                .computeIfAbsent(partition, __ -&gt; new TimelineHashSet&lt;&gt;(snapshotRegistry, 1))</span>
+<span class="nc" id="L237">                .add(producerId);</span>
+        }
+
+        /**
+         * Clears all open transactions for the given group and topic partition.
+         *
+         * @param groupId    The group id.
+         * @param topic      The topic name.
+         * @param partition  The partition.
+         */
+        private void clear(String groupId, String topic, int partition) {
+<span class="nc" id="L248">            TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, TimelineHashSet&lt;Long&gt;&gt;&gt; openTransactionsByTopic =</span>
+<span class="nc" id="L249">                openTransactionsByGroup.get(groupId);</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">            if (openTransactionsByTopic == null) return;</span>
+
+<span class="nc" id="L252">            TimelineHashMap&lt;Integer, TimelineHashSet&lt;Long&gt;&gt; openTransactionsByPartition = openTransactionsByTopic.get(topic);</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">            if (openTransactionsByPartition == null) return;</span>
+
+<span class="nc" id="L255">            openTransactionsByPartition.remove(partition);</span>
+
+<span class="nc bnc" id="L257" title="All 2 branches missed.">            if (openTransactionsByPartition.isEmpty()) {</span>
+<span class="nc" id="L258">                openTransactionsByTopic.remove(topic);</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">                if (openTransactionsByTopic.isEmpty()) {</span>
+<span class="nc" id="L260">                    openTransactionsByGroup.remove(groupId);</span>
+                }
+            }
+<span class="nc" id="L263">        }</span>
+
+        /**
+         * Returns {@code true} if the given group has any pending transactional offsets.
+         *
+         * @param groupId The group id.
+         * @return {@code true} if the given group has any pending transactional offsets.
+         */
+        private boolean contains(String groupId) {
+<span class="nc" id="L272">            return openTransactionsByGroup.containsKey(groupId);</span>
+        }
+
+        /**
+         * Returns {@code true} if the given group has any pending transactional offsets for the given topic and partition.
+         *
+         * @param groupId   The group id.
+         * @param topic     The topic name.
+         * @param partition The partition.
+         * @return {@code true} if the given group has any pending transactional offsets for the given topic and partition.
+         */
+        private boolean contains(String groupId, String topic, int partition) {
+<span class="nc" id="L284">            TimelineHashSet&lt;Long&gt; openTransactions = get(groupId, topic, partition);</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            return openTransactions != null;</span>
+        }
+
+        /**
+         * Performs the given action for each partition with a pending transactional offset for the given group.
+         *
+         * @param groupId The group id.
+         * @param action  The action to be performed for each partition with a pending transactional offset.
+         */
+        private void forEachTopicPartition(String groupId, BiConsumer&lt;String, Integer&gt; action) {
+<span class="fc" id="L295">            TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, TimelineHashSet&lt;Long&gt;&gt;&gt; openTransactionsByTopic =</span>
+<span class="fc" id="L296">                openTransactionsByGroup.get(groupId);</span>
+<span class="pc bpc" id="L297" title="1 of 2 branches missed.">            if (openTransactionsByTopic == null) return;</span>
+
+<span class="nc" id="L299">            openTransactionsByTopic.forEach((topic, openTransactionsByPartition) -&gt; {</span>
+<span class="nc" id="L300">                openTransactionsByPartition.forEach((partition, producerIds) -&gt; {</span>
+<span class="nc" id="L301">                    action.accept(topic, partition);</span>
+<span class="nc" id="L302">                });</span>
+<span class="nc" id="L303">            });</span>
+<span class="nc" id="L304">        }</span>
+
+        /**
+         * Performs the given action for each producer id with a pending transactional offset for the given group and topic partition.
+         *
+         * @param groupId   The group id.
+         * @param topic     The topic name.
+         * @param partition The partition.
+         * @param action    The action to be performed for each producer id with a pending transactional offset.
+         */
+        private void forEach(String groupId, String topic, int partition, Consumer&lt;Long&gt; action) {
+<span class="nc" id="L315">            TimelineHashSet&lt;Long&gt; openTransactions = get(groupId, topic, partition);</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">            if (openTransactions == null) return;</span>
+
+<span class="nc" id="L318">            openTransactions.forEach(action);</span>
+<span class="nc" id="L319">        }</span>
+
+        /**
+         * Gets the set of producer ids with pending transactional offsets for the given group and topic partition.
+         *
+         * @param groupId   The group id.
+         * @param topic     The topic name.
+         * @param partition The partition.
+         * @return The set of producer ids with pending transactional offsets for the given group and topic partition.
+         */
+        private TimelineHashSet&lt;Long&gt; get(String groupId, String topic, int partition) {
+<span class="nc" id="L330">            TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, TimelineHashSet&lt;Long&gt;&gt;&gt; openTransactionsByTopic =</span>
+<span class="nc" id="L331">                openTransactionsByGroup.get(groupId);</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">            if (openTransactionsByTopic == null) return null;</span>
+
+<span class="nc" id="L334">            TimelineHashMap&lt;Integer, TimelineHashSet&lt;Long&gt;&gt; openTransactionsByPartition = openTransactionsByTopic.get(topic);</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            if (openTransactionsByPartition == null) return null;</span>
+
+<span class="nc" id="L337">            return openTransactionsByPartition.get(partition);</span>
+        }
+
+        /**
+         * Removes a producer id from the open transactions for the given group and topic partition.
+         *
+         * @param groupId    The group id.
+         * @param topic      The topic name.
+         * @param partition  The partition.
+         * @param producerId The producer id.
+         * @return {@code true} if the group and topic partition had a pending transactional offset from the producer id.
+         */
+        private boolean remove(String groupId, String topic, int partition, long producerId) {
+<span class="nc" id="L350">            TimelineHashSet&lt;Long&gt; openTransactions = get(groupId, topic, partition);</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">            if (openTransactions == null) return false;</span>
+
+<span class="nc" id="L353">            boolean removed = openTransactions.remove(producerId);</span>
+
+<span class="nc bnc" id="L355" title="All 2 branches missed.">            if (openTransactions.isEmpty()) {</span>
+                // Re-use the clean up in clear.
+<span class="nc" id="L357">                clear(groupId, topic, partition);</span>
+            }
+
+<span class="nc" id="L360">            return removed;</span>
+        }
+    }
+
+    private class Offsets {
+        /**
+         * The offsets keyed by group id, topic name and partition id.
+         */
+        private final TimelineHashMap&lt;String, TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, OffsetAndMetadata&gt;&gt;&gt; offsetsByGroup;
+
+<span class="fc" id="L370">        private Offsets() {</span>
+<span class="fc" id="L371">            this.offsetsByGroup = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L372">        }</span>
+
+        private OffsetAndMetadata get(
+            String groupId,
+            String topic,
+            int partition
+        ) {
+<span class="nc" id="L379">            TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, OffsetAndMetadata&gt;&gt; topicOffsets = offsetsByGroup.get(groupId);</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">            if (topicOffsets == null) {</span>
+<span class="nc" id="L381">                return null;</span>
+            } else {
+<span class="nc" id="L383">                TimelineHashMap&lt;Integer, OffsetAndMetadata&gt; partitionOffsets = topicOffsets.get(topic);</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">                if (partitionOffsets == null) {</span>
+<span class="nc" id="L385">                    return null;</span>
+                } else {
+<span class="nc" id="L387">                    return partitionOffsets.get(partition);</span>
+                }
+            }
+        }
+
+        private OffsetAndMetadata put(
+            String groupId,
+            String topic,
+            int partition,
+            OffsetAndMetadata offsetAndMetadata
+        ) {
+<span class="fc" id="L398">            TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, OffsetAndMetadata&gt;&gt; topicOffsets = offsetsByGroup</span>
+<span class="fc" id="L399">                .computeIfAbsent(groupId, __ -&gt; new TimelineHashMap&lt;&gt;(snapshotRegistry, 0));</span>
+<span class="fc" id="L400">            TimelineHashMap&lt;Integer, OffsetAndMetadata&gt; partitionOffsets = topicOffsets</span>
+<span class="fc" id="L401">                .computeIfAbsent(topic, __ -&gt; new TimelineHashMap&lt;&gt;(snapshotRegistry, 0));</span>
+<span class="fc" id="L402">            return partitionOffsets.put(partition, offsetAndMetadata);</span>
+        }
+
+        private OffsetAndMetadata remove(
+            String groupId,
+            String topic,
+            int partition
+        ) {
+<span class="nc" id="L410">            TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, OffsetAndMetadata&gt;&gt; topicOffsets = offsetsByGroup.get(groupId);</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">            if (topicOffsets == null)</span>
+<span class="nc" id="L412">                return null;</span>
+
+<span class="nc" id="L414">            TimelineHashMap&lt;Integer, OffsetAndMetadata&gt; partitionOffsets = topicOffsets.get(topic);</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">            if (partitionOffsets == null)</span>
+<span class="nc" id="L416">                return null;</span>
+
+<span class="nc" id="L418">            OffsetAndMetadata removedValue = partitionOffsets.remove(partition);</span>
+
+<span class="nc bnc" id="L420" title="All 2 branches missed.">            if (partitionOffsets.isEmpty())</span>
+<span class="nc" id="L421">                topicOffsets.remove(topic);</span>
+
+<span class="nc bnc" id="L423" title="All 2 branches missed.">            if (topicOffsets.isEmpty())</span>
+<span class="nc" id="L424">                offsetsByGroup.remove(groupId);</span>
+
+<span class="nc" id="L426">            return removedValue;</span>
+        }
+    }
+
+    OffsetMetadataManager(
+        SnapshotRegistry snapshotRegistry,
+        LogContext logContext,
+        Time time,
+        CoordinatorMetadataImage metadataImage,
+        GroupMetadataManager groupMetadataManager,
+        GroupCoordinatorConfig config,
+        GroupCoordinatorMetricsShard metrics
+<span class="fc" id="L438">    ) {</span>
+<span class="fc" id="L439">        this.snapshotRegistry = snapshotRegistry;</span>
+<span class="fc" id="L440">        this.log = logContext.logger(OffsetMetadataManager.class);</span>
+<span class="fc" id="L441">        this.time = time;</span>
+<span class="fc" id="L442">        this.metadataImage = metadataImage;</span>
+<span class="fc" id="L443">        this.groupMetadataManager = groupMetadataManager;</span>
+<span class="fc" id="L444">        this.config = config;</span>
+<span class="fc" id="L445">        this.metrics = metrics;</span>
+<span class="fc" id="L446">        this.offsets = new Offsets();</span>
+<span class="fc" id="L447">        this.pendingTransactionalOffsets = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L448">        this.openTransactions = new OpenTransactions();</span>
+<span class="fc" id="L449">    }</span>
+
+    /**
+     * Validates an OffsetCommit request.
+     *
+     * @param context The request context.
+     * @param request The actual request.
+     * @return A validator for per-partition validation.
+     */
+    private CommitPartitionValidator validateOffsetCommit(
+        AuthorizableRequestContext context,
+        OffsetCommitRequestData request
+    ) throws ApiException {
+        Group group;
+        try {
+<span class="fc" id="L464">            group = groupMetadataManager.group(request.groupId());</span>
+<span class="nc" id="L465">        } catch (GroupIdNotFoundException ex) {</span>
+<span class="nc bnc" id="L466" title="All 2 branches missed.">            if (request.generationIdOrMemberEpoch() &lt; 0) {</span>
+                // If the group does not exist and generation id is -1, the request comes from
+                // either the admin client or a consumer which does not use the group management
+                // facility. In this case, a so-called simple group is created and the request
+                // is accepted.
+<span class="nc" id="L471">                log.info(&quot;[GroupId {}] Creating a simple consumer group via manual offset commit.&quot;, request.groupId());</span>
+<span class="nc" id="L472">                group = groupMetadataManager.getOrMaybeCreateClassicGroup(request.groupId(), true);</span>
+            } else {
+<span class="nc bnc" id="L474" title="All 2 branches missed.">                if (context.requestVersion() &gt;= 9) {</span>
+                    // Starting from version 9 of the OffsetCommit API, we return GROUP_ID_NOT_FOUND
+                    // if the group does not exist. This error works for both the old and the new
+                    // protocol for clients using this version of the API.
+<span class="nc" id="L478">                    throw ex;</span>
+                } else {
+                    // For older version, we return ILLEGAL_GENERATION to preserve the backward
+                    // compatibility.
+<span class="nc" id="L482">                    throw Errors.ILLEGAL_GENERATION.exception();</span>
+                }
+            }
+<span class="fc" id="L485">        }</span>
+
+<span class="fc" id="L487">        CommitPartitionValidator validator = group.validateOffsetCommit(</span>
+<span class="fc" id="L488">            request.memberId(),</span>
+<span class="fc" id="L489">            request.groupInstanceId(),</span>
+<span class="fc" id="L490">            request.generationIdOrMemberEpoch(),</span>
+            false,
+<span class="fc" id="L492">            context.requestVersion()</span>
+        );
+
+        // In the old consumer group protocol, the offset commits maintain the session if
+        // the group is in Stable or PreparingRebalance state.
+<span class="pc bpc" id="L497" title="1 of 2 branches missed.">        if (group.type() == Group.GroupType.CLASSIC) {</span>
+<span class="fc" id="L498">            ClassicGroup classicGroup = (ClassicGroup) group;</span>
+<span class="pc bpc" id="L499" title="3 of 4 branches missed.">            if (classicGroup.isInState(ClassicGroupState.STABLE) || classicGroup.isInState(ClassicGroupState.PREPARING_REBALANCE)) {</span>
+<span class="fc" id="L500">                groupMetadataManager.rescheduleClassicGroupMemberHeartbeat(</span>
+                    classicGroup,
+<span class="fc" id="L502">                    classicGroup.member(request.memberId())</span>
+                );
+            }
+        }
+
+<span class="fc" id="L507">        return validator;</span>
+    }
+
+    /**
+     * Validates an TxnOffsetCommit request.
+     *
+     * @param context The request context.
+     * @param request The actual request.
+     * @return A validator for per-partition validation.
+     */
+    private CommitPartitionValidator validateTransactionalOffsetCommit(
+        AuthorizableRequestContext context,
+        TxnOffsetCommitRequestData request
+    ) throws ApiException {
+        Group group;
+        try {
+<span class="nc" id="L523">            group = groupMetadataManager.group(request.groupId());</span>
+<span class="nc" id="L524">        } catch (GroupIdNotFoundException ex) {</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">            if (request.generationId() &lt; 0) {</span>
+                // If the group does not exist and generation id is -1, the request comes from
+                // either the admin client or a consumer which does not use the group management
+                // facility. In this case, a so-called simple group is created and the request
+                // is accepted.
+<span class="nc" id="L530">                group = groupMetadataManager.getOrMaybeCreateClassicGroup(request.groupId(), true);</span>
+            } else {
+<span class="nc" id="L532">                throw Errors.ILLEGAL_GENERATION.exception();</span>
+            }
+<span class="nc" id="L534">        }</span>
+
+        try {
+<span class="nc" id="L537">            return group.validateOffsetCommit(</span>
+<span class="nc" id="L538">                request.memberId(),</span>
+<span class="nc" id="L539">                request.groupInstanceId(),</span>
+<span class="nc" id="L540">                request.generationId(),</span>
+                true,
+<span class="nc" id="L542">                context.requestVersion()</span>
+            );
+<span class="nc" id="L544">        } catch (StaleMemberEpochException ex) {</span>
+<span class="nc" id="L545">            throw Errors.ILLEGAL_GENERATION.exception();</span>
+        }
+    }
+
+    /**
+     * Validates an OffsetFetch request.
+     *
+     * @param request               The actual request.
+     * @param lastCommittedOffset   The last committed offsets in the timeline.
+     */
+    private void validateOffsetFetch(
+        OffsetFetchRequestData.OffsetFetchRequestGroup request,
+        long lastCommittedOffset
+    ) throws GroupIdNotFoundException {
+<span class="fc" id="L559">        Group group = groupMetadataManager.group(request.groupId(), lastCommittedOffset);</span>
+<span class="fc" id="L560">        group.validateOffsetFetch(</span>
+<span class="fc" id="L561">            request.memberId(),</span>
+<span class="fc" id="L562">            request.memberEpoch(),</span>
+            lastCommittedOffset
+        );
+<span class="fc" id="L565">    }</span>
+
+    /**
+     * Validates an OffsetDelete request.
+     *
+     * @param request The actual request.
+     */
+    private Group validateOffsetDelete(
+        OffsetDeleteRequestData request
+    ) throws GroupIdNotFoundException {
+<span class="nc" id="L575">        Group group = groupMetadataManager.group(request.groupId());</span>
+<span class="nc" id="L576">        group.validateOffsetDelete();</span>
+<span class="nc" id="L577">        return group;</span>
+    }
+
+    /**
+     * @return True if the committed metadata is invalid; False otherwise.
+     */
+    private boolean isMetadataInvalid(String metadata) {
+<span class="pc bpc" id="L584" title="2 of 4 branches missed.">        return metadata != null &amp;&amp; metadata.length() &gt; config.offsetMetadataMaxSize();</span>
+    }
+
+    /**
+     * Computes the expiration timestamp based on the retention time provided in the OffsetCommit
+     * request.
+     *
+     * The &quot;default&quot; expiration timestamp is defined as now + retention. The retention may be overridden
+     * in versions from v2 to v4. Otherwise, the retention defined on the broker is used. If an explicit
+     * commit timestamp is provided (v1 only), the expiration timestamp is computed based on that.
+     *
+     * @param retentionTimeMs   The retention time in milliseconds.
+     * @param currentTimeMs     The current time in milliseconds.
+     *
+     * @return An optional containing the expiration timestamp if defined; an empty optional otherwise.
+     */
+    private static OptionalLong expireTimestampMs(
+        long retentionTimeMs,
+        long currentTimeMs
+    ) {
+<span class="pc bpc" id="L604" title="1 of 2 branches missed.">        return retentionTimeMs == OffsetCommitRequest.DEFAULT_RETENTION_TIME ?</span>
+<span class="pc" id="L605">            OptionalLong.empty() : OptionalLong.of(currentTimeMs + retentionTimeMs);</span>
+    }
+
+    /**
+     * Handles an OffsetCommit request.
+     *
+     * @param context The request context.
+     * @param request The OffsetCommit request.
+     *
+     * @return A Result containing the OffsetCommitResponseData response and
+     *         a list of records to update the state machine.
+     */
+    public CoordinatorResult&lt;OffsetCommitResponseData, CoordinatorRecord&gt; commitOffset(
+        AuthorizableRequestContext context,
+        OffsetCommitRequestData request
+    ) throws ApiException {
+<span class="fc" id="L621">        CommitPartitionValidator validator = validateOffsetCommit(context, request);</span>
+
+<span class="fc" id="L623">        final OffsetCommitResponseData response = new OffsetCommitResponseData();</span>
+<span class="fc" id="L624">        final List&lt;CoordinatorRecord&gt; records = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L625">        final long currentTimeMs = time.milliseconds();</span>
+<span class="fc" id="L626">        final OptionalLong expireTimestampMs = expireTimestampMs(request.retentionTimeMs(), currentTimeMs);</span>
+
+<span class="fc" id="L628">        request.topics().forEach(topic -&gt; {</span>
+<span class="fc" id="L629">            final OffsetCommitResponseTopic topicResponse = new OffsetCommitResponseTopic()</span>
+<span class="fc" id="L630">                .setTopicId(topic.topicId())</span>
+<span class="fc" id="L631">                .setName(topic.name());</span>
+<span class="fc" id="L632">            response.topics().add(topicResponse);</span>
+
+<span class="fc" id="L634">            topic.partitions().forEach(partition -&gt; {</span>
+<span class="pc bpc" id="L635" title="1 of 2 branches missed.">                if (isMetadataInvalid(partition.committedMetadata())) {</span>
+<span class="nc" id="L636">                    topicResponse.partitions().add(new OffsetCommitResponsePartition()</span>
+<span class="nc" id="L637">                        .setPartitionIndex(partition.partitionIndex())</span>
+<span class="nc" id="L638">                        .setErrorCode(Errors.OFFSET_METADATA_TOO_LARGE.code()));</span>
+                } else {
+                    // Validate commit per-partition
+<span class="fc" id="L641">                    validator.validate(</span>
+<span class="fc" id="L642">                        topic.name(),</span>
+<span class="fc" id="L643">                        topic.topicId(),</span>
+<span class="fc" id="L644">                        partition.partitionIndex()</span>
+                    );
+
+<span class="fc" id="L647">                    log.debug(&quot;[GroupId {}] Committing offsets {} for partition {}-{}-{} from member {} with leader epoch {}.&quot;,</span>
+<span class="fc" id="L648">                        request.groupId(), partition.committedOffset(), topic.topicId(), topic.name(), partition.partitionIndex(),</span>
+<span class="fc" id="L649">                        request.memberId(), partition.committedLeaderEpoch());</span>
+
+<span class="fc" id="L651">                    topicResponse.partitions().add(new OffsetCommitResponsePartition()</span>
+<span class="fc" id="L652">                        .setPartitionIndex(partition.partitionIndex())</span>
+<span class="fc" id="L653">                        .setErrorCode(Errors.NONE.code()));</span>
+
+<span class="fc" id="L655">                    final OffsetAndMetadata offsetAndMetadata = OffsetAndMetadata.fromRequest(</span>
+<span class="fc" id="L656">                        topic.topicId(),</span>
+                        partition,
+                        currentTimeMs,
+                        expireTimestampMs
+                    );
+
+<span class="fc" id="L662">                    records.add(GroupCoordinatorRecordHelpers.newOffsetCommitRecord(</span>
+<span class="fc" id="L663">                        request.groupId(),</span>
+<span class="fc" id="L664">                        topic.name(),</span>
+<span class="fc" id="L665">                        partition.partitionIndex(),</span>
+                        offsetAndMetadata
+                    ));
+                }
+<span class="fc" id="L669">            });</span>
+<span class="fc" id="L670">        });</span>
+
+<span class="pc bpc" id="L672" title="1 of 2 branches missed.">        if (!records.isEmpty()) {</span>
+<span class="fc" id="L673">            metrics.record(GroupCoordinatorMetrics.OFFSET_COMMITS_SENSOR_NAME, records.size());</span>
+        }
+
+<span class="fc" id="L676">        return new CoordinatorResult&lt;&gt;(records, response);</span>
+    }
+
+    /**
+     * Handles an TxnOffsetCommit request.
+     *
+     * @param context The request context.
+     * @param request The TxnOffsetCommit request.
+     *
+     * @return A Result containing the TxnOffsetCommitResponseData response and
+     *         a list of records to update the state machine.
+     */
+    public CoordinatorResult&lt;TxnOffsetCommitResponseData, CoordinatorRecord&gt; commitTransactionalOffset(
+        AuthorizableRequestContext context,
+        TxnOffsetCommitRequestData request
+    ) throws ApiException {
+<span class="nc" id="L692">        CommitPartitionValidator validator = validateTransactionalOffsetCommit(context, request);</span>
+
+<span class="nc" id="L694">        final TxnOffsetCommitResponseData response = new TxnOffsetCommitResponseData();</span>
+<span class="nc" id="L695">        final List&lt;CoordinatorRecord&gt; records = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L696">        final long currentTimeMs = time.milliseconds();</span>
+
+<span class="nc" id="L698">        request.topics().forEach(topic -&gt; {</span>
+<span class="nc" id="L699">            final TxnOffsetCommitResponseTopic topicResponse = new TxnOffsetCommitResponseTopic().setName(topic.name());</span>
+<span class="nc" id="L700">            response.topics().add(topicResponse);</span>
+
+            // Resolve topicId from the metadata image.
+<span class="nc" id="L703">            final Uuid resolvedTopicId = metadataImage</span>
+<span class="nc" id="L704">                .topicMetadata(topic.name())</span>
+<span class="nc" id="L705">                .map(CoordinatorMetadataImage.TopicMetadata::id)</span>
+<span class="nc" id="L706">                .orElse(Uuid.ZERO_UUID);</span>
+
+            // If the topic doesn't exist in metadata, and we need to validate the member's assignment,
+            // throw ILLEGAL_GENERATION.
+<span class="nc bnc" id="L710" title="All 4 branches missed.">            if (resolvedTopicId.equals(Uuid.ZERO_UUID) &amp;&amp; validator != CommitPartitionValidator.NO_OP) {</span>
+<span class="nc" id="L711">                throw Errors.ILLEGAL_GENERATION.exception();</span>
+            }
+
+<span class="nc" id="L714">            topic.partitions().forEach(partition -&gt; {</span>
+<span class="nc bnc" id="L715" title="All 2 branches missed.">                if (isMetadataInvalid(partition.committedMetadata())) {</span>
+<span class="nc" id="L716">                    topicResponse.partitions().add(new TxnOffsetCommitResponsePartition()</span>
+<span class="nc" id="L717">                        .setPartitionIndex(partition.partitionIndex())</span>
+<span class="nc" id="L718">                        .setErrorCode(Errors.OFFSET_METADATA_TOO_LARGE.code()));</span>
+                } else {
+                    // Validate commit per-partition
+                    try {
+<span class="nc" id="L722">                        validator.validate(</span>
+<span class="nc" id="L723">                            topic.name(),</span>
+                            resolvedTopicId,
+<span class="nc" id="L725">                            partition.partitionIndex()</span>
+                        );
+<span class="nc" id="L727">                    } catch (StaleMemberEpochException ex) {</span>
+<span class="nc" id="L728">                        throw Errors.ILLEGAL_GENERATION.exception();</span>
+<span class="nc" id="L729">                    }</span>
+
+<span class="nc" id="L731">                    log.debug(&quot;[GroupId {}] Committing transactional offsets {} for partition {}-{} from member {} with leader epoch {}.&quot;,</span>
+<span class="nc" id="L732">                        request.groupId(), partition.committedOffset(), topic.name(), partition.partitionIndex(),</span>
+<span class="nc" id="L733">                        request.memberId(), partition.committedLeaderEpoch());</span>
+
+<span class="nc" id="L735">                    topicResponse.partitions().add(new TxnOffsetCommitResponsePartition()</span>
+<span class="nc" id="L736">                        .setPartitionIndex(partition.partitionIndex())</span>
+<span class="nc" id="L737">                        .setErrorCode(Errors.NONE.code()));</span>
+
+<span class="nc" id="L739">                    final OffsetAndMetadata offsetAndMetadata = OffsetAndMetadata.fromRequest(</span>
+                        partition,
+                        currentTimeMs
+                    );
+
+<span class="nc" id="L744">                    records.add(GroupCoordinatorRecordHelpers.newOffsetCommitRecord(</span>
+<span class="nc" id="L745">                        request.groupId(),</span>
+<span class="nc" id="L746">                        topic.name(),</span>
+<span class="nc" id="L747">                        partition.partitionIndex(),</span>
+                        offsetAndMetadata
+                    ));
+                }
+<span class="nc" id="L751">            });</span>
+<span class="nc" id="L752">        });</span>
+
+<span class="nc bnc" id="L754" title="All 2 branches missed.">        if (!records.isEmpty()) {</span>
+<span class="nc" id="L755">            metrics.record(GroupCoordinatorMetrics.OFFSET_COMMITS_SENSOR_NAME, records.size());</span>
+        }
+
+<span class="nc" id="L758">        return new CoordinatorResult&lt;&gt;(records, response);</span>
+    }
+
+    /**
+     * Handles an OffsetDelete request.
+     *
+     * @param request The OffsetDelete request.
+     *
+     * @return A Result containing the OffsetDeleteResponseData response and
+     *         a list of records to update the state machine.
+     */
+    public CoordinatorResult&lt;OffsetDeleteResponseData, CoordinatorRecord&gt; deleteOffsets(
+        OffsetDeleteRequestData request
+    ) throws ApiException {
+<span class="nc" id="L772">        final Group group = validateOffsetDelete(request);</span>
+<span class="nc" id="L773">        final List&lt;CoordinatorRecord&gt; records = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L774">        final OffsetDeleteResponseData.OffsetDeleteResponseTopicCollection responseTopicCollection =</span>
+            new OffsetDeleteResponseData.OffsetDeleteResponseTopicCollection();
+
+<span class="nc" id="L777">        request.topics().forEach(topic -&gt; {</span>
+<span class="nc" id="L778">            final OffsetDeleteResponseData.OffsetDeleteResponsePartitionCollection responsePartitionCollection =</span>
+                new OffsetDeleteResponseData.OffsetDeleteResponsePartitionCollection();
+
+<span class="nc bnc" id="L781" title="All 2 branches missed.">            if (group.isSubscribedToTopic(topic.name())) {</span>
+<span class="nc" id="L782">                topic.partitions().forEach(partition -&gt;</span>
+<span class="nc" id="L783">                    responsePartitionCollection.add(new OffsetDeleteResponseData.OffsetDeleteResponsePartition()</span>
+<span class="nc" id="L784">                        .setPartitionIndex(partition.partitionIndex())</span>
+<span class="nc" id="L785">                        .setErrorCode(Errors.GROUP_SUBSCRIBED_TO_TOPIC.code())</span>
+                    )
+                );
+            } else {
+<span class="nc" id="L789">                topic.partitions().forEach(partition -&gt; {</span>
+                    // We always add the partition to the response.
+<span class="nc" id="L791">                    responsePartitionCollection.add(new OffsetDeleteResponseData.OffsetDeleteResponsePartition()</span>
+<span class="nc" id="L792">                        .setPartitionIndex(partition.partitionIndex())</span>
+                    );
+
+                    // A tombstone is written if an offset is present in the main storage or
+                    // if a pending transactional offset exists.
+<span class="nc bnc" id="L797" title="All 2 branches missed.">                    if (hasCommittedOffset(request.groupId(), topic.name(), partition.partitionIndex()) ||</span>
+<span class="nc bnc" id="L798" title="All 2 branches missed.">                        hasPendingTransactionalOffsets(request.groupId(), topic.name(), partition.partitionIndex())) {</span>
+<span class="nc" id="L799">                        records.add(GroupCoordinatorRecordHelpers.newOffsetCommitTombstoneRecord(</span>
+<span class="nc" id="L800">                            request.groupId(),</span>
+<span class="nc" id="L801">                            topic.name(),</span>
+<span class="nc" id="L802">                            partition.partitionIndex()</span>
+                        ));
+                    }
+<span class="nc" id="L805">                });</span>
+            }
+
+<span class="nc" id="L808">            responseTopicCollection.add(new OffsetDeleteResponseData.OffsetDeleteResponseTopic()</span>
+<span class="nc" id="L809">                .setName(topic.name())</span>
+<span class="nc" id="L810">                .setPartitions(responsePartitionCollection)</span>
+            );
+<span class="nc" id="L812">        });</span>
+<span class="nc" id="L813">        metrics.record(OFFSET_DELETIONS_SENSOR_NAME, records.size());</span>
+
+<span class="nc" id="L815">        return new CoordinatorResult&lt;&gt;(</span>
+            records,
+<span class="nc" id="L817">            new OffsetDeleteResponseData().setTopics(responseTopicCollection)</span>
+        );
+    }
+
+    /**
+     * Deletes offsets as part of a DeleteGroups request.
+     * Populates the record list passed in with records to update the state machine.
+     * Validations are done in {@link GroupCoordinatorShard#deleteGroups(AuthorizableRequestContext, List)}
+     *
+     * @param groupId The id of the given group.
+     * @param records The record list to populate.
+     *
+     * @return The number of offsets to be deleted.
+     */
+    public int deleteAllOffsets(
+        String groupId,
+        List&lt;CoordinatorRecord&gt; records
+    ) {
+<span class="fc" id="L835">        TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, OffsetAndMetadata&gt;&gt; offsetsByTopic = offsets.offsetsByGroup.get(groupId);</span>
+<span class="fc" id="L836">        AtomicInteger numDeletedOffsets = new AtomicInteger();</span>
+
+        // Delete all the offsets from the main storage.
+<span class="pc bpc" id="L839" title="1 of 2 branches missed.">        if (offsetsByTopic != null) {</span>
+<span class="nc" id="L840">            offsetsByTopic.forEach((topic, offsetsByPartition) -&gt;</span>
+<span class="nc" id="L841">                offsetsByPartition.keySet().forEach(partition -&gt; {</span>
+<span class="nc" id="L842">                    records.add(GroupCoordinatorRecordHelpers.newOffsetCommitTombstoneRecord(groupId, topic, partition));</span>
+<span class="nc" id="L843">                    numDeletedOffsets.getAndIncrement();</span>
+<span class="nc" id="L844">                })</span>
+            );
+        }
+
+        // Delete all the pending transactional offsets too. Here we only write a tombstone
+        // if the topic-partition was not in the main storage because we don't need to write
+        // two consecutive tombstones.
+<span class="fc" id="L851">        openTransactions.forEachTopicPartition(groupId, (topic, partition) -&gt; {</span>
+<span class="nc bnc" id="L852" title="All 2 branches missed.">            if (!hasCommittedOffset(groupId, topic, partition)) {</span>
+<span class="nc" id="L853">                records.add(GroupCoordinatorRecordHelpers.newOffsetCommitTombstoneRecord(groupId, topic, partition));</span>
+<span class="nc" id="L854">                numDeletedOffsets.getAndIncrement();</span>
+            }
+<span class="nc" id="L856">        });</span>
+
+<span class="fc" id="L858">        return numDeletedOffsets.get();</span>
+    }
+
+    /**
+     * @return true iff there is at least one pending transactional offset for the given
+     * group, topic and partition.
+     *
+     * Package private for testing.
+     */
+    boolean hasPendingTransactionalOffsets(
+        String groupId,
+        String topic,
+        int partition
+    ) {
+<span class="nc" id="L872">        return openTransactions.contains(groupId, topic, partition);</span>
+    }
+
+    /**
+     * @return true iff there is a committed offset in the main offset store for the
+     * given group, topic and partition.
+     *
+     * Package private for testing.
+     */
+    boolean hasCommittedOffset(
+        String groupId,
+        String topic,
+        int partition
+    ) {
+<span class="nc bnc" id="L886" title="All 2 branches missed.">        return offsets.get(groupId, topic, partition) != null;</span>
+    }
+
+    /**
+     * Fetch offsets for a given Group.
+     *
+     * @param request               The OffsetFetchRequestGroup request.
+     * @param lastCommittedOffset   The last committed offsets in the timeline.
+     *
+     * @return A List of OffsetFetchResponseTopics response.
+     */
+    public OffsetFetchResponseData.OffsetFetchResponseGroup fetchOffsets(
+        OffsetFetchRequestData.OffsetFetchRequestGroup request,
+        long lastCommittedOffset
+    ) throws ApiException {
+<span class="pc bpc" id="L901" title="1 of 2 branches missed.">        final boolean requireStable = lastCommittedOffset == Long.MAX_VALUE;</span>
+
+<span class="fc" id="L903">        boolean failAllPartitions = false;</span>
+        try {
+<span class="fc" id="L905">            validateOffsetFetch(request, lastCommittedOffset);</span>
+<span class="nc" id="L906">        } catch (GroupIdNotFoundException ex) {</span>
+<span class="nc" id="L907">            failAllPartitions = true;</span>
+<span class="fc" id="L908">        }</span>
+
+<span class="fc" id="L910">        final List&lt;OffsetFetchResponseData.OffsetFetchResponseTopics&gt; topicResponses = new ArrayList&lt;&gt;(request.topics().size());</span>
+        final TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, OffsetAndMetadata&gt;&gt; groupOffsets =
+<span class="pc bpc" id="L912" title="1 of 2 branches missed.">            failAllPartitions ? null : offsets.offsetsByGroup.get(request.groupId(), lastCommittedOffset);</span>
+        // We inline the lookups from hasPendingTransactionalOffsets here, to avoid repeating string
+        // comparisons of group ids and topic names for every partition. They're only used when the
+        // client has requested stable offsets.
+        final TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, TimelineHashSet&lt;Long&gt;&gt;&gt; openTransactionsByTopic =
+<span class="pc bpc" id="L917" title="1 of 2 branches missed.">            requireStable ? openTransactions.openTransactionsByGroup.get(request.groupId(), lastCommittedOffset) : null;</span>
+
+<span class="fc" id="L919">        request.topics().forEach(topic -&gt; {</span>
+<span class="fc" id="L920">            final OffsetFetchResponseData.OffsetFetchResponseTopics topicResponse =</span>
+                new OffsetFetchResponseData.OffsetFetchResponseTopics()
+<span class="fc" id="L922">                    .setTopicId(topic.topicId())</span>
+<span class="fc" id="L923">                    .setName(topic.name());</span>
+<span class="fc" id="L924">            topicResponses.add(topicResponse);</span>
+
+<span class="pc bpc" id="L926" title="1 of 2 branches missed.">            final TimelineHashMap&lt;Integer, OffsetAndMetadata&gt; topicOffsets = groupOffsets == null ?</span>
+<span class="pc" id="L927">                null : groupOffsets.get(topic.name(), lastCommittedOffset);</span>
+            final TimelineHashMap&lt;Integer, TimelineHashSet&lt;Long&gt;&gt; openTransactionsByPartition =
+<span class="pc bpc" id="L929" title="2 of 4 branches missed.">                (requireStable &amp;&amp; openTransactionsByTopic != null) ? openTransactionsByTopic.get(topic.name(), lastCommittedOffset) : null;</span>
+
+<span class="fc" id="L931">            topic.partitionIndexes().forEach(partitionIndex -&gt; {</span>
+<span class="pc bpc" id="L932" title="1 of 2 branches missed.">                final OffsetAndMetadata offsetAndMetadata = topicOffsets == null ?</span>
+<span class="pc" id="L933">                    null : topicOffsets.get(partitionIndex, lastCommittedOffset);</span>
+
+<span class="pc bpc" id="L935" title="2 of 4 branches missed.">                if (requireStable &amp;&amp;</span>
+                    openTransactionsByPartition != null &amp;&amp;
+<span class="nc bnc" id="L937" title="All 2 branches missed.">                    openTransactionsByPartition.containsKey(partitionIndex, lastCommittedOffset)) {</span>
+<span class="nc" id="L938">                    topicResponse.partitions().add(new OffsetFetchResponseData.OffsetFetchResponsePartitions()</span>
+<span class="nc" id="L939">                        .setPartitionIndex(partitionIndex)</span>
+<span class="nc" id="L940">                        .setErrorCode(Errors.UNSTABLE_OFFSET_COMMIT.code())</span>
+<span class="nc" id="L941">                        .setCommittedOffset(INVALID_OFFSET)</span>
+<span class="nc" id="L942">                        .setCommittedLeaderEpoch(-1)</span>
+<span class="nc" id="L943">                        .setMetadata(&quot;&quot;));</span>
+<span class="pc bpc" id="L944" title="1 of 2 branches missed.">                } else if (isOffsetInvalid(offsetAndMetadata, topic.topicId())) {</span>
+<span class="fc" id="L945">                    topicResponse.partitions().add(new OffsetFetchResponseData.OffsetFetchResponsePartitions()</span>
+<span class="fc" id="L946">                        .setPartitionIndex(partitionIndex)</span>
+<span class="fc" id="L947">                        .setCommittedOffset(INVALID_OFFSET)</span>
+<span class="fc" id="L948">                        .setCommittedLeaderEpoch(-1)</span>
+<span class="fc" id="L949">                        .setMetadata(&quot;&quot;));</span>
+                } else {
+<span class="nc" id="L951">                    topicResponse.partitions().add(new OffsetFetchResponseData.OffsetFetchResponsePartitions()</span>
+<span class="nc" id="L952">                        .setPartitionIndex(partitionIndex)</span>
+<span class="nc" id="L953">                        .setCommittedOffset(offsetAndMetadata.committedOffset)</span>
+<span class="nc" id="L954">                        .setCommittedLeaderEpoch(offsetAndMetadata.leaderEpoch.orElse(-1))</span>
+<span class="nc" id="L955">                        .setMetadata(offsetAndMetadata.metadata));</span>
+                }
+<span class="fc" id="L957">            });</span>
+<span class="fc" id="L958">        });</span>
+
+<span class="fc" id="L960">        return new OffsetFetchResponseData.OffsetFetchResponseGroup()</span>
+<span class="fc" id="L961">            .setGroupId(request.groupId())</span>
+<span class="fc" id="L962">            .setTopics(topicResponses);</span>
+    }
+
+    private static boolean isOffsetInvalid(OffsetAndMetadata offsetAndMetadata, Uuid expectedTopicId) {
+<span class="pc bpc" id="L966" title="3 of 4 branches missed.">        return offsetAndMetadata == null || isMismatchedTopicId(offsetAndMetadata.topicId, expectedTopicId);</span>
+    }
+
+    private static boolean isMismatchedTopicId(Uuid actual, Uuid expected) {
+<span class="nc bnc" id="L970" title="All 6 branches missed.">        return !actual.equals(Uuid.ZERO_UUID) &amp;&amp; !expected.equals(Uuid.ZERO_UUID) &amp;&amp; !actual.equals(expected);</span>
+    }
+
+    /**
+     * Fetch all offsets for a given Group.
+     *
+     * @param request               The OffsetFetchRequestGroup request.
+     * @param lastCommittedOffset   The last committed offsets in the timeline.
+     *
+     * @return A List of OffsetFetchResponseTopics response.
+     */
+    public OffsetFetchResponseData.OffsetFetchResponseGroup fetchAllOffsets(
+        OffsetFetchRequestData.OffsetFetchRequestGroup request,
+        long lastCommittedOffset
+    ) throws ApiException {
+<span class="nc bnc" id="L985" title="All 2 branches missed.">        final boolean requireStable = lastCommittedOffset == Long.MAX_VALUE;</span>
+
+        try {
+<span class="nc" id="L988">            validateOffsetFetch(request, lastCommittedOffset);</span>
+<span class="nc" id="L989">        } catch (GroupIdNotFoundException ex) {</span>
+<span class="nc" id="L990">            return new OffsetFetchResponseData.OffsetFetchResponseGroup()</span>
+<span class="nc" id="L991">                .setGroupId(request.groupId())</span>
+<span class="nc" id="L992">                .setTopics(List.of());</span>
+<span class="nc" id="L993">        }</span>
+
+<span class="nc" id="L995">        final List&lt;OffsetFetchResponseData.OffsetFetchResponseTopics&gt; topicResponses = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L996">        final TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, OffsetAndMetadata&gt;&gt; groupOffsets =</span>
+<span class="nc" id="L997">            offsets.offsetsByGroup.get(request.groupId(), lastCommittedOffset);</span>
+        // We inline the lookups from hasPendingTransactionalOffsets here, to avoid repeating string
+        // comparisons of group ids and topic names for every partition. They're only used when the
+        // client has requested stable offsets.
+        final TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, TimelineHashSet&lt;Long&gt;&gt;&gt; openTransactionsByTopic =
+<span class="nc bnc" id="L1002" title="All 2 branches missed.">            requireStable ? openTransactions.openTransactionsByGroup.get(request.groupId(), lastCommittedOffset) : null;</span>
+
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">        if (groupOffsets != null) {</span>
+<span class="nc" id="L1005">            groupOffsets.entrySet(lastCommittedOffset).forEach(topicEntry -&gt; {</span>
+<span class="nc" id="L1006">                final String topic = topicEntry.getKey();</span>
+<span class="nc" id="L1007">                final TimelineHashMap&lt;Integer, OffsetAndMetadata&gt; topicOffsets = topicEntry.getValue();</span>
+                final TimelineHashMap&lt;Integer, TimelineHashSet&lt;Long&gt;&gt; openTransactionsByPartition =
+<span class="nc bnc" id="L1009" title="All 4 branches missed.">                    (requireStable &amp;&amp; openTransactionsByTopic != null) ? openTransactionsByTopic.get(topic, lastCommittedOffset) : null;</span>
+
+<span class="nc" id="L1011">                final OffsetFetchResponseData.OffsetFetchResponseTopics topicResponse =</span>
+                    new OffsetFetchResponseData.OffsetFetchResponseTopics()
+                        // It is set to zero for now but it will be set to the persisted
+                        // topic id along the committed offset, if present.
+<span class="nc" id="L1015">                        .setTopicId(Uuid.ZERO_UUID)</span>
+<span class="nc" id="L1016">                        .setName(topic);</span>
+<span class="nc" id="L1017">                topicResponses.add(topicResponse);</span>
+
+<span class="nc" id="L1019">                topicOffsets.entrySet(lastCommittedOffset).forEach(partitionEntry -&gt; {</span>
+<span class="nc" id="L1020">                    final int partition = partitionEntry.getKey();</span>
+<span class="nc" id="L1021">                    final OffsetAndMetadata offsetAndMetadata = partitionEntry.getValue();</span>
+
+<span class="nc bnc" id="L1023" title="All 4 branches missed.">                    if (requireStable &amp;&amp;</span>
+                        openTransactionsByPartition != null &amp;&amp;
+<span class="nc bnc" id="L1025" title="All 2 branches missed.">                        openTransactionsByPartition.containsKey(partition, lastCommittedOffset)) {</span>
+<span class="nc" id="L1026">                        topicResponse.partitions().add(new OffsetFetchResponseData.OffsetFetchResponsePartitions()</span>
+<span class="nc" id="L1027">                            .setPartitionIndex(partition)</span>
+<span class="nc" id="L1028">                            .setErrorCode(Errors.UNSTABLE_OFFSET_COMMIT.code())</span>
+<span class="nc" id="L1029">                            .setCommittedOffset(INVALID_OFFSET)</span>
+<span class="nc" id="L1030">                            .setCommittedLeaderEpoch(-1)</span>
+<span class="nc" id="L1031">                            .setMetadata(&quot;&quot;));</span>
+                    } else {
+<span class="nc" id="L1033">                        topicResponse.partitions().add(new OffsetFetchResponseData.OffsetFetchResponsePartitions()</span>
+<span class="nc" id="L1034">                            .setPartitionIndex(partition)</span>
+<span class="nc" id="L1035">                            .setCommittedOffset(offsetAndMetadata.committedOffset)</span>
+<span class="nc" id="L1036">                            .setCommittedLeaderEpoch(offsetAndMetadata.leaderEpoch.orElse(-1))</span>
+<span class="nc" id="L1037">                            .setMetadata(offsetAndMetadata.metadata));</span>
+                    }
+<span class="nc" id="L1039">                });</span>
+<span class="nc" id="L1040">            });</span>
+        }
+
+<span class="nc" id="L1043">        return new OffsetFetchResponseData.OffsetFetchResponseGroup()</span>
+<span class="nc" id="L1044">            .setGroupId(request.groupId())</span>
+<span class="nc" id="L1045">            .setTopics(topicResponses);</span>
+    }
+
+    /**
+     * Remove expired offsets for the given group.
+     *
+     * @param groupId The group id.
+     * @param records The list of records to populate with offset commit tombstone records.
+     *
+     * @return True if no offsets exist after expiry and no pending transactional offsets exist,
+     *         false otherwise.
+     */
+    public boolean cleanupExpiredOffsets(String groupId, List&lt;CoordinatorRecord&gt; records) {
+<span class="nc" id="L1058">        TimelineHashMap&lt;String, TimelineHashMap&lt;Integer, OffsetAndMetadata&gt;&gt; offsetsByTopic =</span>
+<span class="nc" id="L1059">            offsets.offsetsByGroup.get(groupId);</span>
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">        if (offsetsByTopic == null) {</span>
+<span class="nc bnc" id="L1061" title="All 2 branches missed.">            return !openTransactions.contains(groupId);</span>
+        }
+
+        // We expect the group to exist.
+<span class="nc" id="L1065">        Group group = groupMetadataManager.group(groupId);</span>
+<span class="nc" id="L1066">        long currentTimestampMs = time.milliseconds();</span>
+<span class="nc" id="L1067">        Optional&lt;OffsetExpirationCondition&gt; offsetExpirationCondition = group.offsetExpirationCondition();</span>
+
+<span class="nc bnc" id="L1069" title="All 2 branches missed.">        if (offsetExpirationCondition.isEmpty()) {</span>
+<span class="nc" id="L1070">            return false;</span>
+        }
+
+<span class="nc" id="L1073">        AtomicBoolean allOffsetsExpired = new AtomicBoolean(true);</span>
+<span class="nc" id="L1074">        OffsetExpirationCondition condition = offsetExpirationCondition.get();</span>
+
+<span class="nc" id="L1076">        offsetsByTopic.forEach((topic, partitions) -&gt; {</span>
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">            if (!group.isSubscribedToTopic(topic)) {</span>
+<span class="nc" id="L1078">                partitions.forEach((partition, offsetAndMetadata) -&gt; {</span>
+                    // We don't expire the offset yet if there is a pending transactional offset for the partition.
+<span class="nc bnc" id="L1080" title="All 2 branches missed.">                    if (condition.isOffsetExpired(offsetAndMetadata, currentTimestampMs, config.offsetsRetentionMs()) &amp;&amp;</span>
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">                        !hasPendingTransactionalOffsets(groupId, topic, partition)) {</span>
+<span class="nc" id="L1082">                        appendOffsetCommitTombstone(groupId, topic, partition, records);</span>
+<span class="nc" id="L1083">                        log.debug(&quot;[GroupId {}] Expired offset for partition={}-{}&quot;, groupId, topic, partition);</span>
+                    } else {
+<span class="nc" id="L1085">                        allOffsetsExpired.set(false);</span>
+                    }
+<span class="nc" id="L1087">                });</span>
+            } else {
+<span class="nc" id="L1089">                allOffsetsExpired.set(false);</span>
+            }
+<span class="nc" id="L1091">        });</span>
+<span class="nc" id="L1092">        metrics.record(OFFSET_EXPIRED_SENSOR_NAME, records.size());</span>
+
+        // We don't want to remove the group if there are ongoing transactions with undeleted offsets.
+<span class="nc bnc" id="L1095" title="All 4 branches missed.">        return allOffsetsExpired.get() &amp;&amp; !openTransactions.contains(groupId);</span>
+    }
+
+    /**
+     * Remove offsets of the topics that have been deleted.
+     *
+     * @param deletedTopics   The topics that have been deleted.
+     * @return The list of tombstones (offset commit) to append.
+     */
+    public List&lt;CoordinatorRecord&gt; onTopicsDeleted(
+        List&lt;DeletedTopic&gt; deletedTopics
+    ) {
+<span class="fc" id="L1107">        List&lt;CoordinatorRecord&gt; records = new ArrayList&lt;&gt;();</span>
+
+<span class="fc" id="L1109">        Consumer&lt;Offsets&gt; delete = offsetsToClean -&gt; {</span>
+<span class="fc" id="L1110">            offsetsToClean.offsetsByGroup.forEach((groupId, topicOffsets) -&gt; {</span>
+<span class="nc bnc" id="L1111" title="All 2 branches missed.">                for (DeletedTopic deletedTopic : deletedTopics) {</span>
+<span class="nc" id="L1112">                    var partitionOffsets = topicOffsets.get(deletedTopic.name());</span>
+<span class="nc bnc" id="L1113" title="All 2 branches missed.">                    if (partitionOffsets != null) {</span>
+<span class="nc" id="L1114">                        partitionOffsets.forEach((partition, offsetAndMetadata) -&gt; {</span>
+                            // Delete if the topic ID matches or if the stored topic ID is ZERO_UUID (legacy records).
+<span class="nc bnc" id="L1116" title="All 4 branches missed.">                            if (offsetAndMetadata.topicId.equals(Uuid.ZERO_UUID) || offsetAndMetadata.topicId.equals(deletedTopic.id())) {</span>
+<span class="nc" id="L1117">                                appendOffsetCommitTombstone(groupId, deletedTopic.name(), partition, records);</span>
+                            }
+<span class="nc" id="L1119">                        });</span>
+                    }
+<span class="nc" id="L1121">                }</span>
+<span class="nc" id="L1122">            });</span>
+<span class="fc" id="L1123">        };</span>
+
+        // Delete the offsets from the main storage.
+<span class="fc" id="L1126">        delete.accept(offsets);</span>
+        // Delete the offsets from the pending transactional offsets.
+<span class="pc" id="L1128">        pendingTransactionalOffsets.forEach((__, offsets) -&gt; delete.accept(offsets));</span>
+
+<span class="fc" id="L1130">        return records;</span>
+    }
+
+    /**
+     * Add an offset commit tombstone record for the group.
+     *
+     * @param groupId   The group id.
+     * @param topic     The topic name.
+     * @param partition The partition.
+     * @param records   The list of records to append the tombstone.
+     */
+    private void appendOffsetCommitTombstone(
+        String groupId,
+        String topic,
+        int partition, 
+        List&lt;CoordinatorRecord&gt; records
+    ) {
+<span class="nc" id="L1147">        records.add(GroupCoordinatorRecordHelpers.newOffsetCommitTombstoneRecord(groupId, topic, partition));</span>
+<span class="nc" id="L1148">        log.trace(&quot;[GroupId {}] Removing expired offset and metadata for {}-{}&quot;, groupId, topic, partition);</span>
+<span class="nc" id="L1149">    }</span>
+
+    /**
+     * Replays OffsetCommitKey/Value to update or delete the corresponding offsets.
+     *
+     * @param recordOffset  The offset of the record in the log.
+     * @param producerId    The producer id of the batch containing the provided
+     *                      key and value.
+     * @param key           A OffsetCommitKey key.
+     * @param value         A OffsetCommitValue value.
+     */
+    public void replay(
+        long recordOffset,
+        long producerId,
+        OffsetCommitKey key,
+        OffsetCommitValue value
+    ) {
+<span class="fc" id="L1166">        final String groupId = key.group();</span>
+<span class="fc" id="L1167">        final String topic = key.topic();</span>
+<span class="fc" id="L1168">        final int partition = key.partition();</span>
+
+<span class="pc bpc" id="L1170" title="1 of 2 branches missed.">        if (value != null) {</span>
+            // The classic or consumer group should exist when offsets are committed or
+            // replayed. However, it won't if the consumer commits offsets but does not
+            // use the membership functionality. In this case, we automatically create
+            // a so-called &quot;simple consumer group&quot;. This is an empty classic group
+            // without a protocol type.
+            try {
+<span class="fc" id="L1177">                groupMetadataManager.group(groupId);</span>
+<span class="nc" id="L1178">            } catch (GroupIdNotFoundException ex) {</span>
+<span class="nc" id="L1179">                groupMetadataManager.getOrMaybeCreateClassicGroup(groupId, true);</span>
+<span class="fc" id="L1180">            }</span>
+
+<span class="pc bpc" id="L1182" title="1 of 2 branches missed.">            if (producerId == RecordBatch.NO_PRODUCER_ID) {</span>
+<span class="fc" id="L1183">                log.debug(&quot;Replaying offset commit with key {}, value {}&quot;, key, value);</span>
+                // If the offset is not part of a transaction, it is directly stored
+                // in the offsets store.
+<span class="fc" id="L1186">                OffsetAndMetadata previousValue = offsets.put(</span>
+                    groupId,
+                    topic,
+                    partition,
+<span class="fc" id="L1190">                    OffsetAndMetadata.fromRecord(recordOffset, value)</span>
+                );
+<span class="fc bfc" id="L1192" title="All 2 branches covered.">                if (previousValue == null) {</span>
+<span class="fc" id="L1193">                    metrics.incrementNumOffsets();</span>
+                }
+<span class="fc" id="L1195">            } else {</span>
+<span class="nc" id="L1196">                log.debug(&quot;Replaying transactional offset commit with producer id {}, key {}, value {}&quot;, producerId, key, value);</span>
+                // Otherwise, the transaction offset is stored in the pending transactional
+                // offsets store. Pending offsets there are moved to the main store when
+                // the transaction is committed; or removed when the transaction is aborted.
+<span class="nc" id="L1200">                pendingTransactionalOffsets</span>
+<span class="nc" id="L1201">                    .computeIfAbsent(producerId, __ -&gt; new Offsets())</span>
+<span class="nc" id="L1202">                    .put(</span>
+                        groupId,
+                        topic,
+                        partition,
+<span class="nc" id="L1206">                        OffsetAndMetadata.fromRecord(recordOffset, value)</span>
+                    );
+<span class="nc" id="L1208">                openTransactions.add(groupId, topic, partition, producerId);</span>
+            }
+        } else {
+<span class="nc bnc" id="L1211" title="All 2 branches missed.">            if (offsets.remove(groupId, topic, partition) != null) {</span>
+<span class="nc" id="L1212">                metrics.decrementNumOffsets();</span>
+            }
+
+            // Remove all the pending offset commits related to the tombstone.
+<span class="nc" id="L1216">            openTransactions.forEach(groupId, topic, partition, openProducerId -&gt; {</span>
+<span class="nc" id="L1217">                Offsets pendingOffsets = pendingTransactionalOffsets.get(openProducerId);</span>
+<span class="nc bnc" id="L1218" title="All 2 branches missed.">                if (pendingOffsets != null) {</span>
+<span class="nc" id="L1219">                    pendingOffsets.remove(groupId, topic, partition);</span>
+                }
+<span class="nc" id="L1221">            });</span>
+<span class="nc" id="L1222">            openTransactions.clear(groupId, topic, partition);</span>
+        }
+<span class="fc" id="L1224">    }</span>
+
+    /**
+     * Applies the given transaction marker.
+     *
+     * @param producerId    The producer id.
+     * @param result        The result of the transaction.
+     * @throws RuntimeException if the transaction can not be completed.
+     */
+    @SuppressWarnings(&quot;NPathComplexity&quot;)
+    public void replayEndTransactionMarker(
+        long producerId,
+        TransactionResult result
+    ) throws RuntimeException {
+<span class="nc" id="L1238">        Offsets pendingOffsets = pendingTransactionalOffsets.remove(producerId);</span>
+
+<span class="nc bnc" id="L1240" title="All 2 branches missed.">        if (pendingOffsets == null) {</span>
+<span class="nc" id="L1241">            log.debug(&quot;Replayed end transaction marker with result {} for producer id {} but &quot; +</span>
+<span class="nc" id="L1242">                &quot;no pending offsets are present. Ignoring it.&quot;, result, producerId);</span>
+<span class="nc" id="L1243">            return;</span>
+        }
+
+<span class="nc" id="L1246">        pendingOffsets.offsetsByGroup.forEach((groupId, topicOffsets) -&gt; {</span>
+<span class="nc" id="L1247">            topicOffsets.forEach((topic, partitionOffsets) -&gt; {</span>
+<span class="nc" id="L1248">                partitionOffsets.keySet().forEach(partitionId -&gt; {</span>
+<span class="nc" id="L1249">                    openTransactions.remove(groupId, topic, partitionId, producerId);</span>
+<span class="nc" id="L1250">                });</span>
+<span class="nc" id="L1251">            });</span>
+<span class="nc" id="L1252">        });</span>
+
+<span class="nc bnc" id="L1254" title="All 2 branches missed.">        if (result == TransactionResult.COMMIT) {</span>
+<span class="nc" id="L1255">            log.debug(&quot;Committed transactional offset commits for producer id {}.&quot;, producerId);</span>
+
+<span class="nc" id="L1257">            pendingOffsets.offsetsByGroup.forEach((groupId, topicOffsets) -&gt; {</span>
+<span class="nc" id="L1258">                topicOffsets.forEach((topicName, partitionOffsets) -&gt; {</span>
+<span class="nc" id="L1259">                    partitionOffsets.forEach((partitionId, offsetAndMetadata) -&gt; {</span>
+<span class="nc" id="L1260">                        OffsetAndMetadata existingOffsetAndMetadata = offsets.get(</span>
+                            groupId,
+                            topicName,
+<span class="nc" id="L1263">                            partitionId</span>
+                        );
+
+                        // We always keep the most recent committed offset when we have a mix of transactional and regular
+                        // offset commits. Without preserving information of the commit record offset, compaction of the
+                        // __consumer_offsets topic itself may result in the wrong offset commit being materialized.
+<span class="nc bnc" id="L1269" title="All 4 branches missed.">                        if (existingOffsetAndMetadata == null || offsetAndMetadata.recordOffset &gt; existingOffsetAndMetadata.recordOffset) {</span>
+<span class="nc" id="L1270">                            log.debug(&quot;Committed transactional offset commit {} for producer id {} in group {} &quot; +</span>
+                                &quot;with topic {} and partition {}.&quot;,
+<span class="nc" id="L1272">                                offsetAndMetadata, producerId, groupId, topicName, partitionId);</span>
+<span class="nc" id="L1273">                            OffsetAndMetadata previousValue = offsets.put(</span>
+                                groupId,
+                                topicName,
+<span class="nc" id="L1276">                                partitionId,</span>
+                                offsetAndMetadata
+                            );
+<span class="nc bnc" id="L1279" title="All 2 branches missed.">                            if (previousValue == null) {</span>
+<span class="nc" id="L1280">                                metrics.incrementNumOffsets();</span>
+                            }
+<span class="nc" id="L1282">                        } else {</span>
+<span class="nc" id="L1283">                            log.info(&quot;Skipped the materialization of transactional offset commit {} for producer id {} in group {} with topic {}, &quot; +</span>
+                                &quot;partition {} since its record offset {} is smaller than the record offset {} of the last committed offset.&quot;,
+<span class="nc" id="L1285">                                offsetAndMetadata, producerId, groupId, topicName, partitionId, offsetAndMetadata.recordOffset, existingOffsetAndMetadata.recordOffset);</span>
+                        }
+<span class="nc" id="L1287">                    });</span>
+<span class="nc" id="L1288">                });</span>
+<span class="nc" id="L1289">            });</span>
+        } else {
+<span class="nc" id="L1291">            log.debug(&quot;Aborted transactional offset commits for producer id {}.&quot;, producerId);</span>
+        }
+<span class="nc" id="L1293">    }</span>
+
+    /**
+     * A new metadata image is available.
+     *
+     * @param delta    The delta image.
+     * @param newImage The new metadata image.
+     */
+    public void onMetadataUpdate(CoordinatorMetadataDelta delta, CoordinatorMetadataImage newImage) {
+<span class="fc" id="L1302">        this.metadataImage = newImage;</span>
+<span class="fc" id="L1303">    }</span>
+
+    /**
+     * @return The offset for the provided groupId and topic partition or null
+     * if it does not exist.
+     *
+     * package-private for testing.
+     */
+    OffsetAndMetadata offset(
+        String groupId,
+        String topic,
+        int partition
+    ) {
+<span class="nc" id="L1316">        return offsets.get(groupId, topic, partition);</span>
+    }
+
+    /**
+     * @return The pending transactional offset for the provided parameters or null
+     * if it does not exist.
+     *
+     * package-private for testing.
+     */
+    OffsetAndMetadata pendingTransactionalOffset(
+        long producerId,
+        String groupId,
+        String topic,
+        int partition
+    ) {
+<span class="nc" id="L1331">        Offsets offsets = pendingTransactionalOffsets.get(producerId);</span>
+<span class="nc bnc" id="L1332" title="All 2 branches missed.">        if (offsets == null) return null;</span>
+<span class="nc" id="L1333">        return offsets.get(groupId, topic, partition);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

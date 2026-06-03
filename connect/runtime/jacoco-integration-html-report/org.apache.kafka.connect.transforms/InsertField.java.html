@@ -1,0 +1,296 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>InsertField.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.transforms</a> &gt; <span class="el_source">InsertField.java</span></div><h1>InsertField.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.transforms;
+
+import org.apache.kafka.common.cache.Cache;
+import org.apache.kafka.common.cache.LRUCache;
+import org.apache.kafka.common.cache.SynchronizedCache;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.utils.AppInfoParser;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.data.Timestamp;
+import org.apache.kafka.connect.transforms.util.SchemaUtil;
+import org.apache.kafka.connect.transforms.util.SimpleConfig;
+
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+
+import static org.apache.kafka.connect.transforms.util.Requirements.requireMap;
+import static org.apache.kafka.connect.transforms.util.Requirements.requireSinkRecord;
+import static org.apache.kafka.connect.transforms.util.Requirements.requireStruct;
+
+<span class="fc" id="L42">public abstract class InsertField&lt;R extends ConnectRecord&lt;R&gt;&gt; implements Transformation&lt;R&gt; {</span>
+
+<span class="fc" id="L44">    public static final String OVERVIEW_DOC =</span>
+            &quot;Insert field(s) using attributes from the record metadata or a configured static value.&quot;
+<span class="fc" id="L46">                    + &quot;&lt;p/&gt;Use the concrete transformation type designed for the record key (&lt;code&gt;&quot; + Key.class.getName() + &quot;&lt;/code&gt;) &quot;</span>
+<span class="fc" id="L47">                    + &quot;or value (&lt;code&gt;&quot; + Value.class.getName() + &quot;&lt;/code&gt;).&quot;;</span>
+
+    private interface ConfigName {
+        String TOPIC_FIELD = &quot;topic.field&quot;;
+        String PARTITION_FIELD = &quot;partition.field&quot;;
+        String OFFSET_FIELD = &quot;offset.field&quot;;
+        String TIMESTAMP_FIELD = &quot;timestamp.field&quot;;
+        String STATIC_FIELD = &quot;static.field&quot;;
+        String STATIC_VALUE = &quot;static.value&quot;;
+        String REPLACE_NULL_WITH_DEFAULT = &quot;replace.null.with.default&quot;;
+    }
+
+    private static final String OPTIONALITY_DOC = &quot;Suffix with &lt;code&gt;!&lt;/code&gt; to make this a required field, or &lt;code&gt;?&lt;/code&gt; to keep it optional (the default).&quot;;
+
+<span class="fc" id="L61">    public static final ConfigDef CONFIG_DEF = new ConfigDef()</span>
+<span class="fc" id="L62">            .define(ConfigName.TOPIC_FIELD, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Field name for Kafka topic. &quot; + OPTIONALITY_DOC)
+<span class="fc" id="L64">            .define(ConfigName.PARTITION_FIELD, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Field name for Kafka partition. &quot; + OPTIONALITY_DOC)
+<span class="fc" id="L66">            .define(ConfigName.OFFSET_FIELD, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Field name for Kafka offset - only applicable to sink connectors.&lt;br/&gt;&quot; + OPTIONALITY_DOC)
+<span class="fc" id="L68">            .define(ConfigName.TIMESTAMP_FIELD, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Field name for record timestamp. &quot; + OPTIONALITY_DOC)
+<span class="fc" id="L70">            .define(ConfigName.STATIC_FIELD, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Field name for static data field. &quot; + OPTIONALITY_DOC)
+<span class="fc" id="L72">            .define(ConfigName.STATIC_VALUE, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Static field value, if field name configured.&quot;)
+<span class="fc" id="L74">            .define(ConfigName.REPLACE_NULL_WITH_DEFAULT, ConfigDef.Type.BOOLEAN, true, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Whether to replace fields that have a default value and that are null to the default value. When set to true, the default value is used, otherwise null is used.&quot;);
+
+    private static final String PURPOSE = &quot;field insertion&quot;;
+
+<span class="fc" id="L79">    private static final Schema OPTIONAL_TIMESTAMP_SCHEMA = Timestamp.builder().optional().build();</span>
+
+    private static final class InsertionSpec {
+        final String name;
+        final boolean optional;
+
+<span class="nc" id="L85">        private InsertionSpec(String name, boolean optional) {</span>
+<span class="nc" id="L86">            this.name = name;</span>
+<span class="nc" id="L87">            this.optional = optional;</span>
+<span class="nc" id="L88">        }</span>
+
+        public static InsertionSpec parse(String spec) {
+<span class="nc bnc" id="L91" title="All 2 branches missed.">            if (spec == null) return null;</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">            if (spec.endsWith(&quot;?&quot;)) {</span>
+<span class="nc" id="L93">                return new InsertionSpec(spec.substring(0, spec.length() - 1), true);</span>
+            }
+<span class="nc bnc" id="L95" title="All 2 branches missed.">            if (spec.endsWith(&quot;!&quot;)) {</span>
+<span class="nc" id="L96">                return new InsertionSpec(spec.substring(0, spec.length() - 1), false);</span>
+            }
+<span class="nc" id="L98">            return new InsertionSpec(spec, true);</span>
+        }
+    }
+
+    private InsertionSpec topicField;
+    private InsertionSpec partitionField;
+    private InsertionSpec offsetField;
+    private InsertionSpec timestampField;
+    private InsertionSpec staticField;
+    private String staticValue;
+    private boolean replaceNullWithDefault;
+
+    private Cache&lt;Schema, Schema&gt; schemaUpdateCache;
+
+    @Override
+    public String version() {
+<span class="fc" id="L114">        return AppInfoParser.getVersion();</span>
+    }
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; props) {
+<span class="nc" id="L119">        final SimpleConfig config = new SimpleConfig(CONFIG_DEF, props);</span>
+<span class="nc" id="L120">        topicField = InsertionSpec.parse(config.getString(ConfigName.TOPIC_FIELD));</span>
+<span class="nc" id="L121">        partitionField = InsertionSpec.parse(config.getString(ConfigName.PARTITION_FIELD));</span>
+<span class="nc" id="L122">        offsetField = InsertionSpec.parse(config.getString(ConfigName.OFFSET_FIELD));</span>
+<span class="nc" id="L123">        timestampField = InsertionSpec.parse(config.getString(ConfigName.TIMESTAMP_FIELD));</span>
+<span class="nc" id="L124">        staticField = InsertionSpec.parse(config.getString(ConfigName.STATIC_FIELD));</span>
+<span class="nc" id="L125">        staticValue = config.getString(ConfigName.STATIC_VALUE);</span>
+<span class="nc" id="L126">        replaceNullWithDefault = config.getBoolean(ConfigName.REPLACE_NULL_WITH_DEFAULT);</span>
+
+<span class="nc bnc" id="L128" title="All 10 branches missed.">        if (topicField == null &amp;&amp; partitionField == null &amp;&amp; offsetField == null &amp;&amp; timestampField == null &amp;&amp; staticField == null) {</span>
+<span class="nc" id="L129">            throw new ConfigException(&quot;No field insertion configured&quot;);</span>
+        }
+
+<span class="nc bnc" id="L132" title="All 4 branches missed.">        if (staticField != null &amp;&amp; staticValue == null) {</span>
+<span class="nc" id="L133">            throw new ConfigException(ConfigName.STATIC_VALUE, null, &quot;No value specified for static field: &quot; + staticField);</span>
+        }
+
+<span class="nc" id="L136">        schemaUpdateCache = new SynchronizedCache&lt;&gt;(new LRUCache&lt;&gt;(16));</span>
+<span class="nc" id="L137">    }</span>
+
+    @Override
+    public R apply(R record) {
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        if (operatingValue(record) == null) {</span>
+<span class="nc" id="L142">            return record;</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        } else if (operatingSchema(record) == null) {</span>
+<span class="nc" id="L144">            return applySchemaless(record);</span>
+        } else {
+<span class="nc" id="L146">            return applyWithSchema(record);</span>
+        }
+    }
+
+    private R applySchemaless(R record) {
+<span class="nc" id="L151">        final Map&lt;String, Object&gt; value = requireMap(operatingValue(record), PURPOSE);</span>
+
+<span class="nc" id="L153">        final Map&lt;String, Object&gt; updatedValue = new HashMap&lt;&gt;(value);</span>
+
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        if (topicField != null) {</span>
+<span class="nc" id="L156">            updatedValue.put(topicField.name, record.topic());</span>
+        }
+<span class="nc bnc" id="L158" title="All 4 branches missed.">        if (partitionField != null &amp;&amp; record.kafkaPartition() != null) {</span>
+<span class="nc" id="L159">            updatedValue.put(partitionField.name, record.kafkaPartition());</span>
+        }
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        if (offsetField != null) {</span>
+<span class="nc" id="L162">            updatedValue.put(offsetField.name, requireSinkRecord(record, PURPOSE).kafkaOffset());</span>
+        }
+<span class="nc bnc" id="L164" title="All 4 branches missed.">        if (timestampField != null &amp;&amp; record.timestamp() != null) {</span>
+<span class="nc" id="L165">            updatedValue.put(timestampField.name, record.timestamp());</span>
+        }
+<span class="nc bnc" id="L167" title="All 4 branches missed.">        if (staticField != null &amp;&amp; staticValue != null) {</span>
+<span class="nc" id="L168">            updatedValue.put(staticField.name, staticValue);</span>
+        }
+
+<span class="nc" id="L171">        return newRecord(record, null, updatedValue);</span>
+    }
+
+    private R applyWithSchema(R record) {
+<span class="nc" id="L175">        final Struct value = requireStruct(operatingValue(record), PURPOSE);</span>
+
+<span class="nc" id="L177">        Schema updatedSchema = schemaUpdateCache.get(value.schema());</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">        if (updatedSchema == null) {</span>
+<span class="nc" id="L179">            updatedSchema = makeUpdatedSchema(value.schema());</span>
+<span class="nc" id="L180">            schemaUpdateCache.put(value.schema(), updatedSchema);</span>
+        }
+
+<span class="nc" id="L183">        final Struct updatedValue = new Struct(updatedSchema);</span>
+
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        for (Field field : value.schema().fields()) {</span>
+<span class="nc" id="L186">            updatedValue.put(field.name(), getFieldValue(value, field));</span>
+<span class="nc" id="L187">        }</span>
+
+<span class="nc bnc" id="L189" title="All 2 branches missed.">        if (topicField != null) {</span>
+<span class="nc" id="L190">            updatedValue.put(topicField.name, record.topic());</span>
+        }
+<span class="nc bnc" id="L192" title="All 4 branches missed.">        if (partitionField != null &amp;&amp; record.kafkaPartition() != null) {</span>
+<span class="nc" id="L193">            updatedValue.put(partitionField.name, record.kafkaPartition());</span>
+        }
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        if (offsetField != null) {</span>
+<span class="nc" id="L196">            updatedValue.put(offsetField.name, requireSinkRecord(record, PURPOSE).kafkaOffset());</span>
+        }
+<span class="nc bnc" id="L198" title="All 4 branches missed.">        if (timestampField != null &amp;&amp; record.timestamp() != null) {</span>
+<span class="nc" id="L199">            updatedValue.put(timestampField.name, new Date(record.timestamp()));</span>
+        }
+<span class="nc bnc" id="L201" title="All 4 branches missed.">        if (staticField != null &amp;&amp; staticValue != null) {</span>
+<span class="nc" id="L202">            updatedValue.put(staticField.name, staticValue);</span>
+        }
+
+<span class="nc" id="L205">        return newRecord(record, updatedSchema, updatedValue);</span>
+    }
+
+    private Schema makeUpdatedSchema(Schema schema) {
+<span class="nc" id="L209">        final SchemaBuilder builder = SchemaUtil.copySchemaBasics(schema, SchemaBuilder.struct());</span>
+
+<span class="nc bnc" id="L211" title="All 2 branches missed.">        for (Field field : schema.fields()) {</span>
+<span class="nc" id="L212">            builder.field(field.name(), field.schema());</span>
+<span class="nc" id="L213">        }</span>
+
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        if (topicField != null) {</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">            builder.field(topicField.name, topicField.optional ? Schema.OPTIONAL_STRING_SCHEMA : Schema.STRING_SCHEMA);</span>
+        }
+<span class="nc bnc" id="L218" title="All 2 branches missed.">        if (partitionField != null) {</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            builder.field(partitionField.name, partitionField.optional ? Schema.OPTIONAL_INT32_SCHEMA : Schema.INT32_SCHEMA);</span>
+        }
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        if (offsetField != null) {</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            builder.field(offsetField.name, offsetField.optional ? Schema.OPTIONAL_INT64_SCHEMA : Schema.INT64_SCHEMA);</span>
+        }
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        if (timestampField != null) {</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">            builder.field(timestampField.name, timestampField.optional ? OPTIONAL_TIMESTAMP_SCHEMA : Timestamp.SCHEMA);</span>
+        }
+<span class="nc bnc" id="L227" title="All 2 branches missed.">        if (staticField != null) {</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">            builder.field(staticField.name, staticField.optional ? Schema.OPTIONAL_STRING_SCHEMA : Schema.STRING_SCHEMA);</span>
+        }
+
+<span class="nc" id="L231">        return builder.build();</span>
+    }
+
+    private Object getFieldValue(Struct value, Field field) {
+<span class="nc bnc" id="L235" title="All 2 branches missed.">        if (replaceNullWithDefault) {</span>
+<span class="nc" id="L236">            return value.get(field);</span>
+        }
+<span class="nc" id="L238">        return value.getWithoutDefault(field.name());</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L243">        schemaUpdateCache = null;</span>
+<span class="nc" id="L244">    }</span>
+
+    @Override
+    public ConfigDef config() {
+<span class="nc" id="L248">        return CONFIG_DEF;</span>
+    }
+
+    protected abstract Schema operatingSchema(R record);
+
+    protected abstract Object operatingValue(R record);
+
+    protected abstract R newRecord(R record, Schema updatedSchema, Object updatedValue);
+
+<span class="fc" id="L257">    public static class Key&lt;R extends ConnectRecord&lt;R&gt;&gt; extends InsertField&lt;R&gt; {</span>
+
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L261">            return record.keySchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L266">            return record.key();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue) {
+<span class="nc" id="L271">            return record.newRecord(record.topic(), record.kafkaPartition(), updatedSchema, updatedValue, record.valueSchema(), record.value(), record.timestamp());</span>
+        }
+
+    }
+
+<span class="fc" id="L276">    public static class Value&lt;R extends ConnectRecord&lt;R&gt;&gt; extends InsertField&lt;R&gt; {</span>
+
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L280">            return record.valueSchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L285">            return record.value();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue) {
+<span class="nc" id="L290">            return record.newRecord(record.topic(), record.kafkaPartition(), record.keySchema(), record.key(), updatedSchema, updatedValue, record.timestamp());</span>
+        }
+
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

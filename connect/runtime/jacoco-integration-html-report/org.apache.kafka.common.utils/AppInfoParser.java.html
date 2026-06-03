@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AppInfoParser.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.utils</a> &gt; <span class="el_source">AppInfoParser.java</span></div><h1>AppInfoParser.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.utils;
+
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.metrics.Gauge;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.utils.internals.Sanitizer;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.InputStream;
+import java.lang.management.ManagementFactory;
+import java.util.Map;
+import java.util.Properties;
+
+import javax.management.JMException;
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
+
+<span class="nc" id="L36">public class AppInfoParser {</span>
+<span class="fc" id="L37">    private static final Logger log = LoggerFactory.getLogger(AppInfoParser.class);</span>
+    private static final String VERSION;
+    private static final String COMMIT_ID;
+
+    protected static final String DEFAULT_VALUE = &quot;unknown&quot;;
+
+    static {
+<span class="fc" id="L44">        Properties props = new Properties();</span>
+<span class="fc" id="L45">        try (InputStream resourceStream = AppInfoParser.class.getResourceAsStream(&quot;/kafka/kafka-version.properties&quot;)) {</span>
+<span class="fc" id="L46">            props.load(resourceStream);</span>
+<span class="nc" id="L47">        } catch (Exception e) {</span>
+<span class="nc" id="L48">            log.warn(&quot;Error while loading kafka-version.properties: {}&quot;, e.getMessage());</span>
+<span class="fc" id="L49">        }</span>
+<span class="fc" id="L50">        VERSION = props.getProperty(&quot;version&quot;, DEFAULT_VALUE).trim();</span>
+<span class="fc" id="L51">        COMMIT_ID = props.getProperty(&quot;commitId&quot;, DEFAULT_VALUE).trim();</span>
+<span class="fc" id="L52">    }</span>
+
+    public static String getVersion() {
+<span class="fc" id="L55">        return VERSION;</span>
+    }
+
+    public static String getCommitId() {
+<span class="fc" id="L59">        return COMMIT_ID;</span>
+    }
+
+    public static synchronized void registerAppInfo(String prefix, String id, Metrics metrics, long nowMs) {
+        try {
+<span class="fc" id="L64">            ObjectName name = new ObjectName(prefix + &quot;:type=app-info,id=&quot; + Sanitizer.jmxSanitize(id));</span>
+<span class="fc" id="L65">            MBeanServer server = ManagementFactory.getPlatformMBeanServer();</span>
+<span class="fc bfc" id="L66" title="All 2 branches covered.">            if (server.isRegistered(name)) {</span>
+<span class="fc" id="L67">                log.info(&quot;The mbean of App info: [{}], id: [{}] already exists, so skipping a new mbean creation.&quot;, prefix, id);</span>
+<span class="fc" id="L68">                return;</span>
+            }
+<span class="fc" id="L70">            AppInfo mBean = new AppInfo(nowMs);</span>
+<span class="fc" id="L71">            server.registerMBean(mBean, name);</span>
+
+<span class="fc" id="L73">            registerMetrics(metrics, mBean, id); // prefix will be added later by JmxReporter</span>
+<span class="nc" id="L74">        } catch (JMException e) {</span>
+<span class="nc" id="L75">            log.warn(&quot;Error registering AppInfo mbean&quot;, e);</span>
+<span class="fc" id="L76">        }</span>
+<span class="fc" id="L77">    }</span>
+
+    public static synchronized void unregisterAppInfo(String prefix, String id, Metrics metrics) {
+<span class="fc" id="L80">        MBeanServer server = ManagementFactory.getPlatformMBeanServer();</span>
+        try {
+<span class="fc" id="L82">            ObjectName name = new ObjectName(prefix + &quot;:type=app-info,id=&quot; + Sanitizer.jmxSanitize(id));</span>
+<span class="fc bfc" id="L83" title="All 2 branches covered.">            if (server.isRegistered(name))</span>
+<span class="fc" id="L84">                server.unregisterMBean(name);</span>
+
+<span class="fc" id="L86">            unregisterMetrics(metrics, id);</span>
+<span class="nc" id="L87">        } catch (JMException e) {</span>
+<span class="nc" id="L88">            log.warn(&quot;Error unregistering AppInfo mbean&quot;, e);</span>
+        } finally {
+<span class="fc" id="L90">            log.info(&quot;App info {} for {} unregistered&quot;, prefix, id);</span>
+        }
+<span class="fc" id="L92">    }</span>
+
+    private static MetricName metricName(Metrics metrics, String name, Map&lt;String, String&gt; tags) {
+<span class="fc" id="L95">        return metrics.metricName(name, &quot;app-info&quot;, &quot;Metric indicating &quot; + name, tags);</span>
+    }
+
+    private static void registerMetrics(Metrics metrics, AppInfo appInfo, String clientId) {
+<span class="pc bpc" id="L99" title="1 of 2 branches missed.">        if (metrics == null) return;</span>
+        // Most Kafka clients (producer/consumer/admin) set the client-id tag in the metrics config.
+        // Although we don’t explicitly parse client-id here, these metrics are automatically tagged with client-id.
+<span class="pc" id="L102">        metrics.addMetric(metricName(metrics, &quot;version&quot;, Map.of()), (Gauge&lt;String&gt;) (config, now) -&gt; appInfo.getVersion());</span>
+<span class="pc" id="L103">        metrics.addMetric(metricName(metrics, &quot;commit-id&quot;, Map.of()), (Gauge&lt;String&gt;) (config, now) -&gt; appInfo.getCommitId());</span>
+<span class="pc" id="L104">        metrics.addMetric(metricName(metrics, &quot;start-time-ms&quot;, Map.of()), (Gauge&lt;Long&gt;) (config, now) -&gt; appInfo.getStartTimeMs());</span>
+        // MirrorMaker/Worker doesn't set client-id tag into the metrics config, so we need to set it here.
+<span class="pc bpc" id="L106" title="1 of 4 branches missed.">        if (!metrics.config().tags().containsKey(&quot;client-id&quot;) &amp;&amp; clientId != null) {</span>
+<span class="pc" id="L107">            metrics.addMetric(metricName(metrics, &quot;version&quot;, Map.of(&quot;client-id&quot;, clientId)), (Gauge&lt;String&gt;) (config, now) -&gt; appInfo.getVersion());</span>
+<span class="pc" id="L108">            metrics.addMetric(metricName(metrics, &quot;commit-id&quot;, Map.of(&quot;client-id&quot;, clientId)), (Gauge&lt;String&gt;) (config, now) -&gt; appInfo.getCommitId());</span>
+<span class="pc" id="L109">            metrics.addMetric(metricName(metrics, &quot;start-time-ms&quot;, Map.of(&quot;client-id&quot;, clientId)), (Gauge&lt;Long&gt;) (config, now) -&gt; appInfo.getStartTimeMs());</span>
+        }
+<span class="fc" id="L111">    }</span>
+
+    private static void unregisterMetrics(Metrics metrics, String clientId) {
+<span class="fc bfc" id="L114" title="All 2 branches covered.">        if (metrics == null) return;</span>
+
+<span class="fc" id="L116">        metrics.removeMetric(metricName(metrics, &quot;version&quot;, Map.of()));</span>
+<span class="fc" id="L117">        metrics.removeMetric(metricName(metrics, &quot;commit-id&quot;, Map.of()));</span>
+<span class="fc" id="L118">        metrics.removeMetric(metricName(metrics, &quot;start-time-ms&quot;, Map.of()));</span>
+
+<span class="pc bpc" id="L120" title="1 of 4 branches missed.">        if (!metrics.config().tags().containsKey(&quot;client-id&quot;) &amp;&amp; clientId != null) {</span>
+<span class="fc" id="L121">            metrics.removeMetric(metricName(metrics, &quot;version&quot;, Map.of(&quot;client-id&quot;, clientId)));</span>
+<span class="fc" id="L122">            metrics.removeMetric(metricName(metrics, &quot;commit-id&quot;, Map.of(&quot;client-id&quot;, clientId)));</span>
+<span class="fc" id="L123">            metrics.removeMetric(metricName(metrics, &quot;start-time-ms&quot;, Map.of(&quot;client-id&quot;, clientId)));</span>
+        }
+<span class="fc" id="L125">    }</span>
+
+    public interface AppInfoMBean {
+        String getVersion();
+        String getCommitId();
+        Long getStartTimeMs();
+    }
+
+    public static class AppInfo implements AppInfoMBean {
+
+        private final Long startTimeMs;
+
+<span class="fc" id="L137">        public AppInfo(long startTimeMs) {</span>
+<span class="fc" id="L138">            this.startTimeMs = startTimeMs;</span>
+<span class="fc" id="L139">            log.info(&quot;Kafka version: {}&quot;, AppInfoParser.getVersion());</span>
+<span class="fc" id="L140">            log.info(&quot;Kafka commitId: {}&quot;, AppInfoParser.getCommitId());</span>
+<span class="fc" id="L141">            log.info(&quot;Kafka startTimeMs: {}&quot;, startTimeMs);</span>
+<span class="fc" id="L142">        }</span>
+
+        @Override
+        public String getVersion() {
+<span class="nc" id="L146">            return AppInfoParser.getVersion();</span>
+        }
+
+        @Override
+        public String getCommitId() {
+<span class="nc" id="L151">            return AppInfoParser.getCommitId();</span>
+        }
+
+        @Override
+        public Long getStartTimeMs() {
+<span class="nc" id="L156">            return startTimeMs;</span>
+        }
+
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

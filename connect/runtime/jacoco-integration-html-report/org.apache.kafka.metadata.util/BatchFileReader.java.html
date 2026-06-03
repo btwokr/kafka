@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BatchFileReader.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.metadata.util</a> &gt; <span class="el_source">BatchFileReader.java</span></div><h1>BatchFileReader.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.metadata.util;
+
+import org.apache.kafka.common.message.LeaderChangeMessage;
+import org.apache.kafka.common.message.SnapshotFooterRecord;
+import org.apache.kafka.common.message.SnapshotHeaderRecord;
+import org.apache.kafka.common.protocol.ByteBufferAccessor;
+import org.apache.kafka.common.record.internal.ControlRecordType;
+import org.apache.kafka.common.record.internal.FileLogInputStream.FileChannelRecordBatch;
+import org.apache.kafka.common.record.internal.FileRecords;
+import org.apache.kafka.common.record.internal.Record;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.metadata.MetadataRecordSerde;
+import org.apache.kafka.raft.Batch;
+import org.apache.kafka.server.common.ApiMessageAndVersion;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Objects;
+
+
+/**
+ * Reads a log file containing KRaft record batches.
+ */
+public final class BatchFileReader implements Iterator&lt;BatchFileReader.BatchAndType&gt;, AutoCloseable {
+<span class="nc" id="L48">    private static final Logger log = LoggerFactory.getLogger(BatchFileReader.class);</span>
+
+<span class="nc" id="L50">    public static class Builder {</span>
+<span class="nc" id="L51">        private String path = null;</span>
+
+        public Builder setPath(String path) {
+<span class="nc" id="L54">            this.path = Objects.requireNonNull(path);</span>
+<span class="nc" id="L55">            return this;</span>
+        }
+
+        public BatchFileReader build() throws Exception {
+<span class="nc bnc" id="L59" title="All 2 branches missed.">            if (path == null) {</span>
+<span class="nc" id="L60">                throw new RuntimeException(&quot;You must specify a path.&quot;);</span>
+            }
+<span class="nc" id="L62">            FileRecords fileRecords = FileRecords.open(new File(path), false);</span>
+            try {
+<span class="nc" id="L64">                return new BatchFileReader(fileRecords);</span>
+<span class="nc" id="L65">            } catch (Throwable e) {</span>
+<span class="nc" id="L66">                Utils.closeQuietly(fileRecords, &quot;fileRecords&quot;);</span>
+<span class="nc" id="L67">                throw e;</span>
+            }
+        }
+    }
+
+<span class="nc" id="L72">    public record BatchAndType(Batch&lt;ApiMessageAndVersion&gt; batch, boolean isControl) {</span>
+    }
+
+    private final FileRecords fileRecords;
+    private Iterator&lt;FileChannelRecordBatch&gt; batchIterator;
+    private final MetadataRecordSerde serde;
+
+<span class="nc" id="L79">    private BatchFileReader(FileRecords fileRecords) {</span>
+<span class="nc" id="L80">        this.fileRecords = fileRecords;</span>
+<span class="nc" id="L81">        this.batchIterator = fileRecords.batchIterator();</span>
+<span class="nc" id="L82">        this.serde = new MetadataRecordSerde();</span>
+<span class="nc" id="L83">    }</span>
+
+    @Override
+    public boolean hasNext() {
+<span class="nc" id="L87">        return this.batchIterator.hasNext();</span>
+    }
+
+    @Override
+    public BatchAndType next() {
+<span class="nc" id="L92">        FileChannelRecordBatch input = batchIterator.next();</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">        if (input.isControlBatch()) {</span>
+<span class="nc" id="L94">            return nextControlBatch(input);</span>
+        } else {
+<span class="nc" id="L96">            return nextDataBatch(input);</span>
+        }
+    }
+
+    private BatchAndType nextControlBatch(FileChannelRecordBatch input) {
+<span class="nc" id="L101">        List&lt;ApiMessageAndVersion&gt; messages = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">        for (Record record : input) {</span>
+            try {
+<span class="nc" id="L104">                ControlRecordType type = ControlRecordType.parse(record.key());</span>
+<span class="nc bnc" id="L105" title="All 4 branches missed.">                switch (type) {</span>
+                    case LEADER_CHANGE: {
+<span class="nc" id="L107">                        LeaderChangeMessage message = new LeaderChangeMessage();</span>
+<span class="nc" id="L108">                        message.read(new ByteBufferAccessor(record.value()), (short) 0);</span>
+<span class="nc" id="L109">                        messages.add(new ApiMessageAndVersion(message, (short) 0));</span>
+<span class="nc" id="L110">                        break;</span>
+                    }
+                    case SNAPSHOT_HEADER: {
+<span class="nc" id="L113">                        SnapshotHeaderRecord message = new SnapshotHeaderRecord();</span>
+<span class="nc" id="L114">                        message.read(new ByteBufferAccessor(record.value()), (short) 0);</span>
+<span class="nc" id="L115">                        messages.add(new ApiMessageAndVersion(message, (short) 0));</span>
+<span class="nc" id="L116">                        break;</span>
+                    }
+                    case SNAPSHOT_FOOTER: {
+<span class="nc" id="L119">                        SnapshotFooterRecord message = new SnapshotFooterRecord();</span>
+<span class="nc" id="L120">                        message.read(new ByteBufferAccessor(record.value()), (short) 0);</span>
+<span class="nc" id="L121">                        messages.add(new ApiMessageAndVersion(message, (short) 0));</span>
+<span class="nc" id="L122">                        break;</span>
+                    }
+                    default:
+<span class="nc" id="L125">                        throw new RuntimeException(&quot;Unsupported control record type &quot; + type + &quot; at offset &quot; +</span>
+<span class="nc" id="L126">                                record.offset());</span>
+                }
+<span class="nc" id="L128">            } catch (Throwable e) {</span>
+<span class="nc" id="L129">                throw new RuntimeException(&quot;Unable to read control record at offset &quot; + record.offset(), e);</span>
+<span class="nc" id="L130">            }</span>
+<span class="nc" id="L131">        }</span>
+<span class="nc" id="L132">        return new BatchAndType(Batch.data(</span>
+<span class="nc" id="L133">            input.baseOffset(),</span>
+<span class="nc" id="L134">            input.partitionLeaderEpoch(),</span>
+<span class="nc" id="L135">            input.maxTimestamp(),</span>
+<span class="nc" id="L136">            input.sizeInBytes(),</span>
+            messages), true);
+    }
+
+    private BatchAndType nextDataBatch(FileChannelRecordBatch input) {
+<span class="nc" id="L141">        List&lt;ApiMessageAndVersion&gt; messages = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        for (Record record : input) {</span>
+            try {
+<span class="nc" id="L144">                ByteBufferAccessor accessor = new ByteBufferAccessor(record.value());</span>
+<span class="nc" id="L145">                ApiMessageAndVersion messageAndVersion = serde.read(accessor, record.valueSize());</span>
+<span class="nc" id="L146">                messages.add(messageAndVersion);</span>
+<span class="nc" id="L147">            } catch (Throwable e) {</span>
+<span class="nc" id="L148">                throw new RuntimeException(&quot;unable to deserialize record at offset &quot; + record.offset(), e);</span>
+<span class="nc" id="L149">            }</span>
+<span class="nc" id="L150">        }</span>
+<span class="nc" id="L151">        return new BatchAndType(Batch.data(</span>
+<span class="nc" id="L152">            input.baseOffset(),</span>
+<span class="nc" id="L153">            input.partitionLeaderEpoch(),</span>
+<span class="nc" id="L154">            input.maxTimestamp(),</span>
+<span class="nc" id="L155">            input.sizeInBytes(),</span>
+            messages), false);
+    }
+
+    @Override
+    public void close() {
+        try {
+<span class="nc" id="L162">            fileRecords.closeHandlers();</span>
+<span class="nc" id="L163">        } catch (Exception e) {</span>
+<span class="nc" id="L164">            log.error(&quot;Error closing fileRecords&quot;, e);</span>
+<span class="nc" id="L165">        }</span>
+<span class="nc" id="L166">        this.batchIterator = Collections.emptyIterator();</span>
+<span class="nc" id="L167">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

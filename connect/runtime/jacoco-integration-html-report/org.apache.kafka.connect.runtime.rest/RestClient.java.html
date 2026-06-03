@@ -1,0 +1,260 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RestClient.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.rest</a> &gt; <span class="el_source">RestClient.java</span></div><h1>RestClient.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.connect.runtime.rest;
+
+import org.apache.kafka.common.config.AbstractConfig;
+import org.apache.kafka.connect.runtime.distributed.Crypto;
+import org.apache.kafka.connect.runtime.rest.entities.ErrorMessage;
+import org.apache.kafka.connect.runtime.rest.errors.ConnectRestException;
+import org.apache.kafka.connect.runtime.rest.util.SSLUtils;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import org.eclipse.jetty.client.ContentResponse;
+import org.eclipse.jetty.client.HttpClient;
+import org.eclipse.jetty.client.Request;
+import org.eclipse.jetty.client.StringRequestContent;
+import org.eclipse.jetty.client.transport.HttpClientTransportDynamic;
+import org.eclipse.jetty.http.HttpField;
+import org.eclipse.jetty.http.HttpFields;
+import org.eclipse.jetty.http.HttpStatus;
+import org.eclipse.jetty.io.ClientConnector;
+import org.eclipse.jetty.util.ssl.SslContextFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
+
+import javax.crypto.SecretKey;
+
+import jakarta.ws.rs.core.HttpHeaders;
+import jakarta.ws.rs.core.Response;
+
+/**
+ * Client for outbound REST requests to other members of a Connect cluster
+ * This class is thread-safe.
+ */
+public class RestClient {
+<span class="fc" id="L60">    private static final Logger log = LoggerFactory.getLogger(RestClient.class);</span>
+<span class="fc" id="L61">    private static final ObjectMapper JSON_SERDE = new ObjectMapper();</span>
+
+    private final AbstractConfig config;
+
+<span class="fc" id="L65">    public RestClient(AbstractConfig config) {</span>
+<span class="fc" id="L66">        this.config = config;</span>
+<span class="fc" id="L67">    }</span>
+
+    // VisibleForTesting
+    HttpClient httpClient(SslContextFactory.Client sslContextFactory) {
+        final HttpClient client;
+<span class="pc bpc" id="L72" title="1 of 2 branches missed.">        if (sslContextFactory != null) {</span>
+<span class="nc" id="L73">            ClientConnector clientConnector = new ClientConnector();</span>
+<span class="nc" id="L74">            clientConnector.setSslContextFactory(sslContextFactory);</span>
+<span class="nc" id="L75">            client = new HttpClient(new HttpClientTransportDynamic(clientConnector));</span>
+<span class="nc" id="L76">        } else {</span>
+<span class="fc" id="L77">            client = new HttpClient();</span>
+        }
+<span class="fc" id="L79">        return client;</span>
+    }
+
+    /**
+     * Sends HTTP request to remote REST server
+     *
+     * @param url             HTTP connection will be established with this url, non-null.
+     * @param method          HTTP method (&quot;GET&quot;, &quot;POST&quot;, &quot;PUT&quot;, etc.), non-null
+     * @param headers         HTTP headers from REST endpoint
+     * @param requestBodyData Object to serialize as JSON and send in the request body.
+     * @param responseFormat  Expected format of the response to the HTTP request, non-null.
+     * @param &lt;T&gt;             The type of the deserialized response to the HTTP request.
+     * @return The deserialized response to the HTTP request, containing null if no data is expected or returned.
+     */
+    public &lt;T&gt; HttpResponse&lt;T&gt; httpRequest(String url, String method, HttpHeaders headers, Object requestBodyData,
+                                                  TypeReference&lt;T&gt; responseFormat) {
+<span class="nc" id="L95">        return httpRequest(url, method, headers, requestBodyData, responseFormat, null, null);</span>
+    }
+
+    /**
+     * Sends HTTP request to remote REST server
+     *
+     * @param url                       HTTP connection will be established with this url, non-null.
+     * @param method                    HTTP method (&quot;GET&quot;, &quot;POST&quot;, &quot;PUT&quot;, etc.), non-null
+     * @param headers                   HTTP headers from REST endpoint
+     * @param requestBodyData           Object to serialize as JSON and send in the request body.
+     * @param sessionKey                The key to sign the request with (intended for internal requests only);
+     *                                  may be null if the request doesn't need to be signed
+     * @param requestSignatureAlgorithm The algorithm to sign the request with (intended for internal requests only);
+     *                                  may be null if the request doesn't need to be signed
+     */
+    public void httpRequest(String url, String method, HttpHeaders headers, Object requestBodyData,
+                                           SecretKey sessionKey, String requestSignatureAlgorithm) {
+<span class="fc" id="L112">        httpRequest(url, method, headers, requestBodyData, new TypeReference&lt;Void&gt;() { }, sessionKey, requestSignatureAlgorithm);</span>
+<span class="fc" id="L113">    }</span>
+
+    /**
+     * Sends HTTP request to remote REST server
+     *
+     * @param url                       HTTP connection will be established with this url, non-null.
+     * @param method                    HTTP method (&quot;GET&quot;, &quot;POST&quot;, &quot;PUT&quot;, etc.), non-null
+     * @param headers                   HTTP headers from REST endpoint
+     * @param requestBodyData           Object to serialize as JSON and send in the request body.
+     * @param responseFormat            Expected format of the response to the HTTP request, non-null.
+     * @param &lt;T&gt;                       The type of the deserialized response to the HTTP request.
+     * @param sessionKey                The key to sign the request with (intended for internal requests only);
+     *                                  may be null if the request doesn't need to be signed
+     * @param requestSignatureAlgorithm The algorithm to sign the request with (intended for internal requests only);
+     *                                  may be null if the request doesn't need to be signed
+     * @return The deserialized response to the HTTP request, containing null if no data is expected or returned.
+     */
+    public &lt;T&gt; HttpResponse&lt;T&gt; httpRequest(String url, String method, HttpHeaders headers, Object requestBodyData,
+                                                  TypeReference&lt;T&gt; responseFormat,
+                                                  SecretKey sessionKey, String requestSignatureAlgorithm) {
+<span class="fc" id="L133">        Objects.requireNonNull(url, &quot;url must be non-null&quot;);</span>
+<span class="fc" id="L134">        Objects.requireNonNull(method, &quot;method must be non-null&quot;);</span>
+<span class="fc" id="L135">        Objects.requireNonNull(responseFormat, &quot;response format must be non-null&quot;);</span>
+        // Only try to load SSL configs if we have to (see KAFKA-14816)
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">        SslContextFactory.Client sslContextFactory = url.startsWith(&quot;https://&quot;)</span>
+<span class="nc" id="L138">                ? SSLUtils.createClientSideSslContextFactory(config)</span>
+<span class="fc" id="L139">                : null;</span>
+<span class="fc" id="L140">        HttpClient client = httpClient(sslContextFactory);</span>
+<span class="fc" id="L141">        client.setFollowRedirects(false);</span>
+
+        try {
+<span class="fc" id="L144">            client.start();</span>
+<span class="nc" id="L145">        } catch (Exception e) {</span>
+<span class="nc" id="L146">            log.error(&quot;Failed to start RestClient: &quot;, e);</span>
+<span class="nc" id="L147">            throw new ConnectRestException(Response.Status.INTERNAL_SERVER_ERROR, &quot;Failed to start RestClient: &quot; + e.getMessage(), e);</span>
+<span class="fc" id="L148">        }</span>
+
+        try {
+<span class="fc" id="L151">            return httpRequest(client, url, method, headers, requestBodyData, responseFormat, sessionKey, requestSignatureAlgorithm);</span>
+        } finally {
+            try {
+<span class="fc" id="L154">                client.stop();</span>
+<span class="nc" id="L155">            } catch (Exception e) {</span>
+<span class="nc" id="L156">                log.error(&quot;Failed to stop HTTP client&quot;, e);</span>
+<span class="fc" id="L157">            }</span>
+        }
+    }
+
+    private &lt;T&gt; HttpResponse&lt;T&gt; httpRequest(HttpClient client, String url, String method,
+                                           HttpHeaders headers, Object requestBodyData,
+                                           TypeReference&lt;T&gt; responseFormat, SecretKey sessionKey,
+                                           String requestSignatureAlgorithm) {
+        try {
+<span class="pc bpc" id="L166" title="1 of 2 branches missed.">            String serializedBody = requestBodyData == null ? null : JSON_SERDE.writeValueAsString(requestBodyData);</span>
+<span class="fc" id="L167">            log.trace(&quot;Sending {} with input {} to {}&quot;, method, serializedBody, url);</span>
+
+<span class="fc" id="L169">            Request req = client.newRequest(url);</span>
+<span class="fc" id="L170">            req.method(method);</span>
+<span class="fc" id="L171">            req.accept(&quot;application/json&quot;);</span>
+<span class="fc" id="L172">            req.agent(&quot;kafka-connect&quot;);</span>
+<span class="fc" id="L173">            addHeadersToRequest(headers, req);</span>
+
+<span class="pc bpc" id="L175" title="1 of 2 branches missed.">            if (serializedBody != null) {</span>
+<span class="fc" id="L176">                req.body(new StringRequestContent(&quot;application/json&quot;, serializedBody, StandardCharsets.UTF_8));</span>
+            }
+
+<span class="pc bpc" id="L179" title="2 of 4 branches missed.">            if (sessionKey != null &amp;&amp; requestSignatureAlgorithm != null) {</span>
+<span class="fc" id="L180">                InternalRequestSignature.addToRequest(</span>
+                    Crypto.SYSTEM,
+                    sessionKey,
+<span class="pc bpc" id="L183" title="1 of 2 branches missed.">                    serializedBody != null ? serializedBody.getBytes(StandardCharsets.UTF_8) : null,</span>
+                    requestSignatureAlgorithm,
+                    req
+                );
+            }
+
+<span class="fc" id="L189">            ContentResponse res = req.send();</span>
+
+<span class="fc" id="L191">            int responseCode = res.getStatus();</span>
+<span class="fc" id="L192">            log.debug(&quot;Request's response code: {}&quot;, responseCode);</span>
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">            if (responseCode == HttpStatus.NO_CONTENT_204) {</span>
+<span class="fc" id="L194">                return new HttpResponse&lt;&gt;(responseCode, convertHttpFieldsToMap(res.getHeaders()), null);</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">            } else if (responseCode &gt;= 400) {</span>
+<span class="nc" id="L196">                ErrorMessage errorMessage = JSON_SERDE.readValue(res.getContentAsString(), ErrorMessage.class);</span>
+<span class="nc" id="L197">                throw new ConnectRestException(responseCode, errorMessage.errorCode(), errorMessage.message());</span>
+<span class="nc bnc" id="L198" title="All 4 branches missed.">            } else if (responseCode &gt;= 200 &amp;&amp; responseCode &lt; 300) {</span>
+<span class="nc" id="L199">                T result = JSON_SERDE.readValue(res.getContentAsString(), responseFormat);</span>
+<span class="nc" id="L200">                return new HttpResponse&lt;&gt;(responseCode, convertHttpFieldsToMap(res.getHeaders()), result);</span>
+            } else {
+<span class="nc" id="L202">                throw new ConnectRestException(Response.Status.INTERNAL_SERVER_ERROR,</span>
+<span class="nc" id="L203">                        Response.Status.INTERNAL_SERVER_ERROR.getStatusCode(),</span>
+                        &quot;Unexpected status code when handling forwarded request: &quot; + responseCode);
+            }
+<span class="nc" id="L206">        } catch (IOException | TimeoutException | ExecutionException e) {</span>
+<span class="nc" id="L207">            log.error(&quot;IO error forwarding REST request to {} :&quot;, url, e);</span>
+<span class="nc" id="L208">            throw new ConnectRestException(Response.Status.INTERNAL_SERVER_ERROR, &quot;IO Error trying to forward REST request: &quot; + e.getMessage(), e);</span>
+<span class="nc" id="L209">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L210">            log.error(&quot;Thread was interrupted forwarding REST request to {} :&quot;, url, e);</span>
+<span class="nc" id="L211">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L212">            throw new ConnectRestException(Response.Status.INTERNAL_SERVER_ERROR, &quot;Thread was interrupted trying to forward REST request: &quot; + e.getMessage(), e);</span>
+<span class="nc" id="L213">        } catch (ConnectRestException e) {</span>
+            // catching any explicitly thrown ConnectRestException-s to preserve its status code
+            // and to avoid getting it overridden by the more generic catch (Throwable) clause down below
+<span class="nc" id="L216">            log.error(&quot;Error forwarding REST request to {} :&quot;, url, e);</span>
+<span class="nc" id="L217">            throw e;</span>
+<span class="nc" id="L218">        } catch (Throwable t) {</span>
+<span class="nc" id="L219">            log.error(&quot;Error forwarding REST request to {} :&quot;, url, t);</span>
+<span class="nc" id="L220">            throw new ConnectRestException(Response.Status.INTERNAL_SERVER_ERROR, &quot;Error trying to forward REST request: &quot; + t.getMessage(), t);</span>
+        }
+    }
+
+
+    /**
+     * Extract headers from REST call and add to client request
+     * @param headers         Headers from REST endpoint
+     * @param req             The client request to modify
+     */
+    private static void addHeadersToRequest(HttpHeaders headers, Request req) {
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">        if (headers != null) {</span>
+<span class="nc" id="L232">            String credentialAuthorization = headers.getHeaderString(HttpHeaders.AUTHORIZATION);</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">            if (credentialAuthorization != null) {</span>
+<span class="nc" id="L234">                req.headers(field -&gt; field.add(HttpHeaders.AUTHORIZATION, credentialAuthorization));</span>
+            }
+        }
+<span class="fc" id="L237">    }</span>
+
+    /**
+     * Convert response headers from Jetty format ({@link HttpFields}) to a simple {@link Map}
+     * @param httpFields the response headers
+     * @return a {@link Map} containing the response headers
+     */
+    private static Map&lt;String, String&gt; convertHttpFieldsToMap(HttpFields httpFields) {
+<span class="fc" id="L245">        Map&lt;String, String&gt; headers = new HashMap&lt;&gt;();</span>
+
+<span class="pc bpc" id="L247" title="2 of 4 branches missed.">        if (httpFields == null || httpFields.size() == 0)</span>
+<span class="nc" id="L248">            return headers;</span>
+
+<span class="fc bfc" id="L250" title="All 2 branches covered.">        for (HttpField field : httpFields) {</span>
+<span class="fc" id="L251">            headers.put(field.getName(), field.getValue());</span>
+<span class="fc" id="L252">        }</span>
+
+<span class="fc" id="L254">        return headers;</span>
+    }
+
+<span class="fc" id="L257">    public record HttpResponse&lt;T&gt;(int status, Map&lt;String, String&gt; headers, T body) {</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

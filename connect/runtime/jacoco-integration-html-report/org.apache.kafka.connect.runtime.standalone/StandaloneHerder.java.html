@@ -1,0 +1,636 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StandaloneHerder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.standalone</a> &gt; <span class="el_source">StandaloneHerder.java</span></div><h1>StandaloneHerder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime.standalone;
+
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.ThreadUtils;
+import org.apache.kafka.connect.connector.policy.ConnectorClientConfigOverridePolicy;
+import org.apache.kafka.connect.errors.AlreadyExistsException;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.errors.NotFoundException;
+import org.apache.kafka.connect.runtime.AbstractHerder;
+import org.apache.kafka.connect.runtime.ConnectorConfig;
+import org.apache.kafka.connect.runtime.HerderConnectorContext;
+import org.apache.kafka.connect.runtime.HerderRequest;
+import org.apache.kafka.connect.runtime.RestartPlan;
+import org.apache.kafka.connect.runtime.RestartRequest;
+import org.apache.kafka.connect.runtime.SessionKey;
+import org.apache.kafka.connect.runtime.SinkConnectorConfig;
+import org.apache.kafka.connect.runtime.SourceConnectorConfig;
+import org.apache.kafka.connect.runtime.TargetState;
+import org.apache.kafka.connect.runtime.Worker;
+import org.apache.kafka.connect.runtime.rest.InternalRequestSignature;
+import org.apache.kafka.connect.runtime.rest.entities.ConfigInfos;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorInfo;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorOffsets;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorStateInfo;
+import org.apache.kafka.connect.runtime.rest.entities.Message;
+import org.apache.kafka.connect.runtime.rest.entities.TaskInfo;
+import org.apache.kafka.connect.runtime.rest.errors.BadRequestException;
+import org.apache.kafka.connect.storage.ClusterConfigState;
+import org.apache.kafka.connect.storage.ConfigBackingStore;
+import org.apache.kafka.connect.storage.MemoryConfigBackingStore;
+import org.apache.kafka.connect.storage.MemoryStatusBackingStore;
+import org.apache.kafka.connect.storage.StatusBackingStore;
+import org.apache.kafka.connect.util.Callback;
+import org.apache.kafka.connect.util.ConnectUtils;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
+
+/**
+ * Single process, in-memory &quot;herder&quot;. Useful for a standalone Kafka Connect process.
+ */
+public final class StandaloneHerder extends AbstractHerder {
+<span class="nc" id="L73">    private static final Logger log = LoggerFactory.getLogger(StandaloneHerder.class);</span>
+
+<span class="nc" id="L75">    private final AtomicLong requestSeqNum = new AtomicLong();</span>
+    private final ScheduledExecutorService requestExecutorService;
+    private final HealthCheckThread healthCheckThread;
+
+    // Visible for testing
+    ClusterConfigState configState;
+
+    public StandaloneHerder(Worker worker, String kafkaClusterId,
+                            ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy) {
+<span class="nc" id="L84">        this(worker,</span>
+<span class="nc" id="L85">                worker.workerId(),</span>
+                kafkaClusterId,
+                new MemoryStatusBackingStore(),
+<span class="nc" id="L88">                new MemoryConfigBackingStore(worker.configTransformer()),</span>
+                connectorClientConfigOverridePolicy,
+                Time.SYSTEM
+        );
+<span class="nc" id="L92">    }</span>
+
+    // visible for testing
+    StandaloneHerder(Worker worker,
+                     String workerId,
+                     String kafkaClusterId,
+                     StatusBackingStore statusBackingStore,
+                     MemoryConfigBackingStore configBackingStore,
+                     ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
+                     Time time) {
+<span class="nc" id="L102">        super(worker, workerId, kafkaClusterId, statusBackingStore, configBackingStore, connectorClientConfigOverridePolicy, time);</span>
+<span class="nc" id="L103">        this.configState = ClusterConfigState.EMPTY;</span>
+<span class="nc" id="L104">        this.requestExecutorService = Executors.newSingleThreadScheduledExecutor();</span>
+<span class="nc" id="L105">        this.healthCheckThread = new HealthCheckThread(this);</span>
+<span class="nc" id="L106">        configBackingStore.setUpdateListener(new ConfigUpdateListener());</span>
+<span class="nc" id="L107">    }</span>
+
+    @Override
+    public synchronized void start() {
+<span class="nc" id="L111">        log.info(&quot;Herder starting&quot;);</span>
+<span class="nc" id="L112">        startServices();</span>
+<span class="nc" id="L113">        log.info(&quot;Herder started&quot;);</span>
+<span class="nc" id="L114">    }</span>
+
+    @Override
+    public synchronized void stop() {
+<span class="nc" id="L118">        log.info(&quot;Herder stopping&quot;);</span>
+<span class="nc" id="L119">        ThreadUtils.shutdownExecutorServiceQuietly(requestExecutorService, 30, TimeUnit.SECONDS);</span>
+        // There's no coordination/hand-off to do here since this is all standalone. Instead, we
+        // should just clean up the stuff we normally would, i.e. cleanly checkpoint and shutdown all
+        // the tasks.
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        for (String connName : connectors()) {</span>
+<span class="nc" id="L124">            removeConnectorTasks(connName);</span>
+<span class="nc" id="L125">            worker.stopAndAwaitConnector(connName);</span>
+<span class="nc" id="L126">        }</span>
+<span class="nc" id="L127">        stopServices();</span>
+<span class="nc" id="L128">        healthCheckThread.shutDown();</span>
+<span class="nc" id="L129">        log.info(&quot;Herder stopped&quot;);</span>
+<span class="nc" id="L130">    }</span>
+
+    @Override
+    public void ready() {
+<span class="nc" id="L134">        super.ready();</span>
+<span class="nc" id="L135">        healthCheckThread.start();</span>
+<span class="nc" id="L136">    }</span>
+
+    @Override
+    public void healthCheck(Callback&lt;Void&gt; cb) {
+<span class="nc" id="L140">        healthCheckThread.check(cb);</span>
+<span class="nc" id="L141">    }</span>
+
+    @Override
+    public int generation() {
+<span class="nc" id="L145">        return 0;</span>
+    }
+
+    @Override
+    public synchronized void connectors(Callback&lt;Collection&lt;String&gt;&gt; callback) {
+<span class="nc" id="L150">        callback.onCompletion(null, connectors());</span>
+<span class="nc" id="L151">    }</span>
+
+    @Override
+    public synchronized void connectorInfo(String connName, Callback&lt;ConnectorInfo&gt; callback) {
+<span class="nc" id="L155">        ConnectorInfo connectorInfo = connectorInfo(connName);</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">        if (connectorInfo == null) {</span>
+<span class="nc" id="L157">            callback.onCompletion(new NotFoundException(&quot;Connector &quot; + connName + &quot; not found&quot;), null);</span>
+<span class="nc" id="L158">            return;</span>
+        }
+<span class="nc" id="L160">        callback.onCompletion(null, connectorInfo);</span>
+<span class="nc" id="L161">    }</span>
+
+    private synchronized ConnectorInfo createConnectorInfo(String connector) {
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        if (!configState.contains(connector))</span>
+<span class="nc" id="L165">            return null;</span>
+<span class="nc" id="L166">        Map&lt;String, String&gt; config = configState.rawConnectorConfig(connector);</span>
+<span class="nc" id="L167">        return new ConnectorInfo(connector, config, configState.tasks(connector), connectorType(config));</span>
+    }
+
+    @Override
+    protected synchronized Map&lt;String, String&gt; rawConfig(String connName) {
+<span class="nc" id="L172">        return configState.rawConnectorConfig(connName);</span>
+    }
+
+    @Override
+    public synchronized void deleteConnectorConfig(String connName, Callback&lt;Created&lt;ConnectorInfo&gt;&gt; callback) {
+        try {
+<span class="nc bnc" id="L178" title="All 2 branches missed.">            if (!configState.contains(connName)) {</span>
+                // Deletion, must already exist
+<span class="nc" id="L180">                callback.onCompletion(new NotFoundException(&quot;Connector &quot; + connName + &quot; not found&quot;, null), null);</span>
+<span class="nc" id="L181">                return;</span>
+            }
+
+<span class="nc" id="L184">            removeConnectorTasks(connName);</span>
+<span class="nc" id="L185">            worker.stopAndAwaitConnector(connName);</span>
+<span class="nc" id="L186">            configBackingStore.removeConnectorConfig(connName);</span>
+<span class="nc" id="L187">            onDeletion(connName);</span>
+<span class="nc" id="L188">            callback.onCompletion(null, new Created&lt;&gt;(false, null));</span>
+<span class="nc" id="L189">        } catch (ConnectException e) {</span>
+<span class="nc" id="L190">            callback.onCompletion(e, null);</span>
+<span class="nc" id="L191">        }</span>
+
+<span class="nc" id="L193">    }</span>
+
+    @Override
+    public synchronized void putConnectorConfig(String connName,
+                                                final Map&lt;String, String&gt; config,
+                                                boolean allowReplace,
+                                                final Callback&lt;Created&lt;ConnectorInfo&gt;&gt; callback) {
+<span class="nc" id="L200">        putConnectorConfig(connName, config, null, allowReplace, callback);</span>
+<span class="nc" id="L201">    }</span>
+
+    @Override
+    public void putConnectorConfig(final String connName, final Map&lt;String, String&gt; config, final TargetState targetState,
+                                   final boolean allowReplace, final Callback&lt;Created&lt;ConnectorInfo&gt;&gt; callback) {
+        try {
+<span class="nc" id="L207">            validateConnectorConfig(config, (error, configInfos) -&gt; {</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">                if (error != null) {</span>
+<span class="nc" id="L209">                    callback.onCompletion(error, null);</span>
+<span class="nc" id="L210">                    return;</span>
+                }
+
+<span class="nc" id="L213">                requestExecutorService.submit(</span>
+<span class="nc" id="L214">                    () -&gt; putConnectorConfig(connName, config, targetState, allowReplace, callback, configInfos)</span>
+                );
+<span class="nc" id="L216">            });</span>
+<span class="nc" id="L217">        } catch (Throwable t) {</span>
+<span class="nc" id="L218">            callback.onCompletion(t, null);</span>
+<span class="nc" id="L219">        }</span>
+<span class="nc" id="L220">    }</span>
+
+    private synchronized void putConnectorConfig(String connName,
+                                                 final Map&lt;String, String&gt; config,
+                                                 TargetState targetState,
+                                                 boolean allowReplace,
+                                                 final Callback&lt;Created&lt;ConnectorInfo&gt;&gt; callback,
+                                                 ConfigInfos configInfos) {
+        try {
+<span class="nc bnc" id="L229" title="All 2 branches missed.">            if (maybeAddConfigErrors(configInfos, callback)) {</span>
+<span class="nc" id="L230">                return;</span>
+            }
+
+            final boolean created;
+<span class="nc bnc" id="L234" title="All 2 branches missed.">            if (configState.contains(connName)) {</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">                if (!allowReplace) {</span>
+<span class="nc" id="L236">                    callback.onCompletion(new AlreadyExistsException(&quot;Connector &quot; + connName + &quot; already exists&quot;), null);</span>
+<span class="nc" id="L237">                    return;</span>
+                }
+<span class="nc" id="L239">                worker.stopAndAwaitConnector(connName);</span>
+<span class="nc" id="L240">                created = false;</span>
+            } else {
+<span class="nc" id="L242">                created = true;</span>
+            }
+
+<span class="nc" id="L245">            configBackingStore.putConnectorConfig(connName, config, targetState);</span>
+
+<span class="nc" id="L247">            startConnector(connName, (error, result) -&gt; {</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                if (error != null) {</span>
+<span class="nc" id="L249">                    callback.onCompletion(error, null);</span>
+<span class="nc" id="L250">                    return;</span>
+                }
+
+<span class="nc" id="L253">                requestExecutorService.submit(() -&gt; {</span>
+<span class="nc" id="L254">                    updateConnectorTasks(connName);</span>
+<span class="nc" id="L255">                    callback.onCompletion(null, new Created&lt;&gt;(created, createConnectorInfo(connName)));</span>
+<span class="nc" id="L256">                });</span>
+<span class="nc" id="L257">            });</span>
+<span class="nc" id="L258">        } catch (Throwable t) {</span>
+<span class="nc" id="L259">            callback.onCompletion(t, null);</span>
+<span class="nc" id="L260">        }</span>
+<span class="nc" id="L261">    }</span>
+
+    @Override
+    public synchronized void patchConnectorConfig(String connName, Map&lt;String, String&gt; configPatch, Callback&lt;Created&lt;ConnectorInfo&gt;&gt; callback) {
+        try {
+<span class="nc" id="L266">            ConnectorInfo connectorInfo = connectorInfo(connName);</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            if (connectorInfo == null) {</span>
+<span class="nc" id="L268">                callback.onCompletion(new NotFoundException(&quot;Connector &quot; + connName + &quot; not found&quot;, null), null);</span>
+<span class="nc" id="L269">                return;</span>
+            }
+
+<span class="nc" id="L272">            Map&lt;String, String&gt; patchedConfig = ConnectUtils.patchConfig(connectorInfo.config(), configPatch);</span>
+<span class="nc" id="L273">            validateConnectorConfig(patchedConfig, (error, configInfos) -&gt; {</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">                if (error != null) {</span>
+<span class="nc" id="L275">                    callback.onCompletion(error, null);</span>
+<span class="nc" id="L276">                    return;</span>
+                }
+
+<span class="nc" id="L279">                requestExecutorService.submit(</span>
+<span class="nc" id="L280">                        () -&gt; putConnectorConfig(connName, patchedConfig, null, true, callback, configInfos)</span>
+                );
+<span class="nc" id="L282">            });</span>
+<span class="nc" id="L283">        } catch (Throwable e) {</span>
+<span class="nc" id="L284">            callback.onCompletion(e, null);</span>
+<span class="nc" id="L285">        }</span>
+<span class="nc" id="L286">    }</span>
+
+    @Override
+    public synchronized void stopConnector(String connName, Callback&lt;Void&gt; callback) {
+        try {
+<span class="nc" id="L291">            removeConnectorTasks(connName);</span>
+<span class="nc" id="L292">            configBackingStore.putTargetState(connName, TargetState.STOPPED);</span>
+<span class="nc" id="L293">            callback.onCompletion(null, null);</span>
+<span class="nc" id="L294">        } catch (Throwable t) {</span>
+<span class="nc" id="L295">            callback.onCompletion(t, null);</span>
+<span class="nc" id="L296">        }</span>
+<span class="nc" id="L297">    }</span>
+
+    @Override
+    public synchronized void requestTaskReconfiguration(String connName) {
+<span class="nc bnc" id="L301" title="All 2 branches missed.">        if (!worker.connectorNames().contains(connName)) {</span>
+<span class="nc" id="L302">            log.error(&quot;Task that requested reconfiguration does not exist: {}&quot;, connName);</span>
+<span class="nc" id="L303">            return;</span>
+        }
+<span class="nc" id="L305">        updateConnectorTasks(connName);</span>
+<span class="nc" id="L306">    }</span>
+
+    @Override
+    public synchronized void taskConfigs(String connName, Callback&lt;List&lt;TaskInfo&gt;&gt; callback) {
+<span class="nc bnc" id="L310" title="All 2 branches missed.">        if (!configState.contains(connName)) {</span>
+<span class="nc" id="L311">            callback.onCompletion(new NotFoundException(&quot;Connector &quot; + connName + &quot; not found&quot;, null), null);</span>
+<span class="nc" id="L312">            return;</span>
+        }
+
+<span class="nc" id="L315">        List&lt;TaskInfo&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        for (ConnectorTaskId taskId : configState.tasks(connName))</span>
+<span class="nc" id="L317">            result.add(new TaskInfo(taskId, configState.rawTaskConfig(taskId)));</span>
+<span class="nc" id="L318">        callback.onCompletion(null, result);</span>
+<span class="nc" id="L319">    }</span>
+
+    @Override
+    public void putTaskConfigs(String connName, List&lt;Map&lt;String, String&gt;&gt; configs, Callback&lt;Void&gt; callback, InternalRequestSignature requestSignature) {
+<span class="nc" id="L323">        throw new UnsupportedOperationException(&quot;Kafka Connect in standalone mode does not support externally setting task configurations.&quot;);</span>
+    }
+
+    @Override
+    public void fenceZombieSourceTasks(String connName, Callback&lt;Void&gt; callback, InternalRequestSignature requestSignature) {
+<span class="nc" id="L328">        throw new UnsupportedOperationException(&quot;Kafka Connect in standalone mode does not support exactly-once source connectors.&quot;);</span>
+    }
+
+    @Override
+    public synchronized void restartTask(ConnectorTaskId taskId, Callback&lt;Void&gt; cb) {
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        if (!configState.contains(taskId.connector()))</span>
+<span class="nc" id="L334">            cb.onCompletion(new NotFoundException(&quot;Connector &quot; + taskId.connector() + &quot; not found&quot;, null), null);</span>
+
+<span class="nc" id="L336">        Map&lt;String, String&gt; taskConfigProps = configState.taskConfig(taskId);</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">        if (taskConfigProps == null)</span>
+<span class="nc" id="L338">            cb.onCompletion(new NotFoundException(&quot;Task &quot; + taskId + &quot; not found&quot;, null), null);</span>
+<span class="nc" id="L339">        Map&lt;String, String&gt; connConfigProps = configState.connectorConfig(taskId.connector());</span>
+
+<span class="nc" id="L341">        worker.stopAndAwaitTask(taskId);</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">        if (startTask(taskId, connConfigProps))</span>
+<span class="nc" id="L343">            cb.onCompletion(null, null);</span>
+        else
+<span class="nc" id="L345">            cb.onCompletion(new ConnectException(&quot;Failed to start task: &quot; + taskId), null);</span>
+<span class="nc" id="L346">    }</span>
+
+    @Override
+    public synchronized void restartConnector(String connName, Callback&lt;Void&gt; cb) {
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        if (!configState.contains(connName))</span>
+<span class="nc" id="L351">            cb.onCompletion(new NotFoundException(&quot;Connector &quot; + connName + &quot; not found&quot;, null), null);</span>
+
+<span class="nc" id="L353">        worker.stopAndAwaitConnector(connName);</span>
+
+<span class="nc" id="L355">        startConnector(connName, (error, targetState) -&gt; {</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">            if (targetState == TargetState.STARTED) {</span>
+<span class="nc" id="L357">                requestTaskReconfiguration(connName);</span>
+            }
+<span class="nc" id="L359">            cb.onCompletion(error, null);</span>
+<span class="nc" id="L360">        });</span>
+<span class="nc" id="L361">    }</span>
+
+    @Override
+    public synchronized HerderRequest restartConnector(long delayMs, final String connName, final Callback&lt;Void&gt; cb) {
+<span class="nc" id="L365">        ScheduledFuture&lt;?&gt; future = requestExecutorService.schedule(</span>
+<span class="nc" id="L366">            () -&gt; restartConnector(connName, cb), delayMs, TimeUnit.MILLISECONDS);</span>
+
+<span class="nc" id="L368">        return new StandaloneHerderRequest(requestSeqNum.incrementAndGet(), future);</span>
+    }
+
+    @Override
+    public synchronized void restartConnectorAndTasks(RestartRequest request, Callback&lt;ConnectorStateInfo&gt; cb) {
+        // Ensure the connector exists
+<span class="nc" id="L374">        String connectorName = request.connectorName();</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        if (!configState.contains(connectorName)) {</span>
+<span class="nc" id="L376">            cb.onCompletion(new NotFoundException(&quot;Unknown connector: &quot; + connectorName, null), null);</span>
+<span class="nc" id="L377">            return;</span>
+        }
+
+<span class="nc" id="L380">        Optional&lt;RestartPlan&gt; maybePlan = buildRestartPlan(request);</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        if (maybePlan.isEmpty()) {</span>
+<span class="nc" id="L382">            cb.onCompletion(new NotFoundException(&quot;Status for connector &quot; + connectorName + &quot; not found&quot;, null), null);</span>
+<span class="nc" id="L383">            return;</span>
+        }
+<span class="nc" id="L385">        RestartPlan plan = maybePlan.get();</span>
+
+        // If requested, stop the connector and any tasks, marking each as restarting
+<span class="nc" id="L388">        log.info(&quot;Received {}&quot;, plan);</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">        if (plan.shouldRestartConnector()) {</span>
+<span class="nc" id="L390">            worker.stopAndAwaitConnector(connectorName);</span>
+<span class="nc" id="L391">            onRestart(connectorName);</span>
+        }
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        if (plan.shouldRestartTasks()) {</span>
+            // Stop the tasks and mark as restarting
+<span class="nc" id="L395">            worker.stopAndAwaitTasks(plan.taskIdsToRestart());</span>
+<span class="nc" id="L396">            plan.taskIdsToRestart().forEach(this::onRestart);</span>
+        }
+
+        // Now restart the connector and tasks
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (plan.shouldRestartConnector()) {</span>
+<span class="nc" id="L401">            log.debug(&quot;Restarting connector '{}'&quot;, connectorName);</span>
+<span class="nc" id="L402">            startConnector(connectorName, (error, targetState) -&gt; {</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">                if (error == null) {</span>
+<span class="nc" id="L404">                    log.info(&quot;Connector '{}' restart successful&quot;, connectorName);</span>
+                } else {
+<span class="nc" id="L406">                    log.error(&quot;Connector '{}' restart failed&quot;, connectorName, error);</span>
+                }
+<span class="nc" id="L408">            });</span>
+        }
+<span class="nc bnc" id="L410" title="All 2 branches missed.">        if (plan.shouldRestartTasks()) {</span>
+<span class="nc" id="L411">            log.debug(&quot;Restarting {} of {} tasks for {}&quot;, plan.restartTaskCount(), plan.totalTaskCount(), request);</span>
+<span class="nc" id="L412">            createConnectorTasks(connectorName, plan.taskIdsToRestart());</span>
+<span class="nc" id="L413">            log.debug(&quot;Restarted {} of {} tasks for {} as requested&quot;, plan.restartTaskCount(), plan.totalTaskCount(), request);</span>
+        }
+        // Complete the restart request
+<span class="nc" id="L416">        log.info(&quot;Completed {}&quot;, plan);</span>
+<span class="nc" id="L417">        cb.onCompletion(null, plan.restartConnectorStateInfo());</span>
+<span class="nc" id="L418">    }</span>
+
+    @Override
+    public synchronized void connectorOffsets(String connName, Callback&lt;ConnectorOffsets&gt; cb) {
+<span class="nc" id="L422">        log.trace(&quot;Fetching offsets for connector: {}&quot;, connName);</span>
+<span class="nc" id="L423">        super.connectorOffsets(connName, cb);</span>
+<span class="nc" id="L424">    }</span>
+
+    @Override
+    protected synchronized void modifyConnectorOffsets(String connName, Map&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; offsets, Callback&lt;Message&gt; cb) {
+<span class="nc bnc" id="L428" title="All 2 branches missed.">        if (!modifyConnectorOffsetsChecks(connName, cb)) {</span>
+<span class="nc" id="L429">            return;</span>
+        }
+
+<span class="nc" id="L432">        worker.modifyConnectorOffsets(connName, configState.connectorConfig(connName), offsets, cb);</span>
+<span class="nc" id="L433">    }</span>
+
+    /**
+     * This method performs a few checks for external requests to modify (alter or reset) connector offsets and
+     * completes the callback exceptionally if any check fails.
+     * @param connName the name of the connector whose offsets are to be modified
+     * @param cb callback to invoke upon completion
+     * @return true if all the checks passed, false otherwise
+     */
+    private boolean modifyConnectorOffsetsChecks(String connName, Callback&lt;Message&gt; cb) {
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        if (!configState.contains(connName)) {</span>
+<span class="nc" id="L444">            cb.onCompletion(new NotFoundException(&quot;Connector &quot; + connName + &quot; not found&quot;, null), null);</span>
+<span class="nc" id="L445">            return false;</span>
+        }
+
+<span class="nc bnc" id="L448" title="All 4 branches missed.">        if (configState.targetState(connName) != TargetState.STOPPED || configState.taskCount(connName) != 0) {</span>
+<span class="nc" id="L449">            cb.onCompletion(new BadRequestException(&quot;Connectors must be in the STOPPED state before their offsets can be modified. This can be done &quot; +</span>
+                    &quot;for the specified connector by issuing a 'PUT' request to the '/connectors/&quot; + connName + &quot;/stop' endpoint&quot;), null);
+<span class="nc" id="L451">            return false;</span>
+        }
+
+<span class="nc" id="L454">        return true;</span>
+    }
+
+    @Override
+    public void setClusterLoggerLevel(String namespace, String level) {
+        // In standalone mode, this single worker is the entire cluster
+<span class="nc" id="L460">        setWorkerLoggerLevel(namespace, level);</span>
+<span class="nc" id="L461">    }</span>
+
+    private void startConnector(String connName, Callback&lt;TargetState&gt; onStart) {
+<span class="nc" id="L464">        Map&lt;String, String&gt; connConfigs = configState.connectorConfig(connName);</span>
+<span class="nc" id="L465">        TargetState targetState = configState.targetState(connName);</span>
+<span class="nc" id="L466">        worker.startConnector(connName, connConfigs, new HerderConnectorContext(this, connName, worker.metrics().connectorPluginMetrics(connName)), this, targetState, onStart);</span>
+<span class="nc" id="L467">    }</span>
+
+    private List&lt;Map&lt;String, String&gt;&gt; recomputeTaskConfigs(String connName) {
+<span class="nc" id="L470">        Map&lt;String, String&gt; config = configState.connectorConfig(connName);</span>
+
+<span class="nc bnc" id="L472" title="All 2 branches missed.">        ConnectorConfig connConfig = worker.isSinkConnector(connName) ?</span>
+<span class="nc" id="L473">            new SinkConnectorConfig(plugins(), config) :</span>
+<span class="nc" id="L474">            new SourceConnectorConfig(plugins(), config, worker.isTopicCreationEnabled());</span>
+
+<span class="nc" id="L476">        return worker.connectorTaskConfigs(connName, connConfig);</span>
+    }
+
+    private void createConnectorTasks(String connName) {
+<span class="nc" id="L480">        List&lt;ConnectorTaskId&gt; taskIds = configState.tasks(connName);</span>
+<span class="nc" id="L481">        createConnectorTasks(connName, taskIds);</span>
+<span class="nc" id="L482">    }</span>
+
+    private void createConnectorTasks(String connName, Collection&lt;ConnectorTaskId&gt; taskIds) {
+<span class="nc" id="L485">        Map&lt;String, String&gt; connConfigs = configState.connectorConfig(connName);</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">        for (ConnectorTaskId taskId : taskIds) {</span>
+<span class="nc" id="L487">            startTask(taskId, connConfigs);</span>
+<span class="nc" id="L488">        }</span>
+<span class="nc" id="L489">    }</span>
+
+    private boolean startTask(ConnectorTaskId taskId, Map&lt;String, String&gt; connProps) {
+<span class="nc bnc" id="L492" title="All 3 branches missed.">        return switch (connectorType(connProps)) {</span>
+<span class="nc" id="L493">            case SINK -&gt; worker.startSinkTask(</span>
+                    taskId,
+                    configState,
+                    connProps,
+<span class="nc" id="L497">                    configState.taskConfig(taskId),</span>
+                    this,
+<span class="nc" id="L499">                    configState.targetState(taskId.connector())</span>
+            );
+<span class="nc" id="L501">            case SOURCE -&gt; worker.startSourceTask(</span>
+                    taskId,
+                    configState,
+                    connProps,
+<span class="nc" id="L505">                    configState.taskConfig(taskId),</span>
+                    this,
+<span class="nc" id="L507">                    configState.targetState(taskId.connector())</span>
+            );
+            default -&gt;
+<span class="nc" id="L510">                    throw new ConnectException(&quot;Failed to start task &quot; + taskId + &quot; since it is not a recognizable type (source or sink)&quot;);</span>
+        };
+    }
+
+    private void removeConnectorTasks(String connName) {
+<span class="nc" id="L515">        Collection&lt;ConnectorTaskId&gt; tasks = configState.tasks(connName);</span>
+<span class="nc bnc" id="L516" title="All 2 branches missed.">        if (!tasks.isEmpty()) {</span>
+<span class="nc" id="L517">            worker.stopAndAwaitTasks(tasks);</span>
+<span class="nc" id="L518">            configBackingStore.removeTaskConfigs(connName);</span>
+<span class="nc" id="L519">            tasks.forEach(this::onDeletion);</span>
+        }
+<span class="nc" id="L521">    }</span>
+
+    private synchronized void updateConnectorTasks(String connName) {
+<span class="nc bnc" id="L524" title="All 2 branches missed.">        if (!worker.isRunning(connName)) {</span>
+<span class="nc" id="L525">            log.info(&quot;Skipping update of tasks for connector {} since it is not running&quot;, connName);</span>
+<span class="nc" id="L526">            return;</span>
+<span class="nc bnc" id="L527" title="All 2 branches missed.">        } else if (configState.targetState(connName) != TargetState.STARTED) {</span>
+<span class="nc" id="L528">            log.info(&quot;Skipping update of tasks for connector {} since its target state is {}&quot;, connName, configState.targetState(connName));</span>
+<span class="nc" id="L529">            return;</span>
+        }
+
+<span class="nc" id="L532">        List&lt;Map&lt;String, String&gt;&gt; newTaskConfigs = recomputeTaskConfigs(connName);</span>
+<span class="nc" id="L533">        List&lt;Map&lt;String, String&gt;&gt; rawTaskConfigs = reverseTransform(connName, configState, newTaskConfigs);</span>
+
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        if (taskConfigsChanged(configState, connName, rawTaskConfigs)) {</span>
+<span class="nc" id="L536">            removeConnectorTasks(connName);</span>
+<span class="nc" id="L537">            configBackingStore.putTaskConfigs(connName, rawTaskConfigs);</span>
+<span class="nc" id="L538">            createConnectorTasks(connName);</span>
+        }
+<span class="nc" id="L540">    }</span>
+
+    // This update listener assumes synchronous updates the ConfigBackingStore, which only works
+    // with the MemoryConfigBackingStore. This allows us to write a change (e.g. through
+    // ConfigBackingStore.putConnectorConfig()) and then immediately read it back from an updated
+    // snapshot.
+    // TODO: To get any real benefit from the backing store abstraction, we should move some of
+    // the handling into the callbacks in this listener.
+<span class="nc" id="L548">    private class ConfigUpdateListener implements ConfigBackingStore.UpdateListener {</span>
+
+        @Override
+        public void onConnectorConfigRemove(String connector) {
+<span class="nc" id="L552">            synchronized (StandaloneHerder.this) {</span>
+<span class="nc" id="L553">                configState = configBackingStore.snapshot();</span>
+<span class="nc" id="L554">            }</span>
+<span class="nc" id="L555">        }</span>
+
+        @Override
+        public void onConnectorConfigUpdate(String connector) {
+            // TODO: move connector configuration update handling here to be consistent with
+            //       the semantics of the config backing store
+
+<span class="nc" id="L562">            synchronized (StandaloneHerder.this) {</span>
+<span class="nc" id="L563">                configState = configBackingStore.snapshot();</span>
+<span class="nc" id="L564">            }</span>
+<span class="nc" id="L565">        }</span>
+
+        @Override
+        public void onTaskConfigUpdate(Collection&lt;ConnectorTaskId&gt; tasks) {
+<span class="nc" id="L569">            synchronized (StandaloneHerder.this) {</span>
+<span class="nc" id="L570">                configState = configBackingStore.snapshot();</span>
+<span class="nc" id="L571">            }</span>
+<span class="nc" id="L572">        }</span>
+
+        @Override
+        public void onConnectorTargetStateChange(String connector) {
+<span class="nc" id="L576">            synchronized (StandaloneHerder.this) {</span>
+<span class="nc" id="L577">                configState = configBackingStore.snapshot();</span>
+<span class="nc" id="L578">                TargetState targetState = configState.targetState(connector);</span>
+<span class="nc" id="L579">                worker.setTargetState(connector, targetState, (error, newState) -&gt; {</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">                    if (error != null) {</span>
+<span class="nc" id="L581">                        log.error(&quot;Failed to transition connector {} to target state {}&quot;, connector, targetState, error);</span>
+<span class="nc" id="L582">                        return;</span>
+                    }
+
+<span class="nc bnc" id="L585" title="All 2 branches missed.">                    if (newState == TargetState.STARTED) {</span>
+<span class="nc" id="L586">                        requestExecutorService.submit(() -&gt; updateConnectorTasks(connector));</span>
+                    }
+<span class="nc" id="L588">                });</span>
+<span class="nc" id="L589">            }</span>
+<span class="nc" id="L590">        }</span>
+
+        @Override
+        public void onSessionKeyUpdate(SessionKey sessionKey) {
+            // no-op
+<span class="nc" id="L595">        }</span>
+
+        @Override
+        public void onRestartRequest(RestartRequest restartRequest) {
+            // no-op
+<span class="nc" id="L600">        }</span>
+
+        @Override
+        public void onLoggingLevelUpdate(String namespace, String level) {
+            // no-op
+<span class="nc" id="L605">        }</span>
+    }
+
+    static class StandaloneHerderRequest implements HerderRequest {
+        private final long seq;
+        private final ScheduledFuture&lt;?&gt; future;
+
+<span class="nc" id="L612">        public StandaloneHerderRequest(long seq, ScheduledFuture&lt;?&gt; future) {</span>
+<span class="nc" id="L613">            this.seq = seq;</span>
+<span class="nc" id="L614">            this.future = future;</span>
+<span class="nc" id="L615">        }</span>
+
+        @Override
+        public void cancel() {
+<span class="nc" id="L619">            future.cancel(false);</span>
+<span class="nc" id="L620">        }</span>
+
+        @Override
+        public boolean equals(Object o) {
+<span class="nc bnc" id="L624" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">            if (!(o instanceof StandaloneHerderRequest other))</span>
+<span class="nc" id="L626">                return false;</span>
+<span class="nc bnc" id="L627" title="All 2 branches missed.">            return seq == other.seq;</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L632">            return Objects.hash(seq);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

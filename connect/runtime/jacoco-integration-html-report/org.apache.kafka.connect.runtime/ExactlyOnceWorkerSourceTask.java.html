@@ -1,0 +1,566 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ExactlyOnceWorkerSourceTask.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">ExactlyOnceWorkerSourceTask.java</span></div><h1>ExactlyOnceWorkerSourceTask.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.errors.InvalidProducerEpochException;
+import org.apache.kafka.common.internals.Plugin;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.Avg;
+import org.apache.kafka.common.metrics.stats.Max;
+import org.apache.kafka.common.metrics.stats.Min;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.runtime.errors.ErrorHandlingMetrics;
+import org.apache.kafka.connect.runtime.errors.ErrorReporter;
+import org.apache.kafka.connect.runtime.errors.ProcessingContext;
+import org.apache.kafka.connect.runtime.errors.RetryWithToleranceOperator;
+import org.apache.kafka.connect.runtime.isolation.LoaderSwap;
+import org.apache.kafka.connect.source.SourceRecord;
+import org.apache.kafka.connect.source.SourceTask;
+import org.apache.kafka.connect.source.SourceTask.TransactionBoundary;
+import org.apache.kafka.connect.storage.CloseableOffsetStorageReader;
+import org.apache.kafka.connect.storage.ClusterConfigState;
+import org.apache.kafka.connect.storage.ConnectorOffsetBackingStore;
+import org.apache.kafka.connect.storage.Converter;
+import org.apache.kafka.connect.storage.HeaderConverter;
+import org.apache.kafka.connect.storage.OffsetStorageWriter;
+import org.apache.kafka.connect.storage.StatusBackingStore;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+import org.apache.kafka.connect.util.LoggingContext;
+import org.apache.kafka.connect.util.TopicAdmin;
+import org.apache.kafka.connect.util.TopicCreationGroup;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+
+/**
+ * WorkerTask that uses a {@link SourceTask} to ingest data into Kafka, with support for exactly-once semantics.
+ */
+class ExactlyOnceWorkerSourceTask extends AbstractWorkerSourceTask {
+<span class="nc" id="L69">    private static final Logger log = LoggerFactory.getLogger(ExactlyOnceWorkerSourceTask.class);</span>
+
+    private boolean transactionOpen;
+    private final LinkedHashMap&lt;SourceRecord, RecordMetadata&gt; committableRecords;
+
+    private final TransactionBoundaryManager transactionBoundaryManager;
+    private final TransactionMetricsGroup transactionMetrics;
+
+    private final Runnable preProducerCheck;
+    private final Runnable postProducerCheck;
+
+    public ExactlyOnceWorkerSourceTask(ConnectorTaskId id,
+                                       SourceTask task,
+                                       TaskStatus.Listener statusListener,
+                                       TargetState initialState,
+                                       Plugin&lt;Converter&gt; keyConverterPlugin,
+                                       Plugin&lt;Converter&gt; valueConverterPlugin,
+                                       Plugin&lt;HeaderConverter&gt; headerConverterPlugin,
+                                       TransformationChain&lt;SourceRecord, SourceRecord&gt; transformationChain,
+                                       Producer&lt;byte[], byte[]&gt; producer,
+                                       TopicAdmin admin,
+                                       Map&lt;String, TopicCreationGroup&gt; topicGroups,
+                                       CloseableOffsetStorageReader offsetReader,
+                                       OffsetStorageWriter offsetWriter,
+                                       ConnectorOffsetBackingStore offsetStore,
+                                       WorkerConfig workerConfig,
+                                       ClusterConfigState configState,
+                                       ConnectMetrics connectMetrics,
+                                       ErrorHandlingMetrics errorMetrics,
+                                       ClassLoader loader,
+                                       Time time,
+                                       RetryWithToleranceOperator&lt;SourceRecord&gt; retryWithToleranceOperator,
+                                       StatusBackingStore statusBackingStore,
+                                       SourceConnectorConfig sourceConfig,
+                                       Executor closeExecutor,
+                                       Runnable preProducerCheck,
+                                       Runnable postProducerCheck,
+                                       Supplier&lt;List&lt;ErrorReporter&lt;SourceRecord&gt;&gt;&gt; errorReportersSupplier,
+                                       TaskPluginsMetadata pluginsMetadata,
+                                       Function&lt;ClassLoader, LoaderSwap&gt; pluginLoaderSwapper) {
+<span class="nc" id="L109">        super(id, task, statusListener, initialState, configState, keyConverterPlugin, valueConverterPlugin, headerConverterPlugin, transformationChain,</span>
+<span class="nc" id="L110">                buildTransactionContext(sourceConfig),</span>
+                producer, admin, topicGroups, offsetReader, offsetWriter, offsetStore, workerConfig, connectMetrics, errorMetrics,
+                loader, time, retryWithToleranceOperator, statusBackingStore, closeExecutor, errorReportersSupplier, pluginsMetadata, pluginLoaderSwapper);
+
+<span class="nc" id="L114">        this.transactionOpen = false;</span>
+<span class="nc" id="L115">        this.committableRecords = new LinkedHashMap&lt;&gt;();</span>
+
+<span class="nc" id="L117">        this.preProducerCheck = preProducerCheck;</span>
+<span class="nc" id="L118">        this.postProducerCheck = postProducerCheck;</span>
+
+<span class="nc" id="L120">        this.transactionBoundaryManager = buildTransactionManager(workerConfig, sourceConfig, sourceTaskContext.transactionContext());</span>
+<span class="nc" id="L121">        this.transactionMetrics = new TransactionMetricsGroup(id, connectMetrics);</span>
+<span class="nc" id="L122">    }</span>
+
+    private static WorkerTransactionContext buildTransactionContext(SourceConnectorConfig sourceConfig) {
+<span class="nc bnc" id="L125" title="All 2 branches missed.">        return TransactionBoundary.CONNECTOR.equals(sourceConfig.transactionBoundary())</span>
+<span class="nc" id="L126">                ? new WorkerTransactionContext()</span>
+<span class="nc" id="L127">                : null;</span>
+    }
+
+    @Override
+    protected void prepareToInitializeTask() {
+<span class="nc" id="L132">        preProducerCheck.run();</span>
+
+        // Try not to initialize the transactional producer (which may accidentally fence out other, later task generations) if we've already
+        // been shut down at this point
+<span class="nc bnc" id="L136" title="All 2 branches missed.">        if (isStopping())</span>
+<span class="nc" id="L137">            return;</span>
+<span class="nc" id="L138">        producer.initTransactions();</span>
+
+<span class="nc" id="L140">        postProducerCheck.run();</span>
+<span class="nc" id="L141">    }</span>
+
+    @Override
+    protected void prepareToEnterSendLoop() {
+<span class="nc" id="L145">        transactionBoundaryManager.initialize();</span>
+<span class="nc" id="L146">    }</span>
+
+    @Override
+    protected void beginSendIteration() {
+        // No-op
+<span class="nc" id="L151">    }</span>
+
+    @Override
+    protected void prepareToPollTask() {
+        // No-op
+<span class="nc" id="L156">    }</span>
+
+    @Override
+    protected void recordDropped(SourceRecord record) {
+<span class="nc" id="L160">        synchronized (committableRecords) {</span>
+<span class="nc" id="L161">            committableRecords.put(record, null);</span>
+<span class="nc" id="L162">        }</span>
+<span class="nc" id="L163">        transactionBoundaryManager.maybeCommitTransactionForRecord(record);</span>
+<span class="nc" id="L164">    }</span>
+
+    @Override
+    protected Optional&lt;SubmittedRecords.SubmittedRecord&gt; prepareToSendRecord(
+            SourceRecord sourceRecord,
+            ProducerRecord&lt;byte[], byte[]&gt; producerRecord
+    ) {
+<span class="nc bnc" id="L171" title="All 2 branches missed.">        if (offsetStore.primaryOffsetsTopic().equals(producerRecord.topic())) {</span>
+            // This is to prevent deadlock that occurs when:
+            //     1. A task provides a record whose topic is the task's offsets topic
+            //     2. That record is dispatched to the task's producer in a transaction that remains open
+            //        at least until the worker polls the task again
+            //     3. In the subsequent call to SourceTask::poll, the task requests offsets from the worker
+            //        (which requires a read to the end of the offsets topic, and will block until any open
+            //        transactions on the topic are either committed or aborted)
+<span class="nc" id="L179">            throw new ConnectException(&quot;Source tasks may not produce to their own offsets topics when exactly-once support is enabled&quot;);</span>
+        }
+<span class="nc" id="L181">        maybeBeginTransaction();</span>
+<span class="nc" id="L182">        return Optional.empty();</span>
+    }
+
+    @Override
+    protected void recordDispatched(SourceRecord record) {
+        // Offsets are converted &amp; serialized in the OffsetWriter
+        // Important: we only save offsets for the record after it has been accepted by the producer; this way,
+        // we commit those offsets if and only if the record is sent successfully.
+<span class="nc" id="L190">        offsetWriter.offset(record.sourcePartition(), record.sourceOffset());</span>
+<span class="nc" id="L191">        transactionMetrics.addRecord();</span>
+<span class="nc" id="L192">        transactionBoundaryManager.maybeCommitTransactionForRecord(record);</span>
+<span class="nc" id="L193">    }</span>
+
+    @Override
+    protected void batchDispatched() {
+<span class="nc" id="L197">        transactionBoundaryManager.maybeCommitTransactionForBatch();</span>
+<span class="nc" id="L198">    }</span>
+
+    @Override
+    protected void recordSent(
+            SourceRecord sourceRecord,
+            ProducerRecord&lt;byte[], byte[]&gt; producerRecord,
+            RecordMetadata recordMetadata
+    ) {
+<span class="nc" id="L206">        synchronized (committableRecords) {</span>
+<span class="nc" id="L207">            committableRecords.put(sourceRecord, recordMetadata);</span>
+<span class="nc" id="L208">        }</span>
+<span class="nc" id="L209">    }</span>
+
+    @Override
+    protected void producerSendFailed(
+            ProcessingContext&lt;SourceRecord&gt; context,
+            boolean synchronous,
+            ProducerRecord&lt;byte[], byte[]&gt; producerRecord,
+            SourceRecord preTransformRecord,
+            Exception e
+    ) {
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        if (synchronous) {</span>
+<span class="nc" id="L220">            throw maybeWrapProducerSendException(</span>
+                    &quot;Unrecoverable exception trying to send&quot;,
+                    e
+            );
+        } else {
+            // No-op; all asynchronously-reported producer exceptions should be bubbled up again by Producer::commitTransaction
+        }
+<span class="nc" id="L227">    }</span>
+
+    @Override
+    protected void finalOffsetCommit(boolean failed) {
+<span class="nc bnc" id="L231" title="All 2 branches missed.">        if (failed) {</span>
+<span class="nc" id="L232">            log.debug(&quot;Skipping final offset commit as task has failed&quot;);</span>
+<span class="nc" id="L233">            return;</span>
+        }
+
+        // It should be safe to commit here even if we were in the middle of retrying on RetriableExceptions in the
+        // send loop since we only track source offsets for records that have been successfully dispatched to the
+        // producer.
+        // Any records that we were retrying on (and any records after them in the batch) won't be included in the
+        // transaction and their offsets won't be committed, but (unless the user has requested connector-defined
+        // transaction boundaries), it's better to commit some data than none.
+<span class="nc" id="L242">        transactionBoundaryManager.maybeCommitFinalTransaction();</span>
+<span class="nc" id="L243">    }</span>
+
+    @Override
+    public void removeMetrics() {
+<span class="nc" id="L247">        Utils.closeQuietly(transactionMetrics, &quot;source task transaction metrics tracker&quot;);</span>
+<span class="nc" id="L248">        super.removeMetrics();</span>
+<span class="nc" id="L249">    }</span>
+
+    @Override
+    protected void onPause() {
+<span class="nc" id="L253">        super.onPause();</span>
+        // Commit the transaction now so that we don't end up with a hanging transaction, or worse, get fenced out
+        // and fail the task once unpaused
+<span class="nc" id="L256">        transactionBoundaryManager.maybeCommitFinalTransaction();</span>
+<span class="nc" id="L257">    }</span>
+
+    private void maybeBeginTransaction() {
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (!transactionOpen) {</span>
+<span class="nc" id="L261">            producer.beginTransaction();</span>
+<span class="nc" id="L262">            transactionOpen = true;</span>
+        }
+<span class="nc" id="L264">    }</span>
+
+    private void commitTransaction() {
+<span class="nc" id="L267">        log.debug(&quot;{} Committing offsets&quot;, this);</span>
+
+<span class="nc" id="L269">        long started = time.milliseconds();</span>
+
+<span class="nc" id="L271">        AtomicReference&lt;Throwable&gt; flushError = new AtomicReference&lt;&gt;();</span>
+<span class="nc" id="L272">        boolean shouldFlush = false;</span>
+        try {
+            // Begin the flush without waiting, as there should not be any concurrent flushes.
+            // This is because commitTransaction is always called on the same thread, and should always block until
+            // the flush is complete, or cancel the flush if an error occurs.
+<span class="nc" id="L277">            shouldFlush = offsetWriter.beginFlush();</span>
+<span class="nc" id="L278">        } catch (Throwable e) {</span>
+<span class="nc" id="L279">            flushError.compareAndSet(null, e);</span>
+<span class="nc" id="L280">        }</span>
+<span class="nc bnc" id="L281" title="All 6 branches missed.">        if (flushError.get() == null &amp;&amp; !transactionOpen &amp;&amp; !shouldFlush) {</span>
+            // There is no contents on the framework side to commit, so skip the offset flush and producer commit
+<span class="nc" id="L283">            long durationMillis = time.milliseconds() - started;</span>
+<span class="nc" id="L284">            recordCommitSuccess(durationMillis);</span>
+<span class="nc" id="L285">            log.debug(&quot;{} Finished commitOffsets successfully in {} ms&quot;, this, durationMillis);</span>
+
+<span class="nc" id="L287">            commitSourceTask();</span>
+<span class="nc" id="L288">            return;</span>
+        }
+
+        // We might have just aborted a transaction, in which case we'll have to begin a new one
+        // in order to commit offsets
+<span class="nc" id="L293">        maybeBeginTransaction();</span>
+
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        if (shouldFlush) {</span>
+            // Now we can actually write the offsets to the internal topic.
+            // No need to track the flush future here since it's guaranteed to complete by the time
+            // Producer::commitTransaction completes
+            // We do have to track failures for that callback though, since they may originate from outside
+            // the producer (i.e., the offset writer or the backing offset store), and would not cause
+            // Producer::commitTransaction to fail
+<span class="nc" id="L302">            offsetWriter.doFlush((error, result) -&gt; {</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                if (error != null) {</span>
+<span class="nc" id="L304">                    log.error(&quot;{} Failed to flush offsets to storage: &quot;, ExactlyOnceWorkerSourceTask.this, error);</span>
+<span class="nc" id="L305">                    flushError.compareAndSet(null, error);</span>
+                } else {
+<span class="nc" id="L307">                    log.trace(&quot;{} Finished flushing offsets to storage&quot;, ExactlyOnceWorkerSourceTask.this);</span>
+                }
+<span class="nc" id="L309">            });</span>
+        }
+
+        // Only commit the transaction if we were able to serialize the offsets.
+        // Otherwise, we may commit source records without committing their offsets
+<span class="nc" id="L314">        Throwable error = flushError.get();</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">        if (error == null) {</span>
+            try {
+                // Commit the transaction
+                // Blocks until all outstanding records have been sent and ack'd
+<span class="nc" id="L319">                producer.commitTransaction();</span>
+<span class="nc" id="L320">            } catch (Throwable t) {</span>
+<span class="nc" id="L321">                log.error(&quot;{} Failed to commit producer transaction&quot;, ExactlyOnceWorkerSourceTask.this, t);</span>
+<span class="nc" id="L322">                flushError.compareAndSet(null, t);</span>
+<span class="nc" id="L323">            }</span>
+<span class="nc" id="L324">            transactionOpen = false;</span>
+        }
+
+<span class="nc" id="L327">        error = flushError.get();</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">        if (error != null) {</span>
+<span class="nc" id="L329">            recordCommitFailure(time.milliseconds() - started);</span>
+<span class="nc" id="L330">            offsetWriter.cancelFlush();</span>
+<span class="nc" id="L331">            throw maybeWrapProducerSendException(</span>
+                    &quot;Failed to flush offsets and/or records for task &quot; + id,
+                    error
+            );
+        }
+
+<span class="nc" id="L337">        transactionMetrics.commitTransaction();</span>
+
+<span class="nc" id="L339">        long durationMillis = time.milliseconds() - started;</span>
+<span class="nc" id="L340">        recordCommitSuccess(durationMillis);</span>
+<span class="nc" id="L341">        log.debug(&quot;{} Finished commitOffsets successfully in {} ms&quot;, this, durationMillis);</span>
+
+        // Synchronize in order to guarantee that writes on other threads are picked up by this one
+<span class="nc" id="L344">        synchronized (committableRecords) {</span>
+<span class="nc" id="L345">            committableRecords.forEach(this::commitTaskRecord);</span>
+<span class="nc" id="L346">            committableRecords.clear();</span>
+<span class="nc" id="L347">        }</span>
+<span class="nc" id="L348">        commitSourceTask();</span>
+<span class="nc" id="L349">    }</span>
+
+    private RuntimeException maybeWrapProducerSendException(String message, Throwable error) {
+<span class="nc bnc" id="L352" title="All 2 branches missed.">        if (isPossibleTransactionTimeoutError(error)) {</span>
+<span class="nc" id="L353">            return wrapTransactionTimeoutError(error);</span>
+        } else {
+<span class="nc" id="L355">            return new ConnectException(message, error);</span>
+        }
+    }
+
+    private static boolean isPossibleTransactionTimeoutError(Throwable error) {
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        return error instanceof InvalidProducerEpochException</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">            || error.getCause() instanceof InvalidProducerEpochException;</span>
+    }
+
+    private ConnectException wrapTransactionTimeoutError(Throwable error) {
+<span class="nc" id="L365">        return new ConnectException(</span>
+            &quot;The task &quot; + id + &quot; was unable to finish writing records to Kafka before its producer transaction expired. &quot;
+                + &quot;It may be necessary to reconfigure this connector in order for it to run healthily with exactly-once support. &quot;
+                + &quot;Options for this include: tune the connector's producer configuration for higher throughput, &quot;
+                + &quot;increase the transaction timeout for the connector's producers, &quot;
+                + &quot;decrease the offset commit interval (if using interval-based transaction boundaries), &quot;
+                + &quot;or use the 'poll' transaction boundary (if the connector is not already configured to use it).&quot;,
+            error
+        );
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L378">        return &quot;ExactlyOnceWorkerSourceTask{&quot; +</span>
+            &quot;id=&quot; + id +
+            '}';
+    }
+
+<span class="nc" id="L383">    private abstract class TransactionBoundaryManager {</span>
+        protected boolean shouldCommitTransactionForRecord(SourceRecord record) {
+<span class="nc" id="L385">            return false;</span>
+        }
+
+        protected boolean shouldCommitTransactionForBatch(long currentTimeMs) {
+<span class="nc" id="L389">            return false;</span>
+        }
+
+        protected boolean shouldCommitFinalTransaction() {
+<span class="nc" id="L393">            return false;</span>
+        }
+
+        /**
+         * Hook to signal that a new transaction cycle has been started. May be invoked
+         * multiple times if the task is paused and then resumed. It can be assumed that
+         * a new transaction is created at least every time an existing transaction is
+         * committed; this is just a hook to notify that a new transaction may have been
+         * created outside of that flow as well.
+         */
+        protected void initialize() {
+<span class="nc" id="L404">        }</span>
+
+        public void maybeCommitTransactionForRecord(SourceRecord record) {
+<span class="nc" id="L407">            maybeCommitTransaction(shouldCommitTransactionForRecord(record));</span>
+<span class="nc" id="L408">        }</span>
+
+        public void maybeCommitTransactionForBatch() {
+<span class="nc" id="L411">            maybeCommitTransaction(shouldCommitTransactionForBatch(time.milliseconds()));</span>
+<span class="nc" id="L412">        }</span>
+
+        public void maybeCommitFinalTransaction() {
+<span class="nc" id="L415">            maybeCommitTransaction(shouldCommitFinalTransaction());</span>
+<span class="nc" id="L416">        }</span>
+
+        private void maybeCommitTransaction(boolean shouldCommit) {
+<span class="nc bnc" id="L419" title="All 2 branches missed.">            if (shouldCommit) {</span>
+<span class="nc" id="L420">                try (LoggingContext loggingContext = LoggingContext.forOffsets(id)) {</span>
+<span class="nc" id="L421">                    commitTransaction();</span>
+                }
+            }
+<span class="nc" id="L424">        }</span>
+    }
+
+    private TransactionBoundaryManager buildTransactionManager(
+            WorkerConfig workerConfig,
+            SourceConnectorConfig sourceConfig,
+            WorkerTransactionContext transactionContext) {
+<span class="nc" id="L431">        TransactionBoundary boundary = sourceConfig.transactionBoundary();</span>
+<span class="nc bnc" id="L432" title="All 3 branches missed.">        return switch (boundary) {</span>
+<span class="nc" id="L433">            case POLL -&gt; new TransactionBoundaryManager() {</span>
+                @Override
+                protected boolean shouldCommitTransactionForBatch(long currentTimeMs) {
+<span class="nc" id="L436">                    return true;</span>
+                }
+
+                @Override
+                protected boolean shouldCommitFinalTransaction() {
+<span class="nc" id="L441">                    return true;</span>
+                }
+            };
+            case INTERVAL -&gt; {
+<span class="nc" id="L445">                long transactionBoundaryInterval = Optional.ofNullable(sourceConfig.transactionBoundaryInterval())</span>
+<span class="nc" id="L446">                        .orElse(workerConfig.offsetCommitInterval());</span>
+<span class="nc" id="L447">                yield new TransactionBoundaryManager() {</span>
+<span class="nc" id="L448">                    private final long commitInterval = transactionBoundaryInterval;</span>
+                    private long lastCommit;
+
+                    @Override
+                    public void initialize() {
+<span class="nc" id="L453">                        this.lastCommit = time.milliseconds();</span>
+<span class="nc" id="L454">                    }</span>
+
+                    @Override
+                    protected boolean shouldCommitTransactionForBatch(long currentTimeMs) {
+<span class="nc bnc" id="L458" title="All 2 branches missed.">                        if (time.milliseconds() &gt;= lastCommit + commitInterval) {</span>
+<span class="nc" id="L459">                            lastCommit = time.milliseconds();</span>
+<span class="nc" id="L460">                            return true;</span>
+                        } else {
+<span class="nc" id="L462">                            return false;</span>
+                        }
+                    }
+
+                    @Override
+                    protected boolean shouldCommitFinalTransaction() {
+<span class="nc" id="L468">                        return true;</span>
+                    }
+                };
+            }
+            case CONNECTOR -&gt; {
+<span class="nc" id="L473">                Objects.requireNonNull(transactionContext, &quot;Transaction context must be provided when using connector-defined transaction boundaries&quot;);</span>
+<span class="nc" id="L474">                yield new TransactionBoundaryManager() {</span>
+                    @Override
+                    protected boolean shouldCommitFinalTransaction() {
+<span class="nc" id="L477">                        return shouldCommitTransactionForBatch(time.milliseconds());</span>
+                    }
+
+                    @Override
+                    protected boolean shouldCommitTransactionForBatch(long currentTimeMs) {
+<span class="nc bnc" id="L482" title="All 2 branches missed.">                        if (transactionContext.shouldAbortBatch()) {</span>
+<span class="nc" id="L483">                            log.info(&quot;Aborting transaction for batch as requested by connector&quot;);</span>
+<span class="nc" id="L484">                            maybeAbortTransaction();</span>
+                            // We abort the transaction, which causes all the records up to this point to be dropped, but we still want to
+                            // commit offsets so that the task doesn't see the same records all over again
+<span class="nc" id="L487">                            return true;</span>
+                        }
+<span class="nc" id="L489">                        return transactionContext.shouldCommitBatch();</span>
+                    }
+
+                    @Override
+                    protected boolean shouldCommitTransactionForRecord(SourceRecord record) {
+<span class="nc bnc" id="L494" title="All 2 branches missed.">                        if (transactionContext.shouldAbortOn(record)) {</span>
+<span class="nc" id="L495">                            log.info(&quot;Aborting transaction for record on topic {} as requested by connector&quot;, record.topic());</span>
+<span class="nc" id="L496">                            log.trace(&quot;Last record in aborted transaction: {}&quot;, record);</span>
+<span class="nc" id="L497">                            maybeAbortTransaction();</span>
+                            // We abort the transaction, which causes all the records up to this point to be dropped, but we still want to
+                            // commit offsets so that the task doesn't see the same records all over again
+<span class="nc" id="L500">                            return true;</span>
+                        }
+<span class="nc" id="L502">                        return transactionContext.shouldCommitOn(record);</span>
+                    }
+
+                    private void maybeAbortTransaction() {
+<span class="nc bnc" id="L506" title="All 2 branches missed.">                        if (!transactionOpen) {</span>
+<span class="nc" id="L507">                            log.warn(&quot;Ignoring request by task to abort transaction as the current transaction is empty&quot;);</span>
+<span class="nc" id="L508">                            return;</span>
+                        }
+<span class="nc" id="L510">                        producer.abortTransaction();</span>
+<span class="nc" id="L511">                        transactionMetrics.abortTransaction();</span>
+<span class="nc" id="L512">                        transactionOpen = false;</span>
+<span class="nc" id="L513">                    }</span>
+                };
+            }
+        };
+    }
+
+    TransactionMetricsGroup transactionMetricsGroup() {
+<span class="nc" id="L520">        return transactionMetrics;</span>
+    }
+
+
+    static class TransactionMetricsGroup implements AutoCloseable {
+        private final Sensor transactionSize;
+        private int size;
+        private final ConnectMetrics.MetricGroup metricGroup;
+
+<span class="nc" id="L529">        public TransactionMetricsGroup(ConnectorTaskId id, ConnectMetrics connectMetrics) {</span>
+<span class="nc" id="L530">            ConnectMetricsRegistry registry = connectMetrics.registry();</span>
+<span class="nc" id="L531">            metricGroup = connectMetrics.group(registry.sourceTaskGroupName(),</span>
+<span class="nc" id="L532">                    registry.connectorTagName(), id.connector(),</span>
+<span class="nc" id="L533">                    registry.taskTagName(), Integer.toString(id.task()));</span>
+
+<span class="nc" id="L535">            transactionSize = metricGroup.sensor(&quot;transaction-size&quot;);</span>
+<span class="nc" id="L536">            transactionSize.add(metricGroup.metricName(registry.transactionSizeAvg), new Avg());</span>
+<span class="nc" id="L537">            transactionSize.add(metricGroup.metricName(registry.transactionSizeMin), new Min());</span>
+<span class="nc" id="L538">            transactionSize.add(metricGroup.metricName(registry.transactionSizeMax), new Max());</span>
+<span class="nc" id="L539">        }</span>
+
+        @Override
+        public void close() {
+<span class="nc" id="L543">            metricGroup.close();</span>
+<span class="nc" id="L544">        }</span>
+
+        void addRecord() {
+<span class="nc" id="L547">            size++;</span>
+<span class="nc" id="L548">        }</span>
+
+        void abortTransaction() {
+<span class="nc" id="L551">            size = 0;</span>
+<span class="nc" id="L552">        }</span>
+
+        void commitTransaction() {
+<span class="nc" id="L555">            transactionSize.record(size);</span>
+<span class="nc" id="L556">            size = 0;</span>
+<span class="nc" id="L557">        }</span>
+
+        protected ConnectMetrics.MetricGroup metricGroup() {
+<span class="nc" id="L560">            return metricGroup;</span>
+        }
+
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,793 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MockConsumer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer</a> &gt; <span class="el_source">MockConsumer.java</span></div><h1>MockConsumer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer;
+
+import org.apache.kafka.clients.Metadata;
+import org.apache.kafka.clients.consumer.internals.AutoOffsetResetStrategy;
+import org.apache.kafka.clients.consumer.internals.SubscriptionState;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Metric;
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.WakeupException;
+import org.apache.kafka.common.metrics.KafkaMetric;
+import org.apache.kafka.common.utils.LogContext;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.clients.consumer.internals.ConsumerUtils.DEFAULT_CLOSE_TIMEOUT_MS;
+
+
+/**
+ * A mock of the {@link Consumer} interface you can use for testing code that uses Kafka. This class is &lt;i&gt; not
+ * threadsafe &lt;/i&gt;. However, you can use the {@link #schedulePollTask(Runnable)} method to write multithreaded tests
+ * where a driver thread waits for {@link #poll(Duration)} to be called by a background thread and then can safely perform
+ * operations during a callback.
+ */
+public class MockConsumer&lt;K, V&gt; implements Consumer&lt;K, V&gt; {
+
+    private final Map&lt;String, List&lt;PartitionInfo&gt;&gt; partitions;
+    private final SubscriptionState subscriptions;
+    private final Map&lt;TopicPartition, Long&gt; beginningOffsets;
+    private final Map&lt;TopicPartition, Long&gt; endOffsets;
+    private final Map&lt;TopicPartition, Long&gt; durationResetOffsets;
+    private final Map&lt;TopicPartition, OffsetAndMetadata&gt; committed;
+    private final Queue&lt;Runnable&gt; pollTasks;
+    private final Set&lt;TopicPartition&gt; paused;
+    private final AtomicBoolean wakeup;
+
+    private final Map&lt;TopicPartition, List&lt;ConsumerRecord&lt;K, V&gt;&gt;&gt; records;
+
+    private KafkaException pollException;
+    private KafkaException offsetsException;
+    private Duration lastPollTimeout;
+    private boolean closed;
+    private boolean shouldRebalance;
+<span class="nc" id="L79">    private boolean telemetryDisabled = false;</span>
+    private Uuid clientInstanceId;
+    private int injectTimeoutExceptionCounter;
+
+<span class="nc" id="L83">    private long maxPollRecords = Long.MAX_VALUE;</span>
+
+<span class="nc" id="L85">    private final List&lt;KafkaMetric&gt; addedMetrics = new ArrayList&lt;&gt;();</span>
+
+    /**
+     * @deprecated Since 4.0. Use {@link #MockConsumer(String)} instead.
+     */
+    @Deprecated
+    public MockConsumer(OffsetResetStrategy offsetResetStrategy) {
+<span class="nc" id="L92">        this(AutoOffsetResetStrategy.fromString(offsetResetStrategy.toString()));</span>
+<span class="nc" id="L93">    }</span>
+
+    /**
+     * A mock consumer is instantiated by providing ConsumerConfig.AUTO_OFFSET_RESET_CONFIG value as the input.
+     * @param offsetResetStrategy the offset reset strategy to use
+     */
+    public MockConsumer(String offsetResetStrategy) {
+<span class="nc" id="L100">        this(AutoOffsetResetStrategy.fromString(offsetResetStrategy));</span>
+<span class="nc" id="L101">    }</span>
+
+<span class="nc" id="L103">    private MockConsumer(AutoOffsetResetStrategy offsetResetStrategy) {</span>
+<span class="nc" id="L104">        this.subscriptions = new SubscriptionState(new LogContext(), offsetResetStrategy);</span>
+<span class="nc" id="L105">        this.partitions = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L106">        this.records = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L107">        this.paused = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L108">        this.closed = false;</span>
+<span class="nc" id="L109">        this.beginningOffsets = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L110">        this.endOffsets = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L111">        this.durationResetOffsets = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L112">        this.pollTasks = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L113">        this.pollException = null;</span>
+<span class="nc" id="L114">        this.wakeup = new AtomicBoolean(false);</span>
+<span class="nc" id="L115">        this.committed = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L116">        this.shouldRebalance = false;</span>
+<span class="nc" id="L117">    }</span>
+
+    @Override
+    public synchronized Set&lt;TopicPartition&gt; assignment() {
+<span class="nc" id="L121">        return this.subscriptions.assignedPartitions();</span>
+    }
+
+    /**
+     * Simulate a rebalance event.
+     */
+    public synchronized void rebalance(Collection&lt;TopicPartition&gt; newAssignment) {
+        // compute added and removed partitions for rebalance callback
+<span class="nc" id="L129">        Set&lt;TopicPartition&gt; oldAssignmentSet = this.subscriptions.assignedPartitions();</span>
+<span class="nc" id="L130">        Set&lt;TopicPartition&gt; newAssignmentSet = new HashSet&lt;&gt;(newAssignment);</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">        List&lt;TopicPartition&gt; added = newAssignment.stream().filter(x -&gt; !oldAssignmentSet.contains(x)).collect(Collectors.toList());</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        List&lt;TopicPartition&gt; removed = oldAssignmentSet.stream().filter(x -&gt; !newAssignmentSet.contains(x)).collect(Collectors.toList());</span>
+
+        // rebalance
+<span class="nc" id="L135">        this.records.clear();</span>
+
+        // rebalance callbacks
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        if (!removed.isEmpty()) {</span>
+<span class="nc" id="L139">            this.subscriptions.rebalanceListener().ifPresent(crl -&gt; crl.onPartitionsRevoked(removed));</span>
+        }
+<span class="nc" id="L141">        this.subscriptions.assignFromSubscribed(newAssignment);</span>
+<span class="nc" id="L142">        this.subscriptions.rebalanceListener().ifPresent(crl -&gt; crl.onPartitionsAssigned(added));</span>
+<span class="nc" id="L143">    }</span>
+
+    @Override
+    public synchronized Set&lt;String&gt; subscription() {
+<span class="nc" id="L147">        return this.subscriptions.subscription();</span>
+    }
+
+    @Override
+    public synchronized void subscribe(Collection&lt;String&gt; topics) {
+<span class="nc" id="L152">        subscribe(topics, Optional.empty());</span>
+<span class="nc" id="L153">    }</span>
+
+    @Override
+    public synchronized void subscribe(Pattern pattern, final ConsumerRebalanceListener listener) {
+<span class="nc bnc" id="L157" title="All 2 branches missed.">        if (listener == null)</span>
+<span class="nc" id="L158">            throw new IllegalArgumentException(&quot;RebalanceListener cannot be null&quot;);</span>
+
+<span class="nc" id="L160">        subscribe(pattern, Optional.of(listener));</span>
+<span class="nc" id="L161">    }</span>
+
+    @Override
+    public synchronized void subscribe(Pattern pattern) {
+<span class="nc" id="L165">        subscribe(pattern, Optional.empty());</span>
+<span class="nc" id="L166">    }</span>
+
+    @Override
+    public void subscribe(SubscriptionPattern pattern, ConsumerRebalanceListener listener) {
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        if (listener == null)</span>
+<span class="nc" id="L171">            throw new IllegalArgumentException(&quot;RebalanceListener cannot be null&quot;);</span>
+<span class="nc" id="L172">        subscribe(pattern, Optional.of(listener));</span>
+<span class="nc" id="L173">    }</span>
+
+    @Override
+    public void subscribe(SubscriptionPattern pattern) {
+<span class="nc" id="L177">        subscribe(pattern, Optional.empty());</span>
+<span class="nc" id="L178">    }</span>
+
+    private void subscribe(SubscriptionPattern pattern, Optional&lt;ConsumerRebalanceListener&gt; listener) {
+<span class="nc bnc" id="L181" title="All 4 branches missed.">        if (pattern == null || pattern.toString().isEmpty())</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">            throw new IllegalArgumentException(&quot;Topic pattern cannot be &quot; + (pattern == null ? &quot;null&quot; : &quot;empty&quot;));</span>
+<span class="nc" id="L183">        ensureNotClosed();</span>
+<span class="nc" id="L184">        committed.clear();</span>
+<span class="nc" id="L185">        this.subscriptions.subscribe(pattern, listener);</span>
+<span class="nc" id="L186">    }</span>
+
+    @Override
+    public void subscribe(Collection&lt;String&gt; topics, final ConsumerRebalanceListener listener) {
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (listener == null)</span>
+<span class="nc" id="L191">            throw new IllegalArgumentException(&quot;RebalanceListener cannot be null&quot;);</span>
+
+<span class="nc" id="L193">        subscribe(topics, Optional.of(listener));</span>
+<span class="nc" id="L194">    }</span>
+
+    private synchronized void subscribe(Collection&lt;String&gt; topics, Optional&lt;ConsumerRebalanceListener&gt; listener) {
+<span class="nc" id="L197">        ensureNotClosed();</span>
+<span class="nc" id="L198">        committed.clear();</span>
+<span class="nc" id="L199">        this.subscriptions.subscribe(new HashSet&lt;&gt;(topics), listener);</span>
+<span class="nc" id="L200">    }</span>
+
+    private synchronized void subscribe(Pattern pattern, Optional&lt;ConsumerRebalanceListener&gt; listener) {
+<span class="nc" id="L203">        ensureNotClosed();</span>
+<span class="nc" id="L204">        committed.clear();</span>
+<span class="nc" id="L205">        this.subscriptions.subscribe(pattern, listener);</span>
+<span class="nc" id="L206">        Set&lt;String&gt; topicsToSubscribe = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">        for (String topic: partitions.keySet()) {</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">            if (pattern.matcher(topic).matches() &amp;&amp;</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">                !subscriptions.subscription().contains(topic))</span>
+<span class="nc" id="L210">                topicsToSubscribe.add(topic);</span>
+<span class="nc" id="L211">        }</span>
+<span class="nc" id="L212">        ensureNotClosed();</span>
+<span class="nc" id="L213">        this.subscriptions.subscribeFromPattern(topicsToSubscribe);</span>
+<span class="nc" id="L214">        final Set&lt;TopicPartition&gt; assignedPartitions = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        for (final String topic : topicsToSubscribe) {</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">            for (final PartitionInfo info : this.partitions.get(topic)) {</span>
+<span class="nc" id="L217">                assignedPartitions.add(new TopicPartition(topic, info.partition()));</span>
+<span class="nc" id="L218">            }</span>
+
+<span class="nc" id="L220">        }</span>
+<span class="nc" id="L221">        subscriptions.assignFromSubscribed(assignedPartitions);</span>
+<span class="nc" id="L222">    }</span>
+
+    @Override
+    public void registerMetricForSubscription(KafkaMetric metric) {
+<span class="nc" id="L226">        addedMetrics.add(metric);</span>
+<span class="nc" id="L227">    }</span>
+
+    @Override
+    public void unregisterMetricFromSubscription(KafkaMetric metric) {
+<span class="nc" id="L231">        addedMetrics.remove(metric);</span>
+<span class="nc" id="L232">    }</span>
+
+    @Override
+    public synchronized void assign(Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L236">        ensureNotClosed();</span>
+<span class="nc" id="L237">        committed.clear();</span>
+<span class="nc" id="L238">        this.subscriptions.assignFromUser(new HashSet&lt;&gt;(partitions));</span>
+<span class="nc" id="L239">    }</span>
+
+    @Override
+    public synchronized void unsubscribe() {
+<span class="nc" id="L243">        ensureNotClosed();</span>
+<span class="nc" id="L244">        committed.clear();</span>
+<span class="nc" id="L245">        subscriptions.unsubscribe();</span>
+<span class="nc" id="L246">    }</span>
+
+    @Override
+    public synchronized ConsumerRecords&lt;K, V&gt; poll(final Duration timeout) {
+<span class="nc" id="L250">        ensureNotClosed();</span>
+
+<span class="nc" id="L252">        lastPollTimeout = timeout;</span>
+
+        // Synchronize around the entire execution so new tasks to be triggered on subsequent poll calls can be added in
+        // the callback
+<span class="nc" id="L256">        synchronized (pollTasks) {</span>
+<span class="nc" id="L257">            Runnable task = pollTasks.poll();</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (task != null)</span>
+<span class="nc" id="L259">                task.run();</span>
+<span class="nc" id="L260">        }</span>
+
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        if (wakeup.get()) {</span>
+<span class="nc" id="L263">            wakeup.set(false);</span>
+<span class="nc" id="L264">            throw new WakeupException();</span>
+        }
+
+<span class="nc bnc" id="L267" title="All 2 branches missed.">        if (pollException != null) {</span>
+<span class="nc" id="L268">            RuntimeException exception = this.pollException;</span>
+<span class="nc" id="L269">            this.pollException = null;</span>
+<span class="nc" id="L270">            throw exception;</span>
+        }
+
+        // Handle seeks that need to wait for a poll() call to be processed
+<span class="nc bnc" id="L274" title="All 2 branches missed.">        for (TopicPartition tp : subscriptions.assignedPartitions())</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">            if (!subscriptions.hasValidPosition(tp))</span>
+<span class="nc" id="L276">                updateFetchPosition(tp);</span>
+
+        // update the consumed offset
+<span class="nc" id="L279">        final Map&lt;TopicPartition, List&lt;ConsumerRecord&lt;K, V&gt;&gt;&gt; results = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L280">        final Map&lt;TopicPartition, OffsetAndMetadata&gt; nextOffsetAndMetadata = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L281">        long numPollRecords = 0L;</span>
+
+<span class="nc" id="L283">        final Iterator&lt;Map.Entry&lt;TopicPartition, List&lt;ConsumerRecord&lt;K, V&gt;&gt;&gt;&gt; partitionsIter = this.records.entrySet().iterator();</span>
+<span class="nc bnc" id="L284" title="All 4 branches missed.">        while (partitionsIter.hasNext() &amp;&amp; numPollRecords &lt; this.maxPollRecords) {</span>
+<span class="nc" id="L285">            Map.Entry&lt;TopicPartition, List&lt;ConsumerRecord&lt;K, V&gt;&gt;&gt; entry = partitionsIter.next();</span>
+
+<span class="nc bnc" id="L287" title="All 4 branches missed.">            if (!subscriptions.isPaused(entry.getKey()) &amp;&amp; subscriptions.isAssigned(entry.getKey())) {</span>
+<span class="nc" id="L288">                final Iterator&lt;ConsumerRecord&lt;K, V&gt;&gt; recIterator = entry.getValue().iterator();</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">                while (recIterator.hasNext()) {</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">                    if (numPollRecords &gt;= this.maxPollRecords) {</span>
+<span class="nc" id="L291">                        break;</span>
+                    }
+<span class="nc" id="L293">                    long position = subscriptions.position(entry.getKey()).offset;</span>
+
+<span class="nc" id="L295">                    final ConsumerRecord&lt;K, V&gt; rec = recIterator.next();</span>
+
+<span class="nc bnc" id="L297" title="All 4 branches missed.">                    if (beginningOffsets.get(entry.getKey()) != null &amp;&amp; beginningOffsets.get(entry.getKey()) &gt; position) {</span>
+<span class="nc" id="L298">                        throw new OffsetOutOfRangeException(Collections.singletonMap(entry.getKey(), position));</span>
+                    }
+
+<span class="nc bnc" id="L301" title="All 2 branches missed.">                    if (rec.offset() &gt;= position) {</span>
+<span class="nc" id="L302">                        results.computeIfAbsent(entry.getKey(), partition -&gt; new ArrayList&lt;&gt;()).add(rec);</span>
+<span class="nc" id="L303">                        Metadata.LeaderAndEpoch leaderAndEpoch = new Metadata.LeaderAndEpoch(Optional.empty(), rec.leaderEpoch());</span>
+<span class="nc" id="L304">                        SubscriptionState.FetchPosition newPosition = new SubscriptionState.FetchPosition(</span>
+<span class="nc" id="L305">                                rec.offset() + 1, rec.leaderEpoch(), leaderAndEpoch);</span>
+<span class="nc" id="L306">                        subscriptions.position(entry.getKey(), newPosition);</span>
+<span class="nc" id="L307">                        nextOffsetAndMetadata.put(entry.getKey(), new OffsetAndMetadata(rec.offset() + 1, rec.leaderEpoch(), &quot;&quot;));</span>
+<span class="nc" id="L308">                        numPollRecords++;</span>
+<span class="nc" id="L309">                        recIterator.remove();</span>
+                    }
+<span class="nc" id="L311">                }</span>
+
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                if (entry.getValue().isEmpty()) {</span>
+<span class="nc" id="L314">                    partitionsIter.remove();</span>
+                }
+            }
+<span class="nc" id="L317">        }</span>
+
+<span class="nc" id="L319">        return new ConsumerRecords&lt;&gt;(results, nextOffsetAndMetadata);</span>
+    }
+
+    /**
+     * Adds a record to be returned when {@link #poll(Duration)} is called.
+     *
+     * @param record the record to add
+     * @throws IllegalStateException if the partition is not assigned to the consumer
+     */
+    public synchronized void addRecord(ConsumerRecord&lt;K, V&gt; record) {
+<span class="nc" id="L329">        ensureNotClosed();</span>
+<span class="nc" id="L330">        TopicPartition tp = new TopicPartition(record.topic(), record.partition());</span>
+<span class="nc" id="L331">        Set&lt;TopicPartition&gt; currentAssigned = this.subscriptions.assignedPartitions();</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        if (!currentAssigned.contains(tp))</span>
+<span class="nc" id="L333">            throw new IllegalStateException(&quot;Cannot add records for a partition that is not assigned to the consumer&quot;);</span>
+<span class="nc" id="L334">        List&lt;ConsumerRecord&lt;K, V&gt;&gt; recs = records.computeIfAbsent(tp, k -&gt; new ArrayList&lt;&gt;());</span>
+<span class="nc" id="L335">        recs.add(record);</span>
+<span class="nc" id="L336">    }</span>
+
+    /**
+     * Sets the maximum number of records returned in a single call to {@link #poll(Duration)}.
+     *
+     * @param maxPollRecords the max.poll.records.
+     */
+    public synchronized void setMaxPollRecords(long maxPollRecords) {
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (maxPollRecords &lt; 1) {</span>
+<span class="nc" id="L345">            throw new IllegalArgumentException(&quot;MaxPollRecords must be strictly superior to 0&quot;);</span>
+        }
+<span class="nc" id="L347">        this.maxPollRecords = maxPollRecords;</span>
+<span class="nc" id="L348">    }</span>
+
+    /**
+     * Sets an exception to throw when {@link #poll(Duration)} is called.
+     *
+     * @param exception the exception to throw
+     */
+    public synchronized void setPollException(KafkaException exception) {
+<span class="nc" id="L356">        this.pollException = exception;</span>
+<span class="nc" id="L357">    }</span>
+
+    /**
+     * Sets an exception to throw when offset-related methods are called.
+     *
+     * @param exception the exception to throw
+     */
+    public synchronized void setOffsetsException(KafkaException exception) {
+<span class="nc" id="L365">        this.offsetsException = exception;</span>
+<span class="nc" id="L366">    }</span>
+
+    @Override
+    public synchronized void commitAsync(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets, OffsetCommitCallback callback) {
+<span class="nc" id="L370">        ensureNotClosed();</span>
+<span class="nc" id="L371">        committed.putAll(offsets);</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        if (callback != null) {</span>
+<span class="nc" id="L373">            callback.onComplete(offsets, null);</span>
+        }
+<span class="nc" id="L375">    }</span>
+
+    @Override
+    public synchronized void commitSync(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets) {
+<span class="nc" id="L379">        commitAsync(offsets, null);</span>
+<span class="nc" id="L380">    }</span>
+
+    @Override
+    public synchronized void commitAsync() {
+<span class="nc" id="L384">        commitAsync(null);</span>
+<span class="nc" id="L385">    }</span>
+
+    @Override
+    public synchronized void commitAsync(OffsetCommitCallback callback) {
+<span class="nc" id="L389">        ensureNotClosed();</span>
+<span class="nc" id="L390">        commitAsync(this.subscriptions.allConsumed(), callback);</span>
+<span class="nc" id="L391">    }</span>
+
+    @Override
+    public synchronized void commitSync() {
+<span class="nc" id="L395">        commitSync(this.subscriptions.allConsumed());</span>
+<span class="nc" id="L396">    }</span>
+
+    @Override
+    public synchronized void commitSync(Duration timeout) {
+<span class="nc" id="L400">        commitSync(this.subscriptions.allConsumed());</span>
+<span class="nc" id="L401">    }</span>
+
+    @Override
+    public void commitSync(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets, final Duration timeout) {
+<span class="nc" id="L405">        commitSync(offsets);</span>
+<span class="nc" id="L406">    }</span>
+
+    @Override
+    public synchronized void seek(TopicPartition partition, long offset) {
+<span class="nc" id="L410">        ensureNotClosed();</span>
+<span class="nc" id="L411">        subscriptions.seek(partition, offset);</span>
+<span class="nc" id="L412">    }</span>
+
+    @Override
+    public void seek(TopicPartition partition, OffsetAndMetadata offsetAndMetadata) {
+<span class="nc" id="L416">        ensureNotClosed();</span>
+<span class="nc" id="L417">        subscriptions.seek(partition, offsetAndMetadata.offset());</span>
+<span class="nc" id="L418">    }</span>
+
+    @Override
+    public synchronized Map&lt;TopicPartition, OffsetAndMetadata&gt; committed(final Set&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L422">        ensureNotClosed();</span>
+
+<span class="nc" id="L424">        return partitions.stream()</span>
+<span class="nc" id="L425">            .filter(committed::containsKey)</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">            .collect(Collectors.toMap(tp -&gt; tp, tp -&gt; subscriptions.isAssigned(tp) ?</span>
+<span class="nc" id="L427">                committed.get(tp) : new OffsetAndMetadata(0)));</span>
+    }
+
+    @Override
+    public synchronized Map&lt;TopicPartition, OffsetAndMetadata&gt; committed(final Set&lt;TopicPartition&gt; partitions, final Duration timeout) {
+<span class="nc" id="L432">        return committed(partitions);</span>
+    }
+
+    @Override
+    public synchronized long position(TopicPartition partition) {
+<span class="nc" id="L437">        ensureNotClosed();</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        if (!this.subscriptions.isAssigned(partition))</span>
+<span class="nc" id="L439">            throw new IllegalArgumentException(&quot;You can only check the position for partitions assigned to this consumer.&quot;);</span>
+<span class="nc" id="L440">        SubscriptionState.FetchPosition position = this.subscriptions.position(partition);</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">        if (position == null) {</span>
+<span class="nc" id="L442">            updateFetchPosition(partition);</span>
+<span class="nc" id="L443">            position = this.subscriptions.position(partition);</span>
+        }
+<span class="nc" id="L445">        return position.offset;</span>
+    }
+
+    @Override
+    public synchronized long position(TopicPartition partition, final Duration timeout) {
+<span class="nc" id="L450">        return position(partition);</span>
+    }
+
+    @Override
+    public synchronized void seekToBeginning(Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L455">        ensureNotClosed();</span>
+<span class="nc" id="L456">        subscriptions.requestOffsetReset(partitions, AutoOffsetResetStrategy.EARLIEST);</span>
+<span class="nc" id="L457">    }</span>
+
+    /**
+     * Updates the beginning offsets for the specified partitions.
+     *
+     * @param newOffsets the beginning offsets to set
+     */
+    public synchronized void updateBeginningOffsets(Map&lt;TopicPartition, Long&gt; newOffsets) {
+<span class="nc" id="L465">        beginningOffsets.putAll(newOffsets);</span>
+<span class="nc" id="L466">    }</span>
+
+    @Override
+    public synchronized void seekToEnd(Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L470">        ensureNotClosed();</span>
+<span class="nc" id="L471">        subscriptions.requestOffsetReset(partitions, AutoOffsetResetStrategy.LATEST);</span>
+<span class="nc" id="L472">    }</span>
+
+    /**
+     * Updates the end offsets for the specified partitions.
+     *
+     * @param newOffsets the end offsets to set
+     */
+    public synchronized void updateEndOffsets(final Map&lt;TopicPartition, Long&gt; newOffsets) {
+<span class="nc" id="L480">        endOffsets.putAll(newOffsets);</span>
+<span class="nc" id="L481">    }</span>
+
+    /**
+     * Updates the duration-based reset offsets for the specified partitions.
+     *
+     * @param newOffsets the duration offsets to set
+     */
+    public synchronized void updateDurationOffsets(final Map&lt;TopicPartition, Long&gt; newOffsets) {
+<span class="nc" id="L489">        durationResetOffsets.putAll(newOffsets);</span>
+<span class="nc" id="L490">    }</span>
+
+    /**
+     * Disables telemetry for this mock consumer.
+     */
+    public void disableTelemetry() {
+<span class="nc" id="L496">        telemetryDisabled = true;</span>
+<span class="nc" id="L497">    }</span>
+
+    /**
+     * @param injectTimeoutExceptionCounter use -1 for infinite
+     */
+    public void injectTimeoutException(final int injectTimeoutExceptionCounter) {
+<span class="nc" id="L503">        this.injectTimeoutExceptionCounter = injectTimeoutExceptionCounter;</span>
+<span class="nc" id="L504">    }</span>
+
+    /**
+     * Sets the client instance ID for this mock consumer.
+     *
+     * @param instanceId the client instance ID
+     */
+    public void setClientInstanceId(final Uuid instanceId) {
+<span class="nc" id="L512">        clientInstanceId = instanceId;</span>
+<span class="nc" id="L513">    }</span>
+
+    @Override
+    public Uuid clientInstanceId(Duration timeout) {
+<span class="nc bnc" id="L517" title="All 2 branches missed.">        if (telemetryDisabled) {</span>
+<span class="nc" id="L518">            throw new IllegalStateException();</span>
+        }
+<span class="nc bnc" id="L520" title="All 2 branches missed.">        if (clientInstanceId == null) {</span>
+<span class="nc" id="L521">            throw new UnsupportedOperationException(&quot;clientInstanceId not set&quot;);</span>
+        }
+<span class="nc bnc" id="L523" title="All 2 branches missed.">        if (injectTimeoutExceptionCounter != 0) {</span>
+            // -1 is used as &quot;infinite&quot;
+<span class="nc bnc" id="L525" title="All 2 branches missed.">            if (injectTimeoutExceptionCounter &gt; 0) {</span>
+<span class="nc" id="L526">                --injectTimeoutExceptionCounter;</span>
+            }
+<span class="nc" id="L528">            throw new TimeoutException();</span>
+        }
+
+<span class="nc" id="L531">        return clientInstanceId;</span>
+    }
+
+    @Override
+    public synchronized Map&lt;MetricName, ? extends Metric&gt; metrics() {
+<span class="nc" id="L536">        ensureNotClosed();</span>
+<span class="nc" id="L537">        return Collections.emptyMap();</span>
+    }
+
+    @Override
+    public synchronized List&lt;PartitionInfo&gt; partitionsFor(String topic) {
+<span class="nc" id="L542">        ensureNotClosed();</span>
+<span class="nc" id="L543">        return this.partitions.getOrDefault(topic, Collections.emptyList());</span>
+    }
+
+    @Override
+    public synchronized Map&lt;String, List&lt;PartitionInfo&gt;&gt; listTopics() {
+<span class="nc" id="L548">        ensureNotClosed();</span>
+<span class="nc" id="L549">        return partitions;</span>
+    }
+
+    /**
+     * Updates the partition information for the specified topic.
+     *
+     * @param topic the topic to update
+     * @param partitions the partition information
+     */
+    public synchronized void updatePartitions(String topic, List&lt;PartitionInfo&gt; partitions) {
+<span class="nc" id="L559">        ensureNotClosed();</span>
+<span class="nc" id="L560">        this.partitions.put(topic, partitions);</span>
+<span class="nc" id="L561">    }</span>
+
+    @Override
+    public synchronized void pause(Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc bnc" id="L565" title="All 2 branches missed.">        for (TopicPartition partition : partitions) {</span>
+<span class="nc" id="L566">            subscriptions.pause(partition);</span>
+<span class="nc" id="L567">            paused.add(partition);</span>
+<span class="nc" id="L568">        }</span>
+<span class="nc" id="L569">    }</span>
+
+    @Override
+    public synchronized void resume(Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc bnc" id="L573" title="All 2 branches missed.">        for (TopicPartition partition : partitions) {</span>
+<span class="nc" id="L574">            subscriptions.resume(partition);</span>
+<span class="nc" id="L575">            paused.remove(partition);</span>
+<span class="nc" id="L576">        }</span>
+<span class="nc" id="L577">    }</span>
+
+    @Override
+    public synchronized Map&lt;TopicPartition, OffsetAndTimestamp&gt; offsetsForTimes(Map&lt;TopicPartition, Long&gt; timestampsToSearch) {
+<span class="nc" id="L581">        throw new UnsupportedOperationException(&quot;Not implemented yet.&quot;);</span>
+    }
+
+    @Override
+    public synchronized Map&lt;TopicPartition, Long&gt; beginningOffsets(Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc bnc" id="L586" title="All 2 branches missed.">        if (offsetsException != null) {</span>
+<span class="nc" id="L587">            RuntimeException exception = this.offsetsException;</span>
+<span class="nc" id="L588">            this.offsetsException = null;</span>
+<span class="nc" id="L589">            throw exception;</span>
+        }
+<span class="nc" id="L591">        Map&lt;TopicPartition, Long&gt; result = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">        for (TopicPartition tp : partitions) {</span>
+<span class="nc" id="L593">            Long beginningOffset = beginningOffsets.get(tp);</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">            if (beginningOffset == null)</span>
+<span class="nc" id="L595">                throw new IllegalStateException(&quot;The partition &quot; + tp + &quot; does not have a beginning offset.&quot;);</span>
+<span class="nc" id="L596">            result.put(tp, beginningOffset);</span>
+<span class="nc" id="L597">        }</span>
+<span class="nc" id="L598">        return result;</span>
+    }
+
+    @Override
+    public synchronized Map&lt;TopicPartition, Long&gt; endOffsets(Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc bnc" id="L603" title="All 2 branches missed.">        if (offsetsException != null) {</span>
+<span class="nc" id="L604">            RuntimeException exception = this.offsetsException;</span>
+<span class="nc" id="L605">            this.offsetsException = null;</span>
+<span class="nc" id="L606">            throw exception;</span>
+        }
+<span class="nc" id="L608">        Map&lt;TopicPartition, Long&gt; result = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L609" title="All 2 branches missed.">        for (TopicPartition tp : partitions) {</span>
+<span class="nc" id="L610">            Long endOffset = endOffsets.get(tp);</span>
+<span class="nc bnc" id="L611" title="All 2 branches missed.">            if (endOffset == null)</span>
+<span class="nc" id="L612">                throw new IllegalStateException(&quot;The partition &quot; + tp + &quot; does not have an end offset.&quot;);</span>
+<span class="nc" id="L613">            result.put(tp, endOffset);</span>
+<span class="nc" id="L614">        }</span>
+<span class="nc" id="L615">        return result;</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L620">        close(CloseOptions.timeout(Duration.ofMillis(DEFAULT_CLOSE_TIMEOUT_MS)));</span>
+<span class="nc" id="L621">    }</span>
+
+    @Deprecated
+    @Override
+    public synchronized void close(Duration timeout) {
+<span class="nc" id="L626">        this.closed = true;</span>
+<span class="nc" id="L627">    }</span>
+
+    /**
+     * Returns whether this consumer has been closed.
+     *
+     * @return true if closed, false otherwise
+     */
+    public synchronized boolean closed() {
+<span class="nc" id="L635">        return this.closed;</span>
+    }
+
+    @Override
+    public synchronized void wakeup() {
+<span class="nc" id="L640">        wakeup.set(true);</span>
+<span class="nc" id="L641">    }</span>
+
+    @Override
+    public void close(CloseOptions option) {
+<span class="nc" id="L645">        this.closed = true;</span>
+<span class="nc" id="L646">    }</span>
+
+    /**
+     * Schedule a task to be executed during a poll(). One enqueued task will be executed per {@link #poll(Duration)}
+     * invocation. You can use this repeatedly to mock out multiple responses to poll invocations.
+     * @param task the task to be executed
+     */
+    public synchronized void schedulePollTask(Runnable task) {
+<span class="nc" id="L654">        synchronized (pollTasks) {</span>
+<span class="nc" id="L655">            pollTasks.add(task);</span>
+<span class="nc" id="L656">        }</span>
+<span class="nc" id="L657">    }</span>
+
+    /**
+     * Schedules a no-op task to be executed during a poll invocation.
+     */
+    public synchronized void scheduleNopPollTask() {
+<span class="nc" id="L663">        schedulePollTask(() -&gt; { });</span>
+<span class="nc" id="L664">    }</span>
+
+    public synchronized Set&lt;TopicPartition&gt; paused() {
+<span class="nc" id="L667">        return Set.copyOf(paused);</span>
+    }
+
+    private void ensureNotClosed() {
+<span class="nc bnc" id="L671" title="All 2 branches missed.">        if (this.closed)</span>
+<span class="nc" id="L672">            throw new IllegalStateException(&quot;This consumer has already been closed.&quot;);</span>
+<span class="nc" id="L673">    }</span>
+
+    private void updateFetchPosition(TopicPartition tp) {
+<span class="nc bnc" id="L676" title="All 2 branches missed.">        if (subscriptions.isOffsetResetNeeded(tp)) {</span>
+<span class="nc" id="L677">            resetOffsetPosition(tp);</span>
+<span class="nc bnc" id="L678" title="All 2 branches missed.">        } else if (!committed.containsKey(tp)) {</span>
+<span class="nc" id="L679">            subscriptions.requestOffsetReset(tp);</span>
+<span class="nc" id="L680">            resetOffsetPosition(tp);</span>
+        } else {
+<span class="nc" id="L682">            subscriptions.seek(tp, committed.get(tp).offset());</span>
+        }
+<span class="nc" id="L684">    }</span>
+
+    private void resetOffsetPosition(TopicPartition tp) {
+<span class="nc" id="L687">        AutoOffsetResetStrategy strategy = subscriptions.resetStrategy(tp);</span>
+        Long offset;
+<span class="nc bnc" id="L689" title="All 2 branches missed.">        if (strategy == AutoOffsetResetStrategy.EARLIEST) {</span>
+<span class="nc" id="L690">            offset = beginningOffsets.get(tp);</span>
+<span class="nc bnc" id="L691" title="All 2 branches missed.">            if (offset == null)</span>
+<span class="nc" id="L692">                throw new IllegalStateException(&quot;MockConsumer didn't have beginning offset specified, but tried to seek to beginning&quot;);</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">        } else if (strategy == AutoOffsetResetStrategy.LATEST) {</span>
+<span class="nc" id="L694">            offset = endOffsets.get(tp);</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">            if (offset == null)</span>
+<span class="nc" id="L696">                throw new IllegalStateException(&quot;MockConsumer didn't have end offset specified, but tried to seek to end&quot;);</span>
+<span class="nc bnc" id="L697" title="All 2 branches missed.">        } else if (strategy.type() == AutoOffsetResetStrategy.StrategyType.BY_DURATION) {</span>
+<span class="nc" id="L698">            offset = durationResetOffsets.get(tp);</span>
+<span class="nc bnc" id="L699" title="All 2 branches missed.">            if (offset == null)</span>
+<span class="nc" id="L700">                throw new IllegalStateException(&quot;MockConsumer didn't have duration offset specified, but tried to seek to timestamp&quot;);</span>
+        } else {
+<span class="nc" id="L702">            throw new NoOffsetForPartitionException(tp);</span>
+        }
+<span class="nc" id="L704">        seek(tp, offset);</span>
+<span class="nc" id="L705">    }</span>
+
+    @Override
+    public List&lt;PartitionInfo&gt; partitionsFor(String topic, Duration timeout) {
+<span class="nc" id="L709">        return partitionsFor(topic);</span>
+    }
+
+    @Override
+    public Map&lt;String, List&lt;PartitionInfo&gt;&gt; listTopics(Duration timeout) {
+<span class="nc" id="L714">        return listTopics();</span>
+    }
+
+    @Override
+    public Map&lt;TopicPartition, OffsetAndTimestamp&gt; offsetsForTimes(Map&lt;TopicPartition, Long&gt; timestampsToSearch,
+            Duration timeout) {
+<span class="nc" id="L720">        return offsetsForTimes(timestampsToSearch);</span>
+    }
+
+    @Override
+    public Map&lt;TopicPartition, Long&gt; beginningOffsets(Collection&lt;TopicPartition&gt; partitions, Duration timeout) {
+<span class="nc" id="L725">        return beginningOffsets(partitions);</span>
+    }
+
+    @Override
+    public Map&lt;TopicPartition, Long&gt; endOffsets(Collection&lt;TopicPartition&gt; partitions, Duration timeout) {
+<span class="nc" id="L730">        return endOffsets(partitions);</span>
+    }
+
+    @Override
+    public OptionalLong currentLag(TopicPartition topicPartition) {
+<span class="nc bnc" id="L735" title="All 2 branches missed.">        if (endOffsets.containsKey(topicPartition)) {</span>
+<span class="nc" id="L736">            return OptionalLong.of(endOffsets.get(topicPartition) - position(topicPartition));</span>
+        } else {
+            // if the test doesn't bother to set an end offset, we assume it wants to model being caught up.
+<span class="nc" id="L739">            return OptionalLong.of(0L);</span>
+        }
+    }
+
+    @SuppressWarnings(&quot;removal&quot;)
+    @Override
+    public ConsumerGroupMetadata groupMetadata() {
+<span class="nc" id="L746">        return new ConsumerGroupMetadata(&quot;dummy.group.id&quot;, 1, &quot;1&quot;, Optional.empty());</span>
+    }
+
+    @Override
+    public void enforceRebalance() {
+<span class="nc" id="L751">        enforceRebalance(null);</span>
+<span class="nc" id="L752">    }</span>
+
+    @Override
+    public void enforceRebalance(final String reason) {
+<span class="nc" id="L756">        shouldRebalance = true;</span>
+<span class="nc" id="L757">    }</span>
+
+    /**
+     * Returns whether a rebalance has been triggered via {@link #enforceRebalance()}.
+     *
+     * @return true if rebalance is pending, false otherwise
+     */
+    public boolean shouldRebalance() {
+<span class="nc" id="L765">        return shouldRebalance;</span>
+    }
+
+    /**
+     * Resets the rebalance flag set by {@link #enforceRebalance()}.
+     */
+    public void resetShouldRebalance() {
+<span class="nc" id="L772">        shouldRebalance = false;</span>
+<span class="nc" id="L773">    }</span>
+
+    /**
+     * Returns the timeout used in the last {@link #poll(Duration)} call.
+     *
+     * @return the last poll timeout, or null if poll has not been called
+     */
+    public Duration lastPollTimeout() {
+<span class="nc" id="L781">        return lastPollTimeout;</span>
+    }
+
+    /**
+     * Returns the metrics registered via {@link #registerMetricForSubscription(KafkaMetric)}.
+     *
+     * @return an unmodifiable list of added metrics
+     */
+    public List&lt;KafkaMetric&gt; addedMetrics() {
+<span class="nc" id="L790">        return Collections.unmodifiableList(addedMetrics);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

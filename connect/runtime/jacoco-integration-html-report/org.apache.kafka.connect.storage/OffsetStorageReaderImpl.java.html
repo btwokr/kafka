@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OffsetStorageReaderImpl.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.storage</a> &gt; <span class="el_source">OffsetStorageReaderImpl.java</span></div><h1>OffsetStorageReaderImpl.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.storage;
+
+import org.apache.kafka.connect.data.SchemaAndValue;
+import org.apache.kafka.connect.errors.ConnectException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.ByteBuffer;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Implementation of OffsetStorageReader. Unlike {@link OffsetStorageWriter} which is implemented
+ * directly, the interface is only separate from this implementation because it needs to be
+ * included in the public API package.
+ */
+public class OffsetStorageReaderImpl implements CloseableOffsetStorageReader {
+<span class="fc" id="L42">    private static final Logger log = LoggerFactory.getLogger(OffsetStorageReaderImpl.class);</span>
+
+    private final OffsetBackingStore backingStore;
+    private final String namespace;
+    private final Converter keyConverter;
+    private final Converter valueConverter;
+    private final AtomicBoolean closed;
+    private final Set&lt;Future&lt;Map&lt;ByteBuffer, ByteBuffer&gt;&gt;&gt; offsetReadFutures;
+
+    public OffsetStorageReaderImpl(OffsetBackingStore backingStore, String namespace,
+<span class="fc" id="L52">                                   Converter keyConverter, Converter valueConverter) {</span>
+<span class="fc" id="L53">        this.backingStore = backingStore;</span>
+<span class="fc" id="L54">        this.namespace = namespace;</span>
+<span class="fc" id="L55">        this.keyConverter = keyConverter;</span>
+<span class="fc" id="L56">        this.valueConverter = valueConverter;</span>
+<span class="fc" id="L57">        this.closed = new AtomicBoolean(false);</span>
+<span class="fc" id="L58">        this.offsetReadFutures = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L59">    }</span>
+
+    @Override
+    public &lt;T&gt; Map&lt;String, Object&gt; offset(Map&lt;String, T&gt; partition) {
+<span class="fc" id="L63">        return offsets(List.of(partition)).get(partition);</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public &lt;T&gt; Map&lt;Map&lt;String, T&gt;, Map&lt;String, Object&gt;&gt; offsets(Collection&lt;Map&lt;String, T&gt;&gt; partitions) {
+        // Serialize keys so backing store can work with them
+<span class="fc" id="L70">        Map&lt;ByteBuffer, Map&lt;String, T&gt;&gt; serializedToOriginal = new HashMap&lt;&gt;(partitions.size());</span>
+<span class="fc bfc" id="L71" title="All 2 branches covered.">        for (Map&lt;String, T&gt; key : partitions) {</span>
+            try {
+                // Offsets are treated as schemaless, their format is only validated here (and the returned value below)
+<span class="fc" id="L74">                OffsetUtils.validateFormat(key);</span>
+<span class="fc" id="L75">                byte[] keySerialized = keyConverter.fromConnectData(namespace, null, List.of(namespace, key));</span>
+<span class="pc bpc" id="L76" title="1 of 2 branches missed.">                ByteBuffer keyBuffer = (keySerialized != null) ? ByteBuffer.wrap(keySerialized) : null;</span>
+<span class="fc" id="L77">                serializedToOriginal.put(keyBuffer, key);</span>
+<span class="nc" id="L78">            } catch (Throwable t) {</span>
+<span class="nc" id="L79">                log.error(&quot;CRITICAL: Failed to serialize partition key when getting offsets for task with &quot;</span>
+                        + &quot;namespace {}. No value for this data will be returned, which may break the &quot;
+                        + &quot;task or cause it to skip some data.&quot;, namespace, t);
+<span class="fc" id="L82">            }</span>
+<span class="fc" id="L83">        }</span>
+
+        // Get serialized key -&gt; serialized value from backing store
+        Map&lt;ByteBuffer, ByteBuffer&gt; raw;
+        try {
+            Future&lt;Map&lt;ByteBuffer, ByteBuffer&gt;&gt; offsetReadFuture;
+<span class="fc" id="L89">            synchronized (offsetReadFutures) {</span>
+<span class="pc bpc" id="L90" title="1 of 2 branches missed.">                if (closed.get()) {</span>
+<span class="nc" id="L91">                    throw new ConnectException(</span>
+                        &quot;Offset reader is closed. This is likely because the task has already been &quot;
+                            + &quot;scheduled to stop but has taken longer than the graceful shutdown &quot;
+                            + &quot;period to do so.&quot;);
+                }
+<span class="fc" id="L96">                offsetReadFuture = backingStore.get(serializedToOriginal.keySet());</span>
+<span class="fc" id="L97">                offsetReadFutures.add(offsetReadFuture);</span>
+<span class="fc" id="L98">            }</span>
+
+            try {
+<span class="fc" id="L101">                raw = offsetReadFuture.get();</span>
+<span class="nc" id="L102">            } catch (CancellationException e) {</span>
+<span class="nc" id="L103">                throw new ConnectException(</span>
+                    &quot;Offset reader closed while attempting to read offsets. This is likely because &quot;
+                        + &quot;the task was been scheduled to stop but has taken longer than the &quot;
+                        + &quot;graceful shutdown period to do so.&quot;);
+            } finally {
+<span class="fc" id="L108">                synchronized (offsetReadFutures) {</span>
+<span class="fc" id="L109">                    offsetReadFutures.remove(offsetReadFuture);</span>
+<span class="fc" id="L110">                }</span>
+            }
+<span class="nc" id="L112">        } catch (Exception e) {</span>
+<span class="nc" id="L113">            log.error(&quot;Failed to fetch offsets from namespace {}: &quot;, namespace, e);</span>
+<span class="nc" id="L114">            throw new ConnectException(&quot;Failed to fetch offsets.&quot;, e);</span>
+<span class="fc" id="L115">        }</span>
+
+        // Deserialize all the values and map back to the original keys
+<span class="fc" id="L118">        Map&lt;Map&lt;String, T&gt;, Map&lt;String, Object&gt;&gt; result = new HashMap&lt;&gt;(partitions.size());</span>
+<span class="fc bfc" id="L119" title="All 2 branches covered.">        for (Map.Entry&lt;ByteBuffer, ByteBuffer&gt; rawEntry : raw.entrySet()) {</span>
+            try {
+                // Since null could be a valid key, explicitly check whether map contains the key
+<span class="pc bpc" id="L122" title="1 of 2 branches missed.">                if (!serializedToOriginal.containsKey(rawEntry.getKey())) {</span>
+<span class="nc" id="L123">                    log.error(&quot;Should be able to map {} back to a requested partition-offset key, backing &quot;</span>
+<span class="nc" id="L124">                            + &quot;store may have returned invalid data&quot;, rawEntry.getKey());</span>
+<span class="nc" id="L125">                    continue;</span>
+                }
+<span class="fc" id="L127">                Map&lt;String, T&gt; origKey = serializedToOriginal.get(rawEntry.getKey());</span>
+<span class="pc bpc" id="L128" title="1 of 2 branches missed.">                SchemaAndValue deserializedSchemaAndValue = valueConverter.toConnectData(namespace, rawEntry.getValue() != null ? rawEntry.getValue().array() : null);</span>
+<span class="fc" id="L129">                Object deserializedValue = deserializedSchemaAndValue.value();</span>
+<span class="fc" id="L130">                OffsetUtils.validateFormat(deserializedValue);</span>
+
+<span class="fc" id="L132">                result.put(origKey, (Map&lt;String, Object&gt;) deserializedValue);</span>
+<span class="nc" id="L133">            } catch (Throwable t) {</span>
+<span class="nc" id="L134">                log.error(&quot;CRITICAL: Failed to deserialize offset data when getting offsets for task with&quot;</span>
+                        + &quot; namespace {}. No value for this data will be returned, which may break the &quot;
+                        + &quot;task or cause it to skip some data. This could either be due to an error in &quot;
+                        + &quot;the connector implementation or incompatible schema.&quot;, namespace, t);
+<span class="fc" id="L138">            }</span>
+<span class="fc" id="L139">        }</span>
+
+<span class="fc" id="L141">        return result;</span>
+    }
+
+    @Override
+    public void close() {
+<span class="pc bpc" id="L146" title="1 of 2 branches missed.">        if (!closed.getAndSet(true)) {</span>
+<span class="fc" id="L147">            synchronized (offsetReadFutures) {</span>
+<span class="pc bpc" id="L148" title="1 of 2 branches missed.">                for (Future&lt;Map&lt;ByteBuffer, ByteBuffer&gt;&gt; offsetReadFuture : offsetReadFutures) {</span>
+                    try {
+<span class="nc" id="L150">                        offsetReadFuture.cancel(true);</span>
+<span class="nc" id="L151">                    } catch (Throwable t) {</span>
+<span class="nc" id="L152">                        log.error(&quot;Failed to cancel offset read future&quot;, t);</span>
+<span class="nc" id="L153">                    }</span>
+<span class="nc" id="L154">                }</span>
+<span class="fc" id="L155">                offsetReadFutures.clear();</span>
+<span class="fc" id="L156">            }</span>
+        }
+<span class="fc" id="L158">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,900 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ClusterControlManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.controller</a> &gt; <span class="el_source">ClusterControlManager.java</span></div><h1>ClusterControlManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.controller;
+
+import org.apache.kafka.common.DirectoryId;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.BrokerIdNotRegisteredException;
+import org.apache.kafka.common.errors.DuplicateBrokerRegistrationException;
+import org.apache.kafka.common.errors.InconsistentClusterIdException;
+import org.apache.kafka.common.errors.InvalidRegistrationException;
+import org.apache.kafka.common.errors.StaleBrokerEpochException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.message.BrokerRegistrationRequestData;
+import org.apache.kafka.common.message.ControllerRegistrationRequestData;
+import org.apache.kafka.common.metadata.BrokerRegistrationChangeRecord;
+import org.apache.kafka.common.metadata.FenceBrokerRecord;
+import org.apache.kafka.common.metadata.RegisterBrokerRecord;
+import org.apache.kafka.common.metadata.RegisterBrokerRecord.BrokerFeature;
+import org.apache.kafka.common.metadata.RegisterControllerRecord;
+import org.apache.kafka.common.metadata.RegisterControllerRecord.ControllerFeatureCollection;
+import org.apache.kafka.common.metadata.UnfenceBrokerRecord;
+import org.apache.kafka.common.metadata.UnregisterBrokerRecord;
+import org.apache.kafka.common.protocol.ApiMessage;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.controller.metrics.QuorumControllerMetrics;
+import org.apache.kafka.metadata.BrokerRegistration;
+import org.apache.kafka.metadata.BrokerRegistrationFencingChange;
+import org.apache.kafka.metadata.BrokerRegistrationInControlledShutdownChange;
+import org.apache.kafka.metadata.BrokerRegistrationReply;
+import org.apache.kafka.metadata.ControllerRegistration;
+import org.apache.kafka.metadata.FinalizedControllerFeatures;
+import org.apache.kafka.metadata.ListenerInfo;
+import org.apache.kafka.metadata.VersionRange;
+import org.apache.kafka.metadata.placement.ReplicaPlacer;
+import org.apache.kafka.metadata.placement.StripedReplicaPlacer;
+import org.apache.kafka.metadata.placement.UsableBroker;
+import org.apache.kafka.server.common.ApiMessageAndVersion;
+import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.timeline.SnapshotRegistry;
+import org.apache.kafka.timeline.TimelineHashMap;
+
+import org.slf4j.Logger;
+
+import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+
+
+/**
+ * The ClusterControlManager manages all the hard state associated with the Kafka cluster.
+ * Hard state is state which appears in the metadata log, such as broker registrations,
+ * brokers being fenced or unfenced, and broker feature versions.
+ */
+public class ClusterControlManager {
+<span class="fc" id="L84">    static final long DEFAULT_SESSION_TIMEOUT_NS = NANOSECONDS.convert(9, TimeUnit.SECONDS);</span>
+
+<span class="fc" id="L86">    static class Builder {</span>
+<span class="fc" id="L87">        private LogContext logContext = null;</span>
+<span class="fc" id="L88">        private String clusterId = null;</span>
+<span class="fc" id="L89">        private Time time = Time.SYSTEM;</span>
+<span class="fc" id="L90">        private SnapshotRegistry snapshotRegistry = null;</span>
+<span class="fc" id="L91">        private long sessionTimeoutNs = DEFAULT_SESSION_TIMEOUT_NS;</span>
+<span class="fc" id="L92">        private ReplicaPlacer replicaPlacer = null;</span>
+<span class="fc" id="L93">        private FeatureControlManager featureControl = null;</span>
+<span class="fc" id="L94">        private BrokerShutdownHandler brokerShutdownHandler = null;</span>
+<span class="fc" id="L95">        private QuorumControllerMetrics metrics = null;</span>
+
+        Builder setLogContext(LogContext logContext) {
+<span class="fc" id="L98">            this.logContext = logContext;</span>
+<span class="fc" id="L99">            return this;</span>
+        }
+
+        Builder setClusterId(String clusterId) {
+<span class="fc" id="L103">            this.clusterId = clusterId;</span>
+<span class="fc" id="L104">            return this;</span>
+        }
+
+        Builder setTime(Time time) {
+<span class="fc" id="L108">            this.time = time;</span>
+<span class="fc" id="L109">            return this;</span>
+        }
+
+        Builder setSnapshotRegistry(SnapshotRegistry snapshotRegistry) {
+<span class="fc" id="L113">            this.snapshotRegistry = snapshotRegistry;</span>
+<span class="fc" id="L114">            return this;</span>
+        }
+
+        Builder setSessionTimeoutNs(long sessionTimeoutNs) {
+<span class="fc" id="L118">            this.sessionTimeoutNs = sessionTimeoutNs;</span>
+<span class="fc" id="L119">            return this;</span>
+        }
+
+        Builder setReplicaPlacer(ReplicaPlacer replicaPlacer) {
+<span class="fc" id="L123">            this.replicaPlacer = replicaPlacer;</span>
+<span class="fc" id="L124">            return this;</span>
+        }
+
+        Builder setFeatureControlManager(FeatureControlManager featureControl) {
+<span class="fc" id="L128">            this.featureControl = featureControl;</span>
+<span class="fc" id="L129">            return this;</span>
+        }
+
+        Builder setBrokerShutdownHandler(BrokerShutdownHandler brokerShutdownHandler) {
+<span class="fc" id="L133">            this.brokerShutdownHandler = brokerShutdownHandler;</span>
+<span class="fc" id="L134">            return this;</span>
+        }
+
+
+        Builder setMetrics(QuorumControllerMetrics metrics) {
+<span class="fc" id="L139">            this.metrics = metrics;</span>
+<span class="fc" id="L140">            return this;</span>
+        }
+
+        ClusterControlManager build() {
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">            if (logContext == null) {</span>
+<span class="nc" id="L145">                logContext = new LogContext();</span>
+            }
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">            if (clusterId == null) {</span>
+<span class="nc" id="L148">                clusterId = Uuid.randomUuid().toString();</span>
+            }
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">            if (snapshotRegistry == null) {</span>
+<span class="nc" id="L151">                snapshotRegistry = new SnapshotRegistry(logContext);</span>
+            }
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">            if (replicaPlacer == null) {</span>
+<span class="nc" id="L154">                replicaPlacer = new StripedReplicaPlacer(new Random());</span>
+            }
+<span class="pc bpc" id="L156" title="1 of 2 branches missed.">            if (featureControl == null) {</span>
+<span class="nc" id="L157">                throw new RuntimeException(&quot;You must specify FeatureControlManager&quot;);</span>
+            }
+<span class="pc bpc" id="L159" title="1 of 2 branches missed.">            if (brokerShutdownHandler == null) {</span>
+<span class="nc" id="L160">                throw new RuntimeException(&quot;You must specify BrokerShutdownHandler&quot;);</span>
+            }
+<span class="pc bpc" id="L162" title="1 of 2 branches missed.">            if (metrics == null) {</span>
+<span class="nc" id="L163">                metrics = new QuorumControllerMetrics(Optional.empty(), time, 0);</span>
+            }
+<span class="fc" id="L165">            return new ClusterControlManager(logContext,</span>
+                clusterId,
+                time,
+                snapshotRegistry,
+                sessionTimeoutNs,
+                replicaPlacer,
+                featureControl,
+                brokerShutdownHandler,
+                metrics
+            );
+        }
+    }
+
+    class ReadyBrokersFuture {
+        private final CompletableFuture&lt;Void&gt; future;
+        private final int minBrokers;
+
+<span class="fc" id="L182">        ReadyBrokersFuture(CompletableFuture&lt;Void&gt; future, int minBrokers) {</span>
+<span class="fc" id="L183">            this.future = future;</span>
+<span class="fc" id="L184">            this.minBrokers = minBrokers;</span>
+<span class="fc" id="L185">        }</span>
+
+        boolean check() {
+<span class="fc" id="L188">            int numUnfenced = 0;</span>
+<span class="pc bpc" id="L189" title="1 of 2 branches missed.">            for (BrokerRegistration registration : brokerRegistrations.values()) {</span>
+<span class="pc bpc" id="L190" title="1 of 2 branches missed.">                if (!registration.fenced()) {</span>
+<span class="fc" id="L191">                    numUnfenced++;</span>
+                }
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">                if (numUnfenced &gt;= minBrokers) {</span>
+<span class="fc" id="L194">                    return true;</span>
+                }
+<span class="nc" id="L196">            }</span>
+<span class="nc" id="L197">            return false;</span>
+        }
+    }
+
+    /**
+     * The SLF4J log context.
+     */
+    private final LogContext logContext;
+
+    /**
+     * The ID of this cluster.
+     */
+    private final String clusterId;
+
+    /**
+     * The SLF4J log object.
+     */
+    private final Logger log;
+
+    /**
+     * The Kafka clock object to use.
+     */
+    private final Time time;
+
+    /**
+     * How long sessions should last, in nanoseconds.
+     */
+    private final long sessionTimeoutNs;
+
+    /**
+     * The replica placer to use.
+     */
+    private final ReplicaPlacer replicaPlacer;
+
+    /**
+     * Maps broker IDs to broker registrations.
+     */
+    private final TimelineHashMap&lt;Integer, BrokerRegistration&gt; brokerRegistrations;
+
+    /**
+     * Save the offset of each broker registration record, we will only unfence a
+     * broker when its high watermark has reached its broker registration record,
+     * this is not necessarily the exact offset of each broker registration record
+     * but should not be smaller than it.
+     */
+    private final TimelineHashMap&lt;Integer, Long&gt; registerBrokerRecordOffsets;
+
+    /**
+     * The broker heartbeat manager, or null if this controller is on standby.
+     */
+    private volatile BrokerHeartbeatManager heartbeatManager;
+
+    /**
+     * A future which is completed as soon as we have the given number of brokers
+     * ready.
+     */
+    private Optional&lt;ReadyBrokersFuture&gt; readyBrokersFuture;
+
+    /**
+     * The feature control manager.
+     */
+    private final FeatureControlManager featureControl;
+
+    private final BrokerShutdownHandler brokerShutdownHandler;
+
+    /**
+     * Maps controller IDs to controller registrations.
+     */
+    private final TimelineHashMap&lt;Integer, ControllerRegistration&gt; controllerRegistrations;
+
+    /**
+     * Maps directories to their respective brokers.
+     */
+    private final TimelineHashMap&lt;Uuid, Integer&gt; directoryToBroker;
+
+    /**
+     * Manages the kafka.controller:type=KafkaController,name=TimeSinceLastHeartbeatReceivedMs,broker=&lt;brokerId&gt; metrics.
+     */
+    private final QuorumControllerMetrics metrics;
+
+    private ClusterControlManager(
+        LogContext logContext,
+        String clusterId,
+        Time time,
+        SnapshotRegistry snapshotRegistry,
+        long sessionTimeoutNs,
+        ReplicaPlacer replicaPlacer,
+        FeatureControlManager featureControl,
+        BrokerShutdownHandler brokerShutdownHandler,
+        QuorumControllerMetrics metrics
+<span class="fc" id="L287">    ) {</span>
+<span class="fc" id="L288">        this.logContext = logContext;</span>
+<span class="fc" id="L289">        this.clusterId = clusterId;</span>
+<span class="fc" id="L290">        this.log = logContext.logger(ClusterControlManager.class);</span>
+<span class="fc" id="L291">        this.time = time;</span>
+<span class="fc" id="L292">        this.sessionTimeoutNs = sessionTimeoutNs;</span>
+<span class="fc" id="L293">        this.replicaPlacer = replicaPlacer;</span>
+<span class="fc" id="L294">        this.brokerRegistrations = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L295">        this.registerBrokerRecordOffsets = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L296">        this.heartbeatManager = null;</span>
+<span class="fc" id="L297">        this.readyBrokersFuture = Optional.empty();</span>
+<span class="fc" id="L298">        this.featureControl = featureControl;</span>
+<span class="fc" id="L299">        this.controllerRegistrations = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L300">        this.directoryToBroker = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L301">        this.brokerShutdownHandler = brokerShutdownHandler;</span>
+<span class="fc" id="L302">        this.metrics = metrics;</span>
+<span class="fc" id="L303">    }</span>
+
+    ReplicaPlacer replicaPlacer() {
+<span class="fc" id="L306">        return replicaPlacer;</span>
+    }
+
+    /**
+     * Transition this ClusterControlManager to active.
+     */
+    public void activate() {
+<span class="fc" id="L313">        heartbeatManager = new BrokerHeartbeatManager(logContext, time, sessionTimeoutNs);</span>
+<span class="fc" id="L314">        long nowNs = time.nanoseconds();</span>
+<span class="pc bpc" id="L315" title="1 of 2 branches missed.">        for (BrokerRegistration registration : brokerRegistrations.values()) {</span>
+<span class="nc" id="L316">            int brokerId = registration.id();</span>
+<span class="nc" id="L317">            heartbeatManager.register(brokerId, registration.fenced());</span>
+<span class="nc" id="L318">            metrics.addTimeSinceLastHeartbeatMetric(brokerId);</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">            if (!registration.fenced()) {</span>
+<span class="nc" id="L320">                heartbeatManager.tracker().updateContactTime(</span>
+<span class="nc" id="L321">                    new BrokerIdAndEpoch(brokerId, registration.epoch()), nowNs);</span>
+            }
+<span class="nc" id="L323">        }</span>
+<span class="fc" id="L324">    }</span>
+
+    String clusterId() { // Visible for testing
+<span class="nc" id="L327">        return clusterId;</span>
+    }
+
+    /**
+     * Transition this ClusterControlManager to standby.
+     */
+    public void deactivate() {
+<span class="nc" id="L334">        heartbeatManager = null;</span>
+<span class="nc" id="L335">        metrics.removeTimeSinceLastHeartbeatMetrics();</span>
+<span class="nc" id="L336">    }</span>
+
+    Map&lt;Integer, BrokerRegistration&gt; brokerRegistrations() {
+<span class="fc" id="L339">        return brokerRegistrations;</span>
+    }
+
+    Map&lt;Integer, ControllerRegistration&gt; controllerRegistrations() {
+<span class="nc" id="L343">        return controllerRegistrations;</span>
+    }
+
+    /**
+     * Process an incoming broker registration request.
+     */
+    public ControllerResult&lt;BrokerRegistrationReply&gt; registerBroker(
+        BrokerRegistrationRequestData request,
+        long newBrokerEpoch,
+        FinalizedControllerFeatures finalizedFeatures,
+        boolean cleanShutdownDetectionEnabled
+    ) {
+<span class="pc bpc" id="L355" title="1 of 2 branches missed.">        if (heartbeatManager == null) {</span>
+<span class="nc" id="L356">            throw new RuntimeException(&quot;ClusterControlManager is not active.&quot;);</span>
+        }
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">        if (!clusterId.equals(request.clusterId())) {</span>
+<span class="nc" id="L359">            throw new InconsistentClusterIdException(&quot;Expected cluster ID &quot; + clusterId +</span>
+<span class="nc" id="L360">                &quot;, but got cluster ID &quot; + request.clusterId());</span>
+        }
+<span class="fc" id="L362">        int brokerId = request.brokerId();</span>
+<span class="fc" id="L363">        List&lt;ApiMessageAndVersion&gt; records = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L364">        BrokerRegistration existing = brokerRegistrations.get(brokerId);</span>
+<span class="fc" id="L365">        Uuid prevIncarnationId = null;</span>
+<span class="fc" id="L366">        long storedBrokerEpoch = -2; // BrokerRegistration.previousBrokerEpoch default value is -1</span>
+<span class="pc bpc" id="L367" title="1 of 2 branches missed.">        if (existing != null) {</span>
+<span class="nc" id="L368">            prevIncarnationId = existing.incarnationId();</span>
+<span class="nc" id="L369">            storedBrokerEpoch = existing.epoch();</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">            if (heartbeatManager.hasValidSession(brokerId, existing.epoch())) {</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">                if (!request.incarnationId().equals(prevIncarnationId)) {</span>
+<span class="nc" id="L372">                    throw new DuplicateBrokerRegistrationException(&quot;Another broker is registered with that broker id. If the broker &quot; +</span>
+                            &quot;was recently restarted this should self-resolve once the heartbeat manager expires the broker's session.&quot;);
+                }
+            }
+        }
+
+<span class="pc bpc" id="L378" title="1 of 2 branches missed.">        if (request.isMigratingZkBroker()) {</span>
+<span class="nc" id="L379">            throw new BrokerIdNotRegisteredException(&quot;Controller does not support registering ZK brokers.&quot;);</span>
+        }
+
+<span class="pc bpc" id="L382" title="1 of 2 branches missed.">        if (featureControl.metadataVersionOrThrow().isDirectoryAssignmentSupported()) {</span>
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">            if (request.logDirs().isEmpty()) {</span>
+<span class="nc" id="L384">                throw new InvalidRegistrationException(&quot;No directories specified in request&quot;);</span>
+            }
+<span class="pc bpc" id="L386" title="1 of 2 branches missed.">            if (request.logDirs().stream().anyMatch(DirectoryId::reserved)) {</span>
+<span class="nc" id="L387">                throw new InvalidRegistrationException(&quot;Reserved directory ID in request&quot;);</span>
+            }
+<span class="fc" id="L389">            Set&lt;Uuid&gt; set = new HashSet&lt;&gt;(request.logDirs());</span>
+<span class="pc bpc" id="L390" title="1 of 2 branches missed.">            if (set.size() != request.logDirs().size()) {</span>
+<span class="nc" id="L391">                throw new InvalidRegistrationException(&quot;Duplicate directory ID in request&quot;);</span>
+            }
+<span class="fc bfc" id="L393" title="All 2 branches covered.">            for (Uuid directory : request.logDirs()) {</span>
+<span class="fc" id="L394">                Integer dirBrokerId = directoryToBroker.get(directory);</span>
+<span class="pc bpc" id="L395" title="3 of 4 branches missed.">                if (dirBrokerId != null &amp;&amp; dirBrokerId != brokerId) {</span>
+<span class="nc" id="L396">                    throw new InvalidRegistrationException(&quot;Broker &quot; + dirBrokerId +</span>
+                            &quot; is already registered with directory &quot; + directory);
+                }
+<span class="fc" id="L399">            }</span>
+        }
+
+<span class="fc" id="L402">        ListenerInfo listenerInfo = ListenerInfo.fromBrokerRegistrationRequest(request.listeners());</span>
+<span class="fc" id="L403">        RegisterBrokerRecord record = new RegisterBrokerRecord().</span>
+<span class="fc" id="L404">            setBrokerId(brokerId).</span>
+<span class="fc" id="L405">            setIsMigratingZkBroker(request.isMigratingZkBroker()).</span>
+<span class="fc" id="L406">            setIncarnationId(request.incarnationId()).</span>
+<span class="fc" id="L407">            setRack(request.rack()).</span>
+<span class="fc" id="L408">            setEndPoints(listenerInfo.toBrokerRegistrationRecord());</span>
+
+        // Track which finalized features we have not yet verified are supported by the broker.
+<span class="fc" id="L411">        Map&lt;String, Short&gt; unverifiedFeatures = new HashMap&lt;&gt;(finalizedFeatures.featureMap());</span>
+
+        // Check every broker feature version range includes the finalized version.
+<span class="fc bfc" id="L414" title="All 2 branches covered.">        for (BrokerRegistrationRequestData.Feature feature : request.features()) {</span>
+<span class="fc" id="L415">            record.features().add(processRegistrationFeature(brokerId, finalizedFeatures, feature));</span>
+<span class="fc" id="L416">            unverifiedFeatures.remove(feature.name());</span>
+<span class="fc" id="L417">        }</span>
+
+<span class="pc bpc" id="L419" title="1 of 2 branches missed.">        if (request.features().find(MetadataVersion.FEATURE_NAME) == null)</span>
+<span class="nc" id="L420">            throw new InvalidRegistrationException(&quot;Request features do not contain '&quot; + MetadataVersion.FEATURE_NAME + &quot;'&quot;);</span>
+
+        // We also need to check every controller feature is supported by the broker.
+<span class="fc" id="L423">        unverifiedFeatures.forEach((featureName, finalizedVersion) -&gt; {</span>
+<span class="nc bnc" id="L424" title="All 4 branches missed.">            if (finalizedVersion != 0 &amp;&amp; request.features().findAll(featureName).isEmpty()) {</span>
+<span class="nc" id="L425">                processRegistrationFeature(brokerId, finalizedFeatures,</span>
+                    new BrokerRegistrationRequestData.Feature().
+<span class="nc" id="L427">                        setName(featureName).</span>
+<span class="nc" id="L428">                        setMinSupportedVersion((short) 0).</span>
+<span class="nc" id="L429">                        setMaxSupportedVersion((short) 0));</span>
+            }
+<span class="nc" id="L431">        });</span>
+<span class="pc bpc" id="L432" title="1 of 2 branches missed.">        if (featureControl.metadataVersionOrThrow().isDirectoryAssignmentSupported()) {</span>
+<span class="fc" id="L433">            record.setLogDirs(request.logDirs());</span>
+        }
+<span class="pc bpc" id="L435" title="1 of 2 branches missed.">        if (featureControl.metadataVersionOrThrow().isCordonedLogDirsSupported()) {</span>
+<span class="fc" id="L436">            record.setCordonedLogDirs(request.cordonedLogDirs());</span>
+        }
+<span class="pc bpc" id="L438" title="1 of 2 branches missed.">        if (!request.incarnationId().equals(prevIncarnationId)) {</span>
+<span class="fc" id="L439">            int prevNumRecords = records.size();</span>
+<span class="pc bpc" id="L440" title="1 of 2 branches missed.">            boolean isCleanShutdown = cleanShutdownDetectionEnabled ?</span>
+<span class="pc bpc" id="L441" title="1 of 2 branches missed.">                storedBrokerEpoch == request.previousBrokerEpoch() : false;</span>
+<span class="fc" id="L442">            brokerShutdownHandler.addRecordsForShutdown(request.brokerId(), isCleanShutdown, records);</span>
+<span class="fc" id="L443">            int numRecordsAdded = records.size() - prevNumRecords;</span>
+<span class="pc bpc" id="L444" title="1 of 2 branches missed.">            if (existing == null) {</span>
+<span class="fc" id="L445">                log.info(&quot;No previous registration found for broker {}. New incarnation ID is &quot; +</span>
+                        &quot;{}.  Generated {} record(s) to clean up previous incarnations. New broker &quot; +
+<span class="fc" id="L447">                        &quot;epoch is {}.&quot;, brokerId, request.incarnationId(), numRecordsAdded, newBrokerEpoch);</span>
+<span class="fc" id="L448">                metrics.addTimeSinceLastHeartbeatMetric(brokerId);</span>
+            } else {
+<span class="nc" id="L450">                log.info(&quot;Registering a new incarnation of broker {}. Previous incarnation ID &quot; +</span>
+                        &quot;was {}; new incarnation ID is {}. Generated {} record(s) to clean up &quot; +
+<span class="nc" id="L452">                        &quot;previous incarnations. Broker epoch will become {}.&quot;, brokerId,</span>
+<span class="nc" id="L453">                        existing.incarnationId(), request.incarnationId(), numRecordsAdded,</span>
+<span class="nc" id="L454">                        newBrokerEpoch);</span>
+            }
+<span class="fc" id="L456">            record.setBrokerEpoch(newBrokerEpoch);</span>
+<span class="fc" id="L457">        } else {</span>
+<span class="nc" id="L458">            log.info(&quot;Amending registration of broker {}, incarnation ID {}. Broker epoch remains {}.&quot;,</span>
+<span class="nc" id="L459">                    request.brokerId(), request.incarnationId(), existing.epoch());</span>
+<span class="nc" id="L460">            record.setFenced(existing.fenced());</span>
+<span class="nc" id="L461">            record.setInControlledShutdown(existing.inControlledShutdown());</span>
+<span class="nc" id="L462">            record.setBrokerEpoch(existing.epoch());</span>
+        }
+<span class="fc" id="L464">        records.add(new ApiMessageAndVersion(record, featureControl.metadataVersionOrThrow().</span>
+<span class="fc" id="L465">            registerBrokerRecordVersion()));</span>
+
+<span class="pc bpc" id="L467" title="1 of 2 branches missed.">        if (!request.incarnationId().equals(prevIncarnationId)) {</span>
+            // Remove any existing session for the old broker incarnation.
+<span class="fc" id="L469">            heartbeatManager.remove(brokerId);</span>
+        }
+<span class="fc" id="L471">        heartbeatManager.register(brokerId, record.fenced());</span>
+
+        // A broker registration that cleans up a previous incarnation's unclean shutdown may generate a large number of records.
+        // It is safe to return these records as a non-atomic batch as long as the registration record is added last.
+        // This ensures that in case of a controller failure, the broker will re-register and the new controller
+        // can retry the unclean shutdown cleanup.
+<span class="fc" id="L477">        return ControllerResult.of(records, new BrokerRegistrationReply(record.brokerEpoch()));</span>
+    }
+
+    ControllerResult&lt;Void&gt; registerController(ControllerRegistrationRequestData request) {
+<span class="pc bpc" id="L481" title="1 of 2 branches missed.">        if (!featureControl.metadataVersionOrThrow().isControllerRegistrationSupported()) {</span>
+<span class="nc" id="L482">            throw new UnsupportedVersionException(&quot;The current MetadataVersion is too old to &quot; +</span>
+                    &quot;support controller registrations.&quot;);
+        }
+<span class="fc" id="L485">        ListenerInfo listenerInfo = ListenerInfo.fromControllerRegistrationRequest(request.listeners());</span>
+<span class="fc" id="L486">        ControllerFeatureCollection features = new ControllerFeatureCollection();</span>
+<span class="fc" id="L487">        request.features().forEach(feature -&gt;</span>
+<span class="fc" id="L488">            features.add(new RegisterControllerRecord.ControllerFeature().</span>
+<span class="fc" id="L489">                setName(feature.name()).</span>
+<span class="fc" id="L490">                setMaxSupportedVersion(feature.maxSupportedVersion()).</span>
+<span class="fc" id="L491">                setMinSupportedVersion(feature.minSupportedVersion()))</span>
+        );
+<span class="fc" id="L493">        List&lt;ApiMessageAndVersion&gt; records = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L494">        records.add(new ApiMessageAndVersion(new RegisterControllerRecord().</span>
+<span class="fc" id="L495">            setControllerId(request.controllerId()).</span>
+<span class="fc" id="L496">            setIncarnationId(request.incarnationId()).</span>
+<span class="fc" id="L497">            setZkMigrationReady(false).</span>
+<span class="fc" id="L498">            setEndPoints(listenerInfo.toControllerRegistrationRecord()).</span>
+<span class="fc" id="L499">            setFeatures(features),</span>
+                (short) 0));
+<span class="fc" id="L501">        return ControllerResult.atomicOf(records, null);</span>
+    }
+
+    BrokerFeature processRegistrationFeature(
+        int brokerId,
+        FinalizedControllerFeatures finalizedFeatures,
+        BrokerRegistrationRequestData.Feature feature
+    ) {
+        // MetadataVersion has no default while the other features default to `0`
+        short finalized;
+<span class="fc bfc" id="L511" title="All 2 branches covered.">        if (feature.name().equals(MetadataVersion.FEATURE_NAME))</span>
+<span class="fc" id="L512">            finalized = finalizedFeatures.get(feature.name()).orElseThrow(() -&gt;</span>
+<span class="nc" id="L513">                new IllegalArgumentException(&quot;Feature with name '&quot; + MetadataVersion.FEATURE_NAME + &quot;' not found in finalizedFeatures &quot; + finalizedFeatures));</span>
+        else
+<span class="fc" id="L515">            finalized = finalizedFeatures.versionOrDefault(feature.name(), (short) 0);</span>
+
+<span class="pc bpc" id="L517" title="1 of 2 branches missed.">        if (!VersionRange.of(feature.minSupportedVersion(), feature.maxSupportedVersion()).contains(finalized)) {</span>
+<span class="nc" id="L518">            throw new UnsupportedVersionException(&quot;Unable to register because the broker &quot; +</span>
+<span class="nc" id="L519">                &quot;does not support finalized version &quot; + finalized + &quot; of &quot; + feature.name() +</span>
+<span class="nc" id="L520">                    &quot;. The broker wants a version between &quot; + feature.minSupportedVersion() + &quot; and &quot; +</span>
+<span class="nc" id="L521">                    feature.maxSupportedVersion() + &quot;, inclusive.&quot;);</span>
+        }
+        // A feature is not found in the finalizedFeature map if it is unknown to the controller or set to 0 (feature not enabled).
+<span class="pc bpc" id="L524" title="1 of 2 branches missed.">        if (!finalizedFeatures.featureNames().contains(feature.name()))</span>
+<span class="nc" id="L525">            log.debug(&quot;Broker {} registered with version range ({}, {}] of feature {} which controller does not know &quot; +</span>
+                    &quot;or has finalized version of 0.&quot;,
+<span class="nc" id="L527">                    brokerId, feature.minSupportedVersion(), feature.maxSupportedVersion(), feature.name());</span>
+<span class="fc" id="L528">        return new BrokerFeature().</span>
+<span class="fc" id="L529">                setName(feature.name()).</span>
+<span class="fc" id="L530">                setMinSupportedVersion(feature.minSupportedVersion()).</span>
+<span class="fc" id="L531">                setMaxSupportedVersion(feature.maxSupportedVersion());</span>
+    }
+
+    /**
+     * Track an incoming broker heartbeat. Unlike most functions, this one is not called from the main
+     * controller thread, so it can only access local, volatile and atomic data.
+     *
+     * @param brokerId      The broker id to track.
+     * @param brokerEpoch   The broker epoch to track.
+     *
+     * @return              True only if the ClusterControlManager is active.
+     */
+    boolean trackBrokerHeartbeat(int brokerId, long brokerEpoch) {
+<span class="fc" id="L544">        BrokerHeartbeatManager manager = heartbeatManager;</span>
+<span class="pc bpc" id="L545" title="1 of 2 branches missed.">        if (manager == null) return false;</span>
+<span class="fc" id="L546">        manager.tracker().updateContactTime(new BrokerIdAndEpoch(brokerId, brokerEpoch));</span>
+<span class="fc" id="L547">        return true;</span>
+    }
+
+    public OptionalLong registerBrokerRecordOffset(int brokerId) {
+<span class="fc" id="L551">        Long registrationOffset = registerBrokerRecordOffsets.get(brokerId);</span>
+<span class="pc bpc" id="L552" title="1 of 2 branches missed.">        if (registrationOffset != null) {</span>
+<span class="fc" id="L553">            return OptionalLong.of(registrationOffset);</span>
+        }
+<span class="nc" id="L555">        return OptionalLong.empty();</span>
+    }
+
+    public void updateCordonedLogDirs(int brokerId, List&lt;Uuid&gt; cordonedLogDirs) {
+<span class="fc" id="L559">        brokerRegistrations.compute(brokerId,</span>
+<span class="fc" id="L560">                (k, brokerRegistration) -&gt; new BrokerRegistration.Builder().</span>
+<span class="fc" id="L561">                        setId(brokerId).</span>
+<span class="fc" id="L562">                        setEpoch(brokerRegistration.epoch()).</span>
+<span class="fc" id="L563">                        setIncarnationId(brokerRegistration.incarnationId()).</span>
+<span class="fc" id="L564">                        setListeners(brokerRegistration.listeners()).</span>
+<span class="fc" id="L565">                        setSupportedFeatures(brokerRegistration.supportedFeatures()).</span>
+<span class="fc" id="L566">                        setRack(brokerRegistration.rack()).</span>
+<span class="fc" id="L567">                        setFenced(brokerRegistration.fenced()).</span>
+<span class="fc" id="L568">                        setInControlledShutdown(brokerRegistration.inControlledShutdown()).</span>
+<span class="fc" id="L569">                        setDirectories(brokerRegistration.directories()).</span>
+<span class="fc" id="L570">                        setCordonedDirectories(cordonedLogDirs).</span>
+<span class="fc" id="L571">                        build());</span>
+<span class="fc" id="L572">    }</span>
+
+    public void replay(RegisterBrokerRecord record, long offset) {
+<span class="fc" id="L575">        registerBrokerRecordOffsets.put(record.brokerId(), offset);</span>
+<span class="fc" id="L576">        int brokerId = record.brokerId();</span>
+<span class="fc" id="L577">        ListenerInfo listenerInfo = ListenerInfo.fromBrokerRegistrationRecord(record.endPoints());</span>
+<span class="fc" id="L578">        Map&lt;String, VersionRange&gt; features = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L579" title="All 2 branches covered.">        for (BrokerFeature feature : record.features()) {</span>
+<span class="fc" id="L580">            features.put(feature.name(), VersionRange.of(</span>
+<span class="fc" id="L581">                feature.minSupportedVersion(), feature.maxSupportedVersion()));</span>
+<span class="fc" id="L582">        }</span>
+        // Update broker registrations.
+<span class="fc" id="L584">        BrokerRegistration prevRegistration = brokerRegistrations.put(brokerId,</span>
+            new BrokerRegistration.Builder().
+<span class="fc" id="L586">                setId(brokerId).</span>
+<span class="fc" id="L587">                setEpoch(record.brokerEpoch()).</span>
+<span class="fc" id="L588">                setIncarnationId(record.incarnationId()).</span>
+<span class="fc" id="L589">                setListeners(listenerInfo.listeners()).</span>
+<span class="fc" id="L590">                setSupportedFeatures(features).</span>
+<span class="fc" id="L591">                setRack(Optional.ofNullable(record.rack())).</span>
+<span class="fc" id="L592">                setFenced(record.fenced()).</span>
+<span class="fc" id="L593">                setInControlledShutdown(record.inControlledShutdown()).</span>
+<span class="fc" id="L594">                setIsMigratingZkBroker(record.isMigratingZkBroker()).</span>
+<span class="fc" id="L595">                setDirectories(record.logDirs()).</span>
+<span class="fc" id="L596">                setCordonedDirectories(record.cordonedLogDirs()).</span>
+<span class="fc" id="L597">                    build());</span>
+<span class="pc bpc" id="L598" title="1 of 2 branches missed.">        updateDirectories(brokerId, prevRegistration == null ? null : prevRegistration.directories(), record.logDirs());</span>
+<span class="pc bpc" id="L599" title="1 of 2 branches missed.">        if (heartbeatManager != null) {</span>
+<span class="pc bpc" id="L600" title="1 of 2 branches missed.">            if (prevRegistration != null) heartbeatManager.remove(brokerId);</span>
+<span class="fc" id="L601">            heartbeatManager.register(brokerId, record.fenced());</span>
+        }
+<span class="pc bpc" id="L603" title="1 of 2 branches missed.">        if (prevRegistration == null) {</span>
+<span class="fc" id="L604">            log.info(&quot;Replayed initial RegisterBrokerRecord for broker {}: {}&quot;, record.brokerId(), record);</span>
+<span class="nc bnc" id="L605" title="All 2 branches missed.">        } else if (prevRegistration.incarnationId().equals(record.incarnationId())) {</span>
+<span class="nc" id="L606">            log.info(&quot;Replayed RegisterBrokerRecord modifying the registration for broker {}: {}&quot;,</span>
+<span class="nc" id="L607">                record.brokerId(), record);</span>
+        } else {
+<span class="nc" id="L609">            log.info(&quot;Replayed RegisterBrokerRecord establishing a new incarnation of broker {}: {}&quot;,</span>
+<span class="nc" id="L610">                record.brokerId(), record);</span>
+        }
+<span class="fc" id="L612">    }</span>
+
+    public void replay(UnregisterBrokerRecord record) {
+<span class="nc" id="L615">        registerBrokerRecordOffsets.remove(record.brokerId());</span>
+<span class="nc" id="L616">        int brokerId = record.brokerId();</span>
+<span class="nc" id="L617">        BrokerRegistration registration = brokerRegistrations.get(brokerId);</span>
+<span class="nc bnc" id="L618" title="All 2 branches missed.">        if (registration == null) {</span>
+<span class="nc" id="L619">            throw new RuntimeException(String.format(&quot;Unable to replay %s: no broker &quot; +</span>
+                &quot;registration found for that id&quot;, record));
+<span class="nc bnc" id="L621" title="All 2 branches missed.">        } else if (registration.epoch() != record.brokerEpoch()) {</span>
+<span class="nc" id="L622">            throw new RuntimeException(String.format(&quot;Unable to replay %s: no broker &quot; +</span>
+                &quot;registration with that epoch found&quot;, record));
+        } else {
+<span class="nc bnc" id="L625" title="All 2 branches missed.">            if (heartbeatManager != null) heartbeatManager.remove(brokerId);</span>
+<span class="nc" id="L626">            updateDirectories(brokerId, registration.directories(), null);</span>
+<span class="nc" id="L627">            brokerRegistrations.remove(brokerId);</span>
+<span class="nc" id="L628">            log.info(&quot;Replayed {}&quot;, record);</span>
+        }
+<span class="nc" id="L630">    }</span>
+
+    public void replay(FenceBrokerRecord record) {
+<span class="nc" id="L633">        replayRegistrationChange(</span>
+            record,
+<span class="nc" id="L635">            record.id(),</span>
+<span class="nc" id="L636">            record.epoch(),</span>
+<span class="nc" id="L637">            BrokerRegistrationFencingChange.FENCE.asBoolean(),</span>
+<span class="nc" id="L638">            BrokerRegistrationInControlledShutdownChange.NONE.asBoolean(),</span>
+<span class="nc" id="L639">            Optional.empty(),</span>
+<span class="nc" id="L640">            Optional.empty()</span>
+        );
+<span class="nc" id="L642">    }</span>
+
+    public void replay(UnfenceBrokerRecord record) {
+<span class="nc" id="L645">        replayRegistrationChange(</span>
+            record,
+<span class="nc" id="L647">            record.id(),</span>
+<span class="nc" id="L648">            record.epoch(),</span>
+<span class="nc" id="L649">            BrokerRegistrationFencingChange.UNFENCE.asBoolean(),</span>
+<span class="nc" id="L650">            BrokerRegistrationInControlledShutdownChange.NONE.asBoolean(),</span>
+<span class="nc" id="L651">            Optional.empty(),</span>
+<span class="nc" id="L652">            Optional.empty()</span>
+        );
+<span class="nc" id="L654">    }</span>
+
+    public void replay(BrokerRegistrationChangeRecord record) {
+<span class="fc" id="L657">        BrokerRegistrationFencingChange fencingChange =</span>
+<span class="fc" id="L658">            BrokerRegistrationFencingChange.fromValue(record.fenced()).orElseThrow(</span>
+<span class="nc" id="L659">                () -&gt; new IllegalStateException(String.format(&quot;Unable to replay %s: unknown &quot; +</span>
+<span class="nc" id="L660">                    &quot;value for fenced field: %x&quot;, record, record.fenced())));</span>
+<span class="fc" id="L661">        BrokerRegistrationInControlledShutdownChange inControlledShutdownChange =</span>
+<span class="fc" id="L662">            BrokerRegistrationInControlledShutdownChange.fromValue(record.inControlledShutdown()).orElseThrow(</span>
+<span class="nc" id="L663">                () -&gt; new IllegalStateException(String.format(&quot;Unable to replay %s: unknown &quot; +</span>
+<span class="nc" id="L664">                    &quot;value for inControlledShutdown field: %x&quot;, record, record.inControlledShutdown())));</span>
+<span class="pc bpc" id="L665" title="1 of 2 branches missed.">        Optional&lt;List&lt;Uuid&gt;&gt; directoriesChange = Optional.ofNullable(record.logDirs()).filter(list -&gt; !list.isEmpty());</span>
+<span class="pc bpc" id="L666" title="1 of 2 branches missed.">        Optional&lt;List&lt;Uuid&gt;&gt; cordonedDirectoriesChange = Optional.ofNullable(record.cordonedLogDirs()).filter(list -&gt; !list.isEmpty());</span>
+<span class="fc" id="L667">        replayRegistrationChange(</span>
+            record,
+<span class="fc" id="L669">            record.brokerId(),</span>
+<span class="fc" id="L670">            record.brokerEpoch(),</span>
+<span class="fc" id="L671">            fencingChange.asBoolean(),</span>
+<span class="fc" id="L672">            inControlledShutdownChange.asBoolean(),</span>
+            directoriesChange,
+            cordonedDirectoriesChange
+        );
+<span class="fc" id="L676">    }</span>
+
+    private void replayRegistrationChange(
+        ApiMessage record,
+        int brokerId,
+        long brokerEpoch,
+        Optional&lt;Boolean&gt; fencingChange,
+        Optional&lt;Boolean&gt; inControlledShutdownChange,
+        Optional&lt;List&lt;Uuid&gt;&gt; directoriesChange,
+        Optional&lt;List&lt;Uuid&gt;&gt; cordonedDirectoriesChange
+    ) {
+<span class="fc" id="L687">        BrokerRegistration curRegistration = brokerRegistrations.get(brokerId);</span>
+<span class="pc bpc" id="L688" title="1 of 2 branches missed.">        if (curRegistration == null) {</span>
+<span class="nc" id="L689">            throw new RuntimeException(String.format(&quot;Unable to replay %s: no broker &quot; +</span>
+<span class="nc" id="L690">                &quot;registration found for that id&quot;, record.toString()));</span>
+<span class="pc bpc" id="L691" title="1 of 2 branches missed.">        } else if (curRegistration.epoch() != brokerEpoch) {</span>
+<span class="nc" id="L692">            throw new RuntimeException(String.format(&quot;Unable to replay %s: no broker &quot; +</span>
+<span class="nc" id="L693">                &quot;registration with that epoch found&quot;, record.toString()));</span>
+        } else {
+<span class="fc" id="L695">            BrokerRegistration nextRegistration = curRegistration.cloneWith(</span>
+                fencingChange,
+                inControlledShutdownChange,
+                directoriesChange,
+                cordonedDirectoriesChange
+            );
+<span class="pc bpc" id="L701" title="1 of 2 branches missed.">            if (!curRegistration.equals(nextRegistration)) {</span>
+<span class="fc" id="L702">                log.info(&quot;Replayed {} modifying the registration for broker {}: {}&quot;,</span>
+<span class="fc" id="L703">                        record.getClass().getSimpleName(), brokerId, record);</span>
+<span class="fc" id="L704">                brokerRegistrations.put(brokerId, nextRegistration);</span>
+            } else {
+<span class="nc" id="L706">                log.info(&quot;Ignoring no-op registration change for {}&quot;, curRegistration);</span>
+            }
+<span class="fc" id="L708">            updateDirectories(brokerId, curRegistration.directories(), nextRegistration.directories());</span>
+<span class="pc bpc" id="L709" title="1 of 2 branches missed.">            if (heartbeatManager != null) heartbeatManager.register(brokerId, nextRegistration.fenced());</span>
+<span class="pc bpc" id="L710" title="1 of 2 branches missed.">            if (readyBrokersFuture.isPresent()) {</span>
+<span class="nc bnc" id="L711" title="All 2 branches missed.">                if (readyBrokersFuture.get().check()) {</span>
+<span class="nc" id="L712">                    readyBrokersFuture.get().future.complete(null);</span>
+<span class="nc" id="L713">                    readyBrokersFuture = Optional.empty();</span>
+                }
+            }
+        }
+<span class="fc" id="L717">    }</span>
+
+    public void replay(RegisterControllerRecord record) {
+<span class="fc" id="L720">        ControllerRegistration newRegistration = new ControllerRegistration.Builder(record).build();</span>
+<span class="fc" id="L721">        ControllerRegistration prevRegistration =</span>
+<span class="fc" id="L722">            controllerRegistrations.put(record.controllerId(), newRegistration);</span>
+<span class="fc" id="L723">        log.info(&quot;Replayed RegisterControllerRecord containing {}.{}&quot;, newRegistration,</span>
+<span class="pc bpc" id="L724" title="1 of 2 branches missed.">            prevRegistration == null ? &quot;&quot; :</span>
+<span class="nc" id="L725">                &quot; Previous incarnation was &quot; + prevRegistration.incarnationId());</span>
+<span class="fc" id="L726">    }</span>
+
+    Iterator&lt;UsableBroker&gt; usableBrokers() {
+<span class="pc bpc" id="L729" title="1 of 2 branches missed.">        if (heartbeatManager == null) {</span>
+<span class="nc" id="L730">            throw new RuntimeException(&quot;ClusterControlManager is not active.&quot;);</span>
+        }
+<span class="fc" id="L732">        return heartbeatManager.usableBrokers(</span>
+<span class="fc" id="L733">            id -&gt; brokerRegistrations.get(id).rack(),</span>
+<span class="fc" id="L734">            id -&gt; brokerRegistrations.get(id).hasUncordonedDirs());</span>
+    }
+
+    /**
+     * Returns true if the broker is unfenced; Returns false if it is
+     * not or if it does not exist.
+     */
+    public boolean isUnfenced(int brokerId) {
+<span class="nc" id="L742">        BrokerRegistration registration = brokerRegistrations.get(brokerId);</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">        if (registration == null) return false;</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">        return !registration.fenced();</span>
+    }
+
+    /**
+     * Get a broker registration if it exists.
+     *
+     * @param brokerId The brokerId to get the registration for
+     * @return The current registration or null if the broker is not registered
+     */
+    public BrokerRegistration registration(int brokerId) {
+<span class="fc" id="L754">        return brokerRegistrations.get(brokerId);</span>
+    }
+
+    /**
+     * Returns true if the broker is in controlled shutdown state; Returns false
+     * if it is not or if it does not exist.
+     */
+    public boolean inControlledShutdown(int brokerId) {
+<span class="fc" id="L762">        BrokerRegistration registration = brokerRegistrations.get(brokerId);</span>
+<span class="pc bpc" id="L763" title="1 of 2 branches missed.">        if (registration == null) return false;</span>
+<span class="fc" id="L764">        return registration.inControlledShutdown();</span>
+    }
+
+    /**
+     * Returns true if the broker is active. Active means not fenced nor in controlled
+     * shutdown; Returns false if it is not active or if it does not exist.
+     */
+    public boolean isActive(int brokerId) {
+<span class="fc" id="L772">        BrokerRegistration registration = brokerRegistrations.get(brokerId);</span>
+<span class="pc bpc" id="L773" title="1 of 2 branches missed.">        if (registration == null) return false;</span>
+<span class="pc bpc" id="L774" title="2 of 4 branches missed.">        return !registration.inControlledShutdown() &amp;&amp; !registration.fenced();</span>
+    }
+
+    BrokerHeartbeatManager heartbeatManager() {
+        // We throw RuntimeException here rather than NotControllerException because all the callers
+        // have already verified that we are active. For example, ControllerWriteEvent.run verifies
+        // that we are the current active controller before running any event-specific code.
+<span class="pc bpc" id="L781" title="1 of 2 branches missed.">        if (heartbeatManager == null) {</span>
+<span class="nc" id="L782">            throw new RuntimeException(&quot;ClusterControlManager is not active.&quot;);</span>
+        }
+<span class="fc" id="L784">        return heartbeatManager;</span>
+    }
+
+    public void checkBrokerEpoch(int brokerId, long brokerEpoch) {
+<span class="fc" id="L788">        BrokerRegistration registration = brokerRegistrations.get(brokerId);</span>
+<span class="pc bpc" id="L789" title="1 of 2 branches missed.">        if (registration == null) {</span>
+<span class="nc" id="L790">            throw new StaleBrokerEpochException(&quot;No broker registration found for &quot; +</span>
+                &quot;broker id &quot; + brokerId);
+        }
+<span class="pc bpc" id="L793" title="1 of 2 branches missed.">        if (registration.epoch() != brokerEpoch) {</span>
+<span class="nc" id="L794">            throw new StaleBrokerEpochException(&quot;Expected broker epoch &quot; +</span>
+<span class="nc" id="L795">                registration.epoch() + &quot;, but got broker epoch &quot; + brokerEpoch);</span>
+        }
+<span class="fc" id="L797">    }</span>
+
+    public void addReadyBrokersFuture(CompletableFuture&lt;Void&gt; future, int minBrokers) {
+<span class="fc" id="L800">        readyBrokersFuture = Optional.of(new ReadyBrokersFuture(future, minBrokers));</span>
+<span class="pc bpc" id="L801" title="1 of 2 branches missed.">        if (readyBrokersFuture.get().check()) {</span>
+<span class="fc" id="L802">            readyBrokersFuture.get().future.complete(null);</span>
+<span class="fc" id="L803">            readyBrokersFuture = Optional.empty();</span>
+        }
+<span class="fc" id="L805">    }</span>
+
+    /**
+     * Determines whether the specified directory is online in the specified broker.
+     * Returns false whether the directory is not online or the broker is not registered.
+     */
+    public boolean hasOnlineDir(int brokerId, Uuid directoryId) {
+<span class="nc" id="L812">        BrokerRegistration registration = registration(brokerId);</span>
+<span class="nc bnc" id="L813" title="All 4 branches missed.">        return registration != null &amp;&amp; registration.hasOnlineDir(directoryId);</span>
+    }
+
+    /**
+     * Determines the default directory for new partitions placed on a given broker.
+     */
+    public Uuid defaultDir(int brokerId) {
+<span class="fc" id="L820">        BrokerRegistration registration = registration(brokerId);</span>
+<span class="pc bpc" id="L821" title="1 of 2 branches missed.">        if (registration == null) {</span>
+            // throwing an exception here can break the expected error from an
+            // Admin call, so instead, we return UNASSIGNED, and let the fact
+            // that the broker is not registered be handled elsewhere.
+<span class="nc" id="L825">            return DirectoryId.UNASSIGNED;</span>
+        }
+<span class="fc" id="L827">        List&lt;Uuid&gt; directories = registration.directories();</span>
+<span class="pc bpc" id="L828" title="1 of 2 branches missed.">        if (directories.isEmpty()) {</span>
+<span class="nc" id="L829">            return DirectoryId.MIGRATING;</span>
+        }
+<span class="pc bpc" id="L831" title="1 of 2 branches missed.">        if (directories.size() == 1) {</span>
+<span class="fc" id="L832">            return directories.get(0);</span>
+        }
+<span class="nc" id="L834">        return DirectoryId.UNASSIGNED;</span>
+    }
+
+    void updateDirectories(int brokerId, List&lt;Uuid&gt; dirsToRemove, List&lt;Uuid&gt; dirsToAdd) {
+<span class="fc bfc" id="L838" title="All 2 branches covered.">        if (dirsToRemove != null) {</span>
+<span class="fc bfc" id="L839" title="All 2 branches covered.">            for (Uuid directory : dirsToRemove) {</span>
+<span class="pc bpc" id="L840" title="1 of 2 branches missed.">                if (!directoryToBroker.remove(directory, brokerId)) {</span>
+<span class="nc" id="L841">                    throw new IllegalStateException(&quot;BUG: directory &quot; + directory + &quot; not assigned to broker &quot; + brokerId);</span>
+                }
+<span class="fc" id="L843">            }</span>
+        }
+<span class="pc bpc" id="L845" title="1 of 2 branches missed.">        if (dirsToAdd != null) {</span>
+<span class="fc bfc" id="L846" title="All 2 branches covered.">            for (Uuid directory : dirsToAdd) {</span>
+<span class="fc" id="L847">                Integer existingId = directoryToBroker.putIfAbsent(directory, brokerId);</span>
+<span class="pc bpc" id="L848" title="3 of 4 branches missed.">                if (existingId != null &amp;&amp; existingId != brokerId) {</span>
+<span class="nc" id="L849">                    throw new IllegalStateException(&quot;BUG: directory &quot; + directory + &quot; already assigned to broker &quot; + existingId);</span>
+                }
+<span class="fc" id="L851">            }</span>
+        }
+<span class="fc" id="L853">    }</span>
+
+    Iterator&lt;Entry&lt;Integer, Map&lt;String, VersionRange&gt;&gt;&gt; brokerSupportedFeatures() {
+<span class="nc" id="L856">        return new Iterator&lt;&gt;() {</span>
+<span class="nc" id="L857">            private final Iterator&lt;BrokerRegistration&gt; iter = brokerRegistrations.values().iterator();</span>
+
+            @Override
+            public boolean hasNext() {
+<span class="nc" id="L861">                return iter.hasNext();</span>
+            }
+
+            @Override
+            public Entry&lt;Integer, Map&lt;String, VersionRange&gt;&gt; next() {
+<span class="nc" id="L866">                BrokerRegistration registration = iter.next();</span>
+<span class="nc" id="L867">                return new AbstractMap.SimpleImmutableEntry&lt;&gt;(registration.id(),</span>
+<span class="nc" id="L868">                        registration.supportedFeatures());</span>
+            }
+        };
+    }
+
+    Iterator&lt;Entry&lt;Integer, Map&lt;String, VersionRange&gt;&gt;&gt; controllerSupportedFeatures() {
+<span class="nc bnc" id="L874" title="All 2 branches missed.">        if (!featureControl.metadataVersionOrThrow().isControllerRegistrationSupported()) {</span>
+<span class="nc" id="L875">            throw new UnsupportedVersionException(&quot;The current MetadataVersion is too old to &quot; +</span>
+                    &quot;support controller registrations.&quot;);
+        }
+<span class="nc" id="L878">        return new Iterator&lt;&gt;() {</span>
+<span class="nc" id="L879">            private final Iterator&lt;ControllerRegistration&gt; iter = controllerRegistrations.values().iterator();</span>
+
+            @Override
+            public boolean hasNext() {
+<span class="nc" id="L883">                return iter.hasNext();</span>
+            }
+
+            @Override
+            public Entry&lt;Integer, Map&lt;String, VersionRange&gt;&gt; next() {
+<span class="nc" id="L888">                ControllerRegistration registration = iter.next();</span>
+<span class="nc" id="L889">                return new AbstractMap.SimpleImmutableEntry&lt;&gt;(registration.id(),</span>
+<span class="nc" id="L890">                        registration.supportedFeatures());</span>
+            }
+        };
+    }
+
+    @FunctionalInterface
+    interface BrokerShutdownHandler {
+        void addRecordsForShutdown(int brokerId, boolean isCleanShutdown, List&lt;ApiMessageAndVersion&gt; records);
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ListDeserializer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.serialization</a> &gt; <span class="el_source">ListDeserializer.java</span></div><h1>ListDeserializer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.serialization;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.errors.SerializationException;
+import org.apache.kafka.common.header.Headers;
+import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.serialization.Serdes.ListSerde;
+import org.apache.kafka.common.utils.Utils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import static org.apache.kafka.common.serialization.Serdes.ListSerde.SerializationStrategy;
+
+public class ListDeserializer&lt;Inner&gt; implements Deserializer&lt;List&lt;Inner&gt;&gt; {
+
+<span class="nc" id="L44">    final Logger log = LoggerFactory.getLogger(ListDeserializer.class);</span>
+
+<span class="nc" id="L46">    private static final Map&lt;Class&lt;? extends Deserializer&lt;?&gt;&gt;, Integer&gt; FIXED_LENGTH_DESERIALIZERS = Map.of(</span>
+<span class="nc" id="L47">        ShortDeserializer.class, Short.BYTES,</span>
+<span class="nc" id="L48">        IntegerDeserializer.class, Integer.BYTES,</span>
+<span class="nc" id="L49">        FloatDeserializer.class, Float.BYTES,</span>
+<span class="nc" id="L50">        LongDeserializer.class, Long.BYTES,</span>
+<span class="nc" id="L51">        DoubleDeserializer.class, Double.BYTES,</span>
+<span class="nc" id="L52">        UUIDDeserializer.class, 36</span>
+    );
+
+    private Deserializer&lt;Inner&gt; inner;
+    private Class&lt;?&gt; listClass;
+    private Integer primitiveSize;
+
+<span class="nc" id="L59">    public ListDeserializer() {}</span>
+
+<span class="nc" id="L61">    public &lt;L extends List&lt;Inner&gt;&gt; ListDeserializer(Class&lt;L&gt; listClass, Deserializer&lt;Inner&gt; inner) {</span>
+<span class="nc bnc" id="L62" title="All 4 branches missed.">        if (listClass == null || inner == null) {</span>
+<span class="nc" id="L63">            log.error(&quot;Could not construct ListDeserializer as not all required parameters were present -- listClass: {}, inner: {}&quot;, listClass, inner);</span>
+<span class="nc" id="L64">            throw new IllegalArgumentException(&quot;ListDeserializer requires both \&quot;listClass\&quot; and \&quot;innerDeserializer\&quot; parameters to be provided during initialization&quot;);</span>
+        }
+<span class="nc" id="L66">        this.listClass = listClass;</span>
+<span class="nc" id="L67">        this.inner = inner;</span>
+<span class="nc" id="L68">        this.primitiveSize = FIXED_LENGTH_DESERIALIZERS.get(inner.getClass());</span>
+<span class="nc" id="L69">    }</span>
+
+    public Deserializer&lt;Inner&gt; innerDeserializer() {
+<span class="nc" id="L72">        return inner;</span>
+    }
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs, boolean isKey) {
+<span class="nc bnc" id="L77" title="All 4 branches missed.">        if (listClass != null || inner != null) {</span>
+<span class="nc" id="L78">            log.error(&quot;Could not configure ListDeserializer as some parameters were already set -- listClass: {}, inner: {}&quot;, listClass, inner);</span>
+<span class="nc" id="L79">            throw new ConfigException(&quot;List deserializer was already initialized using a non-default constructor&quot;);</span>
+        }
+<span class="nc" id="L81">        configureListClass(configs, isKey);</span>
+<span class="nc" id="L82">        configureInnerSerde(configs, isKey);</span>
+<span class="nc" id="L83">    }</span>
+
+    private void configureListClass(Map&lt;String, ?&gt; configs, boolean isKey) {
+<span class="nc bnc" id="L86" title="All 2 branches missed.">        String listTypePropertyName = isKey ? CommonClientConfigs.DEFAULT_LIST_KEY_SERDE_TYPE_CLASS : CommonClientConfigs.DEFAULT_LIST_VALUE_SERDE_TYPE_CLASS;</span>
+<span class="nc" id="L87">        final Object listClassOrName = configs.get(listTypePropertyName);</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">        if (listClassOrName == null) {</span>
+<span class="nc" id="L89">            throw new ConfigException(&quot;Not able to determine the list class because it was neither passed via the constructor nor set in the config.&quot;);</span>
+        }
+        try {
+<span class="nc bnc" id="L92" title="All 2 branches missed.">            if (listClassOrName instanceof String) {</span>
+<span class="nc" id="L93">                listClass = Utils.loadClass((String) listClassOrName, Object.class);</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">            } else if (listClassOrName instanceof Class) {</span>
+<span class="nc" id="L95">                listClass = (Class&lt;?&gt;) listClassOrName;</span>
+            } else {
+<span class="nc" id="L97">                throw new KafkaException(&quot;Could not determine the list class instance using \&quot;&quot; + listTypePropertyName + &quot;\&quot; property.&quot;);</span>
+            }
+<span class="nc" id="L99">        } catch (final ClassNotFoundException e) {</span>
+<span class="nc" id="L100">            throw new ConfigException(listTypePropertyName, listClassOrName, &quot;Deserializer's list class \&quot;&quot; + listClassOrName + &quot;\&quot; could not be found.&quot;);</span>
+<span class="nc" id="L101">        }</span>
+<span class="nc" id="L102">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private void configureInnerSerde(Map&lt;String, ?&gt; configs, boolean isKey) {
+<span class="nc bnc" id="L106" title="All 2 branches missed.">        String innerSerdePropertyName = isKey ? CommonClientConfigs.DEFAULT_LIST_KEY_SERDE_INNER_CLASS : CommonClientConfigs.DEFAULT_LIST_VALUE_SERDE_INNER_CLASS;</span>
+<span class="nc" id="L107">        final Object innerSerdeClassOrName = configs.get(innerSerdePropertyName);</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">        if (innerSerdeClassOrName == null) {</span>
+<span class="nc" id="L109">            throw new ConfigException(&quot;Not able to determine the inner serde class because it was neither passed via the constructor nor set in the config.&quot;);</span>
+        }
+        try {
+<span class="nc bnc" id="L112" title="All 2 branches missed.">            if (innerSerdeClassOrName instanceof String) {</span>
+<span class="nc" id="L113">                inner = Utils.newInstance((String) innerSerdeClassOrName, Serde.class).deserializer();</span>
+<span class="nc bnc" id="L114" title="All 2 branches missed.">            } else if (innerSerdeClassOrName instanceof Class) {</span>
+<span class="nc" id="L115">                inner = (Deserializer&lt;Inner&gt;) ((Serde) Utils.newInstance((Class) innerSerdeClassOrName)).deserializer();</span>
+            } else {
+<span class="nc" id="L117">                throw new KafkaException(&quot;Could not determine the inner serde class instance using \&quot;&quot; + innerSerdePropertyName + &quot;\&quot; property.&quot;);</span>
+            }
+<span class="nc" id="L119">            inner.configure(configs, isKey);</span>
+<span class="nc" id="L120">            primitiveSize = FIXED_LENGTH_DESERIALIZERS.get(inner.getClass());</span>
+<span class="nc" id="L121">        } catch (final ClassNotFoundException e) {</span>
+<span class="nc" id="L122">            throw new ConfigException(innerSerdePropertyName, innerSerdeClassOrName, &quot;Deserializer's inner serde class \&quot;&quot; + innerSerdeClassOrName + &quot;\&quot; could not be found.&quot;);</span>
+<span class="nc" id="L123">        }</span>
+<span class="nc" id="L124">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private List&lt;Inner&gt; createListInstance(int listSize) {
+        try {
+            Constructor&lt;List&lt;Inner&gt;&gt; listConstructor;
+            try {
+<span class="nc" id="L131">                listConstructor = (Constructor&lt;List&lt;Inner&gt;&gt;) listClass.getConstructor(Integer.TYPE);</span>
+<span class="nc" id="L132">                return listConstructor.newInstance(listSize);</span>
+<span class="nc" id="L133">            } catch (NoSuchMethodException e) {</span>
+<span class="nc" id="L134">                listConstructor = (Constructor&lt;List&lt;Inner&gt;&gt;) listClass.getConstructor();</span>
+<span class="nc" id="L135">                return listConstructor.newInstance();</span>
+            }
+<span class="nc" id="L137">        } catch (InstantiationException | IllegalAccessException | NoSuchMethodException |</span>
+                IllegalArgumentException | InvocationTargetException e) {
+<span class="nc" id="L139">            log.error(&quot;Failed to construct list due to &quot;, e);</span>
+<span class="nc" id="L140">            throw new KafkaException(&quot;Could not construct a list instance of \&quot;&quot; + listClass.getCanonicalName() + &quot;\&quot;&quot;, e);</span>
+        }
+    }
+
+    private SerializationStrategy parseSerializationStrategyFlag(final int serializationStrategyFlag) throws IOException {
+<span class="nc bnc" id="L145" title="All 4 branches missed.">        if (serializationStrategyFlag &lt; 0 || serializationStrategyFlag &gt;= SerializationStrategy.VALUES.length) {</span>
+<span class="nc" id="L146">            throw new SerializationException(&quot;Invalid serialization strategy flag value&quot;);</span>
+        }
+<span class="nc" id="L148">        return SerializationStrategy.VALUES[serializationStrategyFlag];</span>
+    }
+
+    private List&lt;Integer&gt; deserializeNullIndexList(final DataInputStream dis) throws IOException {
+<span class="nc" id="L152">        int nullIndexListSize = dis.readInt();</span>
+<span class="nc" id="L153">        List&lt;Integer&gt; nullIndexList = new ArrayList&lt;&gt;(nullIndexListSize);</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        while (nullIndexListSize != 0) {</span>
+<span class="nc" id="L155">            nullIndexList.add(dis.readInt());</span>
+<span class="nc" id="L156">            nullIndexListSize--;</span>
+        }
+<span class="nc" id="L158">        return nullIndexList;</span>
+    }
+
+    @Override
+    public List&lt;Inner&gt; deserialize(String topic, byte[] data) {
+<span class="nc" id="L163">        return deserialize(topic, new RecordHeaders(), data);</span>
+    }
+
+    @Override
+    public List&lt;Inner&gt; deserialize(String topic, Headers headers, byte[] data) {
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        if (data == null) {</span>
+<span class="nc" id="L169">            return null;</span>
+        }
+<span class="nc" id="L171">        try (final DataInputStream dis = new DataInputStream(new ByteArrayInputStream(data))) {</span>
+<span class="nc" id="L172">            SerializationStrategy serStrategy = parseSerializationStrategyFlag(dis.readByte());</span>
+<span class="nc" id="L173">            List&lt;Integer&gt; nullIndexList = null;</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">            if (serStrategy == SerializationStrategy.CONSTANT_SIZE) {</span>
+                // In CONSTANT_SIZE strategy, indexes of null entries are decoded from a null index list
+<span class="nc" id="L176">                nullIndexList = deserializeNullIndexList(dis);</span>
+            }
+<span class="nc" id="L178">            final int size = dis.readInt();</span>
+<span class="nc" id="L179">            List&lt;Inner&gt; deserializedList = createListInstance(size);</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">            for (int i = 0; i &lt; size; i++) {</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">                int entrySize = serStrategy == SerializationStrategy.CONSTANT_SIZE ? primitiveSize : dis.readInt();</span>
+<span class="nc bnc" id="L182" title="All 6 branches missed.">                if (entrySize == ListSerde.NULL_ENTRY_VALUE || (nullIndexList != null &amp;&amp; nullIndexList.contains(i))) {</span>
+<span class="nc" id="L183">                    deserializedList.add(null);</span>
+<span class="nc" id="L184">                    continue;</span>
+                }
+<span class="nc" id="L186">                byte[] payload = new byte[entrySize];</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">                if (dis.read(payload) == -1) {</span>
+<span class="nc" id="L188">                    log.error(&quot;Ran out of bytes in serialized list&quot;);</span>
+<span class="nc" id="L189">                    log.trace(&quot;Deserialized list so far: {}&quot;, deserializedList); // avoid logging actual data above TRACE level since it may contain sensitive information</span>
+<span class="nc" id="L190">                    throw new SerializationException(&quot;End of the stream was reached prematurely&quot;);</span>
+                }
+<span class="nc" id="L192">                deserializedList.add(inner.deserialize(topic, headers, payload));</span>
+            }
+<span class="nc" id="L194">            return deserializedList;</span>
+<span class="nc" id="L195">        } catch (IOException e) {</span>
+<span class="nc" id="L196">            throw new KafkaException(&quot;Unable to deserialize into a List&quot;, e);</span>
+        }
+    }
+
+    @Override
+    public void close() {
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        if (inner != null) {</span>
+<span class="nc" id="L203">            inner.close();</span>
+        }
+<span class="nc" id="L205">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

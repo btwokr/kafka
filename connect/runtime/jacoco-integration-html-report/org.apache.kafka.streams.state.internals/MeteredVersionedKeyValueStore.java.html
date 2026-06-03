@@ -1,0 +1,407 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MeteredVersionedKeyValueStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">MeteredVersionedKeyValueStore.java</span></div><h1>MeteredVersionedKeyValueStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.kstream.internals.WrappingNullableUtils;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.processor.internals.ProcessorContextUtils;
+import org.apache.kafka.streams.processor.internals.SerdeGetter;
+import org.apache.kafka.streams.query.KeyQuery;
+import org.apache.kafka.streams.query.MultiVersionedKeyQuery;
+import org.apache.kafka.streams.query.Position;
+import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.Query;
+import org.apache.kafka.streams.query.QueryConfig;
+import org.apache.kafka.streams.query.QueryResult;
+import org.apache.kafka.streams.query.RangeQuery;
+import org.apache.kafka.streams.query.ResultOrder;
+import org.apache.kafka.streams.query.VersionedKeyQuery;
+import org.apache.kafka.streams.query.internals.InternalQueryResultUtil;
+import org.apache.kafka.streams.state.KeyValueStore;
+import org.apache.kafka.streams.state.StateSerdes;
+import org.apache.kafka.streams.state.TimestampedKeyValueStore;
+import org.apache.kafka.streams.state.ValueAndTimestamp;
+import org.apache.kafka.streams.state.VersionedBytesStore;
+import org.apache.kafka.streams.state.VersionedKeyValueStore;
+import org.apache.kafka.streams.state.VersionedRecord;
+import org.apache.kafka.streams.state.VersionedRecordIterator;
+import org.apache.kafka.streams.state.internals.StoreQueryUtils.QueryHandler;
+
+import java.time.Instant;
+import java.util.Map;
+import java.util.Objects;
+
+import static org.apache.kafka.common.utils.Utils.mkEntry;
+import static org.apache.kafka.common.utils.Utils.mkMap;
+import static org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl.maybeMeasureLatency;
+
+/**
+ * A metered {@link VersionedKeyValueStore} wrapper that is used for recording operation
+ * metrics, and hence its inner {@link VersionedBytesStore} implementation does not need to provide
+ * its own metrics collecting functionality. The inner {@code VersionedBytesStore} of this class
+ * is a {@link KeyValueStore} of type &amp;lt;Bytes,byte[]&amp;gt;, so we use {@link Serde}s
+ * to convert from &amp;lt;K,ValueAndTimestamp&amp;lt;V&amp;gt&amp;gt; to &amp;lt;Bytes,byte[]&amp;gt;.
+ *
+ * @param &lt;K&gt; The key type
+ * @param &lt;V&gt; The (raw) value type
+ */
+public class MeteredVersionedKeyValueStore&lt;K, V&gt;
+    extends WrappedStateStore&lt;VersionedBytesStore, K, V&gt;
+    implements VersionedKeyValueStore&lt;K, V&gt; {
+
+    private final MeteredVersionedKeyValueStoreInternal internal;
+
+    MeteredVersionedKeyValueStore(
+        final VersionedBytesStore inner,
+        final String metricScope,
+        final Time time,
+        final Serde&lt;K&gt; keySerde,
+        final Serde&lt;V&gt; valueSerde
+    ) {
+<span class="nc" id="L81">        super(inner);</span>
+<span class="nc" id="L82">        internal = new MeteredVersionedKeyValueStoreInternal(inner, metricScope, time, keySerde, valueSerde);</span>
+<span class="nc" id="L83">    }</span>
+
+    /**
+     * Conceptually, {@link MeteredVersionedKeyValueStore} should {@code extend}
+     * {@link MeteredKeyValueStore}, but due to type conflicts, we cannot do this. (Specifically,
+     * the first needs to be {@link VersionedKeyValueStore} while the second is {@link KeyValueStore}
+     * and the two interfaces conflict.) Thus, we use an internal &lt;it&gt;instance&lt;/it&gt; of
+     * {@code MeteredKeyValueStore} to mimic inheritance instead.
+     * &lt;p&gt;
+     * It's not ideal because it requires an extra step to translate between the APIs of
+     * {@link VersionedKeyValueStore} in {@link MeteredVersionedKeyValueStore} and
+     * the APIs of {@link TimestampedKeyValueStore} in {@link MeteredVersionedKeyValueStoreInternal}.
+     * This extra step is all that the methods of {@code MeteredVersionedKeyValueStoreInternal} do.
+     * &lt;p&gt;
+     * Note that the addition of {@link #get(Object, long)} and {@link #delete(Object, long)} in
+     * this class are to match the interface of {@link VersionedKeyValueStore}.
+     */
+    private class MeteredVersionedKeyValueStoreInternal extends MeteredKeyValueStore&lt;K, ValueAndTimestamp&lt;V&gt;&gt; {
+
+        private final VersionedBytesStore inner;
+        private final Serde&lt;V&gt; plainValueSerde;
+        private StateSerdes&lt;K, V&gt; plainValueSerdes;
+
+<span class="nc" id="L106">        private final Map&lt;Class&lt;?&gt;, QueryHandler&lt;?&gt;&gt; queryHandlers =</span>
+<span class="nc" id="L107">            mkMap(</span>
+<span class="nc" id="L108">                mkEntry(</span>
+                    RangeQuery.class,
+<span class="nc" id="L110">                    (query, positionBound, config, store) -&gt; runRangeQuery(query, positionBound, config)</span>
+                ),
+<span class="nc" id="L112">                mkEntry(</span>
+                    KeyQuery.class,
+<span class="nc" id="L114">                    (query, positionBound, config, store) -&gt; runKeyQuery(query, positionBound, config)</span>
+                ),
+<span class="nc" id="L116">                mkEntry(</span>
+                    VersionedKeyQuery.class,
+<span class="nc" id="L118">                    (query, positionBound, config, store) -&gt; runVersionedKeyQuery(query, positionBound, config)</span>
+                ),
+<span class="nc" id="L120">                mkEntry(</span>
+                    MultiVersionedKeyQuery.class,
+<span class="nc" id="L122">                    (query, positionBound, config, store) -&gt; runMultiVersionedKeyQuery(query, positionBound, config)</span>
+                )
+            );
+
+        MeteredVersionedKeyValueStoreInternal(
+            final VersionedBytesStore inner,
+            final String metricScope,
+            final Time time,
+            final Serde&lt;K&gt; keySerde,
+            final Serde&lt;V&gt; valueSerde
+<span class="nc" id="L132">        ) {</span>
+<span class="nc" id="L133">            super(</span>
+                inner,
+                metricScope,
+                time,
+                keySerde,
+<span class="nc bnc" id="L138" title="All 2 branches missed.">                valueSerde == null</span>
+<span class="nc" id="L139">                    ? null</span>
+<span class="nc" id="L140">                    : new ValueAndTimestampSerde&lt;&gt;(valueSerde)</span>
+            );
+<span class="nc" id="L142">            this.inner = inner;</span>
+<span class="nc" id="L143">            this.plainValueSerde = valueSerde;</span>
+<span class="nc" id="L144">        }</span>
+
+        public long put(final K key, final V value, final long timestamp) {
+<span class="nc" id="L147">            Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+            try {
+<span class="nc" id="L149">                final long validTo = maybeMeasureLatency(</span>
+<span class="nc" id="L150">                    () -&gt; inner.put(</span>
+<span class="nc" id="L151">                        serializeKey(key),</span>
+<span class="nc" id="L152">                        plainValueSerdes.rawValue(value, internalContext.headers()),</span>
+                        timestamp
+                    ),
+                    time,
+                    putSensor
+                );
+<span class="nc" id="L158">                maybeRecordE2ELatency();</span>
+<span class="nc" id="L159">                return validTo;</span>
+<span class="nc" id="L160">            } catch (final ProcessorStateException e) {</span>
+<span class="nc" id="L161">                final String message = String.format(e.getMessage(), key, value);</span>
+<span class="nc" id="L162">                throw new ProcessorStateException(message, e);</span>
+            }
+        }
+
+        public ValueAndTimestamp&lt;V&gt; get(final K key, final long asOfTimestamp) {
+<span class="nc" id="L167">            Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+            try {
+<span class="nc" id="L169">                return maybeMeasureLatency(() -&gt; deserializeValue(inner.get(serializeKey(key), asOfTimestamp)), time, getSensor);</span>
+<span class="nc" id="L170">            } catch (final ProcessorStateException e) {</span>
+<span class="nc" id="L171">                final String message = String.format(e.getMessage(), key);</span>
+<span class="nc" id="L172">                throw new ProcessorStateException(message, e);</span>
+            }
+        }
+
+        public ValueAndTimestamp&lt;V&gt; delete(final K key, final long timestamp) {
+<span class="nc" id="L177">            Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+            try {
+<span class="nc" id="L179">                return maybeMeasureLatency(() -&gt; deserializeValue(inner.delete(serializeKey(key), timestamp)), time, deleteSensor);</span>
+<span class="nc" id="L180">            } catch (final ProcessorStateException e) {</span>
+<span class="nc" id="L181">                final String message = String.format(e.getMessage(), key);</span>
+<span class="nc" id="L182">                throw new ProcessorStateException(message, e);</span>
+            }
+        }
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+        @Override
+        public &lt;R&gt; QueryResult&lt;R&gt; query(
+            final Query&lt;R&gt; query,
+            final PositionBound positionBound,
+            final QueryConfig config
+        ) {
+<span class="nc" id="L193">            final long start = time.nanoseconds();</span>
+            final QueryResult&lt;R&gt; result;
+
+<span class="nc" id="L196">            final QueryHandler&lt;?&gt; handler = queryHandlers.get(query.getClass());</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            if (handler == null) {</span>
+<span class="nc" id="L198">                result = wrapped().query(query, positionBound, config);</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">                if (config.isCollectExecutionInfo()) {</span>
+<span class="nc" id="L200">                    result.addExecutionInfo(&quot;Handled in &quot; + getClass() + &quot; in &quot; + (time.nanoseconds() - start) + &quot;ns&quot;);</span>
+                }
+            } else {
+<span class="nc" id="L203">                result = ((QueryHandler&lt;R&gt;) handler).apply(</span>
+                    query,
+                    positionBound,
+                    config,
+                    this
+                );
+<span class="nc bnc" id="L209" title="All 2 branches missed.">                if (config.isCollectExecutionInfo()) {</span>
+<span class="nc" id="L210">                    result.addExecutionInfo(&quot;Handled in &quot; + getClass() + &quot; with serdes &quot; + serdes + &quot; in &quot; + (time.nanoseconds() - start) + &quot;ns&quot;);</span>
+                }
+            }
+<span class="nc" id="L213">            return result;</span>
+        }
+
+        @SuppressWarnings(&quot;unused&quot;)
+        private &lt;R&gt; QueryResult&lt;R&gt; runRangeQuery(
+            final Query&lt;R&gt; query,
+            final PositionBound positionBound,
+            final QueryConfig config
+        ) {
+            // throw exception for now to reserve the ability to implement this in the future
+            // without clashing with users' custom implementations in the meantime
+<span class="nc" id="L224">            throw new UnsupportedOperationException(&quot;Versioned stores do not support RangeQuery queries at this time.&quot;);</span>
+        }
+
+        @SuppressWarnings(&quot;unused&quot;)
+        private &lt;R&gt; QueryResult&lt;R&gt; runKeyQuery(
+            final Query&lt;R&gt; query,
+            final PositionBound positionBound,
+            final QueryConfig config
+        ) {
+            // throw exception for now to reserve the ability to implement this in the future
+            // without clashing with users' custom implementations in the meantime
+<span class="nc" id="L235">            throw new UnsupportedOperationException(&quot;Versioned stores do not support KeyQuery queries at this time.&quot;);</span>
+        }
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+        private &lt;R&gt; QueryResult&lt;R&gt; runVersionedKeyQuery(
+            final Query&lt;R&gt; query,
+            final PositionBound positionBound,
+            final QueryConfig config
+        ) {
+            final QueryResult&lt;R&gt; result;
+<span class="nc" id="L245">            final VersionedKeyQuery&lt;K, V&gt; typedKeyQuery = (VersionedKeyQuery&lt;K, V&gt;) query;</span>
+<span class="nc" id="L246">            VersionedKeyQuery&lt;Bytes, byte[]&gt; rawKeyQuery = VersionedKeyQuery.withKey(serializeKey(typedKeyQuery.key()));</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            if (typedKeyQuery.asOfTimestamp().isPresent()) {</span>
+<span class="nc" id="L248">                rawKeyQuery = rawKeyQuery.asOf(typedKeyQuery.asOfTimestamp().get());</span>
+            }
+<span class="nc" id="L250">            final QueryResult&lt;VersionedRecord&lt;byte[]&gt;&gt; rawResult =</span>
+<span class="nc" id="L251">                wrapped().query(rawKeyQuery, positionBound, config);</span>
+<span class="nc bnc" id="L252" title="All 4 branches missed.">            if (rawResult.isSuccess() &amp;&amp; rawResult.getResult() != null) {</span>
+<span class="nc" id="L253">                final VersionedRecord&lt;V&gt; versionedRecord = StoreQueryUtils.deserializeVersionedRecord(plainValueSerdes, rawResult.getResult());</span>
+<span class="nc" id="L254">                final QueryResult&lt;VersionedRecord&lt;V&gt;&gt; typedQueryResult =</span>
+<span class="nc" id="L255">                    InternalQueryResultUtil.copyAndSubstituteDeserializedResult(rawResult, versionedRecord);</span>
+<span class="nc" id="L256">                result = (QueryResult&lt;R&gt;) typedQueryResult;</span>
+<span class="nc" id="L257">            } else {</span>
+                // the generic type doesn't matter, since failed queries have no result set.
+<span class="nc" id="L259">                result = (QueryResult&lt;R&gt;) rawResult;</span>
+            }
+<span class="nc" id="L261">            return result;</span>
+        }
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+        private &lt;R&gt; QueryResult&lt;R&gt; runMultiVersionedKeyQuery(
+            final Query&lt;R&gt; query,
+            final PositionBound positionBound,
+            final QueryConfig config
+        ) {
+            final QueryResult&lt;R&gt; result;
+<span class="nc" id="L271">            final MultiVersionedKeyQuery&lt;K, V&gt; typedKeyQuery = (MultiVersionedKeyQuery&lt;K, V&gt;) query;</span>
+
+<span class="nc" id="L273">            final Instant fromTime = typedKeyQuery.fromTime().orElse(Instant.ofEpochMilli(Long.MIN_VALUE));</span>
+<span class="nc" id="L274">            final Instant toTime = typedKeyQuery.toTime().orElse(Instant.ofEpochMilli(Long.MAX_VALUE));</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">            if (fromTime.compareTo(toTime) &gt; 0) {</span>
+<span class="nc" id="L276">                throw new IllegalArgumentException(&quot;The `fromTime` timestamp must be smaller than the `toTime` timestamp.&quot;);</span>
+            }
+<span class="nc" id="L278">            MultiVersionedKeyQuery&lt;Bytes, byte[]&gt; rawKeyQuery = MultiVersionedKeyQuery.withKey(serializeKey(typedKeyQuery.key()));</span>
+<span class="nc" id="L279">            rawKeyQuery = rawKeyQuery.fromTime(fromTime).toTime(toTime);</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">            if (typedKeyQuery.resultOrder().equals(ResultOrder.DESCENDING)) {</span>
+<span class="nc" id="L281">                rawKeyQuery = rawKeyQuery.withDescendingTimestamps();</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">            } else if (typedKeyQuery.resultOrder().equals(ResultOrder.ASCENDING)) {</span>
+<span class="nc" id="L283">                rawKeyQuery = rawKeyQuery.withAscendingTimestamps();</span>
+            }
+
+<span class="nc" id="L286">            final QueryResult&lt;VersionedRecordIterator&lt;byte[]&gt;&gt; rawResult = wrapped().query(rawKeyQuery, positionBound, config);</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">            if (rawResult.isSuccess()) {</span>
+<span class="nc" id="L288">                final MeteredMultiVersionedKeyQueryIterator&lt;V&gt; typedResult =</span>
+                    new MeteredMultiVersionedKeyQueryIterator&lt;&gt;(
+<span class="nc" id="L290">                        rawResult.getResult(),</span>
+                        iteratorDurationSensor,
+                        time,
+<span class="nc" id="L293">                        StoreQueryUtils.deserializeValue(plainValueSerdes),</span>
+                        numOpenIterators,
+                        openIterators
+                    );
+<span class="nc" id="L297">                final QueryResult&lt;MeteredMultiVersionedKeyQueryIterator&lt;V&gt;&gt; typedQueryResult =</span>
+<span class="nc" id="L298">                    InternalQueryResultUtil.copyAndSubstituteDeserializedResult(rawResult, typedResult);</span>
+<span class="nc" id="L299">                result = (QueryResult&lt;R&gt;) typedQueryResult;</span>
+<span class="nc" id="L300">            } else {</span>
+                // the generic type doesn't matter, since failed queries have no result set.
+<span class="nc" id="L302">                result = (QueryResult&lt;R&gt;) rawResult;</span>
+            }
+<span class="nc" id="L304">            return result;</span>
+        }
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+        @Override
+        protected Serde&lt;ValueAndTimestamp&lt;V&gt;&gt; prepareValueSerdeForStore(
+            final Serde&lt;ValueAndTimestamp&lt;V&gt;&gt; valueSerde,
+            final SerdeGetter getter
+        ) {
+<span class="nc bnc" id="L313" title="All 2 branches missed.">            if (valueSerde == null) {</span>
+<span class="nc" id="L314">                return new ValueAndTimestampSerde&lt;&gt;((Serde&lt;V&gt;) getter.valueSerde());</span>
+            } else {
+<span class="nc" id="L316">                return super.prepareValueSerdeForStore(valueSerde, getter);</span>
+            }
+        }
+
+        @Override
+        protected void initStoreSerde(final StateStoreContext context) {
+<span class="nc" id="L322">            super.initStoreSerde(context);</span>
+
+            // additionally init raw value serde
+<span class="nc" id="L325">            final String storeName = super.name();</span>
+<span class="nc" id="L326">            final String changelogTopic = ProcessorContextUtils.changelogFor(context, storeName, Boolean.FALSE);</span>
+<span class="nc" id="L327">            plainValueSerdes = StoreSerdeInitializer.prepareStoreSerde(</span>
+                context,
+                storeName,
+                changelogTopic,
+                keySerde,
+                plainValueSerde,
+                WrappingNullableUtils::prepareValueSerde
+            );
+<span class="nc" id="L335">        }</span>
+    }
+
+    @Override
+    public long put(final K key, final V value, final long timestamp) {
+<span class="nc" id="L340">        return internal.put(key, value, timestamp);</span>
+    }
+
+    @Override
+    public VersionedRecord&lt;V&gt; delete(final K key, final long timestamp) {
+<span class="nc" id="L345">        final ValueAndTimestamp&lt;V&gt; valueAndTimestamp = internal.delete(key, timestamp);</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        return valueAndTimestamp == null</span>
+<span class="nc" id="L347">            ? null</span>
+<span class="nc" id="L348">            : new VersionedRecord&lt;&gt;(valueAndTimestamp.value(), valueAndTimestamp.timestamp());</span>
+    }
+
+    @Override
+    public VersionedRecord&lt;V&gt; get(final K key) {
+<span class="nc" id="L353">        final ValueAndTimestamp&lt;V&gt; valueAndTimestamp = internal.get(key);</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">        return valueAndTimestamp == null</span>
+<span class="nc" id="L355">            ? null</span>
+<span class="nc" id="L356">            : new VersionedRecord&lt;&gt;(valueAndTimestamp.value(), valueAndTimestamp.timestamp());</span>
+    }
+
+    @Override
+    public VersionedRecord&lt;V&gt; get(final K key, final long asOfTimestamp) {
+<span class="nc" id="L361">        final ValueAndTimestamp&lt;V&gt; valueAndTimestamp = internal.get(key, asOfTimestamp);</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">        return valueAndTimestamp == null</span>
+<span class="nc" id="L363">            ? null</span>
+<span class="nc" id="L364">            : new VersionedRecord&lt;&gt;(valueAndTimestamp.value(), valueAndTimestamp.timestamp());</span>
+    }
+
+    @Override
+    public String name() {
+<span class="nc" id="L369">        return internal.name();</span>
+    }
+
+    @Override
+    public void init(final StateStoreContext stateStoreContext, final StateStore root) {
+<span class="nc" id="L374">        internal.init(stateStoreContext, root);</span>
+<span class="nc" id="L375">    }</span>
+
+    @Override
+    public void commit(final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc" id="L379">        internal.commit(changelogOffsets);</span>
+<span class="nc" id="L380">    }</span>
+
+    @Override
+    public void close() {
+<span class="nc" id="L384">        internal.close();</span>
+<span class="nc" id="L385">    }</span>
+
+    @Override
+    public boolean persistent() {
+<span class="nc" id="L389">        return internal.persistent();</span>
+    }
+
+    @Override
+    public boolean isOpen() {
+<span class="nc" id="L394">        return internal.isOpen();</span>
+    }
+
+    @Override
+    public &lt;R&gt; QueryResult&lt;R&gt; query(final Query&lt;R&gt; query, final PositionBound positionBound, final QueryConfig config) {
+<span class="nc" id="L399">        return internal.query(query, positionBound, config);</span>
+    }
+
+    @Override
+    public Position getPosition() {
+<span class="nc" id="L404">        return internal.getPosition();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,401 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaOffsetBackingStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.storage</a> &gt; <span class="el_source">KafkaOffsetBackingStore.java</span></div><h1>KafkaOffsetBackingStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.storage;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.runtime.WorkerConfig;
+import org.apache.kafka.connect.runtime.distributed.DistributedConfig;
+import org.apache.kafka.connect.util.Callback;
+import org.apache.kafka.connect.util.ConnectUtils;
+import org.apache.kafka.connect.util.ConvertingFutureCallback;
+import org.apache.kafka.connect.util.KafkaBasedLog;
+import org.apache.kafka.connect.util.TopicAdmin;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.ByteBuffer;
+import java.time.Duration;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Supplier;
+
+/**
+ * &lt;p&gt;
+ *     Implementation of OffsetBackingStore that uses a Kafka topic to store offset data.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ *     Internally, this implementation both produces to and consumes from a Kafka topic which stores the offsets.
+ *     It accepts producer and consumer overrides via its configuration but forces some settings to specific values
+ *     to ensure correct behavior (e.g. acks, auto.offset.reset).
+ * &lt;/p&gt;
+ */
+public class KafkaOffsetBackingStore extends KafkaTopicBasedBackingStore implements OffsetBackingStore {
+<span class="fc" id="L69">    private static final Logger log = LoggerFactory.getLogger(KafkaOffsetBackingStore.class);</span>
+
+    /**
+     * Build a connector-specific offset store with read and write support. The producer will be {@link Producer#close(Duration) closed}
+     * and the consumer will be {@link Consumer#close(Duration) closed} when this store is {@link #stop() stopped}, but the topic admin
+     * must be {@link TopicAdmin#close(Duration) closed} by the caller.
+     * @param topic the name of the offsets topic to use
+     * @param producer the producer to use for writing to the offsets topic
+     * @param consumer the consumer to use for reading from the offsets topic
+     * @param topicAdmin the topic admin to use for creating and querying metadata for the offsets topic
+     * @param keyConverter the worker's internal key converter that can be used to deserialize offset keys from the {@link KafkaBasedLog}
+     * @return an offset store backed by the given topic and Kafka clients
+     */
+    public static KafkaOffsetBackingStore readWriteStore(
+            String topic,
+            Producer&lt;byte[], byte[]&gt; producer,
+            Consumer&lt;byte[], byte[]&gt; consumer,
+            TopicAdmin topicAdmin,
+            Converter keyConverter
+    ) {
+<span class="nc" id="L89">        return new KafkaOffsetBackingStore(() -&gt; topicAdmin, KafkaOffsetBackingStore::noClientId, keyConverter) {</span>
+            @Override
+            public void configure(final WorkerConfig config) {
+<span class="nc" id="L92">                this.exactlyOnce = config.exactlyOnceSourceEnabled();</span>
+<span class="nc" id="L93">                this.offsetLog = KafkaBasedLog.withExistingClients(</span>
+                        topic,
+                        consumer,
+                        producer,
+                        topicAdmin,
+                        consumedCallback,
+                        Time.SYSTEM,
+<span class="nc" id="L100">                        topicInitializer(topic, newTopicDescription(topic, config), config, Time.SYSTEM),</span>
+<span class="nc" id="L101">                        ignored -&gt; true</span>
+                );
+<span class="nc" id="L103">            }</span>
+        };
+    }
+
+    /**
+     * Build a connector-specific offset store with read-only support. The consumer will be {@link Consumer#close(Duration) closed}
+     * when this store is {@link #stop() stopped}, but the topic admin must be {@link TopicAdmin#close(Duration) closed} by the caller.
+     * @param topic the name of the offsets topic to use
+     * @param consumer the consumer to use for reading from the offsets topic
+     * @param topicAdmin the topic admin to use for creating and querying metadata for the offsets topic
+     * @param keyConverter the worker's internal key converter that can be used to deserialize offset keys from the {@link KafkaBasedLog}
+     * @return a read-only offset store backed by the given topic and Kafka clients
+     */
+    public static KafkaOffsetBackingStore readOnlyStore(
+            String topic,
+            Consumer&lt;byte[], byte[]&gt; consumer,
+            TopicAdmin topicAdmin,
+            Converter keyConverter
+    ) {
+<span class="nc" id="L122">        return new KafkaOffsetBackingStore(() -&gt; topicAdmin, KafkaOffsetBackingStore::noClientId, keyConverter) {</span>
+            @Override
+            public void configure(final WorkerConfig config) {
+<span class="nc" id="L125">                this.exactlyOnce = config.exactlyOnceSourceEnabled();</span>
+<span class="nc" id="L126">                this.offsetLog = KafkaBasedLog.withExistingClients(</span>
+                        topic,
+                        consumer,
+                        null,
+                        topicAdmin,
+                        consumedCallback,
+                        Time.SYSTEM,
+<span class="nc" id="L133">                        topicInitializer(topic, newTopicDescription(topic, config), config, Time.SYSTEM),</span>
+<span class="nc" id="L134">                        ignored -&gt; true</span>
+                );
+<span class="nc" id="L136">            }</span>
+        };
+    }
+
+    private static String noClientId() {
+<span class="nc" id="L141">        throw new UnsupportedOperationException(&quot;This offset store should not instantiate any Kafka clients&quot;);</span>
+    }
+
+    protected KafkaBasedLog&lt;byte[], byte[]&gt; offsetLog;
+    // Visible for testing
+<span class="fc" id="L146">    final HashMap&lt;ByteBuffer, ByteBuffer&gt; data = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L147">    private final Map&lt;String, Set&lt;Map&lt;String, Object&gt;&gt;&gt; connectorPartitions = new HashMap&lt;&gt;();</span>
+    private Converter keyConverter;
+    private final Supplier&lt;TopicAdmin&gt; topicAdminSupplier;
+    private final Supplier&lt;String&gt; clientIdBase;
+    protected boolean exactlyOnce;
+
+    /**
+     * Create an {@link OffsetBackingStore} backed by a Kafka topic. This constructor will use the given
+     * {@link Supplier} to acquire a {@link TopicAdmin} that will be used for interactions with the backing
+     * Kafka topic. The caller is expected to manage the lifecycle of that object, including
+     * {@link TopicAdmin#close(Duration) closing} it when it is no longer needed.
+     * @param topicAdmin a {@link Supplier} for the {@link TopicAdmin} to use for this backing store;
+     *                   may not be null, and may not return null
+     * @param clientIdBase a {@link Supplier} that will be used to create a
+     * {@link CommonClientConfigs#CLIENT_ID_DOC client ID} for Kafka clients instantiated by this store;
+     *                     may not be null, and may not return null, but may throw {@link UnsupportedOperationException}
+     *                     if this offset store should not create its own Kafka clients
+     */
+<span class="fc" id="L165">    public KafkaOffsetBackingStore(Supplier&lt;TopicAdmin&gt; topicAdmin, Supplier&lt;String&gt; clientIdBase, Converter keyConverter) {</span>
+<span class="fc" id="L166">        this.topicAdminSupplier = Objects.requireNonNull(topicAdmin);</span>
+<span class="fc" id="L167">        this.clientIdBase = Objects.requireNonNull(clientIdBase);</span>
+<span class="fc" id="L168">        this.keyConverter = keyConverter;</span>
+<span class="fc" id="L169">    }</span>
+
+    @Override
+    public void configure(final WorkerConfig config) {
+<span class="fc" id="L173">        String topic = config.getString(DistributedConfig.OFFSET_STORAGE_TOPIC_CONFIG);</span>
+<span class="pc bpc" id="L174" title="2 of 4 branches missed.">        if (topic == null || topic.trim().isEmpty())</span>
+<span class="nc" id="L175">            throw new ConfigException(&quot;Offset storage topic must be specified&quot;);</span>
+
+<span class="fc" id="L177">        this.exactlyOnce = config.exactlyOnceSourceEnabled();</span>
+
+<span class="fc" id="L179">        String clusterId = config.kafkaClusterId();</span>
+<span class="fc" id="L180">        String clientId = Objects.requireNonNull(clientIdBase.get()) + &quot;offsets&quot;;</span>
+
+<span class="fc" id="L182">        Map&lt;String, Object&gt; originals = config.originals();</span>
+<span class="fc" id="L183">        Map&lt;String, Object&gt; producerProps = new HashMap&lt;&gt;(originals);</span>
+<span class="fc" id="L184">        producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());</span>
+<span class="fc" id="L185">        producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());</span>
+<span class="fc" id="L186">        producerProps.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, Integer.MAX_VALUE);</span>
+        // By default, Connect disables idempotent behavior for all producers, even though idempotence became
+        // default for Kafka producers. This is to ensure Connect continues to work with many Kafka broker versions, including older brokers that do not support
+        // idempotent producers or require explicit steps to enable them (e.g. adding the IDEMPOTENT_WRITE ACL to brokers older than 2.8).
+        // These settings might change when https://cwiki.apache.org/confluence/display/KAFKA/KIP-318%3A+Make+Kafka+Connect+Source+idempotent
+        // gets approved and scheduled for release.
+<span class="fc" id="L192">        producerProps.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, &quot;false&quot;);</span>
+<span class="fc" id="L193">        producerProps.put(CommonClientConfigs.CLIENT_ID_CONFIG, clientId);</span>
+<span class="fc" id="L194">        ConnectUtils.addMetricsContextProperties(producerProps, config, clusterId);</span>
+
+<span class="fc" id="L196">        Map&lt;String, Object&gt; consumerProps = new HashMap&lt;&gt;(originals);</span>
+<span class="fc" id="L197">        consumerProps.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());</span>
+<span class="fc" id="L198">        consumerProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());</span>
+<span class="fc" id="L199">        consumerProps.put(CommonClientConfigs.CLIENT_ID_CONFIG, clientId);</span>
+<span class="fc" id="L200">        ConnectUtils.addMetricsContextProperties(consumerProps, config, clusterId);</span>
+<span class="pc bpc" id="L201" title="1 of 2 branches missed.">        if (config.exactlyOnceSourceEnabled()) {</span>
+<span class="nc" id="L202">            ConnectUtils.ensureProperty(</span>
+<span class="nc" id="L203">                    consumerProps, ConsumerConfig.ISOLATION_LEVEL_CONFIG, IsolationLevel.READ_COMMITTED.toString(),</span>
+                    &quot;for the worker offsets topic consumer when exactly-once source support is enabled&quot;,
+                    false
+            );
+        }
+
+<span class="fc" id="L209">        Map&lt;String, Object&gt; adminProps = new HashMap&lt;&gt;(originals);</span>
+<span class="fc" id="L210">        adminProps.put(CommonClientConfigs.CLIENT_ID_CONFIG, clientId);</span>
+<span class="fc" id="L211">        ConnectUtils.addMetricsContextProperties(adminProps, config, clusterId);</span>
+<span class="fc" id="L212">        NewTopic topicDescription = newTopicDescription(topic, config);</span>
+
+<span class="fc" id="L214">        this.offsetLog = createKafkaBasedLog(topic, producerProps, consumerProps, consumedCallback, topicDescription, topicAdminSupplier, config, Time.SYSTEM);</span>
+<span class="fc" id="L215">    }</span>
+
+    protected NewTopic newTopicDescription(final String topic, final WorkerConfig config) {
+<span class="pc bpc" id="L218" title="1 of 2 branches missed.">        Map&lt;String, Object&gt; topicSettings = config instanceof DistributedConfig</span>
+<span class="fc" id="L219">                ? ((DistributedConfig) config).offsetStorageTopicSettings()</span>
+<span class="pc" id="L220">                : Map.of();</span>
+<span class="fc" id="L221">        return TopicAdmin.defineTopic(topic)</span>
+<span class="fc" id="L222">                .config(topicSettings) // first so that we override user-supplied settings as needed</span>
+<span class="fc" id="L223">                .compacted()</span>
+<span class="fc" id="L224">                .partitions(config.getInt(DistributedConfig.OFFSET_STORAGE_PARTITIONS_CONFIG))</span>
+<span class="fc" id="L225">                .replicationFactor(config.getShort(DistributedConfig.OFFSET_STORAGE_REPLICATION_FACTOR_CONFIG))</span>
+<span class="fc" id="L226">                .build();</span>
+    }
+
+    @Override
+    public void start() {
+<span class="fc" id="L231">        log.info(&quot;Starting KafkaOffsetBackingStore&quot;);</span>
+        try {
+<span class="fc" id="L233">            offsetLog.start();</span>
+<span class="nc" id="L234">        } catch (UnsupportedVersionException e) {</span>
+            String message;
+<span class="nc bnc" id="L236" title="All 2 branches missed.">            if (exactlyOnce) {</span>
+<span class="nc" id="L237">                message = &quot;Enabling exactly-once support for source connectors requires a Kafka broker version that allows &quot;</span>
+                        + &quot;admin clients to read consumer offsets. Please either disable the worker's exactly-once &quot;
+                        + &quot;support for source connectors, or upgrade to a newer Kafka broker version.&quot;;
+            } else {
+<span class="nc" id="L241">                message = &quot;When &quot; + ConsumerConfig.ISOLATION_LEVEL_CONFIG + &quot;is set to &quot;</span>
+                        + IsolationLevel.READ_COMMITTED
+                        + &quot;, a Kafka broker version that allows admin clients to read consumer offsets is required. &quot;
+                        + &quot;Please either reconfigure the worker or connector, or upgrade to a newer Kafka broker version.&quot;;
+            }
+<span class="nc" id="L246">            throw new ConnectException(message, e);</span>
+<span class="fc" id="L247">        }</span>
+<span class="fc" id="L248">        log.info(&quot;Finished reading offsets topic and starting KafkaOffsetBackingStore&quot;);</span>
+<span class="fc" id="L249">    }</span>
+
+    /**
+     * Stop reading from and writing to the offsets topic, and relinquish resources allocated for interacting
+     * with it, including Kafka clients.
+     * &lt;p&gt;
+     * The admin client derived from the given {@link Supplier} will not be closed and it is the
+     * caller's responsibility to manage its lifecycle accordingly.
+     */
+    @Override
+    public void stop() {
+<span class="fc" id="L260">        log.info(&quot;Stopping KafkaOffsetBackingStore&quot;);</span>
+<span class="fc" id="L261">        offsetLog.stop();</span>
+<span class="fc" id="L262">        log.info(&quot;Stopped KafkaOffsetBackingStore&quot;);</span>
+<span class="fc" id="L263">    }</span>
+
+    @Override
+    public Future&lt;Map&lt;ByteBuffer, ByteBuffer&gt;&gt; get(final Collection&lt;ByteBuffer&gt; keys) {
+<span class="fc" id="L267">        ConvertingFutureCallback&lt;Void, Map&lt;ByteBuffer, ByteBuffer&gt;&gt; future = new ConvertingFutureCallback&lt;&gt;() {</span>
+            @Override
+            public Map&lt;ByteBuffer, ByteBuffer&gt; convert(Void result) {
+<span class="fc" id="L270">                Map&lt;ByteBuffer, ByteBuffer&gt; values = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L271" title="All 2 branches covered.">                for (ByteBuffer key : keys)</span>
+<span class="fc" id="L272">                    values.put(key, data.get(key));</span>
+<span class="fc" id="L273">                return values;</span>
+            }
+        };
+        // This operation may be relatively (but not too) expensive since it always requires checking end offsets, even
+        // if we've already read up to the end. However, it also should not be common (offsets should only be read when
+        // resetting a task). Always requiring that we read to the end is simpler than trying to differentiate when it
+        // is safe not to (which should only be if we *know* we've maintained ownership since the last write).
+<span class="fc" id="L280">        offsetLog.readToEnd(future);</span>
+<span class="fc" id="L281">        return future;</span>
+    }
+
+    @Override
+    public Future&lt;Void&gt; set(final Map&lt;ByteBuffer, ByteBuffer&gt; values, final Callback&lt;Void&gt; callback) {
+<span class="fc" id="L286">        SetCallbackFuture producerCallback = new SetCallbackFuture(values.size(), callback);</span>
+
+<span class="fc bfc" id="L288" title="All 2 branches covered.">        for (Map.Entry&lt;ByteBuffer, ByteBuffer&gt; entry : values.entrySet()) {</span>
+<span class="fc" id="L289">            ByteBuffer key = entry.getKey();</span>
+<span class="fc" id="L290">            ByteBuffer value = entry.getValue();</span>
+<span class="pc bpc" id="L291" title="2 of 4 branches missed.">            offsetLog.send(key == null ? null : key.array(), value == null ? null : value.array(), producerCallback);</span>
+<span class="fc" id="L292">        }</span>
+
+<span class="fc" id="L294">        return producerCallback;</span>
+    }
+
+    @Override
+    public Set&lt;Map&lt;String, Object&gt;&gt; connectorPartitions(String connectorName) {
+<span class="nc" id="L299">        return connectorPartitions.getOrDefault(connectorName, Set.of());</span>
+    }
+
+<span class="fc" id="L302">    protected final Callback&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; consumedCallback = (error, record) -&gt; {</span>
+<span class="pc bpc" id="L303" title="1 of 2 branches missed.">        if (error != null) {</span>
+<span class="nc" id="L304">            log.error(&quot;Failed to read from the offsets topic&quot;, error);</span>
+<span class="nc" id="L305">            return;</span>
+        }
+
+<span class="fc" id="L308">        OffsetUtils.processPartitionKey(record.key(), record.value(), keyConverter, connectorPartitions);</span>
+
+<span class="pc bpc" id="L310" title="1 of 2 branches missed.">        ByteBuffer key = record.key() != null ? ByteBuffer.wrap(record.key()) : null;</span>
+
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">        if (record.value() == null) {</span>
+<span class="nc" id="L313">            data.remove(key);</span>
+        } else {
+<span class="fc" id="L315">            data.put(key, ByteBuffer.wrap(record.value()));</span>
+        }
+<span class="fc" id="L317">    };</span>
+
+    @Override
+    protected String getTopicConfig() {
+<span class="fc" id="L321">        return DistributedConfig.OFFSET_STORAGE_TOPIC_CONFIG;</span>
+    }
+
+    @Override
+    protected String getTopicPurpose() {
+<span class="fc" id="L326">        return &quot;source connector offsets&quot;;</span>
+    }
+
+    private static class SetCallbackFuture implements org.apache.kafka.clients.producer.Callback, Future&lt;Void&gt; {
+        private int numLeft;
+<span class="fc" id="L331">        private boolean completed = false;</span>
+<span class="fc" id="L332">        private Throwable exception = null;</span>
+        private final Callback&lt;Void&gt; callback;
+
+<span class="fc" id="L335">        public SetCallbackFuture(int numRecords, Callback&lt;Void&gt; callback) {</span>
+<span class="fc" id="L336">            numLeft = numRecords;</span>
+<span class="fc" id="L337">            this.callback = callback;</span>
+<span class="fc" id="L338">        }</span>
+
+        @Override
+        public synchronized void onCompletion(RecordMetadata metadata, Exception exception) {
+<span class="pc bpc" id="L342" title="1 of 2 branches missed.">            if (exception != null) {</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                if (!completed) {</span>
+<span class="nc" id="L344">                    this.exception = exception;</span>
+<span class="nc" id="L345">                    callback.onCompletion(exception, null);</span>
+<span class="nc" id="L346">                    completed = true;</span>
+<span class="nc" id="L347">                    this.notify();</span>
+                }
+<span class="nc" id="L349">                return;</span>
+            }
+
+<span class="fc" id="L352">            numLeft -= 1;</span>
+<span class="pc bpc" id="L353" title="1 of 2 branches missed.">            if (numLeft == 0) {</span>
+<span class="fc" id="L354">                callback.onCompletion(null, null);</span>
+<span class="fc" id="L355">                completed = true;</span>
+<span class="fc" id="L356">                this.notify();</span>
+            }
+<span class="fc" id="L358">        }</span>
+
+        @Override
+        public synchronized boolean cancel(boolean mayInterruptIfRunning) {
+<span class="nc" id="L362">            return false;</span>
+        }
+
+        @Override
+        public synchronized boolean isCancelled() {
+<span class="nc" id="L367">            return false;</span>
+        }
+
+        @Override
+        public synchronized boolean isDone() {
+<span class="nc" id="L372">            return completed;</span>
+        }
+
+        @Override
+        public synchronized Void get() throws InterruptedException, ExecutionException {
+<span class="nc bnc" id="L377" title="All 2 branches missed.">            while (!completed) {</span>
+<span class="nc" id="L378">                this.wait();</span>
+            }
+<span class="nc bnc" id="L380" title="All 2 branches missed.">            if (exception != null)</span>
+<span class="nc" id="L381">                throw new ExecutionException(exception);</span>
+<span class="nc" id="L382">            return null;</span>
+        }
+
+        @Override
+        public synchronized Void get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+<span class="fc" id="L387">            long started = System.currentTimeMillis();</span>
+<span class="fc" id="L388">            long limit = started + unit.toMillis(timeout);</span>
+<span class="fc bfc" id="L389" title="All 2 branches covered.">            while (!completed) {</span>
+<span class="fc" id="L390">                long leftMs = limit - System.currentTimeMillis();</span>
+<span class="pc bpc" id="L391" title="1 of 2 branches missed.">                if (leftMs &lt; 0)</span>
+<span class="nc" id="L392">                    throw new TimeoutException(&quot;KafkaOffsetBackingStore Future timed out.&quot;);</span>
+<span class="fc" id="L393">                this.wait(leftMs);</span>
+<span class="fc" id="L394">            }</span>
+<span class="pc bpc" id="L395" title="1 of 2 branches missed.">            if (exception != null)</span>
+<span class="nc" id="L396">                throw new ExecutionException(exception);</span>
+<span class="fc" id="L397">            return null;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

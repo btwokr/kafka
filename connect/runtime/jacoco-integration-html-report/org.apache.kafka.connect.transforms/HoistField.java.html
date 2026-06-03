@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HoistField.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.transforms</a> &gt; <span class="el_source">HoistField.java</span></div><h1>HoistField.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.transforms;
+
+import org.apache.kafka.common.cache.Cache;
+import org.apache.kafka.common.cache.LRUCache;
+import org.apache.kafka.common.cache.SynchronizedCache;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.utils.AppInfoParser;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.transforms.util.SimpleConfig;
+
+import java.util.HashMap;
+import java.util.Map;
+
+<span class="fc" id="L33">public abstract class HoistField&lt;R extends ConnectRecord&lt;R&gt;&gt; implements Transformation&lt;R&gt; {</span>
+
+<span class="fc" id="L35">    public static final String OVERVIEW_DOC =</span>
+            &quot;Wrap data using the specified field name in a Struct when schema present, or a Map in the case of schemaless data.&quot;
+<span class="fc" id="L37">                    + &quot;&lt;p/&gt;Use the concrete transformation type designed for the record key (&lt;code&gt;&quot; + Key.class.getName() + &quot;&lt;/code&gt;) &quot;</span>
+<span class="fc" id="L38">                    + &quot;or value (&lt;code&gt;&quot; + Value.class.getName() + &quot;&lt;/code&gt;).&quot;;</span>
+
+    private static final String FIELD_CONFIG = &quot;field&quot;;
+
+<span class="fc" id="L42">    public static final ConfigDef CONFIG_DEF = new ConfigDef()</span>
+<span class="fc" id="L43">            .define(FIELD_CONFIG, ConfigDef.Type.STRING, ConfigDef.NO_DEFAULT_VALUE, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Field name for the single field that will be created in the resulting Struct or Map.&quot;);
+
+    private Cache&lt;Schema, Schema&gt; schemaUpdateCache;
+
+    private String fieldName;
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; props) {
+<span class="nc" id="L52">        final SimpleConfig config = new SimpleConfig(CONFIG_DEF, props);</span>
+<span class="nc" id="L53">        fieldName = config.getString(&quot;field&quot;);</span>
+<span class="nc" id="L54">        schemaUpdateCache = new SynchronizedCache&lt;&gt;(new LRUCache&lt;&gt;(16));</span>
+<span class="nc" id="L55">    }</span>
+
+    @Override
+    public R apply(R record) {
+<span class="nc" id="L59">        final Schema schema = operatingSchema(record);</span>
+<span class="nc" id="L60">        final Object value = operatingValue(record);</span>
+
+<span class="nc bnc" id="L62" title="All 2 branches missed.">        if (schema == null) {</span>
+<span class="nc" id="L63">            Map&lt;String, Object&gt; updatedValue = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L64">            updatedValue.put(fieldName, value);</span>
+<span class="nc" id="L65">            return newRecord(record, null, updatedValue);</span>
+        } else {
+<span class="nc" id="L67">            Schema updatedSchema = schemaUpdateCache.get(schema);</span>
+<span class="nc bnc" id="L68" title="All 2 branches missed.">            if (updatedSchema == null) {</span>
+<span class="nc" id="L69">                updatedSchema = SchemaBuilder.struct().field(fieldName, schema).build();</span>
+<span class="nc" id="L70">                schemaUpdateCache.put(schema, updatedSchema);</span>
+            }
+
+<span class="nc" id="L73">            final Struct updatedValue = new Struct(updatedSchema).put(fieldName, value);</span>
+
+<span class="nc" id="L75">            return newRecord(record, updatedSchema, updatedValue);</span>
+        }
+    }
+
+    @Override
+    public String version() {
+<span class="fc" id="L81">        return AppInfoParser.getVersion();</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L86">        schemaUpdateCache = null;</span>
+<span class="nc" id="L87">    }</span>
+
+    @Override
+    public ConfigDef config() {
+<span class="nc" id="L91">        return CONFIG_DEF;</span>
+    }
+
+    protected abstract Schema operatingSchema(R record);
+
+    protected abstract Object operatingValue(R record);
+
+    protected abstract R newRecord(R record, Schema updatedSchema, Object updatedValue);
+
+<span class="fc" id="L100">    public static class Key&lt;R extends ConnectRecord&lt;R&gt;&gt; extends HoistField&lt;R&gt; {</span>
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L103">            return record.keySchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L108">            return record.key();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue) {
+<span class="nc" id="L113">            return record.newRecord(record.topic(), record.kafkaPartition(), updatedSchema, updatedValue, record.valueSchema(), record.value(), record.timestamp());</span>
+        }
+    }
+
+<span class="fc" id="L117">    public static class Value&lt;R extends ConnectRecord&lt;R&gt;&gt; extends HoistField&lt;R&gt; {</span>
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L120">            return record.valueSchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L125">            return record.value();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue) {
+<span class="nc" id="L130">            return record.newRecord(record.topic(), record.kafkaPartition(), record.keySchema(), record.key(), updatedSchema, updatedValue, record.timestamp());</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

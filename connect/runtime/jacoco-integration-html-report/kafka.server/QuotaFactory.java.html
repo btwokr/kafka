@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>QuotaFactory.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">kafka.server</a> &gt; <span class="el_source">QuotaFactory.java</span></div><h1>QuotaFactory.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package kafka.server;
+
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.internals.Plugin;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.metadata.publisher.QuotaConfigChangeListener;
+import org.apache.kafka.server.config.ClientQuotaManagerConfig;
+import org.apache.kafka.server.config.QuotaConfig;
+import org.apache.kafka.server.config.ReplicationQuotaManagerConfig;
+import org.apache.kafka.server.quota.ClientQuotaCallback;
+import org.apache.kafka.server.quota.ClientQuotaManager;
+import org.apache.kafka.server.quota.ControllerMutationQuotaManager;
+import org.apache.kafka.server.quota.QuotaType;
+import org.apache.kafka.server.quota.ReplicaQuota;
+import org.apache.kafka.server.quota.ReplicationQuotaManager;
+
+import java.util.Optional;
+
+
+<span class="nc" id="L38">public class QuotaFactory {</span>
+
+<span class="fc" id="L40">    public static final ReplicaQuota UNBOUNDED_QUOTA = new ReplicaQuota() {</span>
+        @Override
+        public boolean isThrottled(TopicPartition topicPartition) {
+<span class="nc" id="L43">            return false;</span>
+        }
+
+        @Override
+        public boolean isQuotaExceeded() {
+<span class="nc" id="L48">            return false;</span>
+        }
+
+        @Override
+        public void record(long value) {
+            // No-op
+<span class="nc" id="L54">        }</span>
+    };
+
+<span class="fc" id="L57">    public record QuotaManagers(ClientQuotaManager fetch,</span>
+                                ClientQuotaManager produce,
+                                ClientRequestQuotaManager request,
+                                ControllerMutationQuotaManager controllerMutation,
+                                ReplicationQuotaManager leader,
+                                ReplicationQuotaManager follower,
+                                ReplicationQuotaManager alterLogDirs,
+                                Optional&lt;Plugin&lt;ClientQuotaCallback&gt;&gt; clientQuotaCallbackPlugin) {
+
+        public void shutdown() {
+<span class="fc" id="L67">            fetch.shutdown();</span>
+<span class="fc" id="L68">            produce.shutdown();</span>
+<span class="fc" id="L69">            request.shutdown();</span>
+<span class="fc" id="L70">            controllerMutation.shutdown();</span>
+<span class="pc" id="L71">            clientQuotaCallbackPlugin.ifPresent(plugin -&gt; Utils.closeQuietly(plugin, &quot;client quota callback plugin&quot;));</span>
+<span class="fc" id="L72">        }</span>
+
+        public QuotaConfigChangeListener quotaConfigChangeListener() {
+<span class="fc" id="L75">            return () -&gt; {</span>
+<span class="nc" id="L76">                fetch.updateQuotaMetricConfigs();</span>
+<span class="nc" id="L77">                produce.updateQuotaMetricConfigs();</span>
+<span class="nc" id="L78">                request.updateQuotaMetricConfigs();</span>
+<span class="nc" id="L79">                controllerMutation.updateQuotaMetricConfigs();</span>
+<span class="nc" id="L80">            };</span>
+        }
+    }
+
+    public static QuotaManagers instantiate(
+        KafkaConfig cfg,
+        Metrics metrics,
+        Time time,
+        String threadNamePrefix,
+        String role
+    ) {
+<span class="fc" id="L91">        Optional&lt;Plugin&lt;ClientQuotaCallback&gt;&gt; clientQuotaCallbackPlugin = createClientQuotaCallback(cfg, metrics, role);</span>
+
+<span class="fc" id="L93">        return new QuotaManagers(</span>
+<span class="fc" id="L94">            new ClientQuotaManager(clientConfig(cfg), metrics, QuotaType.FETCH, time, threadNamePrefix, clientQuotaCallbackPlugin),</span>
+<span class="fc" id="L95">            new ClientQuotaManager(clientConfig(cfg), metrics, QuotaType.PRODUCE, time, threadNamePrefix, clientQuotaCallbackPlugin),</span>
+<span class="fc" id="L96">            new ClientRequestQuotaManager(clientConfig(cfg), metrics, time, threadNamePrefix, clientQuotaCallbackPlugin),</span>
+<span class="fc" id="L97">            new ControllerMutationQuotaManager(clientControllerMutationConfig(cfg), metrics, time, threadNamePrefix, clientQuotaCallbackPlugin),</span>
+<span class="fc" id="L98">            new ReplicationQuotaManager(replicationConfig(cfg), metrics, QuotaType.LEADER_REPLICATION, time),</span>
+<span class="fc" id="L99">            new ReplicationQuotaManager(replicationConfig(cfg), metrics, QuotaType.FOLLOWER_REPLICATION, time),</span>
+<span class="fc" id="L100">            new ReplicationQuotaManager(alterLogDirsReplicationConfig(cfg), metrics, QuotaType.ALTER_LOG_DIRS_REPLICATION, time),</span>
+            clientQuotaCallbackPlugin
+        );
+    }
+
+    private static Optional&lt;Plugin&lt;ClientQuotaCallback&gt;&gt; createClientQuotaCallback(
+        KafkaConfig cfg, 
+        Metrics metrics, 
+        String role
+    ) {
+<span class="fc" id="L110">        ClientQuotaCallback clientQuotaCallback = cfg.getConfiguredInstance(</span>
+            QuotaConfig.CLIENT_QUOTA_CALLBACK_CLASS_CONFIG, ClientQuotaCallback.class);
+<span class="pc bpc" id="L112" title="1 of 2 branches missed.">        return clientQuotaCallback == null ? Optional.empty() : Optional.of(Plugin.wrapInstance(</span>
+            clientQuotaCallback,
+            metrics,
+            QuotaConfig.CLIENT_QUOTA_CALLBACK_CLASS_CONFIG,
+            &quot;role&quot;, role
+        ));
+    }
+
+    private static ClientQuotaManagerConfig clientConfig(KafkaConfig cfg) {
+<span class="fc" id="L121">        return new ClientQuotaManagerConfig(</span>
+<span class="fc" id="L122">            cfg.quotaConfig().numQuotaSamples(),</span>
+<span class="fc" id="L123">            cfg.quotaConfig().quotaWindowSizeSeconds()</span>
+        );
+    }
+
+    private static ClientQuotaManagerConfig clientControllerMutationConfig(KafkaConfig cfg) {
+<span class="fc" id="L128">        return new ClientQuotaManagerConfig(</span>
+<span class="fc" id="L129">            cfg.quotaConfig().numControllerQuotaSamples(),</span>
+<span class="fc" id="L130">            cfg.quotaConfig().controllerQuotaWindowSizeSeconds()</span>
+        );
+    }
+
+    private static ReplicationQuotaManagerConfig replicationConfig(KafkaConfig cfg) {
+<span class="fc" id="L135">        return new ReplicationQuotaManagerConfig(</span>
+<span class="fc" id="L136">            cfg.quotaConfig().numReplicationQuotaSamples(),</span>
+<span class="fc" id="L137">            cfg.quotaConfig().replicationQuotaWindowSizeSeconds()</span>
+        );
+    }
+
+    private static ReplicationQuotaManagerConfig alterLogDirsReplicationConfig(KafkaConfig cfg) {
+<span class="fc" id="L142">        return new ReplicationQuotaManagerConfig(</span>
+<span class="fc" id="L143">            cfg.quotaConfig().numAlterLogDirsReplicationQuotaSamples(),</span>
+<span class="fc" id="L144">            cfg.quotaConfig().alterLogDirsReplicationQuotaWindowSizeSeconds()</span>
+        );
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,315 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ClusterTestExtensions.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.test.junit</a> &gt; <span class="el_source">ClusterTestExtensions.java</span></div><h1>ClusterTestExtensions.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.test.junit;
+
+import org.apache.kafka.common.network.ListenerName;
+import org.apache.kafka.common.test.api.AutoStart;
+import org.apache.kafka.common.test.api.ClusterConfig;
+import org.apache.kafka.common.test.api.ClusterConfigProperty;
+import org.apache.kafka.common.test.api.ClusterFeature;
+import org.apache.kafka.common.test.api.ClusterTemplate;
+import org.apache.kafka.common.test.api.ClusterTest;
+import org.apache.kafka.common.test.api.ClusterTestDefaults;
+import org.apache.kafka.common.test.api.ClusterTests;
+import org.apache.kafka.common.test.api.DetectThreadLeak;
+import org.apache.kafka.common.test.api.Type;
+import org.apache.kafka.server.common.Feature;
+import org.apache.kafka.server.util.timer.SystemTimer;
+
+import org.junit.jupiter.api.extension.AfterEachCallback;
+import org.junit.jupiter.api.extension.BeforeEachCallback;
+import org.junit.jupiter.api.extension.ExtensionContext;
+import org.junit.jupiter.api.extension.ExtensionContext.Namespace;
+import org.junit.jupiter.api.extension.ExtensionContext.Store;
+import org.junit.jupiter.api.extension.TestTemplateInvocationContext;
+import org.junit.jupiter.api.extension.TestTemplateInvocationContextProvider;
+import org.junit.platform.commons.util.ReflectionUtils;
+
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
+
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * This class is a custom JUnit extension that will generate some number of test invocations depending on the processing
+ * of a few custom annotations. These annotations are placed on so-called test template methods. Template methods look
+ * like normal JUnit test methods, but instead of being invoked directly, they are used as templates for generating
+ * multiple test invocations.
+ *
+ * Test class that use this extension should use one of the following annotations on each template method:
+ *
+ * &lt;ul&gt;
+ *     &lt;li&gt;{@link ClusterTest}, define a single cluster configuration&lt;/li&gt;
+ *     &lt;li&gt;{@link ClusterTests}, provide multiple instances of @ClusterTest&lt;/li&gt;
+ *     &lt;li&gt;{@link ClusterTemplate}, define a static method that generates cluster configurations&lt;/li&gt;
+ * &lt;/ul&gt;
+ *
+ * Any combination of these annotations may be used on a given test template method. If no test invocations are
+ * generated after processing the annotations, an error is thrown.
+ *
+ * Depending on which annotations are used, and what values are given, different {@link ClusterConfig} will be
+ * generated. Each ClusterConfig is used to create an underlying Kafka cluster that is used for the actual test
+ * invocation.
+ *
+ * For example:
+ *
+ * &lt;pre&gt;
+ * class SomeIntegrationTest {
+ *   &amp;#64;ClusterTest(brokers = 1, controllers = 1, types = {Type.KRAFT, Type.CO_KRAFT})
+ *   void someTest(ClusterInstance cluster) {
+ *     assertTrue(condition)
+ *   }
+ * }
+ * &lt;/pre&gt;
+ *
+ * will generate two invocations of &quot;someTest&quot; (since two cluster types were specified). For each invocation, the test class
+ * SomeIntegrationTest will be instantiated, lifecycle methods (before/after) will be run, and &quot;someTest&quot; will be invoked.
+ *
+ * A special system property &quot;kafka.cluster.test.repeat&quot; can be used to cause repeated invocation of the tests.
+ *
+ * For example:
+ *
+ * &lt;pre&gt;
+ * ./gradlew -Pkafka.cluster.test.repeat=3 :core:test
+ * &lt;/pre&gt;
+ *
+ * will cause all ClusterTest-s in the :core module to be invoked three times.
+ */
+<span class="nc" id="L101">public class ClusterTestExtensions implements TestTemplateInvocationContextProvider, BeforeEachCallback, AfterEachCallback {</span>
+    public static final String CLUSTER_TEST_REPEAT_SYSTEM_PROP = &quot;kafka.cluster.test.repeat&quot;;
+
+    private static final String METRICS_METER_TICK_THREAD_PREFIX = &quot;metrics-meter-tick-thread&quot;;
+    private static final String SCALA_THREAD_PREFIX = &quot;scala-&quot;;
+    private static final String FORK_JOIN_POOL_THREAD_PREFIX = &quot;ForkJoinPool&quot;;
+    private static final String JUNIT_THREAD_PREFIX = &quot;junit-&quot;;
+    private static final String ATTACH_LISTENER_THREAD_PREFIX = &quot;Attach Listener&quot;;
+    private static final String PROCESS_REAPER_THREAD_PREFIX = &quot;process reaper&quot;;
+    private static final String RMI_THREAD_PREFIX = &quot;RMI&quot;;
+    private static final String DETECT_THREAD_LEAK_KEY = &quot;detectThreadLeak&quot;;
+<span class="nc" id="L112">    private static final Set&lt;String&gt; SKIPPED_THREAD_PREFIX = Set.of(METRICS_METER_TICK_THREAD_PREFIX, SCALA_THREAD_PREFIX,</span>
+            FORK_JOIN_POOL_THREAD_PREFIX, JUNIT_THREAD_PREFIX, ATTACH_LISTENER_THREAD_PREFIX, PROCESS_REAPER_THREAD_PREFIX,
+            RMI_THREAD_PREFIX, SystemTimer.SYSTEM_TIMER_THREAD_PREFIX);
+
+    @Override
+    public boolean supportsTestTemplate(ExtensionContext context) {
+<span class="nc" id="L118">        return true;</span>
+    }
+
+    /**
+     * Indicates whether this provider may return zero test template invocation contexts.
+     * Prior to JUnit 5.12, returning zero contexts was silently allowed. Starting from JUnit 5.12,
+     * a PreconditionViolationException is thrown unless this method explicitly returns {@code true}.
+     *
+     * @param context the extension context for the test template method
+     * @return {@code true} to allow this provider to return zero invocation contexts
+     * @see &lt;a href=&quot;https://github.com/junit-team/junit5/commit/89a46dfa10c6447ef010fbff7903bfcb3c18975a&quot;&gt;JUnit 5.12 Breaking Change&lt;/a&gt;
+     */
+    public boolean mayReturnZeroTestTemplateInvocationContexts(ExtensionContext context) {
+<span class="nc" id="L131">        return true;</span>
+    }
+
+    private boolean isClusterTest(ExtensionContext context) {
+<span class="nc" id="L135">        Method method = context.getRequiredTestMethod();</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">        return method.getDeclaredAnnotation(ClusterTemplate.class) != null ||</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">            method.getDeclaredAnnotation(ClusterTest.class) != null ||</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">            method.getDeclaredAnnotation(ClusterTests.class) != null;</span>
+    }
+
+    @Override
+    public Stream&lt;TestTemplateInvocationContext&gt; provideTestTemplateInvocationContexts(ExtensionContext context) {
+<span class="nc" id="L143">        ClusterTestDefaults defaults = getClusterTestDefaults(context.getRequiredTestClass());</span>
+<span class="nc" id="L144">        List&lt;TestTemplateInvocationContext&gt; generatedContexts = new ArrayList&lt;&gt;();</span>
+
+        // Process the @ClusterTemplate annotation
+<span class="nc" id="L147">        ClusterTemplate clusterTemplateAnnot = context.getRequiredTestMethod().getDeclaredAnnotation(ClusterTemplate.class);</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (clusterTemplateAnnot != null) {</span>
+<span class="nc" id="L149">            generatedContexts.addAll(processClusterTemplate(context, clusterTemplateAnnot));</span>
+        }
+
+        // Process single @ClusterTest annotation
+<span class="nc" id="L153">        ClusterTest clusterTestAnnot = context.getRequiredTestMethod().getDeclaredAnnotation(ClusterTest.class);</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if (clusterTestAnnot != null) {</span>
+<span class="nc" id="L155">            generatedContexts.addAll(processClusterTests(context, new ClusterTest[]{clusterTestAnnot}, defaults));</span>
+        }
+
+        // Process multiple @ClusterTest annotation within @ClusterTests
+<span class="nc" id="L159">        ClusterTests clusterTestsAnnot = context.getRequiredTestMethod().getDeclaredAnnotation(ClusterTests.class);</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (clusterTestsAnnot != null) {</span>
+<span class="nc" id="L161">            generatedContexts.addAll(processClusterTests(context, clusterTestsAnnot.value(), defaults));</span>
+        }
+
+<span class="nc" id="L164">        return generatedContexts.stream();</span>
+    }
+
+    @Override
+    public void beforeEach(ExtensionContext context) {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        if (isClusterTest(context)) {</span>
+<span class="nc" id="L170">            DetectThreadLeak detectThreadLeak = DetectThreadLeak.of(thread -&gt;</span>
+<span class="nc" id="L171">                SKIPPED_THREAD_PREFIX.stream().noneMatch(prefix -&gt; thread.getName().startsWith(prefix)));</span>
+<span class="nc" id="L172">            getStore(context).put(DETECT_THREAD_LEAK_KEY, detectThreadLeak);</span>
+        }
+<span class="nc" id="L174">    }</span>
+
+    @Override
+    public void afterEach(ExtensionContext context) {
+<span class="nc bnc" id="L178" title="All 2 branches missed.">        if (isClusterTest(context)) {</span>
+<span class="nc" id="L179">            DetectThreadLeak detectThreadLeak = getStore(context).remove(DETECT_THREAD_LEAK_KEY, DetectThreadLeak.class);</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">            if (detectThreadLeak == null) {</span>
+<span class="nc" id="L181">                return;</span>
+            }
+<span class="nc" id="L183">            List&lt;Thread&gt; threads = detectThreadLeak.newThreads();</span>
+<span class="nc" id="L184">            assertTrue(threads.isEmpty(), &quot;Thread leak detected: &quot; +</span>
+<span class="nc" id="L185">                threads.stream().map(Thread::getName).collect(Collectors.joining(&quot;, &quot;)));</span>
+        }
+<span class="nc" id="L187">    }</span>
+
+    private Store getStore(ExtensionContext context) {
+<span class="nc" id="L190">        return context.getStore(Namespace.create(context.getUniqueId()));</span>
+    }
+
+    private int getTestRepeatCount() {
+        int count;
+        try {
+<span class="nc" id="L196">            String repeatCount = System.getProperty(CLUSTER_TEST_REPEAT_SYSTEM_PROP, &quot;1&quot;);</span>
+<span class="nc" id="L197">            count = Integer.parseInt(repeatCount);</span>
+<span class="nc" id="L198">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L199">            count = 1;</span>
+<span class="nc" id="L200">        }</span>
+<span class="nc" id="L201">        return count;</span>
+    }
+
+    private TestTemplateInvocationContext invocationContextForClusterType(
+        Type type,
+        String baseDisplayName,
+        ClusterConfig config
+    ) {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        return switch (type) {</span>
+<span class="nc" id="L210">            case KRAFT -&gt; new RaftClusterInvocationContext(baseDisplayName, config, false);</span>
+<span class="nc" id="L211">            case CO_KRAFT -&gt; new RaftClusterInvocationContext(baseDisplayName, config, true);</span>
+        };
+    }
+
+    List&lt;TestTemplateInvocationContext&gt; processClusterTemplate(ExtensionContext context, ClusterTemplate annot) {
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        if (annot.value().trim().isEmpty()) {</span>
+<span class="nc" id="L217">            throw new IllegalStateException(&quot;ClusterTemplate value can't be empty string.&quot;);</span>
+        }
+
+<span class="nc" id="L220">        String baseDisplayName = context.getRequiredTestMethod().getName();</span>
+<span class="nc" id="L221">        int repeatCount = getTestRepeatCount();</span>
+<span class="nc" id="L222">        List&lt;TestTemplateInvocationContext&gt; contexts = IntStream.range(0, repeatCount)</span>
+<span class="nc" id="L223">            .mapToObj(__ -&gt; generateClusterConfiguration(context, annot.value()).stream())</span>
+<span class="nc" id="L224">            .flatMap(Function.identity())</span>
+<span class="nc" id="L225">            .flatMap(config -&gt; config.clusterTypes().stream().map(type -&gt; invocationContextForClusterType(type, baseDisplayName, config)))</span>
+<span class="nc" id="L226">            .collect(Collectors.toList());</span>
+
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        if (contexts.isEmpty()) {</span>
+<span class="nc" id="L229">            throw new IllegalStateException(&quot;ClusterConfig generator method should provide at least one config&quot;);</span>
+        }
+
+<span class="nc" id="L232">        return contexts;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private List&lt;ClusterConfig&gt; generateClusterConfiguration(
+        ExtensionContext context,
+        String generateClustersMethods
+    ) {
+<span class="nc" id="L240">        Object testInstance = context.getTestInstance().orElse(null);</span>
+<span class="nc" id="L241">        Method method = ReflectionUtils.getRequiredMethod(context.getRequiredTestClass(), generateClustersMethods);</span>
+<span class="nc" id="L242">        return (List&lt;ClusterConfig&gt;) ReflectionUtils.invokeMethod(method, testInstance);</span>
+    }
+
+    private List&lt;TestTemplateInvocationContext&gt; processClusterTests(
+        ExtensionContext context,
+        ClusterTest[] clusterTests,
+        ClusterTestDefaults defaults
+    ) {
+<span class="nc" id="L250">        int repeatCount = getTestRepeatCount();</span>
+<span class="nc" id="L251">        List&lt;TestTemplateInvocationContext&gt; ret = IntStream.range(0, repeatCount)</span>
+<span class="nc" id="L252">            .mapToObj(__ -&gt; Arrays.stream(clusterTests))</span>
+<span class="nc" id="L253">            .flatMap(Function.identity())</span>
+<span class="nc" id="L254">            .flatMap(clusterTest -&gt; processClusterTestInternal(context, clusterTest, defaults).stream())</span>
+<span class="nc" id="L255">            .collect(Collectors.toList());</span>
+
+<span class="nc bnc" id="L257" title="All 2 branches missed.">        if (ret.isEmpty()) {</span>
+<span class="nc" id="L258">            throw new IllegalStateException(&quot;processClusterTests method should provide at least one config&quot;);</span>
+        }
+
+<span class="nc" id="L261">        return ret;</span>
+    }
+
+    private List&lt;TestTemplateInvocationContext&gt; processClusterTestInternal(
+        ExtensionContext context,
+        ClusterTest clusterTest,
+        ClusterTestDefaults defaults
+    ) {
+<span class="nc bnc" id="L269" title="All 2 branches missed.">        Type[] types = clusterTest.types().length == 0 ? defaults.types() : clusterTest.types();</span>
+<span class="nc" id="L270">        Map&lt;String, String&gt; serverProperties = Stream.concat(Arrays.stream(defaults.serverProperties()), Arrays.stream(clusterTest.serverProperties()))</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            .filter(e -&gt; e.id() == -1)</span>
+<span class="nc" id="L272">            .collect(Collectors.toMap(ClusterConfigProperty::key, ClusterConfigProperty::value, (a, b) -&gt; b));</span>
+
+<span class="nc" id="L274">        Map&lt;Integer, Map&lt;String, String&gt;&gt; perServerProperties = Stream.concat(Arrays.stream(defaults.serverProperties()), Arrays.stream(clusterTest.serverProperties()))</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">            .filter(e -&gt; e.id() != -1)</span>
+<span class="nc" id="L276">            .collect(Collectors.groupingBy(ClusterConfigProperty::id, Collectors.mapping(Function.identity(),</span>
+<span class="nc" id="L277">                Collectors.toMap(ClusterConfigProperty::key, ClusterConfigProperty::value, (a, b) -&gt; b))));</span>
+
+<span class="nc" id="L279">        Map&lt;Feature, Short&gt; features = Arrays.stream(clusterTest.features())</span>
+<span class="nc" id="L280">            .collect(Collectors.toMap(ClusterFeature::feature, ClusterFeature::version));</span>
+
+<span class="nc" id="L282">        ClusterConfig config = ClusterConfig.builder()</span>
+<span class="nc" id="L283">            .setTypes(Set.of(types))</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">            .setBrokers(clusterTest.brokers() == 0 ? defaults.brokers() : clusterTest.brokers())</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            .setControllers(clusterTest.controllers() == 0 ? defaults.controllers() : clusterTest.controllers())</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">            .setDisksPerBroker(clusterTest.disksPerBroker() == 0 ? defaults.disksPerBroker() : clusterTest.disksPerBroker())</span>
+<span class="nc bnc" id="L287" title="All 4 branches missed.">            .setAutoStart(clusterTest.autoStart() == AutoStart.DEFAULT ? defaults.autoStart() : clusterTest.autoStart() == AutoStart.YES)</span>
+<span class="nc" id="L288">            .setBrokerListenerName(ListenerName.normalised(clusterTest.brokerListener()))</span>
+<span class="nc" id="L289">            .setBrokerSecurityProtocol(clusterTest.brokerSecurityProtocol())</span>
+<span class="nc" id="L290">            .setControllerListenerName(ListenerName.normalised(clusterTest.controllerListener()))</span>
+<span class="nc" id="L291">            .setControllerSecurityProtocol(clusterTest.controllerSecurityProtocol())</span>
+<span class="nc" id="L292">            .setServerProperties(serverProperties)</span>
+<span class="nc" id="L293">            .setPerServerProperties(perServerProperties)</span>
+<span class="nc" id="L294">            .setMetadataVersion(clusterTest.metadataVersion())</span>
+<span class="nc" id="L295">            .setTags(List.of(clusterTest.tags()))</span>
+<span class="nc" id="L296">            .setFeatures(features)</span>
+<span class="nc" id="L297">            .setStandalone(clusterTest.standalone())</span>
+<span class="nc" id="L298">            .build();</span>
+
+<span class="nc" id="L300">        return Arrays.stream(types)</span>
+<span class="nc" id="L301">            .map(type -&gt; invocationContextForClusterType(type, context.getRequiredTestMethod().getName(), config))</span>
+<span class="nc" id="L302">            .collect(Collectors.toList());</span>
+    }
+
+    private ClusterTestDefaults getClusterTestDefaults(Class&lt;?&gt; testClass) {
+<span class="nc" id="L306">        return Optional.ofNullable(testClass.getDeclaredAnnotation(ClusterTestDefaults.class))</span>
+<span class="nc" id="L307">            .orElseGet(() -&gt; EmptyClass.class.getDeclaredAnnotation(ClusterTestDefaults.class));</span>
+    }
+
+    @ClusterTestDefaults
+    private static final class EmptyClass {
+        // Just used as a convenience to get default values from the annotation
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

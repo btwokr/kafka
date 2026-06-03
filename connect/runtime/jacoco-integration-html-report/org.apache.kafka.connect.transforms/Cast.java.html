@@ -1,0 +1,475 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Cast.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.transforms</a> &gt; <span class="el_source">Cast.java</span></div><h1>Cast.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.connect.transforms;
+
+import org.apache.kafka.common.cache.Cache;
+import org.apache.kafka.common.cache.LRUCache;
+import org.apache.kafka.common.cache.SynchronizedCache;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.utils.AppInfoParser;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.data.ConnectSchema;
+import org.apache.kafka.connect.data.Date;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.Schema.Type;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.data.Time;
+import org.apache.kafka.connect.data.Timestamp;
+import org.apache.kafka.connect.data.Values;
+import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.transforms.util.SchemaUtil;
+import org.apache.kafka.connect.transforms.util.SimpleConfig;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.ByteBuffer;
+import java.util.Base64;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+
+import static org.apache.kafka.connect.transforms.util.Requirements.requireMap;
+import static org.apache.kafka.connect.transforms.util.Requirements.requireStruct;
+
+<span class="fc" id="L57">public abstract class Cast&lt;R extends ConnectRecord&lt;R&gt;&gt; implements Transformation&lt;R&gt; {</span>
+<span class="fc" id="L58">    private static final Logger log = LoggerFactory.getLogger(Cast.class);</span>
+
+    // TODO: Currently we only support top-level field casting. Ideally we could use a dotted notation in the spec to
+    // allow casting nested fields.
+<span class="fc" id="L62">    public static final String OVERVIEW_DOC =</span>
+            &quot;Cast fields or the entire key or value to a specific type, e.g. to force an integer field to a smaller &quot;
+                    + &quot;width. Cast from integers, floats, boolean and string to any other type, &quot;
+                    + &quot;and cast binary to string (base64 encoded).&quot;
+<span class="fc" id="L66">                    + &quot;&lt;p/&gt;Use the concrete transformation type designed for the record key (&lt;code&gt;&quot; + Key.class.getName() + &quot;&lt;/code&gt;) &quot;</span>
+<span class="fc" id="L67">                    + &quot;or value (&lt;code&gt;&quot; + Value.class.getName() + &quot;&lt;/code&gt;).&quot;;</span>
+
+    public static final String SPEC_CONFIG = &quot;spec&quot;;
+    public static final String REPLACE_NULL_WITH_DEFAULT_CONFIG = &quot;replace.null.with.default&quot;;
+
+<span class="fc" id="L72">    public static final ConfigDef CONFIG_DEF = new ConfigDef()</span>
+<span class="fc" id="L73">            .define(SPEC_CONFIG, ConfigDef.Type.LIST, ConfigDef.NO_DEFAULT_VALUE, ConfigDef.LambdaValidator.with(</span>
+                    (name, valueObject) -&gt; {
+                        @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L76">                        List&lt;String&gt; value = (List&lt;String&gt;) valueObject;</span>
+<span class="nc bnc" id="L77" title="All 4 branches missed.">                        if (value == null || value.isEmpty()) {</span>
+<span class="nc" id="L78">                            throw new ConfigException(&quot;Must specify at least one field to cast.&quot;);</span>
+                        }
+<span class="nc" id="L80">                        parseFieldTypes(value);</span>
+<span class="nc" id="L81">                    },</span>
+<span class="nc" id="L82">                    () -&gt; &quot;list of colon-delimited pairs, e.g. &lt;code&gt;foo:bar,abc:xyz&lt;/code&gt;&quot;),</span>
+            ConfigDef.Importance.HIGH,
+            &quot;List of fields and the type to cast them to of the form field1:type,field2:type to cast fields of &quot;
+                    + &quot;Maps or Structs. A single type to cast the entire value. Valid types are int8, int16, int32, &quot;
+                    + &quot;int64, float32, float64, boolean, and string. Note that binary fields can only be cast to string.&quot;)
+<span class="fc" id="L87">            .define(REPLACE_NULL_WITH_DEFAULT_CONFIG,</span>
+                    ConfigDef.Type.BOOLEAN,
+<span class="fc" id="L89">                    true,</span>
+                    ConfigDef.Importance.MEDIUM,
+                    &quot;Whether to replace fields that have a default value and that are null to the default value. When set to true, the default value is used, otherwise null is used.&quot;);
+
+    private static final String PURPOSE = &quot;cast types&quot;;
+
+<span class="fc" id="L95">    private static final Set&lt;Schema.Type&gt; SUPPORTED_CAST_INPUT_TYPES = EnumSet.of(</span>
+            Schema.Type.INT8, Schema.Type.INT16, Schema.Type.INT32, Schema.Type.INT64,
+                    Schema.Type.FLOAT32, Schema.Type.FLOAT64, Schema.Type.BOOLEAN,
+                            Schema.Type.STRING, Schema.Type.BYTES
+    );
+
+<span class="fc" id="L101">    private static final Set&lt;Schema.Type&gt; SUPPORTED_CAST_OUTPUT_TYPES = EnumSet.of(</span>
+            Schema.Type.INT8, Schema.Type.INT16, Schema.Type.INT32, Schema.Type.INT64,
+                    Schema.Type.FLOAT32, Schema.Type.FLOAT64, Schema.Type.BOOLEAN,
+                            Schema.Type.STRING
+    );
+
+    // As a special case for casting the entire value (e.g. the incoming key is a int64 but you know it could be an
+    // int32 and want the smaller width), we use an otherwise invalid field name in the cast spec to track this.
+<span class="fc" id="L109">    private static final String WHOLE_VALUE_CAST = null;</span>
+
+    private Map&lt;String, Schema.Type&gt; casts;
+    private Schema.Type wholeValueCastType;
+    private Cache&lt;Schema, Schema&gt; schemaUpdateCache;
+    private boolean replaceNullWithDefault;
+
+    @Override
+    public String version() {
+<span class="fc" id="L118">        return AppInfoParser.getVersion();</span>
+    }
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; props) {
+<span class="nc" id="L123">        final SimpleConfig config = new SimpleConfig(CONFIG_DEF, props);</span>
+<span class="nc" id="L124">        casts = parseFieldTypes(config.getList(SPEC_CONFIG));</span>
+<span class="nc" id="L125">        wholeValueCastType = casts.get(WHOLE_VALUE_CAST);</span>
+<span class="nc" id="L126">        schemaUpdateCache = new SynchronizedCache&lt;&gt;(new LRUCache&lt;&gt;(16));</span>
+<span class="nc" id="L127">        replaceNullWithDefault = config.getBoolean(REPLACE_NULL_WITH_DEFAULT_CONFIG);</span>
+<span class="nc" id="L128">    }</span>
+
+    @Override
+    public R apply(R record) {
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (operatingValue(record) == null) {</span>
+<span class="nc" id="L133">            return record;</span>
+        }
+
+<span class="nc bnc" id="L136" title="All 2 branches missed.">        if (operatingSchema(record) == null) {</span>
+<span class="nc" id="L137">            return applySchemaless(record);</span>
+        } else {
+<span class="nc" id="L139">            return applyWithSchema(record);</span>
+        }
+    }
+
+    @Override
+    public ConfigDef config() {
+<span class="nc" id="L145">        return CONFIG_DEF;</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L150">    }</span>
+
+
+    private R applySchemaless(R record) {
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if (wholeValueCastType != null) {</span>
+<span class="nc" id="L155">            return newRecord(record, null, castValueToType(null, operatingValue(record), wholeValueCastType));</span>
+        }
+
+<span class="nc" id="L158">        final Map&lt;String, Object&gt; value = requireMap(operatingValue(record), PURPOSE);</span>
+<span class="nc" id="L159">        final HashMap&lt;String, Object&gt; updatedValue = new HashMap&lt;&gt;(value);</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        for (Map.Entry&lt;String, Schema.Type&gt; fieldSpec : casts.entrySet()) {</span>
+<span class="nc" id="L161">            String field = fieldSpec.getKey();</span>
+<span class="nc" id="L162">            updatedValue.put(field, castValueToType(null, value.get(field), fieldSpec.getValue()));</span>
+<span class="nc" id="L163">        }</span>
+<span class="nc" id="L164">        return newRecord(record, null, updatedValue);</span>
+    }
+
+    private R applyWithSchema(R record) {
+<span class="nc" id="L168">        Schema valueSchema = operatingSchema(record);</span>
+<span class="nc" id="L169">        Schema updatedSchema = getOrBuildSchema(valueSchema);</span>
+
+        // Whole-record casting
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        if (wholeValueCastType != null)</span>
+<span class="nc" id="L173">            return newRecord(record, updatedSchema, castValueToType(valueSchema, operatingValue(record), wholeValueCastType));</span>
+
+        // Casting within a struct
+<span class="nc" id="L176">        final Struct value = requireStruct(operatingValue(record), PURPOSE);</span>
+
+<span class="nc" id="L178">        final Struct updatedValue = new Struct(updatedSchema);</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        for (Field field : value.schema().fields()) {</span>
+<span class="nc" id="L180">            final Object origFieldValue = getFieldValue(value, field);</span>
+<span class="nc" id="L181">            final Schema.Type targetType = casts.get(field.name());</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">            final Object newFieldValue = targetType != null ? castValueToType(field.schema(), origFieldValue, targetType) : origFieldValue;</span>
+<span class="nc" id="L183">            log.trace(&quot;Cast field '{}' from '{}' to '{}'&quot;, field.name(), origFieldValue, newFieldValue);</span>
+<span class="nc" id="L184">            updatedValue.put(updatedSchema.field(field.name()), newFieldValue);</span>
+<span class="nc" id="L185">        }</span>
+<span class="nc" id="L186">        return newRecord(record, updatedSchema, updatedValue);</span>
+    }
+
+    private Object getFieldValue(Struct value, Field field) {
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (replaceNullWithDefault) {</span>
+<span class="nc" id="L191">            return value.get(field);</span>
+        }
+<span class="nc" id="L193">        return value.getWithoutDefault(field.name());</span>
+    }
+
+    private Schema getOrBuildSchema(Schema valueSchema) {
+<span class="nc" id="L197">        Schema updatedSchema = schemaUpdateCache.get(valueSchema);</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        if (updatedSchema != null)</span>
+<span class="nc" id="L199">            return updatedSchema;</span>
+
+        final SchemaBuilder builder;
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        if (wholeValueCastType != null) {</span>
+<span class="nc" id="L203">            builder = SchemaUtil.copySchemaBasics(valueSchema, convertFieldType(wholeValueCastType));</span>
+        } else {
+<span class="nc" id="L205">            builder = SchemaUtil.copySchemaBasics(valueSchema, SchemaBuilder.struct());</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">            for (Field field : valueSchema.fields()) {</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                if (casts.containsKey(field.name())) {</span>
+<span class="nc" id="L208">                    SchemaBuilder fieldBuilder = convertFieldType(casts.get(field.name()));</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">                    if (field.schema().isOptional())</span>
+<span class="nc" id="L210">                        fieldBuilder.optional();</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">                    if (field.schema().defaultValue() != null) {</span>
+<span class="nc" id="L212">                        Schema fieldSchema = field.schema();</span>
+<span class="nc" id="L213">                        fieldBuilder.defaultValue(castValueToType(fieldSchema, fieldSchema.defaultValue(), fieldBuilder.type()));</span>
+                    }
+<span class="nc" id="L215">                    builder.field(field.name(), fieldBuilder.build());</span>
+<span class="nc" id="L216">                } else {</span>
+<span class="nc" id="L217">                    builder.field(field.name(), field.schema());</span>
+                }
+<span class="nc" id="L219">            }</span>
+        }
+
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        if (valueSchema.isOptional())</span>
+<span class="nc" id="L223">            builder.optional();</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        if (valueSchema.defaultValue() != null)</span>
+<span class="nc" id="L225">            builder.defaultValue(castValueToType(valueSchema, valueSchema.defaultValue(), builder.type()));</span>
+
+<span class="nc" id="L227">        updatedSchema = builder.build();</span>
+<span class="nc" id="L228">        schemaUpdateCache.put(valueSchema, updatedSchema);</span>
+<span class="nc" id="L229">        return updatedSchema;</span>
+    }
+
+    private SchemaBuilder convertFieldType(Schema.Type type) {
+<span class="nc bnc" id="L233" title="All 9 branches missed.">        return switch (type) {</span>
+<span class="nc" id="L234">            case INT8 -&gt; SchemaBuilder.int8();</span>
+<span class="nc" id="L235">            case INT16 -&gt; SchemaBuilder.int16();</span>
+<span class="nc" id="L236">            case INT32 -&gt; SchemaBuilder.int32();</span>
+<span class="nc" id="L237">            case INT64 -&gt; SchemaBuilder.int64();</span>
+<span class="nc" id="L238">            case FLOAT32 -&gt; SchemaBuilder.float32();</span>
+<span class="nc" id="L239">            case FLOAT64 -&gt; SchemaBuilder.float64();</span>
+<span class="nc" id="L240">            case BOOLEAN -&gt; SchemaBuilder.bool();</span>
+<span class="nc" id="L241">            case STRING -&gt; SchemaBuilder.string();</span>
+<span class="nc" id="L242">            default -&gt; throw new DataException(&quot;Unexpected type in Cast transformation: &quot; + type);</span>
+        };
+    }
+
+    private static Object encodeLogicalType(Schema schema, Object value) {
+<span class="nc bnc" id="L247" title="All 4 branches missed.">        return switch (schema.name()) {</span>
+<span class="nc" id="L248">            case Date.LOGICAL_NAME -&gt; Date.fromLogical(schema, (java.util.Date) value);</span>
+<span class="nc" id="L249">            case Time.LOGICAL_NAME -&gt; Time.fromLogical(schema, (java.util.Date) value);</span>
+<span class="nc" id="L250">            case Timestamp.LOGICAL_NAME -&gt; Timestamp.fromLogical(schema, (java.util.Date) value);</span>
+<span class="nc" id="L251">            default -&gt; value;</span>
+        };
+    }
+
+    private static Object castValueToType(Schema schema, Object value, Schema.Type targetType) {
+        try {
+<span class="nc bnc" id="L257" title="All 2 branches missed.">            if (value == null) return null;</span>
+
+<span class="nc bnc" id="L259" title="All 2 branches missed.">            Schema.Type inferredType = schema == null ? ConnectSchema.schemaType(value.getClass()) :</span>
+<span class="nc" id="L260">                    schema.type();</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">            if (inferredType == null) {</span>
+<span class="nc" id="L262">                throw new DataException(&quot;Cast transformation was passed a value of type &quot; + value.getClass()</span>
+                        + &quot; which is not supported by Connect's data API&quot;);
+            }
+            // Ensure the type we are trying to cast from is supported
+<span class="nc" id="L266">            validCastType(inferredType, FieldType.INPUT);</span>
+
+            // Perform logical type encoding to their internal representation.
+<span class="nc bnc" id="L269" title="All 6 branches missed.">            if (schema != null &amp;&amp; schema.name() != null &amp;&amp; targetType != Type.STRING) {</span>
+<span class="nc" id="L270">                value = encodeLogicalType(schema, value);</span>
+            }
+
+<span class="nc bnc" id="L273" title="All 9 branches missed.">            return switch (targetType) {</span>
+<span class="nc" id="L274">                case INT8 -&gt; castToInt8(value);</span>
+<span class="nc" id="L275">                case INT16 -&gt; castToInt16(value);</span>
+<span class="nc" id="L276">                case INT32 -&gt; castToInt32(value);</span>
+<span class="nc" id="L277">                case INT64 -&gt; castToInt64(value);</span>
+<span class="nc" id="L278">                case FLOAT32 -&gt; castToFloat32(value);</span>
+<span class="nc" id="L279">                case FLOAT64 -&gt; castToFloat64(value);</span>
+<span class="nc" id="L280">                case BOOLEAN -&gt; castToBoolean(value);</span>
+<span class="nc" id="L281">                case STRING -&gt; castToString(value);</span>
+<span class="nc" id="L282">                default -&gt; throw new DataException(targetType + &quot; is not supported in the Cast transformation.&quot;);</span>
+            };
+<span class="nc" id="L284">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L285">            throw new DataException(&quot;Value (&quot; + value.toString() + &quot;) was out of range for requested data type&quot;, e);</span>
+        }
+    }
+
+    private static byte castToInt8(Object value) {
+<span class="nc bnc" id="L290" title="All 2 branches missed.">        if (value instanceof Number)</span>
+<span class="nc" id="L291">            return ((Number) value).byteValue();</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        else if (value instanceof Boolean)</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">            return ((boolean) value) ? (byte) 1 : (byte) 0;</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        else if (value instanceof String)</span>
+<span class="nc" id="L295">            return Byte.parseByte((String) value);</span>
+        else
+<span class="nc" id="L297">            throw new DataException(&quot;Unexpected type in Cast transformation: &quot; + value.getClass());</span>
+    }
+
+    private static short castToInt16(Object value) {
+<span class="nc bnc" id="L301" title="All 2 branches missed.">        if (value instanceof Number)</span>
+<span class="nc" id="L302">            return ((Number) value).shortValue();</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        else if (value instanceof Boolean)</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">            return ((boolean) value) ? (short) 1 : (short) 0;</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">        else if (value instanceof String)</span>
+<span class="nc" id="L306">            return Short.parseShort((String) value);</span>
+        else
+<span class="nc" id="L308">            throw new DataException(&quot;Unexpected type in Cast transformation: &quot; + value.getClass());</span>
+    }
+
+    private static int castToInt32(Object value) {
+<span class="nc bnc" id="L312" title="All 2 branches missed.">        if (value instanceof Number)</span>
+<span class="nc" id="L313">            return ((Number) value).intValue();</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        else if (value instanceof Boolean)</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            return ((boolean) value) ? 1 : 0;</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        else if (value instanceof String)</span>
+<span class="nc" id="L317">            return Integer.parseInt((String) value);</span>
+        else
+<span class="nc" id="L319">            throw new DataException(&quot;Unexpected type in Cast transformation: &quot; + value.getClass());</span>
+    }
+
+    private static long castToInt64(Object value) {
+<span class="nc bnc" id="L323" title="All 2 branches missed.">        if (value instanceof Number)</span>
+<span class="nc" id="L324">            return ((Number) value).longValue();</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        else if (value instanceof Boolean)</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">            return ((boolean) value) ? (long) 1 : (long) 0;</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">        else if (value instanceof String)</span>
+<span class="nc" id="L328">            return Long.parseLong((String) value);</span>
+        else
+<span class="nc" id="L330">            throw new DataException(&quot;Unexpected type in Cast transformation: &quot; + value.getClass());</span>
+    }
+
+    private static float castToFloat32(Object value) {
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        if (value instanceof Number)</span>
+<span class="nc" id="L335">            return ((Number) value).floatValue();</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        else if (value instanceof Boolean)</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">            return ((boolean) value) ? 1.f : 0.f;</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        else if (value instanceof String)</span>
+<span class="nc" id="L339">            return Float.parseFloat((String) value);</span>
+        else
+<span class="nc" id="L341">            throw new DataException(&quot;Unexpected type in Cast transformation: &quot; + value.getClass());</span>
+    }
+
+    private static double castToFloat64(Object value) {
+<span class="nc bnc" id="L345" title="All 2 branches missed.">        if (value instanceof Number)</span>
+<span class="nc" id="L346">            return ((Number) value).doubleValue();</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        else if (value instanceof Boolean)</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            return ((boolean) value) ? 1. : 0.;</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">        else if (value instanceof String)</span>
+<span class="nc" id="L350">            return Double.parseDouble((String) value);</span>
+        else
+<span class="nc" id="L352">            throw new DataException(&quot;Unexpected type in Cast transformation: &quot; + value.getClass());</span>
+    }
+
+    private static boolean castToBoolean(Object value) {
+<span class="nc bnc" id="L356" title="All 2 branches missed.">        if (value instanceof Number)</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">            return ((Number) value).longValue() != 0L;</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        else if (value instanceof Boolean)</span>
+<span class="nc" id="L359">            return (Boolean) value;</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        else if (value instanceof String)</span>
+<span class="nc" id="L361">            return Boolean.parseBoolean((String) value);</span>
+        else
+<span class="nc" id="L363">            throw new DataException(&quot;Unexpected type in Cast transformation: &quot; + value.getClass());</span>
+    }
+
+    private static String castToString(Object value) {
+<span class="nc bnc" id="L367" title="All 2 branches missed.">        if (value instanceof java.util.Date dateValue) {</span>
+<span class="nc" id="L368">            return Values.dateFormatFor(dateValue).format(dateValue);</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">        } else if (value instanceof ByteBuffer byteBuffer) {</span>
+<span class="nc" id="L370">            return Base64.getEncoder().encodeToString(Utils.readBytes(byteBuffer));</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">        } else if (value instanceof byte[] rawBytes) {</span>
+<span class="nc" id="L372">            return Base64.getEncoder().encodeToString(rawBytes);</span>
+        } else {
+<span class="nc" id="L374">            return value.toString();</span>
+        }
+    }
+
+    protected abstract Schema operatingSchema(R record);
+
+    protected abstract Object operatingValue(R record);
+
+    protected abstract R newRecord(R record, Schema updatedSchema, Object updatedValue);
+
+    private static Map&lt;String, Schema.Type&gt; parseFieldTypes(List&lt;String&gt; mappings) {
+<span class="nc" id="L385">        final Map&lt;String, Schema.Type&gt; m = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L386">        boolean isWholeValueCast = false;</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">        for (String mapping : mappings) {</span>
+<span class="nc" id="L388">            final String[] parts = mapping.split(&quot;:&quot;);</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            if (parts.length &gt; 2) {</span>
+<span class="nc" id="L390">                throw new ConfigException(ReplaceField.ConfigName.RENAMES, mappings, &quot;Invalid rename mapping: &quot; + mapping);</span>
+            }
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            if (parts.length == 1) {</span>
+                Schema.Type targetType;
+                try {
+<span class="nc" id="L395">                    targetType = Schema.Type.valueOf(parts[0].trim().toUpperCase(Locale.ROOT));</span>
+<span class="nc" id="L396">                } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L397">                    throw new ConfigException(&quot;Invalid type found in casting spec: &quot; + parts[0].trim(), e);</span>
+<span class="nc" id="L398">                }</span>
+<span class="nc" id="L399">                m.put(WHOLE_VALUE_CAST, validCastType(targetType, FieldType.OUTPUT));</span>
+<span class="nc" id="L400">                isWholeValueCast = true;</span>
+<span class="nc" id="L401">            } else {</span>
+                Schema.Type type;
+                try {
+<span class="nc" id="L404">                    type = Schema.Type.valueOf(parts[1].trim().toUpperCase(Locale.ROOT));</span>
+<span class="nc" id="L405">                } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L406">                    throw new ConfigException(&quot;Invalid type found in casting spec: &quot; + parts[1].trim(), e);</span>
+<span class="nc" id="L407">                }</span>
+<span class="nc" id="L408">                m.put(parts[0].trim(), validCastType(type, FieldType.OUTPUT));</span>
+            }
+<span class="nc" id="L410">        }</span>
+<span class="nc bnc" id="L411" title="All 4 branches missed.">        if (isWholeValueCast &amp;&amp; mappings.size() &gt; 1) {</span>
+<span class="nc" id="L412">            throw new ConfigException(&quot;Cast transformations that specify a type to cast the entire value to &quot;</span>
+                    + &quot;may only specify a single cast in their spec&quot;);
+        }
+<span class="nc" id="L415">        return m;</span>
+    }
+
+<span class="nc" id="L418">    private enum FieldType {</span>
+<span class="nc" id="L419">        INPUT, OUTPUT</span>
+    }
+
+    private static Schema.Type validCastType(Schema.Type type, FieldType fieldType) {
+<span class="nc bnc" id="L423" title="All 3 branches missed.">        switch (fieldType) {</span>
+            case INPUT:
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                if (!SUPPORTED_CAST_INPUT_TYPES.contains(type)) {</span>
+<span class="nc" id="L426">                    throw new DataException(&quot;Cast transformation does not support casting from &quot; +</span>
+                        type + &quot;; supported types are &quot; + SUPPORTED_CAST_INPUT_TYPES);
+                }
+                break;
+            case OUTPUT:
+<span class="nc bnc" id="L431" title="All 2 branches missed.">                if (!SUPPORTED_CAST_OUTPUT_TYPES.contains(type)) {</span>
+<span class="nc" id="L432">                    throw new ConfigException(&quot;Cast transformation does not support casting to &quot; +</span>
+                        type + &quot;; supported types are &quot; + SUPPORTED_CAST_OUTPUT_TYPES);
+                }
+                break;
+        }
+<span class="nc" id="L437">        return type;</span>
+    }
+
+<span class="fc" id="L440">    public static final class Key&lt;R extends ConnectRecord&lt;R&gt;&gt; extends Cast&lt;R&gt; {</span>
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L443">            return record.keySchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L448">            return record.key();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue) {
+<span class="nc" id="L453">            return record.newRecord(record.topic(), record.kafkaPartition(), updatedSchema, updatedValue, record.valueSchema(), record.value(), record.timestamp());</span>
+        }
+    }
+
+<span class="fc" id="L457">    public static final class Value&lt;R extends ConnectRecord&lt;R&gt;&gt; extends Cast&lt;R&gt; {</span>
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L460">            return record.valueSchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L465">            return record.value();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue) {
+<span class="nc" id="L470">            return record.newRecord(record.topic(), record.kafkaPartition(), record.keySchema(), record.key(), updatedSchema, updatedValue, record.timestamp());</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,1025 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RocksDBVersionedStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">RocksDBVersionedStore.java</span></div><h1>RocksDBVersionedStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.errors.InvalidStateStoreException;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.processor.internals.ChangelogRecordDeserializationHelper;
+import org.apache.kafka.streams.processor.internals.InternalProcessorContext;
+import org.apache.kafka.streams.processor.internals.ProcessorContextUtils;
+import org.apache.kafka.streams.processor.internals.RecordBatchingStateRestoreCallback;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+import org.apache.kafka.streams.processor.internals.metrics.TaskMetrics;
+import org.apache.kafka.streams.query.Position;
+import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.Query;
+import org.apache.kafka.streams.query.QueryConfig;
+import org.apache.kafka.streams.query.QueryResult;
+import org.apache.kafka.streams.query.ResultOrder;
+import org.apache.kafka.streams.state.VersionedKeyValueStore;
+import org.apache.kafka.streams.state.VersionedRecord;
+import org.apache.kafka.streams.state.VersionedRecordIterator;
+import org.apache.kafka.streams.state.internals.RocksDBVersionedStoreSegmentValueFormatter.SegmentValue;
+import org.apache.kafka.streams.state.internals.RocksDBVersionedStoreSegmentValueFormatter.SegmentValue.SegmentSearchResult;
+import org.apache.kafka.streams.state.internals.metrics.RocksDBMetricsRecorder;
+
+import org.rocksdb.RocksDBException;
+import org.rocksdb.WriteBatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+import static org.apache.kafka.streams.StreamsConfig.InternalConfig.IQ_CONSISTENCY_OFFSET_VECTOR_ENABLED;
+import static org.apache.kafka.streams.state.internals.RocksDBStore.DB_FILE_DIR;
+
+/**
+ * A persistent, versioned key-value store based on RocksDB.
+ * &lt;p&gt;
+ * This store implementation consists of a &quot;latest value store&quot; and &quot;segment stores.&quot; The latest
+ * record version for each key is stored in the latest value store, while older record versions
+ * are stored in the segment stores. Conceptually, each record version has two associated
+ * timestamps:
+ * &lt;ul&gt;
+ *     &lt;li&gt;a {@code validFrom} timestamp. This timestamp is explicitly associated with the record
+ *     as part of the {@link VersionedKeyValueStore#put(Object, Object, long)}} call to the store;
+ *     i.e., this is the record's timestamp.&lt;/li&gt;
+ *     &lt;li&gt;a {@code validTo} timestamp. This is the timestamp of the next record (or deletion)
+ *     associated with the same key, and is implicitly associated with the record. This timestamp
+ *     can change as new records are inserted into the store.&lt;/li&gt;
+ * &lt;/ul&gt;
+ * The validity interval of a record is from validFrom (inclusive) to validTo (exclusive), and
+ * can change as new record versions are inserted into the store (and validTo changes as a result).
+ * &lt;p&gt;
+ * Old record versions are stored in segment stores according to their validTo timestamps. This
+ * allows for efficient expiry of old record versions, as entire segments can be dropped from the
+ * store at a time, once the records contained in the segment are no longer relevant based on the
+ * store's history retention (for an explanation of &quot;history retention&quot;, see
+ * {@link VersionedKeyValueStore}). Multiple record versions (for the same key) within a single
+ * segment are stored together using the format specified in {@link RocksDBVersionedStoreSegmentValueFormatter}.
+ */
+public class RocksDBVersionedStore implements VersionedKeyValueStore&lt;Bytes, byte[]&gt; {
+<span class="nc" id="L90">    private static final Logger LOG = LoggerFactory.getLogger(RocksDBVersionedStore.class);</span>
+    // a marker to indicate that no record version has yet been found as part of an ongoing
+    // put() procedure. any value which is not a valid record timestamp will do.
+    private static final long SENTINEL_TIMESTAMP = Long.MIN_VALUE;
+
+    private final String name;
+    private final long historyRetention;
+    private final long gracePeriod;
+    private final RocksDBMetricsRecorder metricsRecorder;
+
+    private final LogicalKeyValueSegment latestValueStore; // implemented as a &quot;reserved segment&quot; of the segments store
+    private final LogicalKeyValueSegments segmentStores;
+    private final RocksDBVersionedStoreClient versionedStoreClient;
+    private final RocksDBVersionedStoreRestoreWriteBuffer restoreWriteBuffer;
+
+    private InternalProcessorContext&lt;?, ?&gt; internalProcessorContext;
+    private Sensor expiredRecordSensor;
+<span class="nc" id="L107">    private long observedStreamTime = ConsumerRecord.NO_TIMESTAMP;</span>
+<span class="nc" id="L108">    private boolean consistencyEnabled = false;</span>
+    private Position position;
+    private volatile boolean open;
+
+<span class="nc" id="L112">    RocksDBVersionedStore(final String name, final String metricsScope, final long historyRetention, final long segmentInterval) {</span>
+<span class="nc" id="L113">        this.name = name;</span>
+<span class="nc" id="L114">        this.historyRetention = historyRetention;</span>
+        // history retention doubles as grace period for now. could be nice to allow users to
+        // configure the two separately in the future. if/when we do, we should enforce that
+        // history retention &gt;= grace period, for sound semantics.
+<span class="nc" id="L118">        this.gracePeriod = historyRetention;</span>
+<span class="nc" id="L119">        this.metricsRecorder = new RocksDBMetricsRecorder(metricsScope, name);</span>
+        // pass store name as segments name so state dir subdirectory uses the store name
+<span class="nc" id="L121">        this.segmentStores = new LogicalKeyValueSegments(name, DB_FILE_DIR, historyRetention, segmentInterval, metricsRecorder);</span>
+<span class="nc" id="L122">        this.latestValueStore = this.segmentStores.createReservedSegment(-1L, latestValueStoreName(name));</span>
+<span class="nc" id="L123">        this.versionedStoreClient = new RocksDBVersionedStoreClient();</span>
+<span class="nc" id="L124">        this.restoreWriteBuffer = new RocksDBVersionedStoreRestoreWriteBuffer(versionedStoreClient);</span>
+<span class="nc" id="L125">    }</span>
+
+    @Override
+    public long put(final Bytes key, final byte[] value, final long timestamp) {
+<span class="nc" id="L129">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L130">        validateStoreOpen();</span>
+
+<span class="nc" id="L132">        synchronized (position) {</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">            if (timestamp &lt; observedStreamTime - gracePeriod) {</span>
+<span class="nc" id="L134">                expiredRecordSensor.record(1.0d, internalProcessorContext.currentSystemTimeMs());</span>
+<span class="nc" id="L135">                LOG.warn(&quot;Skipping record for expired put.&quot;);</span>
+<span class="nc" id="L136">                StoreQueryUtils.updatePosition(position, internalProcessorContext);</span>
+<span class="nc" id="L137">                return PUT_RETURN_CODE_NOT_PUT;</span>
+            }
+<span class="nc" id="L139">            observedStreamTime = Math.max(observedStreamTime, timestamp);</span>
+
+<span class="nc" id="L141">            final long foundTs = doPut(</span>
+                versionedStoreClient,
+                observedStreamTime,
+                key,
+                value,
+                timestamp
+            );
+
+<span class="nc" id="L149">            StoreQueryUtils.updatePosition(position, internalProcessorContext);</span>
+
+<span class="nc" id="L151">            return foundTs;</span>
+        }
+    }
+
+    @Override
+    public VersionedRecord&lt;byte[]&gt; delete(final Bytes key, final long timestamp) {
+<span class="nc" id="L157">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L158">        validateStoreOpen();</span>
+
+<span class="nc" id="L160">        synchronized (position) {</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">            if (timestamp &lt; observedStreamTime - gracePeriod) {</span>
+<span class="nc" id="L162">                expiredRecordSensor.record(1.0d, internalProcessorContext.currentSystemTimeMs());</span>
+<span class="nc" id="L163">                LOG.warn(&quot;Skipping record for expired delete.&quot;);</span>
+<span class="nc" id="L164">                return null;</span>
+            }
+
+<span class="nc" id="L167">            final VersionedRecord&lt;byte[]&gt; existingRecord = get(key, timestamp);</span>
+
+<span class="nc" id="L169">            observedStreamTime = Math.max(observedStreamTime, timestamp);</span>
+<span class="nc" id="L170">            doPut(</span>
+                versionedStoreClient,
+                observedStreamTime,
+                key,
+                null,
+                timestamp
+            );
+
+<span class="nc" id="L178">            StoreQueryUtils.updatePosition(position, internalProcessorContext);</span>
+
+<span class="nc" id="L180">            return existingRecord;</span>
+        }
+    }
+
+    @Override
+    public VersionedRecord&lt;byte[]&gt; get(final Bytes key) {
+<span class="nc" id="L186">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L187">        validateStoreOpen();</span>
+
+        // latest value (if present) is guaranteed to be in the latest value store
+<span class="nc" id="L190">        final byte[] rawLatestValueAndTimestamp = latestValueStore.get(key);</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        if (rawLatestValueAndTimestamp != null) {</span>
+<span class="nc" id="L192">            return new VersionedRecord&lt;&gt;(</span>
+<span class="nc" id="L193">                LatestValueFormatter.value(rawLatestValueAndTimestamp),</span>
+<span class="nc" id="L194">                LatestValueFormatter.timestamp(rawLatestValueAndTimestamp)</span>
+            );
+        } else {
+<span class="nc" id="L197">            return null;</span>
+        }
+    }
+
+    @Override
+    public VersionedRecord&lt;byte[]&gt; get(final Bytes key, final long asOfTimestamp) {
+<span class="nc" id="L203">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L204">        validateStoreOpen();</span>
+
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        if (asOfTimestamp &lt; observedStreamTime - historyRetention) {</span>
+            // history retention exceeded. we still check the latest value store in case the
+            // latest record version satisfies the timestamp bound, in which case it should
+            // still be returned (i.e., the latest record version per key never expires).
+<span class="nc" id="L210">            final byte[] rawLatestValueAndTimestamp = latestValueStore.get(key);</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">            if (rawLatestValueAndTimestamp != null) {</span>
+<span class="nc" id="L212">                final long latestTimestamp = LatestValueFormatter.timestamp(rawLatestValueAndTimestamp);</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">                if (latestTimestamp &lt;= asOfTimestamp) {</span>
+                    // latest value satisfies timestamp bound
+<span class="nc" id="L215">                    return new VersionedRecord&lt;&gt;(</span>
+<span class="nc" id="L216">                        LatestValueFormatter.value(rawLatestValueAndTimestamp),</span>
+                        latestTimestamp
+                    );
+                }
+            }
+
+            // history retention has elapsed and the latest record version (if present) does
+            // not satisfy the timestamp bound. return null for predictability, even if data
+            // is still present in segments.
+<span class="nc" id="L225">            LOG.warn(&quot;Returning null for expired get.&quot;);</span>
+<span class="nc" id="L226">            return null;</span>
+        }
+
+        // first check the latest value store
+<span class="nc" id="L230">        final byte[] rawLatestValueAndTimestamp = latestValueStore.get(key);</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">        if (rawLatestValueAndTimestamp != null) {</span>
+<span class="nc" id="L232">            final long latestTimestamp = LatestValueFormatter.timestamp(rawLatestValueAndTimestamp);</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">            if (latestTimestamp &lt;= asOfTimestamp) {</span>
+<span class="nc" id="L234">                return new VersionedRecord&lt;&gt;(LatestValueFormatter.value(rawLatestValueAndTimestamp), latestTimestamp);</span>
+            }
+        }
+
+        // check segment stores
+<span class="nc" id="L239">        final List&lt;LogicalKeyValueSegment&gt; segments = segmentStores.segments(asOfTimestamp, Long.MAX_VALUE, false);</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        for (final LogicalKeyValueSegment segment : segments) {</span>
+<span class="nc" id="L241">            final byte[] rawSegmentValue = segment.get(key);</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">            if (rawSegmentValue != null) {</span>
+<span class="nc" id="L243">                final long nextTs = RocksDBVersionedStoreSegmentValueFormatter.nextTimestamp(rawSegmentValue);</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">                if (nextTs &lt;= asOfTimestamp) {</span>
+                    // this segment contains no data for the queried timestamp, so earlier segments
+                    // cannot either
+<span class="nc" id="L247">                    return null;</span>
+                }
+
+<span class="nc bnc" id="L250" title="All 2 branches missed.">                if (RocksDBVersionedStoreSegmentValueFormatter.minTimestamp(rawSegmentValue) &gt; asOfTimestamp) {</span>
+                    // the segment only contains data for after the queried timestamp. skip and
+                    // continue the search to earlier segments. as an optimization, this code
+                    // could be updated to skip forward to the segment containing the minTimestamp
+                    // in the if-condition above.
+<span class="nc" id="L255">                    continue;</span>
+                }
+
+                // the desired result is contained in this segment
+<span class="nc" id="L259">                final SegmentSearchResult searchResult =</span>
+                        RocksDBVersionedStoreSegmentValueFormatter
+<span class="nc" id="L261">                                .deserialize(rawSegmentValue)</span>
+<span class="nc" id="L262">                                .find(asOfTimestamp, true);</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">                if (searchResult.value() != null) {</span>
+<span class="nc" id="L264">                    return new VersionedRecord&lt;&gt;(searchResult.value(), searchResult.validFrom(), searchResult.validTo());</span>
+                } else {
+<span class="nc" id="L266">                    return null;</span>
+                }
+            }
+<span class="nc" id="L269">        }</span>
+
+        // checked all segments and no results found
+<span class="nc" id="L272">        return null;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    VersionedRecordIterator&lt;byte[]&gt; get(final Bytes key, final long fromTimestamp, final long toTimestamp, final ResultOrder order) {
+<span class="nc" id="L277">        validateStoreOpen();</span>
+
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        if (toTimestamp &lt; observedStreamTime - historyRetention) {</span>
+            // history retention exceeded. we still check the latest value store in case the
+            // latest record version satisfies the timestamp bound, in which case it should
+            // still be returned (i.e., the latest record version per key never expires).
+<span class="nc" id="L283">            return new LogicalSegmentIterator(Collections.singletonList(latestValueStore).listIterator(), key, fromTimestamp, toTimestamp, order);</span>
+        } else {
+<span class="nc" id="L285">            final List&lt;LogicalKeyValueSegment&gt; segments = new ArrayList&lt;&gt;();</span>
+            // add segment stores
+            // consider the search lower bound as -INF (LONG.MIN_VALUE) to find the record that has been inserted before the {@code fromTimestamp}
+            // but is still valid in query specified time interval.
+<span class="nc bnc" id="L289" title="All 2 branches missed.">            if (order.equals(ResultOrder.ASCENDING)) {</span>
+<span class="nc" id="L290">                segments.addAll(segmentStores.segments(Long.MIN_VALUE, toTimestamp, true));</span>
+<span class="nc" id="L291">                segments.add(latestValueStore);</span>
+            } else {
+<span class="nc" id="L293">                segments.add(latestValueStore);</span>
+<span class="nc" id="L294">                segments.addAll(segmentStores.segments(Long.MIN_VALUE, toTimestamp, false));</span>
+            }
+<span class="nc" id="L296">            return new LogicalSegmentIterator(segments.listIterator(), key, fromTimestamp, toTimestamp, order);</span>
+        }
+    }
+
+    @Override
+    public String name() {
+<span class="nc" id="L302">        return name;</span>
+    }
+
+    @Override
+    public void commit(final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc" id="L307">        segmentStores.commit(changelogOffsets);</span>
+        // committing segments store includes committing latest value store, since they share the
+        // same physical RocksDB instance
+<span class="nc" id="L310">    }</span>
+
+    @SuppressWarnings(&quot;deprecation&quot;)
+    @Override
+    public boolean managesOffsets() {
+<span class="nc" id="L315">        return segmentStores.managesOffsets();</span>
+    }
+
+    @Override
+    public Long committedOffset(final TopicPartition partition) {
+<span class="nc" id="L320">        return segmentStores.committedOffset(partition);</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L325">        open = false;</span>
+
+<span class="nc" id="L327">        segmentStores.close();</span>
+        // closing segments store includes closing latest value store, since they share the
+        // same physical RocksDB instance
+<span class="nc" id="L330">    }</span>
+
+    @Override
+    public &lt;R&gt; QueryResult&lt;R&gt; query(
+            final Query&lt;R&gt; query,
+            final PositionBound positionBound,
+            final QueryConfig config) {
+<span class="nc" id="L337">        return StoreQueryUtils.handleBasicQueries(</span>
+            query,
+            positionBound,
+            config,
+            this,
+            position,
+            internalProcessorContext
+        );
+    }
+
+    @Override
+    public boolean persistent() {
+<span class="nc" id="L349">        return true;</span>
+    }
+
+    @Override
+    public boolean isOpen() {
+<span class="nc" id="L354">        return open;</span>
+    }
+
+    @Override
+    public Position getPosition() {
+<span class="nc" id="L359">        return position;</span>
+    }
+
+    @Override
+    public void init(final StateStoreContext stateStoreContext, final StateStore root) {
+<span class="nc" id="L364">        this.internalProcessorContext = ProcessorContextUtils.asInternalProcessorContext(stateStoreContext);</span>
+
+<span class="nc" id="L366">        final StreamsMetricsImpl metrics = ProcessorContextUtils.metricsImpl(stateStoreContext);</span>
+<span class="nc" id="L367">        final String threadId = Thread.currentThread().getName();</span>
+<span class="nc" id="L368">        final String taskName = stateStoreContext.taskId().toString();</span>
+
+<span class="nc" id="L370">        expiredRecordSensor = TaskMetrics.droppedRecordsSensor(</span>
+                threadId,
+                taskName,
+                metrics
+        );
+
+<span class="nc" id="L376">        metricsRecorder.init(ProcessorContextUtils.metricsImpl(stateStoreContext), stateStoreContext.taskId());</span>
+
+<span class="nc" id="L378">        segmentStores.openExisting(internalProcessorContext, observedStreamTime);</span>
+<span class="nc" id="L379">        this.position = segmentStores.position;</span>
+<span class="nc" id="L380">        StoreQueryUtils.maybeMigrateExistingPositionFile(stateStoreContext.stateDir(), name(), this.position);</span>
+
+        // register and possibly restore the state from the logs
+<span class="nc" id="L383">        stateStoreContext.register(</span>
+                root,
+                (RecordBatchingStateRestoreCallback) RocksDBVersionedStore.this::restoreBatch,
+<span class="nc" id="L386">                segmentStores::writePosition</span>
+        );
+
+<span class="nc" id="L389">        open = true;</span>
+
+<span class="nc" id="L391">        consistencyEnabled = StreamsConfig.InternalConfig.getBoolean(</span>
+<span class="nc" id="L392">                stateStoreContext.appConfigs(),</span>
+                IQ_CONSISTENCY_OFFSET_VECTOR_ENABLED,
+                false
+        );
+<span class="nc" id="L396">    }</span>
+
+    // VisibleForTesting
+    void restoreBatch(final Collection&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; records) {
+
+        // compute the observed stream time at the end of the restore batch, in order to speed up
+        // restore by not bothering to read from/write to segments which will have expired by the
+        // time the restoration process is complete.
+<span class="nc" id="L404">        long endOfBatchStreamTime = observedStreamTime;</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        for (final ConsumerRecord&lt;byte[], byte[]&gt; record : records) {</span>
+<span class="nc" id="L406">            endOfBatchStreamTime = Math.max(endOfBatchStreamTime, record.timestamp());</span>
+<span class="nc" id="L407">        }</span>
+
+<span class="nc" id="L409">        final VersionedStoreClient&lt;?&gt; restoreClient = restoreWriteBuffer.getClient();</span>
+
+        // note: there is increased risk for hitting an out-of-memory during this restore loop,
+        // compared to for non-versioned key-value stores, because this versioned store
+        // implementation stores multiple records (for the same key) together in a single RocksDB
+        // &quot;segment&quot; entry -- restoring a single changelog entry could require loading multiple
+        // records into memory. how high this memory amplification will be is very much dependent
+        // on the specific workload and the value of the &quot;segment interval&quot; parameter.
+<span class="nc" id="L417">        synchronized (position) {</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">            for (final ConsumerRecord&lt;byte[], byte[]&gt; record : records) {</span>
+<span class="nc bnc" id="L419" title="All 2 branches missed.">                if (record.timestamp() &lt; observedStreamTime - gracePeriod) {</span>
+                    // record is older than grace period and was therefore never written to the store
+<span class="nc" id="L421">                    continue;</span>
+                }
+                // advance observed stream time as usual, for use in deciding whether records have
+                // exceeded the store's grace period and should be dropped.
+<span class="nc" id="L425">                observedStreamTime = Math.max(observedStreamTime, record.timestamp());</span>
+
+<span class="nc" id="L427">                ChangelogRecordDeserializationHelper.applyChecksAndUpdatePosition(</span>
+                    record,
+                    consistencyEnabled,
+                    position
+                );
+
+                // put records to write buffer
+<span class="nc" id="L434">                doPut(</span>
+                    restoreClient,
+                    endOfBatchStreamTime,
+<span class="nc" id="L437">                    new Bytes(record.key()),</span>
+<span class="nc" id="L438">                    record.value(),</span>
+<span class="nc" id="L439">                    record.timestamp()</span>
+                );
+<span class="nc" id="L441">            }</span>
+
+            try {
+<span class="nc" id="L444">                restoreWriteBuffer.flush();</span>
+<span class="nc" id="L445">            } catch (final RocksDBException e) {</span>
+<span class="nc" id="L446">                throw new ProcessorStateException(&quot;Error restoring batch to store &quot; + name, e);</span>
+<span class="nc" id="L447">            }</span>
+<span class="nc" id="L448">        }</span>
+
+<span class="nc" id="L450">    }</span>
+
+    private void validateStoreOpen() {
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        if (!open) {</span>
+<span class="nc" id="L454">            throw new InvalidStateStoreException(&quot;Store &quot; + name + &quot; is currently closed&quot;);</span>
+        }
+<span class="nc" id="L456">    }</span>
+
+    /**
+     * Generic interface for segment stores. See {@link VersionedStoreClient} for use.
+     */
+    interface VersionedStoreSegment {
+
+        /**
+         * @return segment id
+         */
+        long id();
+
+        void put(Bytes key, byte[] value);
+
+        byte[] get(Bytes key);
+    }
+
+    /**
+     * Extracts all operations required for writing to the versioned store (via
+     * {@link #put(Bytes, byte[], long)}) into a generic client interface, so that the same
+     * {@code put(...)} logic can be shared during regular store operation and during restore.
+     *
+     * @param &lt;T&gt; the segment type used by this client
+     */
+    interface VersionedStoreClient&lt;T extends VersionedStoreSegment&gt; {
+
+        /**
+         * @return the contents of the latest value store, for the given key
+         */
+        byte[] latestValue(Bytes key);
+
+        /**
+         * Puts the provided key and value into the latest value store.
+         */
+        void putLatestValue(Bytes key, byte[] value);
+
+        /**
+         * Deletes the existing value (if any) from the latest value store, for the given key.
+         */
+        void deleteLatestValue(Bytes key);
+
+        /**
+         * @return the segment with the provided id, or {@code null} if the segment is expired
+         */
+        T getOrCreateSegmentIfLive(long segmentId, StateStoreContext context, long streamTime);
+
+        /**
+         * @return all segments in the store which contain timestamps at least the provided
+         * timestamp bound, in reverse order by segment id (and time), i.e., such that
+         * the most recent segment is first
+         */
+        List&lt;T&gt; reversedSegments(long timestampFrom);
+
+        /**
+         * @return the segment id associated with the provided timestamp
+         */
+        long segmentIdForTimestamp(long timestamp);
+    }
+
+    /**
+     * Client for writing into (and reading from) this persistent {@link RocksDBVersionedStore}.
+     */
+<span class="nc" id="L518">    class RocksDBVersionedStoreClient implements VersionedStoreClient&lt;LogicalKeyValueSegment&gt; {</span>
+
+        @Override
+        public byte[] latestValue(final Bytes key) {
+<span class="nc" id="L522">            return latestValueStore.get(key);</span>
+        }
+
+        @Override
+        public void putLatestValue(final Bytes key, final byte[] value) {
+<span class="nc" id="L527">            latestValueStore.put(key, value);</span>
+<span class="nc" id="L528">        }</span>
+
+        @Override
+        public void deleteLatestValue(final Bytes key) {
+<span class="nc" id="L532">            latestValueStore.delete(key);</span>
+<span class="nc" id="L533">        }</span>
+
+        @Override
+        public LogicalKeyValueSegment getOrCreateSegmentIfLive(final long segmentId, final StateStoreContext context, final long streamTime) {
+<span class="nc" id="L537">            return segmentStores.getOrCreateSegmentIfLive(segmentId, context, streamTime);</span>
+        }
+
+        @Override
+        public List&lt;LogicalKeyValueSegment&gt; reversedSegments(final long timestampFrom) {
+<span class="nc" id="L542">            return segmentStores.segments(timestampFrom, Long.MAX_VALUE, false);</span>
+        }
+
+        @Override
+        public long segmentIdForTimestamp(final long timestamp) {
+<span class="nc" id="L547">            return segmentStores.segmentId(timestamp);</span>
+        }
+
+        /**
+         * Adds the provided record into the provided batch, in preparation for writing into the
+         * latest value store.
+         * &lt;p&gt;
+         * Together with {@link #writeLatestValues(WriteBatch)}, this method supports batch writes
+         * into the latest value store.
+         *
+         * @throws RocksDBException if a failure occurs adding the record to the {@link WriteBatch}
+         */
+        public void addToLatestValueBatch(final KeyValue&lt;byte[], byte[]&gt; record, final WriteBatch batch) throws RocksDBException {
+<span class="nc" id="L560">            latestValueStore.addToBatch(record, batch);</span>
+<span class="nc" id="L561">        }</span>
+
+        /**
+         * Writes the provided batch of records into the latest value store.
+         * &lt;p&gt;
+         * Together with {@link #addToLatestValueBatch(KeyValue, WriteBatch)}, this method supports
+         * batch writes into the latest value store.
+         *
+         * @throws RocksDBException if a failure occurs while writing the {@link WriteBatch} to the store
+         */
+        public void writeLatestValues(final WriteBatch batch) throws RocksDBException {
+<span class="nc" id="L572">            latestValueStore.write(batch);</span>
+<span class="nc" id="L573">        }</span>
+    }
+
+    /**
+     * Helper method shared between put and restore.
+     * &lt;p&gt;
+     * This method does not check whether the record being put is expired based on grace period
+     * or not; that is the caller's responsibility. This method does, however, check whether the
+     * record is expired based on history retention, by using the current
+     * {@code observedStreamTime}, and returns without inserting into the store if so. It can be
+     * possible that a record is not expired based on grace period but is expired based on
+     * history retention, even though history retention is always at least the grace period,
+     * during restore because restore advances {@code observedStreamTime} to the largest timestamp
+     * in the entire restore batch at the beginning of restore, in order to optimize for not
+     * putting records into the store which will have expired by the end of the restore.
+     */
+    private &lt;T extends VersionedStoreSegment&gt; long doPut(
+            final VersionedStoreClient&lt;T&gt; versionedStoreClient,
+            final long observedStreamTime,
+            final Bytes key,
+            final byte[] value,
+            final long timestamp
+    ) {
+<span class="nc" id="L596">        segmentStores.cleanupExpiredSegments(observedStreamTime);</span>
+
+        // track the smallest timestamp seen so far that is larger than insertion timestamp.
+        // this timestamp determines, based on all segments searched so far, which segment the
+        // new record should be inserted into.
+        long foundTs;
+
+        // check latest value store
+<span class="nc" id="L604">        PutStatus status = maybePutToLatestValueStore(</span>
+                versionedStoreClient,
+                observedStreamTime,
+                key,
+                value,
+                timestamp
+        );
+<span class="nc bnc" id="L611" title="All 2 branches missed.">        if (status.isComplete) {</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">            return status.foundTs == SENTINEL_TIMESTAMP ? PUT_RETURN_CODE_VALID_TO_UNDEFINED : status.foundTs;</span>
+        } else {
+<span class="nc" id="L614">            foundTs = status.foundTs;</span>
+        }
+
+        // continue search in segments
+<span class="nc" id="L618">        status = maybePutToSegments(</span>
+                versionedStoreClient,
+                observedStreamTime,
+                key,
+                value,
+                timestamp,
+                foundTs
+        );
+<span class="nc bnc" id="L626" title="All 2 branches missed.">        if (status.isComplete) {</span>
+<span class="nc bnc" id="L627" title="All 2 branches missed.">            return status.foundTs == SENTINEL_TIMESTAMP ? PUT_RETURN_CODE_VALID_TO_UNDEFINED : status.foundTs;</span>
+        } else {
+<span class="nc" id="L629">            foundTs = status.foundTs;</span>
+        }
+
+        // the record did not unconditionally belong in any specific store (latest value store
+        // or segments store). insert based on foundTs here instead.
+<span class="nc" id="L634">        foundTs = finishPut(</span>
+                versionedStoreClient,
+                observedStreamTime,
+                key,
+                value,
+                timestamp,
+                foundTs
+        );
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        return foundTs == SENTINEL_TIMESTAMP ? PUT_RETURN_CODE_VALID_TO_UNDEFINED : foundTs;</span>
+    }
+
+    /**
+     * Represents the status of an ongoing put() operation.
+     */
+    private static class PutStatus {
+
+        /**
+         * Whether the put() call has been completed.
+         */
+        final boolean isComplete;
+
+        /**
+         * The smallest timestamp seen so far, as part of this current put() operation, that is
+         * larger than insertion timestamp. This timestamp determines, based on all segments
+         * searched so far, which segment the new record should be inserted into.
+         */
+        final long foundTs;
+
+<span class="nc" id="L662">        PutStatus(final boolean isComplete, final long foundTs) {</span>
+<span class="nc" id="L663">            this.isComplete = isComplete;</span>
+<span class="nc" id="L664">            this.foundTs = foundTs;</span>
+<span class="nc" id="L665">        }</span>
+    }
+
+    private &lt;T extends VersionedStoreSegment&gt; PutStatus maybePutToLatestValueStore(
+            final VersionedStoreClient&lt;T&gt; versionedStoreClient,
+            final long observedStreamTime,
+            final Bytes key,
+            final byte[] value,
+            final long timestamp
+    ) {
+        // initialize with a starting &quot;sentinel timestamp&quot; which represents
+        // that the segment should be inserted into the latest value store.
+<span class="nc" id="L677">        long foundTs = SENTINEL_TIMESTAMP;</span>
+
+<span class="nc" id="L679">        final byte[] rawLatestValueAndTimestamp = versionedStoreClient.latestValue(key);</span>
+<span class="nc bnc" id="L680" title="All 2 branches missed.">        if (rawLatestValueAndTimestamp != null) {</span>
+<span class="nc" id="L681">            final long latestValueStoreTimestamp = LatestValueFormatter.timestamp(rawLatestValueAndTimestamp);</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">            if (timestamp &gt;= latestValueStoreTimestamp) {</span>
+                // new record belongs in the latest value store
+<span class="nc bnc" id="L684" title="All 2 branches missed.">                if (timestamp &gt; latestValueStoreTimestamp) {</span>
+                    // move existing latest value into segment.
+                    // it's important that this step happens before the update to the latest value
+                    // store. if there is a partial failure (this step succeeds but the update to
+                    // the latest value store fails), updating the segment first means there will
+                    // not be data loss. (rather, there will be duplicated data which is fine as
+                    // it can/will be reconciled later.)
+<span class="nc" id="L691">                    final long segmentId = versionedStoreClient.segmentIdForTimestamp(timestamp);</span>
+<span class="nc" id="L692">                    final T segment = versionedStoreClient.getOrCreateSegmentIfLive(segmentId, internalProcessorContext, observedStreamTime);</span>
+                    // `segment == null` implies that all data in the segment is older than the
+                    // history retention of this store, and therefore does not need to tracked.
+                    // as a result, we only need to move the existing record from the latest value
+                    // store into a segment if `segment != null`. (also, we do not call the
+                    // `expiredRecordSensor` in this case because the expired record sensor is only
+                    // called when the record being put is itself expired, which is not the case
+                    // here. only the existing record already present in the latest value store
+                    // is expired.) so, there is nothing to do for this step if `segment == null`,
+                    // but we do still update the latest value store with the new record below.
+<span class="nc bnc" id="L702" title="All 2 branches missed.">                    if (segment != null) {</span>
+<span class="nc" id="L703">                        final byte[] rawValueToMove = LatestValueFormatter.value(rawLatestValueAndTimestamp);</span>
+<span class="nc" id="L704">                        final byte[] rawSegmentValue = segment.get(key);</span>
+<span class="nc bnc" id="L705" title="All 2 branches missed.">                        if (rawSegmentValue == null) {</span>
+<span class="nc" id="L706">                            segment.put(</span>
+                                    key,
+                                    RocksDBVersionedStoreSegmentValueFormatter
+<span class="nc" id="L709">                                            .newSegmentValueWithRecord(rawValueToMove, latestValueStoreTimestamp, timestamp)</span>
+<span class="nc" id="L710">                                            .serialize()</span>
+                            );
+                        } else {
+<span class="nc" id="L713">                            final SegmentValue segmentValue = RocksDBVersionedStoreSegmentValueFormatter.deserialize(rawSegmentValue);</span>
+<span class="nc" id="L714">                            segmentValue.insertAsLatest(latestValueStoreTimestamp, timestamp, rawValueToMove);</span>
+<span class="nc" id="L715">                            segment.put(key, segmentValue.serialize());</span>
+                        }
+                    }
+                }
+
+                // update latest value store
+<span class="nc bnc" id="L721" title="All 2 branches missed.">                if (value != null) {</span>
+<span class="nc" id="L722">                    versionedStoreClient.putLatestValue(key, LatestValueFormatter.from(value, timestamp));</span>
+                } else {
+<span class="nc" id="L724">                    versionedStoreClient.deleteLatestValue(key);</span>
+                }
+<span class="nc" id="L726">                return new PutStatus(true, foundTs);</span>
+            } else {
+<span class="nc" id="L728">                foundTs = latestValueStoreTimestamp;</span>
+            }
+        }
+<span class="nc" id="L731">        return new PutStatus(false, foundTs);</span>
+    }
+
+    private &lt;T extends VersionedStoreSegment&gt; PutStatus maybePutToSegments(
+            final VersionedStoreClient&lt;T&gt; versionedStoreClient,
+            final long observedStreamTime,
+            final Bytes key,
+            final byte[] value,
+            final long timestamp,
+            final long prevFoundTs
+    ) {
+        // initialize with current foundTs value
+<span class="nc" id="L743">        long foundTs = prevFoundTs;</span>
+
+<span class="nc" id="L745">        final List&lt;T&gt; segments = versionedStoreClient.reversedSegments(timestamp);</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">        for (final T segment : segments) {</span>
+<span class="nc" id="L747">            final byte[] rawSegmentValue = segment.get(key);</span>
+<span class="nc bnc" id="L748" title="All 2 branches missed.">            if (rawSegmentValue != null) {</span>
+<span class="nc" id="L749">                final long foundNextTs = RocksDBVersionedStoreSegmentValueFormatter.nextTimestamp(rawSegmentValue);</span>
+<span class="nc bnc" id="L750" title="All 2 branches missed.">                if (foundNextTs &lt;= timestamp) {</span>
+                    // this segment (and all earlier segments) does not contain records affected by
+                    // this put. insert into the segment specified by foundTs (i.e., the next
+                    // phase of the put() procedure) and conclude the procedure.
+<span class="nc" id="L754">                    return new PutStatus(false, foundTs);</span>
+                }
+
+<span class="nc" id="L757">                final long foundMinTs = RocksDBVersionedStoreSegmentValueFormatter.minTimestamp(rawSegmentValue);</span>
+<span class="nc bnc" id="L758" title="All 2 branches missed.">                if (foundMinTs &lt;= timestamp) {</span>
+                    // the record being inserted belongs in this segment.
+                    // insert and conclude the procedure.
+<span class="nc" id="L761">                    foundTs = putToSegment(</span>
+                            versionedStoreClient,
+                            observedStreamTime,
+                            segment,
+                            rawSegmentValue,
+                            key,
+                            value,
+                            timestamp
+                    );
+<span class="nc" id="L770">                    return new PutStatus(true, foundTs);</span>
+                }
+
+<span class="nc bnc" id="L773" title="All 2 branches missed.">                if (foundMinTs &lt; observedStreamTime - historyRetention) {</span>
+                    // the record being inserted does not affect version history. discard and return.
+                    // this can happen during restore because individual put calls are executed after
+                    // observedStreamTime is fast-forwarded for the entire batch of records being
+                    // restored at once.
+<span class="nc" id="L778">                    return new PutStatus(true, PUT_RETURN_CODE_NOT_PUT);</span>
+                }
+
+                // it's possible the record belongs in this segment, but also possible it belongs
+                // in an earlier segment. mark as tentative and continue. as an optimization, this
+                // code could be updated to skip forward to the segment containing foundMinTs.
+<span class="nc" id="L784">                foundTs = foundMinTs;</span>
+            }
+<span class="nc" id="L786">        }</span>
+<span class="nc" id="L787">        return new PutStatus(false, foundTs);</span>
+    }
+
+    /**
+     * @return updated {@code foundTs} value, i.e., the validTo timestamp of the record being put
+     */
+    private &lt;T extends VersionedStoreSegment&gt; long putToSegment(
+            final VersionedStoreClient&lt;T&gt; versionedStoreClient,
+            final long observedStreamTime,
+            final T segment,
+            final byte[] rawSegmentValue,
+            final Bytes key,
+            final byte[] value,
+            final long timestamp
+    ) {
+<span class="nc" id="L802">        final long segmentIdForTimestamp = versionedStoreClient.segmentIdForTimestamp(timestamp);</span>
+        // it's possible that putting the current record into a segment will require moving an
+        // existing record from this segment into an older segment. this is because records belong
+        // in segments based on their validTo timestamps, and putting a new record into a segment
+        // updates the validTo timestamp for the previous record. the new validTo timestamp
+        // of the previous record will be the (validFrom) timestamp of the record being put.
+        // if this (validFrom) timestamp belongs in a different segment, then it may be required
+        // to move an existing record from this segment into an older one.
+<span class="nc bnc" id="L810" title="All 2 branches missed.">        final boolean writeToOlderSegmentMaybeNeeded = segmentIdForTimestamp != segment.id();</span>
+
+<span class="nc" id="L812">        final SegmentValue segmentValue = RocksDBVersionedStoreSegmentValueFormatter.deserialize(rawSegmentValue);</span>
+        // we pass `writeToOlderSegmentMaybeNeeded` as `includeValue` in the call to find() below
+        // because moving a record from this segment into an older one will require knowing its
+        // value. unless such a move is required, we do not need the existing record value.
+<span class="nc" id="L816">        final SegmentSearchResult searchResult = segmentValue.find(timestamp, writeToOlderSegmentMaybeNeeded);</span>
+
+<span class="nc bnc" id="L818" title="All 2 branches missed.">        if (searchResult.validFrom() == timestamp) {</span>
+            // this put() replaces an existing entry, rather than adding a new one. as a result,
+            // the validTo timestamp of the previous record does not need to be updated either,
+            // and we do not need to move an existing record to an older segment (i.e., we can
+            // ignore `writeToOlderSegmentMaybeNeeded`).
+<span class="nc" id="L823">            segmentValue.updateRecord(timestamp, value, searchResult.index());</span>
+<span class="nc" id="L824">            segment.put(key, segmentValue.serialize());</span>
+<span class="nc" id="L825">            return searchResult.validTo();</span>
+        }
+
+<span class="nc bnc" id="L828" title="All 2 branches missed.">        if (writeToOlderSegmentMaybeNeeded) {</span>
+            // existing record needs to be moved to an older segment.
+            // it's important that this step happens before updating the current
+            // segment. if there is a partial failure (this step succeeds but the
+            // update to the current segment fails), updating the older segment
+            // first means there will not be data loss. (rather, there will be
+            // duplicated data which is fine as it can/will be reconciled later.)
+<span class="nc" id="L835">            final T olderSegment = versionedStoreClient</span>
+<span class="nc" id="L836">                    .getOrCreateSegmentIfLive(segmentIdForTimestamp, internalProcessorContext, observedStreamTime);</span>
+            // `olderSegment == null` implies that all data in the older segment is older than the
+            // history retention of this store, and therefore does not need to tracked.
+            // as a result, we only need to move the existing record from the newer segment
+            // into the older segment if `olderSegment != null`. (also, we do not call the
+            // `expiredRecordSensor` in this case because the expired record sensor is only
+            // called when the record being put is itself expired, which is not the case
+            // here. only the existing record already present in the newer segment is
+            // expired.) so, there is nothing to do for this step if `olderSegment == null`,
+            // but we do still update the newer segment with the new record below.
+<span class="nc bnc" id="L846" title="All 2 branches missed.">            if (olderSegment != null) {</span>
+<span class="nc" id="L847">                final byte[] rawOlderSegmentValue = olderSegment.get(key);</span>
+<span class="nc bnc" id="L848" title="All 2 branches missed.">                if (rawOlderSegmentValue == null) {</span>
+<span class="nc" id="L849">                    olderSegment.put(</span>
+                            key,
+<span class="nc" id="L851">                            RocksDBVersionedStoreSegmentValueFormatter.newSegmentValueWithRecord(</span>
+<span class="nc" id="L852">                                    searchResult.value(), searchResult.validFrom(), timestamp</span>
+<span class="nc" id="L853">                            ).serialize()</span>
+                    );
+                } else {
+<span class="nc" id="L856">                    final SegmentValue olderSegmentValue</span>
+<span class="nc" id="L857">                            = RocksDBVersionedStoreSegmentValueFormatter.deserialize(rawOlderSegmentValue);</span>
+<span class="nc" id="L858">                    olderSegmentValue.insertAsLatest(searchResult.validFrom(), timestamp, searchResult.value());</span>
+<span class="nc" id="L859">                    olderSegment.put(key, olderSegmentValue.serialize());</span>
+                }
+            }
+
+            // update in newer segment (replace the record that was just moved with the new one)
+<span class="nc" id="L864">            segmentValue.updateRecord(timestamp, value, searchResult.index());</span>
+<span class="nc" id="L865">            segment.put(key, segmentValue.serialize());</span>
+<span class="nc" id="L866">            return searchResult.validTo();</span>
+        }
+
+        // plain insert into segment. no additional handling required.
+<span class="nc" id="L870">        segmentValue.insert(timestamp, value, searchResult.index());</span>
+<span class="nc" id="L871">        segment.put(key, segmentValue.serialize());</span>
+<span class="nc" id="L872">        return searchResult.validTo();</span>
+    }
+
+    /**
+     * @return updated {@code foundTs} value, i.e., the validTo timestamp of the record being put
+     */
+    private &lt;T extends VersionedStoreSegment&gt; long finishPut(
+            final VersionedStoreClient&lt;T&gt; versionedStoreClient,
+            final long observedStreamTime,
+            final Bytes key,
+            final byte[] value,
+            final long timestamp,
+            final long foundTs
+    ) {
+<span class="nc bnc" id="L886" title="All 2 branches missed.">        if (foundTs == SENTINEL_TIMESTAMP) {</span>
+            // insert into latest value store
+<span class="nc bnc" id="L888" title="All 2 branches missed.">            if (value != null) {</span>
+<span class="nc" id="L889">                versionedStoreClient.putLatestValue(key, LatestValueFormatter.from(value, timestamp));</span>
+            } else {
+                // tombstones are not inserted into the latest value store. insert into segment instead.
+                // the specific segment to insert to is determined based on the tombstone's timestamp
+<span class="nc" id="L893">                final T segment = versionedStoreClient.getOrCreateSegmentIfLive(</span>
+<span class="nc" id="L894">                        versionedStoreClient.segmentIdForTimestamp(timestamp), internalProcessorContext, observedStreamTime);</span>
+<span class="nc bnc" id="L895" title="All 2 branches missed.">                if (segment == null) {</span>
+                    // the record being inserted does not affect version history. discard and return.
+                    // this can happen during restore because individual put calls are executed after
+                    // observedStreamTime is fast-forwarded for the entire batch of records being
+                    // restored at once.
+<span class="nc" id="L900">                    return PUT_RETURN_CODE_NOT_PUT;</span>
+                }
+
+<span class="nc" id="L903">                final byte[] rawSegmentValue = segment.get(key);</span>
+<span class="nc bnc" id="L904" title="All 2 branches missed.">                if (rawSegmentValue == null) {</span>
+                    // in this special case where the latest record version (for a particular key)
+                    // is a tombstone, and the segment that the tombstone belongs in contains no
+                    // record versions for this key, create a new &quot;degenerate&quot; segment with the
+                    // tombstone's timestamp as both validFrom and validTo timestamps for the segment
+<span class="nc" id="L909">                    segment.put(</span>
+                            key,
+                            RocksDBVersionedStoreSegmentValueFormatter
+<span class="nc" id="L912">                                    .newSegmentValueWithRecord(null, timestamp, timestamp)</span>
+<span class="nc" id="L913">                                    .serialize()</span>
+                    );
+                } else {
+                    // insert as latest, since foundTs = sentinel means nothing later exists
+<span class="nc bnc" id="L917" title="All 2 branches missed.">                    if (RocksDBVersionedStoreSegmentValueFormatter.nextTimestamp(rawSegmentValue) == timestamp) {</span>
+                        // next timestamp equal to put() timestamp already represents a tombstone,
+                        // so no additional insertion is needed in this case
+<span class="nc" id="L920">                        return foundTs;</span>
+                    }
+<span class="nc" id="L922">                    final SegmentValue segmentValue</span>
+<span class="nc" id="L923">                            = RocksDBVersionedStoreSegmentValueFormatter.deserialize(rawSegmentValue);</span>
+<span class="nc" id="L924">                    segmentValue.insertAsLatest(</span>
+<span class="nc" id="L925">                            RocksDBVersionedStoreSegmentValueFormatter.nextTimestamp(rawSegmentValue),</span>
+                            timestamp,
+                            null
+                    );
+<span class="nc" id="L929">                    segment.put(key, segmentValue.serialize());</span>
+                }
+<span class="nc" id="L931">            }</span>
+        } else {
+            // insert into segment corresponding to foundTs, as foundTs represents the validTo
+            // timestamp of the current put.
+            // the new record is either the earliest or the latest in this segment, depending on the
+            // circumstances of the fall-through. (it cannot belong in the middle because otherwise
+            // putSegments() above would have identified a segment for which
+            // minTimestamp &lt;= timestamp &lt; nextTimestamp, and putSegments would've completed the
+            // put procedure without reaching this fall-through case.)
+<span class="nc" id="L940">            final T segment = versionedStoreClient.getOrCreateSegmentIfLive(</span>
+<span class="nc" id="L941">                    versionedStoreClient.segmentIdForTimestamp(foundTs), internalProcessorContext, observedStreamTime);</span>
+<span class="nc bnc" id="L942" title="All 2 branches missed.">            if (segment == null) {</span>
+                // the record being inserted does not affect version history. discard and return.
+                // this can happen during restore because individual put calls are executed after
+                // observedStreamTime is fast-forwarded for the entire batch of records being
+                // restored at once.
+<span class="nc" id="L947">                return PUT_RETURN_CODE_NOT_PUT;</span>
+            }
+
+<span class="nc" id="L950">            final byte[] rawSegmentValue = segment.get(key);</span>
+<span class="nc bnc" id="L951" title="All 2 branches missed.">            if (rawSegmentValue == null) {</span>
+<span class="nc" id="L952">                segment.put(</span>
+                        key,
+                        RocksDBVersionedStoreSegmentValueFormatter
+<span class="nc" id="L955">                                .newSegmentValueWithRecord(value, timestamp, foundTs)</span>
+<span class="nc" id="L956">                                .serialize()</span>
+                );
+            } else {
+<span class="nc" id="L959">                final long foundNextTs = RocksDBVersionedStoreSegmentValueFormatter.nextTimestamp(rawSegmentValue);</span>
+<span class="nc bnc" id="L960" title="All 2 branches missed.">                if (foundNextTs &lt;= timestamp) {</span>
+                    // insert as latest. this case is possible if the found segment is &quot;degenerate&quot;
+                    // (cf RocksDBVersionedStoreSegmentValueFormatter.java for details) as older
+                    // degenerate segments may result in &quot;gaps&quot; between one record version's validTo
+                    // timestamp and the next record version's validFrom timestamp
+<span class="nc" id="L965">                    final SegmentValue segmentValue = RocksDBVersionedStoreSegmentValueFormatter.deserialize(rawSegmentValue);</span>
+<span class="nc" id="L966">                    segmentValue.insertAsLatest(timestamp, foundTs, value);</span>
+<span class="nc" id="L967">                    segment.put(key, segmentValue.serialize());</span>
+<span class="nc" id="L968">                } else {</span>
+                    // insert as earliest
+<span class="nc" id="L970">                    final SegmentValue segmentValue = RocksDBVersionedStoreSegmentValueFormatter.deserialize(rawSegmentValue);</span>
+<span class="nc" id="L971">                    segmentValue.insertAsEarliest(timestamp, value);</span>
+<span class="nc" id="L972">                    segment.put(key, segmentValue.serialize());</span>
+                }
+            }
+        }
+<span class="nc" id="L976">        return foundTs;</span>
+    }
+
+    /**
+     * Bytes layout for the value portion of rows stored in the latest value store. The layout is
+     * a fixed-size timestamp concatenated with the actual record value.
+     */
+<span class="nc" id="L983">    static final class LatestValueFormatter {</span>
+
+        private static final int TIMESTAMP_SIZE = 8;
+
+        /**
+         * @return the timestamp, from the latest value store value bytes (representing value
+         * and timestamp)
+         */
+        static long timestamp(final byte[] rawLatestValueAndTimestamp) {
+<span class="nc" id="L992">            return ByteBuffer.wrap(rawLatestValueAndTimestamp).getLong();</span>
+        }
+
+        /**
+         * @return the actual record value, from the latest value store value bytes (representing
+         * value and timestamp)
+         */
+        static byte[] value(final byte[] rawLatestValueAndTimestamp) {
+<span class="nc" id="L1000">            final byte[] rawValue = new byte[rawLatestValueAndTimestamp.length - TIMESTAMP_SIZE];</span>
+<span class="nc" id="L1001">            System.arraycopy(rawLatestValueAndTimestamp, TIMESTAMP_SIZE, rawValue, 0, rawValue.length);</span>
+<span class="nc" id="L1002">            return rawValue;</span>
+        }
+
+        /**
+         * @return the formatted bytes containing the provided {@code rawValue} and
+         * {@code timestamp}, ready to be stored into the latest value store
+         */
+        static byte[] from(final byte[] rawValue, final long timestamp) {
+<span class="nc bnc" id="L1010" title="All 2 branches missed.">            if (rawValue == null) {</span>
+<span class="nc" id="L1011">                throw new IllegalStateException(&quot;Cannot store tombstone in latest value&quot;);</span>
+            }
+
+<span class="nc" id="L1014">            return ByteBuffer.allocate(TIMESTAMP_SIZE + rawValue.length)</span>
+<span class="nc" id="L1015">                    .putLong(timestamp)</span>
+<span class="nc" id="L1016">                    .put(rawValue)</span>
+<span class="nc" id="L1017">                    .array();</span>
+        }
+    }
+
+    private static String latestValueStoreName(final String storeName) {
+<span class="nc" id="L1022">        return storeName + &quot;.latestValues&quot;;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

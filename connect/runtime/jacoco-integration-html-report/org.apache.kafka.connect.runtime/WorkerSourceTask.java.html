@@ -1,0 +1,361 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>WorkerSourceTask.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">WorkerSourceTask.java</span></div><h1>WorkerSourceTask.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.internals.Plugin;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.runtime.errors.ErrorHandlingMetrics;
+import org.apache.kafka.connect.runtime.errors.ErrorReporter;
+import org.apache.kafka.connect.runtime.errors.ProcessingContext;
+import org.apache.kafka.connect.runtime.errors.RetryWithToleranceOperator;
+import org.apache.kafka.connect.runtime.errors.Stage;
+import org.apache.kafka.connect.runtime.errors.ToleranceType;
+import org.apache.kafka.connect.runtime.isolation.LoaderSwap;
+import org.apache.kafka.connect.source.SourceRecord;
+import org.apache.kafka.connect.source.SourceTask;
+import org.apache.kafka.connect.storage.CloseableOffsetStorageReader;
+import org.apache.kafka.connect.storage.ClusterConfigState;
+import org.apache.kafka.connect.storage.ConnectorOffsetBackingStore;
+import org.apache.kafka.connect.storage.Converter;
+import org.apache.kafka.connect.storage.HeaderConverter;
+import org.apache.kafka.connect.storage.OffsetStorageWriter;
+import org.apache.kafka.connect.storage.StatusBackingStore;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+import org.apache.kafka.connect.util.TopicAdmin;
+import org.apache.kafka.connect.util.TopicCreationGroup;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+import static org.apache.kafka.connect.runtime.SubmittedRecords.CommittableOffsets;
+
+/**
+ * {@link WorkerTask} that uses a {@link SourceTask} to ingest data into Kafka.
+ */
+class WorkerSourceTask extends AbstractWorkerSourceTask {
+<span class="fc" id="L66">    private static final Logger log = LoggerFactory.getLogger(WorkerSourceTask.class);</span>
+
+    private volatile CommittableOffsets committableOffsets;
+    //VisibleForTesting
+    final SubmittedRecords submittedRecords;
+    private final AtomicReference&lt;Exception&gt; producerSendException;
+
+    public WorkerSourceTask(ConnectorTaskId id,
+                            SourceTask task,
+                            TaskStatus.Listener statusListener,
+                            TargetState initialState,
+                            Plugin&lt;Converter&gt; keyConverterPlugin,
+                            Plugin&lt;Converter&gt; valueConverterPlugin,
+                            ErrorHandlingMetrics errorMetrics,
+                            Plugin&lt;HeaderConverter&gt; headerConverterPlugin,
+                            TransformationChain&lt;SourceRecord, SourceRecord&gt; transformationChain,
+                            Producer&lt;byte[], byte[]&gt; producer,
+                            TopicAdmin admin,
+                            Map&lt;String, TopicCreationGroup&gt; topicGroups,
+                            CloseableOffsetStorageReader offsetReader,
+                            OffsetStorageWriter offsetWriter,
+                            ConnectorOffsetBackingStore offsetStore,
+                            WorkerConfig workerConfig,
+                            ClusterConfigState configState,
+                            ConnectMetrics connectMetrics,
+                            ClassLoader loader,
+                            Time time,
+                            RetryWithToleranceOperator&lt;SourceRecord&gt; retryWithToleranceOperator,
+                            StatusBackingStore statusBackingStore,
+                            Executor closeExecutor,
+                            Supplier&lt;List&lt;ErrorReporter&lt;SourceRecord&gt;&gt;&gt; errorReportersSupplier,
+                            TaskPluginsMetadata pluginsMetadata,
+                            Function&lt;ClassLoader, LoaderSwap&gt; pluginLoaderSwapper) {
+
+<span class="fc" id="L100">        super(id, task, statusListener, initialState, configState, keyConverterPlugin, valueConverterPlugin, headerConverterPlugin, transformationChain,</span>
+                null, producer,
+                admin, topicGroups, offsetReader, offsetWriter, offsetStore, workerConfig, connectMetrics, errorMetrics, loader,
+                time, retryWithToleranceOperator, statusBackingStore, closeExecutor, errorReportersSupplier, pluginsMetadata, pluginLoaderSwapper);
+
+<span class="fc" id="L105">        this.committableOffsets = CommittableOffsets.EMPTY;</span>
+<span class="fc" id="L106">        this.submittedRecords = new SubmittedRecords();</span>
+<span class="fc" id="L107">        this.producerSendException = new AtomicReference&lt;&gt;();</span>
+<span class="fc" id="L108">    }</span>
+
+    @Override
+    protected void prepareToInitializeTask() {
+        // No-op
+<span class="fc" id="L113">    }</span>
+
+    @Override
+    protected void prepareToEnterSendLoop() {
+        // No-op
+<span class="fc" id="L118">    }</span>
+
+    @Override
+    protected void beginSendIteration() {
+<span class="fc" id="L122">        updateCommittableOffsets();</span>
+<span class="fc" id="L123">    }</span>
+
+    @Override
+    protected void prepareToPollTask() {
+<span class="fc" id="L127">        maybeThrowProducerSendException();</span>
+<span class="fc" id="L128">    }</span>
+
+    @Override
+    protected void recordDropped(SourceRecord record) {
+<span class="nc" id="L132">        commitTaskRecord(record, null);</span>
+<span class="nc" id="L133">    }</span>
+
+    @Override
+    protected Optional&lt;SubmittedRecords.SubmittedRecord&gt; prepareToSendRecord(
+            SourceRecord sourceRecord,
+            ProducerRecord&lt;byte[], byte[]&gt; producerRecord
+    ) {
+<span class="fc" id="L140">        maybeThrowProducerSendException();</span>
+<span class="fc" id="L141">        return Optional.of(submittedRecords.submit(sourceRecord));</span>
+    }
+
+    @Override
+    protected void recordDispatched(SourceRecord record) {
+        // No-op
+<span class="fc" id="L147">    }</span>
+
+    @Override
+    protected void batchDispatched() {
+        // No-op
+<span class="fc" id="L152">    }</span>
+
+    @Override
+    protected void recordSent(
+            SourceRecord sourceRecord,
+            ProducerRecord&lt;byte[], byte[]&gt; producerRecord,
+            RecordMetadata recordMetadata
+    ) {
+<span class="fc" id="L160">        commitTaskRecord(sourceRecord, recordMetadata);</span>
+<span class="fc" id="L161">    }</span>
+
+    @Override
+    protected void producerSendFailed(
+            ProcessingContext&lt;SourceRecord&gt; context,
+            boolean synchronous,
+            ProducerRecord&lt;byte[], byte[]&gt; producerRecord,
+            SourceRecord preTransformRecord,
+            Exception e
+    ) {
+<span class="nc bnc" id="L171" title="All 2 branches missed.">        if (synchronous) {</span>
+<span class="nc" id="L172">            throw new ConnectException(&quot;Unrecoverable exception trying to send&quot;, e);</span>
+        }
+
+<span class="nc" id="L175">        String topic = producerRecord.topic();</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">        if (retryWithToleranceOperator.getErrorToleranceType() == ToleranceType.ALL) {</span>
+<span class="nc" id="L177">            log.trace(</span>
+                    &quot;Ignoring failed record send: {} failed to send record to {}: &quot;,
+                    WorkerSourceTask.this,
+                    topic,
+                    e
+            );
+            // executeFailed here allows the use of existing logging infrastructure/configuration
+<span class="nc" id="L184">            retryWithToleranceOperator.executeFailed(</span>
+                    context,
+                    Stage.KAFKA_PRODUCE,
+                    WorkerSourceTask.class,
+                    e
+            );
+<span class="nc" id="L190">            commitTaskRecord(preTransformRecord, null);</span>
+        } else {
+<span class="nc" id="L192">            producerSendException.compareAndSet(null, e);</span>
+        }
+<span class="nc" id="L194">    }</span>
+
+    @Override
+    protected void finalOffsetCommit(boolean failed) {
+        // It should still be safe to commit offsets since any exception would have
+        // simply resulted in not getting more records but all the existing records should be ok to flush
+        // and commit offsets. Worst case, task.commit() will also throw an exception causing the offset
+        // commit to fail.
+<span class="fc" id="L202">        submittedRecords.awaitAllMessages(</span>
+<span class="fc" id="L203">                workerConfig.getLong(WorkerConfig.OFFSET_COMMIT_TIMEOUT_MS_CONFIG),</span>
+                TimeUnit.MILLISECONDS
+        );
+<span class="fc" id="L206">        updateCommittableOffsets();</span>
+<span class="fc" id="L207">        commitOffsets();</span>
+<span class="fc" id="L208">    }</span>
+
+    /**
+     * @return whether an attempt to commit offsets should be made for the task (i.e., there are pending uncommitted
+     * offsets and the task's producer has not already failed to send a record with a non-retriable error).
+     */
+    public boolean shouldCommitOffsets() {
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        return !isFailed();</span>
+    }
+
+    public boolean commitOffsets() {
+<span class="fc" id="L219">        long commitTimeoutMs = workerConfig.getLong(WorkerConfig.OFFSET_COMMIT_TIMEOUT_MS_CONFIG);</span>
+
+<span class="fc" id="L221">        log.debug(&quot;{} Committing offsets&quot;, this);</span>
+
+<span class="fc" id="L223">        long started = time.milliseconds();</span>
+<span class="fc" id="L224">        long timeout = started + commitTimeoutMs;</span>
+
+        CommittableOffsets offsetsToCommit;
+<span class="fc" id="L227">        synchronized (this) {</span>
+<span class="fc" id="L228">            offsetsToCommit = this.committableOffsets;</span>
+<span class="fc" id="L229">            this.committableOffsets = CommittableOffsets.EMPTY;</span>
+<span class="fc" id="L230">        }</span>
+
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">        if (offsetsToCommit.isEmpty()) {</span>
+<span class="nc" id="L233">            log.debug(&quot;{} Either no records were produced by the task since the last offset commit, &quot; </span>
+                    + &quot;or every record has been filtered out by a transformation &quot; 
+                    + &quot;or dropped due to transformation or conversion errors.&quot;,
+                    this
+            );
+            // We continue with the offset commit process here instead of simply returning immediately
+            // in order to invoke SourceTask::commit and record metrics for a successful offset commit
+        } else {
+<span class="fc" id="L241">            log.info(&quot;{} Committing offsets for {} acknowledged messages&quot;, this, offsetsToCommit.numCommittableMessages());</span>
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">            if (offsetsToCommit.hasPending()) {</span>
+<span class="nc" id="L243">                log.debug(&quot;{} There are currently {} pending messages spread across {} source partitions whose offsets will not be committed. &quot;</span>
+                                + &quot;The source partition with the most pending messages is {}, with {} pending messages&quot;,
+                        this,
+<span class="nc" id="L246">                        offsetsToCommit.numUncommittableMessages(),</span>
+<span class="nc" id="L247">                        offsetsToCommit.numDeques(),</span>
+<span class="nc" id="L248">                        offsetsToCommit.largestDequePartition(),</span>
+<span class="nc" id="L249">                        offsetsToCommit.largestDequeSize()</span>
+                );
+            } else {
+<span class="fc" id="L252">                log.debug(&quot;{} There are currently no pending messages for this offset commit; &quot;</span>
+                                + &quot;all messages dispatched to the task's producer since the last commit have been acknowledged&quot;,
+                        this
+                );
+            }
+        }
+
+        // Update the offset writer with any new offsets for records that have been acked.
+        // The offset writer will continue to track all offsets until they are able to be successfully flushed.
+        // IOW, if the offset writer fails to flush, it keeps those offset for the next attempt,
+        // though we may update them here with newer offsets for acked records.
+<span class="fc" id="L263">        offsetsToCommit.offsets().forEach(offsetWriter::offset);</span>
+
+        boolean shouldFlush;
+        try {
+<span class="fc" id="L267">            shouldFlush = offsetWriter.beginFlush(timeout - time.milliseconds(), TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L268">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L269">            log.warn(&quot;{} Interrupted while waiting for previous offset flush to complete, cancelling&quot;, this);</span>
+<span class="nc" id="L270">            recordCommitFailure(time.milliseconds() - started);</span>
+<span class="nc" id="L271">            return false;</span>
+<span class="nc" id="L272">        } catch (TimeoutException e) {</span>
+<span class="nc" id="L273">            log.warn(&quot;{} Timed out while waiting for previous offset flush to complete, cancelling&quot;, this);</span>
+<span class="nc" id="L274">            recordCommitFailure(time.milliseconds() - started);</span>
+<span class="nc" id="L275">            return false;</span>
+<span class="fc" id="L276">        }</span>
+<span class="pc bpc" id="L277" title="1 of 2 branches missed.">        if (!shouldFlush) {</span>
+            // There was nothing in the offsets to process, but we still mark a successful offset commit.
+<span class="nc" id="L279">            long durationMillis = time.milliseconds() - started;</span>
+<span class="nc" id="L280">            recordCommitSuccess(durationMillis);</span>
+<span class="nc" id="L281">            log.debug(&quot;{} Finished offset commitOffsets successfully in {} ms&quot;,</span>
+<span class="nc" id="L282">                    this, durationMillis);</span>
+
+<span class="nc" id="L284">            commitSourceTask();</span>
+<span class="nc" id="L285">            return true;</span>
+        }
+
+        // Now we can actually flush the offsets to user storage.
+<span class="fc" id="L289">        Future&lt;Void&gt; flushFuture = offsetWriter.doFlush((error, result) -&gt; {</span>
+<span class="pc bpc" id="L290" title="1 of 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L291">                log.error(&quot;{} Failed to flush offsets to storage: &quot;, WorkerSourceTask.this, error);</span>
+            } else {
+<span class="fc" id="L293">                log.trace(&quot;{} Finished flushing offsets to storage&quot;, WorkerSourceTask.this);</span>
+            }
+<span class="fc" id="L295">        });</span>
+        // Very rare case: offsets were unserializable and we finished immediately, unable to store
+        // any data
+<span class="pc bpc" id="L298" title="1 of 2 branches missed.">        if (flushFuture == null) {</span>
+<span class="nc" id="L299">            offsetWriter.cancelFlush();</span>
+<span class="nc" id="L300">            recordCommitFailure(time.milliseconds() - started);</span>
+<span class="nc" id="L301">            return false;</span>
+        }
+        try {
+<span class="fc" id="L304">            flushFuture.get(Math.max(timeout - time.milliseconds(), 0), TimeUnit.MILLISECONDS);</span>
+            // There's a small race here where we can get the callback just as this times out (and log
+            // success), but then catch the exception below and cancel everything. This won't cause any
+            // errors, is only wasteful in this minor edge case, and the worst result is that the log
+            // could look a little confusing.
+<span class="nc" id="L309">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L310">            log.warn(&quot;{} Flush of offsets interrupted, cancelling&quot;, this);</span>
+<span class="nc" id="L311">            offsetWriter.cancelFlush();</span>
+<span class="nc" id="L312">            recordCommitFailure(time.milliseconds() - started);</span>
+<span class="nc" id="L313">            return false;</span>
+<span class="nc" id="L314">        } catch (ExecutionException e) {</span>
+<span class="nc" id="L315">            log.error(&quot;{} Flush of offsets threw an unexpected exception: &quot;, this, e);</span>
+<span class="nc" id="L316">            offsetWriter.cancelFlush();</span>
+<span class="nc" id="L317">            recordCommitFailure(time.milliseconds() - started);</span>
+<span class="nc" id="L318">            return false;</span>
+<span class="nc" id="L319">        } catch (TimeoutException e) {</span>
+<span class="nc" id="L320">            log.error(&quot;{} Timed out waiting to flush offsets to storage; will try again on next flush interval with latest offsets&quot;, this);</span>
+<span class="nc" id="L321">            offsetWriter.cancelFlush();</span>
+<span class="nc" id="L322">            recordCommitFailure(time.milliseconds() - started);</span>
+<span class="nc" id="L323">            return false;</span>
+<span class="fc" id="L324">        }</span>
+
+<span class="fc" id="L326">        long durationMillis = time.milliseconds() - started;</span>
+<span class="fc" id="L327">        recordCommitSuccess(durationMillis);</span>
+<span class="fc" id="L328">        log.debug(&quot;{} Finished commitOffsets successfully in {} ms&quot;,</span>
+<span class="fc" id="L329">                this, durationMillis);</span>
+
+<span class="fc" id="L331">        commitSourceTask();</span>
+
+<span class="fc" id="L333">        return true;</span>
+    }
+
+    // Visible for testing
+    void updateCommittableOffsets() {
+<span class="fc" id="L338">        CommittableOffsets newOffsets = submittedRecords.committableOffsets();</span>
+<span class="fc" id="L339">        synchronized (this) {</span>
+<span class="fc" id="L340">            this.committableOffsets = this.committableOffsets.updatedWith(newOffsets);</span>
+<span class="fc" id="L341">        }</span>
+<span class="fc" id="L342">    }</span>
+
+    private void maybeThrowProducerSendException() {
+<span class="pc bpc" id="L345" title="1 of 2 branches missed.">        if (producerSendException.get() != null) {</span>
+<span class="nc" id="L346">            throw new ConnectException(</span>
+                    &quot;Unrecoverable exception from producer send callback&quot;,
+<span class="nc" id="L348">                    producerSendException.get()</span>
+            );
+        }
+<span class="fc" id="L351">    }</span>
+
+    @Override
+    public String toString() {
+<span class="fc" id="L355">        return &quot;WorkerSourceTask{&quot; +</span>
+                &quot;id=&quot; + id +
+                '}';
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

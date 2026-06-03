@@ -1,0 +1,1106 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ControllerApis.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">kafka.server</a> &gt; <span class="el_source">ControllerApis.scala</span></div><h1>ControllerApis.scala</h1><pre class="source lang-java linenums">/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package kafka.server
+
+import java.{lang, util}
+import java.nio.ByteBuffer
+import java.util.{Collections, OptionalLong}
+import java.util.Map.Entry
+import java.util.concurrent.CompletableFuture
+import java.util.function.Consumer
+import kafka.network.RequestChannel
+import kafka.server.QuotaFactory.QuotaManagers
+import kafka.server.logger.RuntimeLoggerManager
+import kafka.utils.Logging
+import org.apache.kafka.clients.admin.{AlterConfigOp, EndpointType}
+import org.apache.kafka.common.Uuid.ZERO_UUID
+import org.apache.kafka.common.acl.AclOperation.{ALTER, ALTER_CONFIGS, CLUSTER_ACTION, CREATE, CREATE_TOKENS, DELETE, DESCRIBE, DESCRIBE_CONFIGS}
+import org.apache.kafka.common.config.ConfigResource
+import org.apache.kafka.common.errors.{ApiException, ClusterAuthorizationException, InvalidRequestException, TopicDeletionDisabledException, UnsupportedVersionException}
+import org.apache.kafka.common.internals.{FatalExitError, Plugin, Topic}
+import org.apache.kafka.common.message.AlterConfigsResponseData.{AlterConfigsResourceResponse =&gt; OldAlterConfigsResourceResponse}
+import org.apache.kafka.common.message.CreatePartitionsRequestData.CreatePartitionsTopic
+import org.apache.kafka.common.message.CreatePartitionsResponseData.CreatePartitionsTopicResult
+import org.apache.kafka.common.message.CreateTopicsResponseData.CreatableTopicResult
+import org.apache.kafka.common.message.DeleteTopicsResponseData.{DeletableTopicResult, DeletableTopicResultCollection}
+import org.apache.kafka.common.message.IncrementalAlterConfigsResponseData.AlterConfigsResourceResponse
+import org.apache.kafka.common.message._
+import org.apache.kafka.common.protocol.Errors._
+import org.apache.kafka.common.protocol.{ApiKeys, ApiMessage, Errors}
+import org.apache.kafka.common.requests._
+import org.apache.kafka.common.resource.Resource.CLUSTER_NAME
+import org.apache.kafka.common.resource.ResourceType.{CLUSTER, GROUP, TOPIC, USER}
+import org.apache.kafka.common.utils.Time
+import org.apache.kafka.common.Uuid
+import org.apache.kafka.controller.ControllerRequestContext.requestTimeoutMsToDeadlineNs
+import org.apache.kafka.controller.{Controller, ControllerRequestContext}
+import org.apache.kafka.image.publisher.ControllerRegistrationsPublisher
+import org.apache.kafka.metadata.{BrokerHeartbeatReply, BrokerRegistrationReply, KRaftMetadataCache}
+import org.apache.kafka.common.security.auth.KafkaPrincipal
+import org.apache.kafka.common.security.auth.SecurityProtocol
+import org.apache.kafka.raft.RaftManager
+import org.apache.kafka.security.DelegationTokenManager
+import org.apache.kafka.server.{ApiVersionManager, ProcessRole}
+import org.apache.kafka.server.authorizer.Authorizer
+import org.apache.kafka.server.common.{ApiMessageAndVersion, RequestLocal}
+import org.apache.kafka.server.quota.ControllerMutationQuota
+
+import scala.jdk.CollectionConverters._
+
+
+/**
+ * Request handler for Controller APIs
+ */
+<span class="pc bpc" id="L69" title="2 of 4 branches missed.">class ControllerApis(</span>
+<span class="fc" id="L70">  val requestChannel: RequestChannel,</span>
+<span class="pc" id="L71">  val authorizerPlugin: Option[Plugin[Authorizer]],</span>
+<span class="fc" id="L72">  val quotas: QuotaManagers,</span>
+<span class="fc" id="L73">  val time: Time,</span>
+<span class="fc" id="L74">  val controller: Controller,</span>
+<span class="pc" id="L75">  val raftManager: RaftManager[ApiMessageAndVersion],</span>
+<span class="fc" id="L76">  val config: KafkaConfig,</span>
+<span class="pc" id="L77">  val clusterId: String,</span>
+<span class="pc" id="L78">  val registrationsPublisher: ControllerRegistrationsPublisher,</span>
+<span class="fc" id="L79">  val apiVersionManager: ApiVersionManager,</span>
+<span class="pc" id="L80">  val metadataCache: KRaftMetadataCache</span>
+<span class="fc" id="L81">) extends ApiRequestHandler with Logging {</span>
+
+<span class="fc" id="L83">  this.logIdent = s&quot;[ControllerApis nodeId=${config.nodeId}] &quot;</span>
+<span class="fc" id="L84">  val authHelper = new AuthHelper(authorizerPlugin)</span>
+<span class="pc" id="L85">  val configHelper = new ConfigHelper(metadataCache, config, metadataCache)</span>
+<span class="fc" id="L86">  val requestHelper = new RequestHandlerHelper(requestChannel, quotas, time)</span>
+<span class="pc" id="L87">  val runtimeLoggerManager = new RuntimeLoggerManager(config.nodeId, logger.underlying)</span>
+<span class="fc" id="L88">  private val aclApis = new AclApis(authHelper, authorizerPlugin, requestHelper, ProcessRole.ControllerRole, config)</span>
+
+<span class="nc" id="L90">  def isClosed: Boolean = aclApis.isClosed</span>
+
+<span class="fc" id="L92">  def close(): Unit = aclApis.close()</span>
+
+  override def handle(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
+    try {
+<span class="fc" id="L96">      val handlerFuture: CompletableFuture[Unit] = request.header.apiKey match {</span>
+<span class="pc bpc" id="L97" title="1 of 2 branches missed.">        case ApiKeys.FETCH =&gt; handleFetch(request)</span>
+<span class="pc bpc" id="L98" title="1 of 2 branches missed.">        case ApiKeys.FETCH_SNAPSHOT =&gt; handleFetchSnapshot(request)</span>
+<span class="fc bfc" id="L99" title="All 2 branches covered.">        case ApiKeys.CREATE_TOPICS =&gt; handleCreateTopics(request)</span>
+<span class="fc bfc" id="L100" title="All 2 branches covered.">        case ApiKeys.DELETE_TOPICS =&gt; handleDeleteTopics(request)</span>
+<span class="fc bfc" id="L101" title="All 2 branches covered.">        case ApiKeys.API_VERSIONS =&gt; handleApiVersionsRequest(request)</span>
+<span class="pc bpc" id="L102" title="1 of 2 branches missed.">        case ApiKeys.ALTER_CONFIGS =&gt; handleLegacyAlterConfigs(request)</span>
+<span class="pc bpc" id="L103" title="1 of 2 branches missed.">        case ApiKeys.VOTE =&gt; handleVote(request)</span>
+<span class="pc bpc" id="L104" title="1 of 2 branches missed.">        case ApiKeys.BEGIN_QUORUM_EPOCH =&gt; handleBeginQuorumEpoch(request)</span>
+<span class="pc bpc" id="L105" title="1 of 2 branches missed.">        case ApiKeys.END_QUORUM_EPOCH =&gt; handleEndQuorumEpoch(request)</span>
+<span class="pc bpc" id="L106" title="1 of 2 branches missed.">        case ApiKeys.DESCRIBE_QUORUM =&gt; handleDescribeQuorum(request)</span>
+<span class="pc bpc" id="L107" title="1 of 2 branches missed.">        case ApiKeys.ALTER_PARTITION =&gt; handleAlterPartitionRequest(request)</span>
+<span class="fc bfc" id="L108" title="All 2 branches covered.">        case ApiKeys.BROKER_REGISTRATION =&gt; handleBrokerRegistration(request)</span>
+<span class="fc bfc" id="L109" title="All 2 branches covered.">        case ApiKeys.BROKER_HEARTBEAT =&gt; handleBrokerHeartBeatRequest(request)</span>
+<span class="pc bpc" id="L110" title="1 of 2 branches missed.">        case ApiKeys.UNREGISTER_BROKER =&gt; handleUnregisterBroker(request)</span>
+<span class="pc bpc" id="L111" title="1 of 2 branches missed.">        case ApiKeys.ALTER_CLIENT_QUOTAS =&gt; handleAlterClientQuotas(request)</span>
+<span class="pc bpc" id="L112" title="1 of 2 branches missed.">        case ApiKeys.INCREMENTAL_ALTER_CONFIGS =&gt; handleIncrementalAlterConfigs(request)</span>
+<span class="pc bpc" id="L113" title="1 of 2 branches missed.">        case ApiKeys.ALTER_PARTITION_REASSIGNMENTS =&gt; handleAlterPartitionReassignments(request)</span>
+<span class="pc bpc" id="L114" title="1 of 2 branches missed.">        case ApiKeys.LIST_PARTITION_REASSIGNMENTS =&gt; handleListPartitionReassignments(request)</span>
+<span class="pc bpc" id="L115" title="1 of 2 branches missed.">        case ApiKeys.ALTER_USER_SCRAM_CREDENTIALS =&gt; handleAlterUserScramCredentials(request)</span>
+<span class="pc bpc" id="L116" title="1 of 2 branches missed.">        case ApiKeys.CREATE_DELEGATION_TOKEN =&gt; handleCreateDelegationTokenRequest(request)</span>
+<span class="pc bpc" id="L117" title="1 of 2 branches missed.">        case ApiKeys.RENEW_DELEGATION_TOKEN =&gt; handleRenewDelegationTokenRequest(request)</span>
+<span class="pc bpc" id="L118" title="1 of 2 branches missed.">        case ApiKeys.EXPIRE_DELEGATION_TOKEN =&gt; handleExpireDelegationTokenRequest(request)</span>
+<span class="fc bfc" id="L119" title="All 2 branches covered.">        case ApiKeys.ENVELOPE =&gt; handleEnvelopeRequest(request, requestLocal)</span>
+<span class="pc bpc" id="L120" title="1 of 2 branches missed.">        case ApiKeys.SASL_HANDSHAKE =&gt; handleSaslHandshakeRequest(request)</span>
+<span class="pc bpc" id="L121" title="1 of 2 branches missed.">        case ApiKeys.SASL_AUTHENTICATE =&gt; handleSaslAuthenticateRequest(request)</span>
+<span class="fc bfc" id="L122" title="All 2 branches covered.">        case ApiKeys.ALLOCATE_PRODUCER_IDS =&gt; handleAllocateProducerIdsRequest(request)</span>
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">        case ApiKeys.CREATE_PARTITIONS =&gt; handleCreatePartitions(request)</span>
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">        case ApiKeys.DESCRIBE_CONFIGS =&gt; handleDescribeConfigsRequest(request)</span>
+<span class="pc bpc" id="L125" title="1 of 2 branches missed.">        case ApiKeys.DESCRIBE_ACLS =&gt; aclApis.handleDescribeAcls(request)</span>
+<span class="pc bpc" id="L126" title="1 of 2 branches missed.">        case ApiKeys.CREATE_ACLS =&gt; aclApis.handleCreateAcls(request)</span>
+<span class="pc bpc" id="L127" title="1 of 2 branches missed.">        case ApiKeys.DELETE_ACLS =&gt; aclApis.handleDeleteAcls(request)</span>
+<span class="pc bpc" id="L128" title="1 of 2 branches missed.">        case ApiKeys.ELECT_LEADERS =&gt; handleElectLeaders(request)</span>
+<span class="pc bpc" id="L129" title="1 of 2 branches missed.">        case ApiKeys.UPDATE_FEATURES =&gt; handleUpdateFeatures(request)</span>
+<span class="pc bpc" id="L130" title="1 of 2 branches missed.">        case ApiKeys.DESCRIBE_CLUSTER =&gt; handleDescribeCluster(request)</span>
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">        case ApiKeys.CONTROLLER_REGISTRATION =&gt; handleControllerRegistration(request)</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        case ApiKeys.ASSIGN_REPLICAS_TO_DIRS =&gt; handleAssignReplicasToDirs(request)</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        case ApiKeys.ADD_RAFT_VOTER =&gt; handleAddRaftVoter(request)</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        case ApiKeys.REMOVE_RAFT_VOTER =&gt; handleRemoveRaftVoter(request)</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">        case ApiKeys.UPDATE_RAFT_VOTER =&gt; handleUpdateRaftVoter(request)</span>
+<span class="nc" id="L136">        case _ =&gt; throw new ApiException(s&quot;Unsupported ApiKey ${request.context.header.apiKey}&quot;)</span>
+      }
+
+      // This catches exceptions in the future and subsequent completion stages returned by the request handlers.
+<span class="fc" id="L140">      handlerFuture.whenComplete { (_, exception) =&gt;</span>
+<span class="pc bpc" id="L141" title="1 of 2 branches missed.">        if (exception != null) {</span>
+          // CompletionException does not include the stack frames in its &quot;cause&quot; exception, so we need to
+          // log the original exception here
+<span class="nc" id="L144">          error(s&quot;Unexpected error handling request ${request.requestDesc(true)} &quot; +</span>
+<span class="nc" id="L145">            s&quot;with context ${request.context}&quot;, exception)</span>
+<span class="pc" id="L146">          requestHelper.handleError(request, exception)</span>
+        }
+      }
+    } catch {
+<span class="nc" id="L150">      case e: FatalExitError =&gt; throw e</span>
+      case t: Throwable =&gt;
+        // This catches exceptions in the blocking parts of the request handlers
+<span class="nc" id="L153">        error(s&quot;Unexpected error handling request ${request.requestDesc(true)} &quot; +</span>
+<span class="nc" id="L154">          s&quot;with context ${request.context}&quot;, t)</span>
+<span class="nc" id="L155">        requestHelper.handleError(request, t)</span>
+    } finally {
+      // Only record local completion time if it is unset.
+<span class="fc bfc" id="L158" title="All 2 branches covered.">      if (request.apiLocalCompleteTimeNanos &lt; 0) {</span>
+<span class="fc" id="L159">        request.apiLocalCompleteTimeNanos = time.nanoseconds</span>
+      }
+    }
+  }
+
+  def handleEnvelopeRequest(request: RequestChannel.Request, requestLocal: RequestLocal): CompletableFuture[Unit] = {
+<span class="pc bpc" id="L165" title="1 of 2 branches missed.">    if (!authHelper.authorize(request.context, CLUSTER_ACTION, CLUSTER, CLUSTER_NAME)) {</span>
+<span class="nc" id="L166">      requestHelper.sendErrorResponseMaybeThrottle(request, new ClusterAuthorizationException(</span>
+<span class="nc" id="L167">        s&quot;Principal ${request.context.principal} does not have required CLUSTER_ACTION for envelope&quot;))</span>
+    } else {
+<span class="fc" id="L169">      EnvelopeUtils.handleEnvelopeRequest(request, requestChannel.metrics, handle(_, requestLocal))</span>
+    }
+<span class="fc" id="L171">    CompletableFuture.completedFuture[Unit](())</span>
+  }
+
+  def handleSaslHandshakeRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L175">    val responseData = new SaslHandshakeResponseData().setErrorCode(ILLEGAL_SASL_STATE.code)</span>
+<span class="nc" id="L176">    requestHelper.sendResponseMaybeThrottle(request, _ =&gt; new SaslHandshakeResponse(responseData))</span>
+<span class="nc" id="L177">    CompletableFuture.completedFuture[Unit](())</span>
+  }
+
+  def handleSaslAuthenticateRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L181">    val responseData = new SaslAuthenticateResponseData()</span>
+<span class="nc" id="L182">      .setErrorCode(ILLEGAL_SASL_STATE.code)</span>
+<span class="nc" id="L183">      .setErrorMessage(&quot;SaslAuthenticate request received after successful authentication&quot;)</span>
+<span class="nc" id="L184">    requestHelper.sendResponseMaybeThrottle(request, _ =&gt; new SaslAuthenticateResponse(responseData))</span>
+<span class="nc" id="L185">    CompletableFuture.completedFuture[Unit](())</span>
+  }
+
+  def handleFetch(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L189">    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)</span>
+<span class="nc" id="L190">    handleRaftRequest(request, response =&gt; FetchResponse.of(response.asInstanceOf[FetchResponseData]))</span>
+  }
+
+  def handleFetchSnapshot(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L194">    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)</span>
+<span class="nc" id="L195">    handleRaftRequest(request, response =&gt; new FetchSnapshotResponse(response.asInstanceOf[FetchSnapshotResponseData]))</span>
+  }
+
+  private def handleDeleteTopics(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="fc" id="L199">    val deleteTopicsRequest = request.body[DeleteTopicsRequest]</span>
+<span class="fc" id="L200">    val controllerMutationQuota = quotas.controllerMutation.newQuotaFor(request.session, request.header, 5)</span>
+<span class="fc" id="L201">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="fc" id="L202">      requestTimeoutMsToDeadlineNs(time, deleteTopicsRequest.data.timeoutMs),</span>
+<span class="fc" id="L203">      controllerMutationQuotaRecorderFor(controllerMutationQuota))</span>
+<span class="fc" id="L204">    val future = deleteTopics(context,</span>
+<span class="fc" id="L205">      deleteTopicsRequest.data,</span>
+<span class="fc" id="L206">      request.context.apiVersion,</span>
+<span class="fc" id="L207">      authHelper.authorize(request.context, DELETE, CLUSTER, CLUSTER_NAME, logIfDenied = false),</span>
+<span class="pc" id="L208">      names =&gt; authHelper.filterByAuthorized(request.context, DESCRIBE, TOPIC, names)(n =&gt; n),</span>
+<span class="pc" id="L209">      names =&gt; authHelper.filterByAuthorized(request.context, DELETE, TOPIC, names)(n =&gt; n))</span>
+<span class="fc" id="L210">    future.handle[Unit] { (results, exception) =&gt;</span>
+<span class="pc bpc" id="L211" title="1 of 2 branches missed.">      val response = if (exception != null) {</span>
+<span class="nc" id="L212">        deleteTopicsRequest.getErrorResponse(exception)</span>
+      } else {
+<span class="fc" id="L214">        val responseData = new DeleteTopicsResponseData()</span>
+<span class="fc" id="L215">          .setResponses(new DeletableTopicResultCollection(results.iterator))</span>
+<span class="fc" id="L216">        new DeleteTopicsResponse(responseData)</span>
+      }
+<span class="fc" id="L218">      requestHelper.sendResponseMaybeThrottleWithControllerQuota(controllerMutationQuota, request, response)</span>
+    }
+  }
+
+  def deleteTopics(
+    context: ControllerRequestContext,
+    request: DeleteTopicsRequestData,
+    apiVersion: Int,
+    hasClusterAuth: Boolean,
+    getDescribableTopics: Iterable[String] =&gt; Set[String],
+    getDeletableTopics: Iterable[String] =&gt; Set[String]
+  ): CompletableFuture[util.List[DeletableTopicResult]] = {
+    // Check if topic deletion is enabled at all.
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">    if (!config.deleteTopicEnable) {</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">      if (apiVersion &lt; 3) {</span>
+<span class="nc" id="L233">        return CompletableFuture.failedFuture(new InvalidRequestException(&quot;This version does not support topic deletion.&quot;))</span>
+      } else {
+<span class="nc" id="L235">        return CompletableFuture.failedFuture(new TopicDeletionDisabledException())</span>
+      }
+    }
+    // The first step is to load up the names and IDs that have been provided by the
+    // request.  This is a bit messy because we support multiple ways of referring to
+    // topics (both by name and by id) and because we need to check for duplicates or
+    // other invalid inputs.
+<span class="fc" id="L242">    val responses = new util.ArrayList[DeletableTopicResult]</span>
+    def appendResponse(name: String, id: Uuid, error: ApiError): Unit = {
+<span class="fc" id="L244">      responses.add(new DeletableTopicResult().</span>
+<span class="fc" id="L245">        setName(name).</span>
+<span class="fc" id="L246">        setTopicId(id).</span>
+<span class="fc" id="L247">        setErrorCode(error.error.code).</span>
+<span class="fc" id="L248">        setErrorMessage(error.message))</span>
+    }
+<span class="fc" id="L250">    val providedNames = new util.HashSet[String]</span>
+<span class="fc" id="L251">    val duplicateProvidedNames = new util.HashSet[String]</span>
+<span class="fc" id="L252">    val providedIds = new util.HashSet[Uuid]</span>
+<span class="fc" id="L253">    val duplicateProvidedIds = new util.HashSet[Uuid]</span>
+    def addProvidedName(name: String): Unit = {
+<span class="pc bpc" id="L255" title="2 of 4 branches missed.">      if (duplicateProvidedNames.contains(name) || !providedNames.add(name)) {</span>
+<span class="nc" id="L256">        duplicateProvidedNames.add(name)</span>
+<span class="pc" id="L257">        providedNames.remove(name)</span>
+      }
+    }
+<span class="pc" id="L260">    request.topicNames.forEach(addProvidedName)</span>
+<span class="fc" id="L261">    request.topics.forEach {</span>
+<span class="pc bpc" id="L262" title="1 of 2 branches missed.">      topic =&gt; if (topic.name == null) {</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        if (topic.topicId.equals(ZERO_UUID)) {</span>
+<span class="nc" id="L264">          appendResponse(null, ZERO_UUID, new ApiError(INVALID_REQUEST,</span>
+<span class="nc" id="L265">            &quot;Neither topic name nor id were specified.&quot;))</span>
+<span class="nc bnc" id="L266" title="All 4 branches missed.">        } else if (duplicateProvidedIds.contains(topic.topicId) || !providedIds.add(topic.topicId)) {</span>
+<span class="nc" id="L267">          duplicateProvidedIds.add(topic.topicId)</span>
+<span class="nc" id="L268">          providedIds.remove(topic.topicId)</span>
+        }
+      } else {
+<span class="pc bpc" id="L271" title="1 of 2 branches missed.">        if (topic.topicId.equals(ZERO_UUID)) {</span>
+<span class="fc" id="L272">          addProvidedName(topic.name)</span>
+        } else {
+<span class="nc" id="L274">          appendResponse(topic.name, topic.topicId, new ApiError(INVALID_REQUEST,</span>
+<span class="nc" id="L275">            &quot;You may not specify both topic name and topic id.&quot;))</span>
+        }
+      }
+    }
+    // Create error responses for duplicates.
+<span class="pc" id="L280">    duplicateProvidedNames.forEach(name =&gt; appendResponse(name, ZERO_UUID,</span>
+<span class="nc" id="L281">      new ApiError(INVALID_REQUEST, &quot;Duplicate topic name.&quot;)))</span>
+<span class="pc" id="L282">    duplicateProvidedIds.forEach(id =&gt; appendResponse(null, id,</span>
+<span class="nc" id="L283">      new ApiError(INVALID_REQUEST, &quot;Duplicate topic id.&quot;)))</span>
+    // At this point we have all the valid names and IDs that have been provided.
+    // However, the Authorizer needs topic names as inputs, not topic IDs.  So
+    // we need to resolve all IDs to names.
+<span class="fc" id="L287">    val toAuthenticate = new util.HashSet[String]</span>
+<span class="fc" id="L288">    toAuthenticate.addAll(providedNames)</span>
+<span class="fc" id="L289">    val idToName = new util.HashMap[Uuid, String]</span>
+<span class="fc" id="L290">    controller.findTopicNames(context, providedIds).thenCompose { topicNames =&gt;</span>
+<span class="fc" id="L291">      topicNames.forEach { (id, nameOrError) =&gt;</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        if (nameOrError.isError) {</span>
+<span class="nc" id="L293">          appendResponse(null, id, nameOrError.error())</span>
+        } else {
+<span class="nc" id="L295">          toAuthenticate.add(nameOrError.result())</span>
+<span class="nc" id="L296">          idToName.put(id, nameOrError.result())</span>
+        }
+      }
+      // Get the list of deletable topics (those we can delete) and the list of describable
+      // topics.
+<span class="fc" id="L301">      val topicsToAuthenticate = toAuthenticate.asScala</span>
+<span class="pc bpc" id="L302" title="1 of 2 branches missed.">      val (describable, deletable) = if (hasClusterAuth) {</span>
+<span class="fc" id="L303">        (topicsToAuthenticate.toSet, topicsToAuthenticate.toSet)</span>
+      } else {
+<span class="pc" id="L305">        (getDescribableTopics(topicsToAuthenticate), getDeletableTopics(topicsToAuthenticate))</span>
+      }
+      // For each topic that was provided by ID, check if authentication failed.
+      // If so, remove it from the idToName map and create an error response for it.
+<span class="fc" id="L309">      val iterator = idToName.entrySet().iterator()</span>
+<span class="pc bpc" id="L310" title="1 of 2 branches missed.">      while (iterator.hasNext) {</span>
+<span class="nc" id="L311">        val entry = iterator.next()</span>
+<span class="nc" id="L312">        val id = entry.getKey</span>
+<span class="nc" id="L313">        val name = entry.getValue</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        if (!deletable.contains(name)) {</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">          if (describable.contains(name)) {</span>
+<span class="nc" id="L316">            appendResponse(name, id, new ApiError(TOPIC_AUTHORIZATION_FAILED))</span>
+          } else {
+<span class="nc" id="L318">            appendResponse(null, id, new ApiError(TOPIC_AUTHORIZATION_FAILED))</span>
+          }
+<span class="nc" id="L320">          iterator.remove()</span>
+        }
+      }
+      // For each topic that was provided by name, check if authentication failed.
+      // If so, create an error response for it. Otherwise, add it to the idToName map.
+<span class="fc" id="L325">      controller.findTopicIds(context, providedNames).thenCompose { topicIds =&gt;</span>
+<span class="fc" id="L326">        topicIds.forEach { (name, idOrError) =&gt;</span>
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">          if (!describable.contains(name)) {</span>
+<span class="nc" id="L328">            appendResponse(name, ZERO_UUID, new ApiError(TOPIC_AUTHORIZATION_FAILED))</span>
+<span class="pc bpc" id="L329" title="1 of 2 branches missed.">          } else if (idOrError.isError) {</span>
+<span class="nc" id="L330">            appendResponse(name, ZERO_UUID, idOrError.error)</span>
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">          } else if (deletable.contains(name)) {</span>
+<span class="fc" id="L332">            val id = idOrError.result()</span>
+<span class="pc bpc" id="L333" title="2 of 4 branches missed.">            if (duplicateProvidedIds.contains(id) || idToName.put(id, name) != null) {</span>
+              // This is kind of a weird case: what if we supply topic ID X and also a name
+              // that maps to ID X?  In that case, _if authorization succeeds_, we end up
+              // here.  If authorization doesn't succeed, we refrain from commenting on the
+              // situation since it would reveal topic ID mappings.
+<span class="nc" id="L338">              duplicateProvidedIds.add(id)</span>
+<span class="nc" id="L339">              idToName.remove(id)</span>
+<span class="pc" id="L340">              appendResponse(name, id, new ApiError(INVALID_REQUEST,</span>
+<span class="nc" id="L341">                &quot;The provided topic name maps to an ID that was already supplied.&quot;))</span>
+            }
+          } else {
+<span class="nc" id="L344">            appendResponse(name, ZERO_UUID, new ApiError(TOPIC_AUTHORIZATION_FAILED))</span>
+          }
+        }
+        // Finally, the idToName map contains all the topics that we are authorized to delete.
+        // Perform the deletion and create responses for each one.
+<span class="fc" id="L349">        controller.deleteTopics(context, idToName.keySet).thenApply { idToError =&gt;</span>
+<span class="fc" id="L350">          idToError.forEach { (id, error) =&gt;</span>
+<span class="fc" id="L351">            appendResponse(idToName.get(id), id, error)</span>
+          }
+          // Shuffle the responses so that users can not use patterns in their positions to
+          // distinguish between absent topics and topics we are not permitted to see.
+<span class="fc" id="L355">          Collections.shuffle(responses)</span>
+<span class="fc" id="L356">          responses</span>
+        }
+      }
+    }
+  }
+
+  private def handleCreateTopics(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="fc" id="L363">    val createTopicsRequest = request.body[CreateTopicsRequest]</span>
+<span class="fc" id="L364">    val controllerMutationQuota = quotas.controllerMutation.newQuotaFor(request.session, request.header, 6)</span>
+<span class="fc" id="L365">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="fc" id="L366">      requestTimeoutMsToDeadlineNs(time, createTopicsRequest.data.timeoutMs),</span>
+<span class="fc" id="L367">      controllerMutationQuotaRecorderFor(controllerMutationQuota))</span>
+<span class="fc" id="L368">    val future = createTopics(context,</span>
+<span class="fc" id="L369">        createTopicsRequest.data,</span>
+<span class="fc" id="L370">        authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME, logIfDenied = false),</span>
+<span class="pc" id="L371">        names =&gt; authHelper.filterByAuthorized(request.context, CREATE, TOPIC, names)(identity),</span>
+<span class="fc" id="L372">        names =&gt; authHelper.filterByAuthorized(request.context, DESCRIBE_CONFIGS, TOPIC,</span>
+<span class="fc" id="L373">            names, logIfDenied = false)(identity))</span>
+<span class="fc" id="L374">    future.handle[Unit] { (result, exception) =&gt;</span>
+<span class="pc bpc" id="L375" title="1 of 2 branches missed.">      val response = if (exception != null) {</span>
+<span class="nc" id="L376">        createTopicsRequest.getErrorResponse(exception)</span>
+      } else {
+<span class="fc" id="L378">        new CreateTopicsResponse(result)</span>
+      }
+<span class="fc" id="L380">      requestHelper.sendResponseMaybeThrottleWithControllerQuota(controllerMutationQuota, request, response)</span>
+    }
+  }
+
+<span class="fc" id="L384">  private def controllerMutationQuotaRecorderFor(controllerMutationQuota: ControllerMutationQuota) = {</span>
+<span class="pc" id="L385">    new Consumer[lang.Integer]() {</span>
+<span class="fc" id="L386">      override def accept(permits: lang.Integer): Unit = controllerMutationQuota.record(permits.doubleValue())</span>
+    }
+  }
+
+  def createTopics(
+    context: ControllerRequestContext,
+    request: CreateTopicsRequestData,
+    hasClusterAuth: Boolean,
+    getCreatableTopics: Iterable[String] =&gt; Set[String],
+    getDescribableTopics: Iterable[String] =&gt; Set[String]
+  ): CompletableFuture[CreateTopicsResponseData] = {
+<span class="fc" id="L397">    val topicNames = new util.HashSet[String]()</span>
+<span class="fc" id="L398">    val duplicateTopicNames = new util.HashSet[String]()</span>
+<span class="fc" id="L399">    request.topics().forEach { topicData =&gt;</span>
+<span class="pc bpc" id="L400" title="1 of 2 branches missed.">      if (!duplicateTopicNames.contains(topicData.name())) {</span>
+<span class="pc bpc" id="L401" title="1 of 2 branches missed.">        if (!topicNames.add(topicData.name())) {</span>
+<span class="nc" id="L402">          topicNames.remove(topicData.name())</span>
+<span class="pc" id="L403">          duplicateTopicNames.add(topicData.name())</span>
+        }
+      }
+    }
+
+<span class="fc" id="L408">    val allowedTopicNames = topicNames.asScala.diff(Set(Topic.CLUSTER_METADATA_TOPIC_NAME))</span>
+
+<span class="pc bpc" id="L410" title="1 of 2 branches missed.">    val authorizedTopicNames = if (hasClusterAuth) {</span>
+<span class="fc" id="L411">      allowedTopicNames</span>
+    } else {
+<span class="pc" id="L413">      getCreatableTopics.apply(allowedTopicNames)</span>
+    }
+<span class="fc" id="L415">    val describableTopicNames = getDescribableTopics.apply(allowedTopicNames).asJava</span>
+<span class="fc" id="L416">    val effectiveRequest = request.duplicate()</span>
+<span class="fc" id="L417">    val iterator = effectiveRequest.topics().iterator()</span>
+<span class="fc bfc" id="L418" title="All 2 branches covered.">    while (iterator.hasNext) {</span>
+<span class="fc" id="L419">      val creatableTopic = iterator.next()</span>
+<span class="pc bpc" id="L420" title="1 of 2 branches missed.">      if (duplicateTopicNames.contains(creatableTopic.name()) ||</span>
+<span class="pc bpc" id="L421" title="1 of 2 branches missed.">          !authorizedTopicNames.contains(creatableTopic.name())) {</span>
+<span class="nc" id="L422">        iterator.remove()</span>
+      }
+    }
+<span class="fc" id="L425">    controller.createTopics(context, effectiveRequest, describableTopicNames).thenApply { response =&gt;</span>
+<span class="fc" id="L426">      duplicateTopicNames.forEach { name =&gt;</span>
+<span class="nc" id="L427">        response.topics().add(new CreatableTopicResult().</span>
+<span class="nc" id="L428">          setName(name).</span>
+<span class="nc" id="L429">          setErrorCode(INVALID_REQUEST.code).</span>
+<span class="nc" id="L430">          setErrorMessage(&quot;Duplicate topic name.&quot;))</span>
+      }
+<span class="fc" id="L432">      topicNames.forEach { name =&gt;</span>
+<span class="pc bpc" id="L433" title="2 of 4 branches missed.">        if (name == Topic.CLUSTER_METADATA_TOPIC_NAME) {</span>
+<span class="nc" id="L434">          response.topics().add(new CreatableTopicResult().</span>
+<span class="nc" id="L435">            setName(name).</span>
+<span class="nc" id="L436">            setErrorCode(INVALID_REQUEST.code).</span>
+<span class="nc" id="L437">            setErrorMessage(s&quot;Creation of internal topic ${Topic.CLUSTER_METADATA_TOPIC_NAME} is prohibited.&quot;))</span>
+<span class="pc bpc" id="L438" title="1 of 2 branches missed.">        } else if (!authorizedTopicNames.contains(name)) {</span>
+<span class="pc" id="L439">          response.topics().add(new CreatableTopicResult().</span>
+<span class="nc" id="L440">            setName(name).</span>
+<span class="nc" id="L441">            setErrorCode(TOPIC_AUTHORIZATION_FAILED.code).</span>
+<span class="nc" id="L442">            setErrorMessage(&quot;Authorization failed.&quot;))</span>
+        }
+      }
+<span class="fc" id="L445">      response</span>
+    }
+  }
+
+  def handleApiVersionsRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    // Note that controller returns its full list of supported ApiKeys and versions regardless of current
+    // authentication state (e.g., before SASL authentication on an SASL listener, do note that no
+    // Kafka protocol requests may take place on an SSL listener before the SSL handshake is finished).
+    // If this is considered to leak information about the controller version a workaround is to use SSL
+    // with client authentication which is performed at an earlier stage of the connection where the
+    // ApiVersionRequest is not available.
+<span class="fc" id="L456">    val apiVersionRequest = request.body[ApiVersionsRequest]</span>
+<span class="pc bpc" id="L457" title="1 of 2 branches missed.">    if (apiVersionRequest.hasUnsupportedRequestVersion) {</span>
+<span class="nc" id="L458">      requestHelper.sendResponseMaybeThrottle(request,</span>
+<span class="nc" id="L459">        requestThrottleMs =&gt; apiVersionRequest.getErrorResponse(requestThrottleMs, UNSUPPORTED_VERSION.exception))</span>
+<span class="pc bpc" id="L460" title="1 of 2 branches missed.">    } else if (!apiVersionRequest.isValid) {</span>
+<span class="nc" id="L461">      requestHelper.sendResponseMaybeThrottle(request,</span>
+<span class="nc" id="L462">        requestThrottleMs =&gt; apiVersionRequest.getErrorResponse(requestThrottleMs, INVALID_REQUEST.exception))</span>
+    } else {
+<span class="fc" id="L464">      requestHelper.sendResponseMaybeThrottle(request,</span>
+<span class="pc bpc" id="L465" title="1 of 2 branches missed.">        requestThrottleMs =&gt; apiVersionManager.apiVersionResponse(requestThrottleMs, request.header.apiVersion() &lt; 4))</span>
+    }
+<span class="fc" id="L467">    CompletableFuture.completedFuture[Unit](())</span>
+  }
+
+  private def authorizeAlterResource(requestContext: RequestContext,
+                                     resource: ConfigResource): ApiError = {
+<span class="nc" id="L472">    resource.`type` match {</span>
+<span class="nc bnc" id="L473" title="All 6 branches missed.">      case ConfigResource.Type.BROKER | ConfigResource.Type.CLIENT_METRICS =&gt;</span>
+<span class="nc bnc" id="L474" title="All 2 branches missed.">        if (authHelper.authorize(requestContext, ALTER_CONFIGS, CLUSTER, CLUSTER_NAME)) {</span>
+<span class="nc" id="L475">          new ApiError(NONE)</span>
+        } else {
+<span class="nc" id="L477">          new ApiError(CLUSTER_AUTHORIZATION_FAILED)</span>
+        }
+<span class="nc bnc" id="L479" title="All 2 branches missed.">      case ConfigResource.Type.TOPIC =&gt;</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">        if (authHelper.authorize(requestContext, ALTER_CONFIGS, TOPIC, resource.name)) {</span>
+<span class="nc" id="L481">          new ApiError(NONE)</span>
+        } else {
+<span class="nc" id="L483">          new ApiError(TOPIC_AUTHORIZATION_FAILED)</span>
+        }
+<span class="nc bnc" id="L485" title="All 2 branches missed.">      case ConfigResource.Type.GROUP =&gt;</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">        if (authHelper.authorize(requestContext, ALTER_CONFIGS, GROUP, resource.name)) {</span>
+<span class="nc" id="L487">          new ApiError(NONE)</span>
+        } else {
+<span class="nc" id="L489">          new ApiError(GROUP_AUTHORIZATION_FAILED)</span>
+        }
+<span class="nc" id="L491">      case rt =&gt; new ApiError(INVALID_REQUEST, s&quot;Unexpected resource type $rt.&quot;)</span>
+    }
+  }
+
+  def handleLegacyAlterConfigs(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L496">    val response = new AlterConfigsResponseData()</span>
+<span class="nc" id="L497">    val alterConfigsRequest = request.body[AlterConfigsRequest]</span>
+<span class="nc" id="L498">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal, OptionalLong.empty())</span>
+<span class="nc" id="L499">    val duplicateResources = new util.HashSet[ConfigResource]</span>
+<span class="nc" id="L500">    val configChanges = new util.HashMap[ConfigResource, util.Map[String, String]]()</span>
+<span class="nc" id="L501">    alterConfigsRequest.data.resources.forEach { resource =&gt;</span>
+<span class="nc" id="L502">      val configResource = new ConfigResource(</span>
+<span class="nc" id="L503">        ConfigResource.Type.forId(resource.resourceType), resource.resourceName())</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">      if (configResource.`type`().equals(ConfigResource.Type.UNKNOWN)) {</span>
+<span class="nc" id="L505">        response.responses().add(new OldAlterConfigsResourceResponse().</span>
+<span class="nc" id="L506">          setErrorCode(UNSUPPORTED_VERSION.code()).</span>
+<span class="nc" id="L507">          setErrorMessage(&quot;Unknown resource type &quot; + resource.resourceType() + &quot;.&quot;).</span>
+<span class="nc" id="L508">          setResourceName(resource.resourceName()).</span>
+<span class="nc" id="L509">          setResourceType(resource.resourceType()))</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">      } else if (!duplicateResources.contains(configResource)) {</span>
+<span class="nc" id="L511">        val configs = new util.HashMap[String, String]()</span>
+<span class="nc" id="L512">        resource.configs().forEach(config =&gt; configs.put(config.name(), config.value()))</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">        if (configChanges.put(configResource, configs) != null) {</span>
+<span class="nc" id="L514">          duplicateResources.add(configResource)</span>
+<span class="nc" id="L515">          configChanges.remove(configResource)</span>
+<span class="nc" id="L516">          response.responses().add(new OldAlterConfigsResourceResponse().</span>
+<span class="nc" id="L517">            setErrorCode(INVALID_REQUEST.code()).</span>
+<span class="nc" id="L518">            setErrorMessage(&quot;Duplicate resource.&quot;).</span>
+<span class="nc" id="L519">            setResourceName(resource.resourceName()).</span>
+<span class="nc" id="L520">            setResourceType(resource.resourceType()))</span>
+        }
+      }
+    }
+<span class="nc" id="L524">    val iterator = configChanges.keySet().iterator()</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">    while (iterator.hasNext) {</span>
+<span class="nc" id="L526">      val resource = iterator.next()</span>
+<span class="nc" id="L527">      val apiError = authorizeAlterResource(request.context, resource)</span>
+<span class="nc bnc" id="L528" title="All 2 branches missed.">      if (apiError.isFailure) {</span>
+<span class="nc" id="L529">        response.responses().add(new OldAlterConfigsResourceResponse().</span>
+<span class="nc" id="L530">          setErrorCode(apiError.error().code()).</span>
+<span class="nc" id="L531">          setErrorMessage(apiError.message()).</span>
+<span class="nc" id="L532">          setResourceName(resource.name()).</span>
+<span class="nc" id="L533">          setResourceType(resource.`type`().id()))</span>
+<span class="nc" id="L534">        iterator.remove()</span>
+      }
+    }
+<span class="nc" id="L537">    controller.legacyAlterConfigs(context, configChanges, alterConfigsRequest.data.validateOnly)</span>
+<span class="nc" id="L538">      .handle[Unit] { (controllerResults, exception) =&gt;</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">        if (exception != null) {</span>
+<span class="nc" id="L540">          requestHelper.handleError(request, exception)</span>
+        } else {
+<span class="nc" id="L542">          controllerResults.forEach((key, value) =&gt; response.responses().add(</span>
+<span class="nc" id="L543">            new OldAlterConfigsResourceResponse().</span>
+<span class="nc" id="L544">              setErrorCode(value.error().code()).</span>
+<span class="nc" id="L545">              setErrorMessage(value.message()).</span>
+<span class="nc" id="L546">              setResourceName(key.name()).</span>
+<span class="nc" id="L547">              setResourceType(key.`type`().id())))</span>
+<span class="nc" id="L548">          requestHelper.sendResponseMaybeThrottle(request, throttleMs =&gt;</span>
+<span class="nc" id="L549">            new AlterConfigsResponse(response.setThrottleTimeMs(throttleMs)))</span>
+        }
+      }
+  }
+
+  def handleVote(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L555">    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)</span>
+<span class="nc" id="L556">    handleRaftRequest(request, response =&gt; new VoteResponse(response.asInstanceOf[VoteResponseData]))</span>
+  }
+
+  def handleBeginQuorumEpoch(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L560">    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)</span>
+<span class="nc" id="L561">    handleRaftRequest(request, response =&gt; new BeginQuorumEpochResponse(response.asInstanceOf[BeginQuorumEpochResponseData]))</span>
+  }
+
+  def handleEndQuorumEpoch(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L565">    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)</span>
+<span class="nc" id="L566">    handleRaftRequest(request, response =&gt; new EndQuorumEpochResponse(response.asInstanceOf[EndQuorumEpochResponseData]))</span>
+  }
+
+  def handleDescribeQuorum(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L570">    authHelper.authorizeClusterOperation(request, DESCRIBE)</span>
+<span class="nc" id="L571">    handleRaftRequest(request, response =&gt; new DescribeQuorumResponse(response.asInstanceOf[DescribeQuorumResponseData]))</span>
+  }
+
+  def handleElectLeaders(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L575">    authHelper.authorizeClusterOperation(request, ALTER)</span>
+<span class="nc" id="L576">    val electLeadersRequest = request.body[ElectLeadersRequest]</span>
+<span class="nc" id="L577">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="nc" id="L578">      requestTimeoutMsToDeadlineNs(time, electLeadersRequest.data.timeoutMs))</span>
+<span class="nc" id="L579">    val future = controller.electLeaders(context, electLeadersRequest.data)</span>
+<span class="nc" id="L580">    future.handle[Unit] { (responseData, exception) =&gt;</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">      if (exception != null) {</span>
+<span class="nc" id="L582">        requestHelper.sendResponseMaybeThrottle(request, throttleMs =&gt; {</span>
+<span class="nc" id="L583">          electLeadersRequest.getErrorResponse(throttleMs, exception)</span>
+        })
+      } else {
+<span class="nc" id="L586">        requestHelper.sendResponseMaybeThrottle(request, throttleMs =&gt; {</span>
+<span class="nc" id="L587">          new ElectLeadersResponse(responseData.setThrottleTimeMs(throttleMs))</span>
+        })
+      }
+    }
+  }
+
+  def handleAlterPartitionRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L594">    val alterPartitionRequest = request.body[AlterPartitionRequest]</span>
+<span class="nc" id="L595">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="nc" id="L596">      OptionalLong.empty())</span>
+<span class="nc" id="L597">    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)</span>
+<span class="nc" id="L598">    val future = controller.alterPartition(context, alterPartitionRequest.data)</span>
+<span class="nc" id="L599">    future.handle[Unit] { (result, exception) =&gt;</span>
+<span class="nc bnc" id="L600" title="All 2 branches missed.">      val response = if (exception != null) {</span>
+<span class="nc" id="L601">        alterPartitionRequest.getErrorResponse(exception)</span>
+      } else {
+<span class="nc" id="L603">        new AlterPartitionResponse(result)</span>
+      }
+<span class="nc" id="L605">      requestHelper.sendResponseExemptThrottle(request, response)</span>
+    }
+  }
+
+  def handleBrokerHeartBeatRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="fc" id="L610">    val heartbeatRequest = request.body[BrokerHeartbeatRequest]</span>
+<span class="fc" id="L611">    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)</span>
+<span class="fc" id="L612">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="fc" id="L613">      requestTimeoutMsToDeadlineNs(time, config.brokerHeartbeatIntervalMs / 2))</span>
+<span class="fc" id="L614">    controller.processBrokerHeartbeat(context, heartbeatRequest.data).handle[Unit] { (reply, e) =&gt;</span>
+      def createResponseCallback(requestThrottleMs: Int,
+                                 reply: BrokerHeartbeatReply,
+                                 e: Throwable): BrokerHeartbeatResponse = {
+<span class="pc bpc" id="L618" title="1 of 2 branches missed.">        if (e != null) {</span>
+<span class="nc" id="L619">          new BrokerHeartbeatResponse(new BrokerHeartbeatResponseData().</span>
+<span class="nc" id="L620">            setThrottleTimeMs(requestThrottleMs).</span>
+<span class="nc" id="L621">            setErrorCode(Errors.forException(e).code))</span>
+        } else {
+<span class="fc" id="L623">          new BrokerHeartbeatResponse(new BrokerHeartbeatResponseData().</span>
+<span class="fc" id="L624">            setThrottleTimeMs(requestThrottleMs).</span>
+<span class="fc" id="L625">            setErrorCode(NONE.code).</span>
+<span class="fc" id="L626">            setIsCaughtUp(reply.isCaughtUp).</span>
+<span class="fc" id="L627">            setIsFenced(reply.isFenced).</span>
+<span class="fc" id="L628">            setShouldShutDown(reply.shouldShutDown))</span>
+        }
+      }
+<span class="fc" id="L631">      requestHelper.sendResponseMaybeThrottle(request,</span>
+<span class="fc" id="L632">        requestThrottleMs =&gt; createResponseCallback(requestThrottleMs, reply, e))</span>
+    }
+  }
+
+  def handleUnregisterBroker(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L637">    val decommissionRequest = request.body[UnregisterBrokerRequest]</span>
+<span class="nc" id="L638">    authHelper.authorizeClusterOperation(request, ALTER)</span>
+<span class="nc" id="L639">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="nc" id="L640">      OptionalLong.empty())</span>
+
+<span class="nc" id="L642">    controller.unregisterBroker(context, decommissionRequest.data.brokerId).handle[Unit] { (_, e) =&gt;</span>
+      def createResponseCallback(requestThrottleMs: Int,
+                                 e: Throwable): UnregisterBrokerResponse = {
+<span class="nc bnc" id="L645" title="All 2 branches missed.">        if (e != null) {</span>
+<span class="nc" id="L646">          decommissionRequest.getErrorResponse(requestThrottleMs, e)</span>
+        } else {
+<span class="nc" id="L648">          new UnregisterBrokerResponse(new UnregisterBrokerResponseData().</span>
+<span class="nc" id="L649">            setThrottleTimeMs(requestThrottleMs))</span>
+        }
+      }
+<span class="nc" id="L652">      requestHelper.sendResponseMaybeThrottle(request,</span>
+<span class="nc" id="L653">        requestThrottleMs =&gt; createResponseCallback(requestThrottleMs, e))</span>
+    }
+  }
+
+  private def handleBrokerRegistration(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="fc" id="L658">    val registrationRequest = request.body[BrokerRegistrationRequest]</span>
+<span class="fc" id="L659">    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)</span>
+<span class="fc" id="L660">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="fc" id="L661">      OptionalLong.empty())</span>
+
+<span class="fc" id="L663">    controller.registerBroker(context, registrationRequest.data).handle[Unit] { (reply, e) =&gt;</span>
+      def createResponseCallback(requestThrottleMs: Int,
+                                 reply: BrokerRegistrationReply,
+                                 e: Throwable): BrokerRegistrationResponse = {
+<span class="pc bpc" id="L667" title="1 of 2 branches missed.">        if (e != null) {</span>
+<span class="nc" id="L668">          new BrokerRegistrationResponse(new BrokerRegistrationResponseData().</span>
+<span class="nc" id="L669">            setThrottleTimeMs(requestThrottleMs).</span>
+<span class="nc" id="L670">            setErrorCode(Errors.forException(e).code))</span>
+        } else {
+<span class="fc" id="L672">          new BrokerRegistrationResponse(new BrokerRegistrationResponseData().</span>
+<span class="fc" id="L673">            setThrottleTimeMs(requestThrottleMs).</span>
+<span class="fc" id="L674">            setErrorCode(NONE.code).</span>
+<span class="fc" id="L675">            setBrokerEpoch(reply.epoch))</span>
+        }
+      }
+<span class="fc" id="L678">      requestHelper.sendResponseMaybeThrottle(request,</span>
+<span class="fc" id="L679">        requestThrottleMs =&gt; createResponseCallback(requestThrottleMs, reply, e))</span>
+    }
+  }
+
+  private def handleRaftRequest(request: RequestChannel.Request,
+                                buildResponse: ApiMessage =&gt; AbstractResponse): CompletableFuture[Unit] = {
+<span class="nc" id="L685">    val requestBody = request.body[AbstractRequest]</span>
+<span class="nc" id="L686">    val future = raftManager.handleRequest(request.context, request.header, requestBody.data, time.milliseconds())</span>
+<span class="nc" id="L687">    future.handle[Unit] { (responseData, exception) =&gt;</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">      val response = if (exception != null) {</span>
+<span class="nc" id="L689">        requestBody.getErrorResponse(exception)</span>
+      } else {
+<span class="nc" id="L691">        buildResponse(responseData)</span>
+      }
+<span class="nc" id="L693">      requestHelper.sendResponseExemptThrottle(request, response)</span>
+    }
+  }
+
+  def handleAlterClientQuotas(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L698">    val quotaRequest = request.body[AlterClientQuotasRequest]</span>
+<span class="nc" id="L699">    authHelper.authorizeClusterOperation(request, ALTER_CONFIGS)</span>
+<span class="nc" id="L700">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="nc" id="L701">      OptionalLong.empty())</span>
+<span class="nc" id="L702">    controller.alterClientQuotas(context, quotaRequest.entries, quotaRequest.validateOnly)</span>
+<span class="nc" id="L703">      .handle[Unit] { (results, exception) =&gt;</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">        if (exception != null) {</span>
+<span class="nc" id="L705">          requestHelper.handleError(request, exception)</span>
+        } else {
+<span class="nc" id="L707">          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L708">            AlterClientQuotasResponse.fromQuotaEntities(results, requestThrottleMs))</span>
+        }
+      }
+  }
+
+  def handleIncrementalAlterConfigs(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L714">    val response = new IncrementalAlterConfigsResponseData()</span>
+<span class="nc" id="L715">    val alterConfigsRequest = request.body[IncrementalAlterConfigsRequest]</span>
+<span class="nc" id="L716">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="nc" id="L717">      OptionalLong.empty())</span>
+<span class="nc" id="L718">    val duplicateResources = new util.HashSet[ConfigResource]</span>
+<span class="nc" id="L719">    val configChanges = new util.HashMap[ConfigResource,</span>
+      util.Map[String, Entry[AlterConfigOp.OpType, String]]]()
+<span class="nc" id="L721">    val brokerLoggerResponses = new util.ArrayList[AlterConfigsResourceResponse](1)</span>
+<span class="nc" id="L722">    alterConfigsRequest.data.resources.forEach { resource =&gt;</span>
+<span class="nc" id="L723">      val configResource = new ConfigResource(</span>
+<span class="nc" id="L724">        ConfigResource.Type.forId(resource.resourceType), resource.resourceName())</span>
+<span class="nc bnc" id="L725" title="All 2 branches missed.">      if (configResource.`type`().equals(ConfigResource.Type.BROKER_LOGGER)) {</span>
+        val apiError = try {
+<span class="nc" id="L727">          runtimeLoggerManager.applyChangesForResource(</span>
+<span class="nc" id="L728">            authHelper.authorize(request.context, CLUSTER_ACTION, CLUSTER, CLUSTER_NAME),</span>
+<span class="nc" id="L729">            alterConfigsRequest.data().validateOnly(),</span>
+<span class="nc" id="L730">            resource)</span>
+<span class="nc" id="L731">          ApiError.NONE</span>
+        } catch {
+<span class="nc" id="L733">          case t: Throwable =&gt; ApiError.fromThrowable(t)</span>
+        }
+<span class="nc" id="L735">        brokerLoggerResponses.add(new AlterConfigsResourceResponse().</span>
+<span class="nc" id="L736">          setResourceName(resource.resourceName()).</span>
+<span class="nc" id="L737">          setResourceType(resource.resourceType()).</span>
+<span class="nc" id="L738">          setErrorCode(apiError.error().code()).</span>
+<span class="nc bnc" id="L739" title="All 2 branches missed.">          setErrorMessage(if (apiError.isFailure) apiError.messageWithFallback() else null))</span>
+<span class="nc bnc" id="L740" title="All 2 branches missed.">      } else if (configResource.`type`().equals(ConfigResource.Type.UNKNOWN)) {</span>
+<span class="nc" id="L741">        response.responses().add(new AlterConfigsResourceResponse().</span>
+<span class="nc" id="L742">          setErrorCode(UNSUPPORTED_VERSION.code()).</span>
+<span class="nc" id="L743">          setErrorMessage(&quot;Unknown resource type &quot; + resource.resourceType() + &quot;.&quot;).</span>
+<span class="nc" id="L744">          setResourceName(resource.resourceName()).</span>
+<span class="nc" id="L745">          setResourceType(resource.resourceType()))</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">      } else if (!duplicateResources.contains(configResource)) {</span>
+<span class="nc" id="L747">        val altersByName = new util.HashMap[String, Entry[AlterConfigOp.OpType, String]]()</span>
+<span class="nc" id="L748">        resource.configs.forEach { config =&gt;</span>
+<span class="nc" id="L749">          altersByName.put(config.name, new util.AbstractMap.SimpleEntry[AlterConfigOp.OpType, String](</span>
+<span class="nc" id="L750">            AlterConfigOp.OpType.forId(config.configOperation), config.value))</span>
+        }
+<span class="nc bnc" id="L752" title="All 2 branches missed.">        if (configChanges.put(configResource, altersByName) != null) {</span>
+<span class="nc" id="L753">          duplicateResources.add(configResource)</span>
+<span class="nc" id="L754">          configChanges.remove(configResource)</span>
+<span class="nc" id="L755">          response.responses().add(new AlterConfigsResourceResponse().</span>
+<span class="nc" id="L756">            setErrorCode(INVALID_REQUEST.code()).</span>
+<span class="nc" id="L757">            setErrorMessage(&quot;Duplicate resource.&quot;).</span>
+<span class="nc" id="L758">            setResourceName(resource.resourceName()).</span>
+<span class="nc" id="L759">            setResourceType(resource.resourceType()))</span>
+        }
+      }
+    }
+<span class="nc" id="L763">    val iterator = configChanges.keySet().iterator()</span>
+<span class="nc bnc" id="L764" title="All 2 branches missed.">    while (iterator.hasNext) {</span>
+<span class="nc" id="L765">      val resource = iterator.next()</span>
+<span class="nc" id="L766">      val apiError = authorizeAlterResource(request.context, resource)</span>
+<span class="nc bnc" id="L767" title="All 2 branches missed.">      if (apiError.isFailure) {</span>
+<span class="nc" id="L768">        response.responses().add(new AlterConfigsResourceResponse().</span>
+<span class="nc" id="L769">          setErrorCode(apiError.error().code()).</span>
+<span class="nc" id="L770">          setErrorMessage(apiError.message()).</span>
+<span class="nc" id="L771">          setResourceName(resource.name()).</span>
+<span class="nc" id="L772">          setResourceType(resource.`type`().id()))</span>
+<span class="nc" id="L773">        iterator.remove()</span>
+      }
+    }
+<span class="nc" id="L776">    controller.incrementalAlterConfigs(context, configChanges, alterConfigsRequest.data.validateOnly)</span>
+<span class="nc" id="L777">      .handle[Unit] { (controllerResults, exception) =&gt;</span>
+<span class="nc bnc" id="L778" title="All 2 branches missed.">        if (exception != null) {</span>
+<span class="nc" id="L779">          requestHelper.handleError(request, exception)</span>
+        } else {
+<span class="nc" id="L781">          controllerResults.forEach((key, value) =&gt; response.responses().add(</span>
+<span class="nc" id="L782">            new AlterConfigsResourceResponse().</span>
+<span class="nc" id="L783">              setErrorCode(value.error().code()).</span>
+<span class="nc" id="L784">              setErrorMessage(value.message()).</span>
+<span class="nc" id="L785">              setResourceName(key.name()).</span>
+<span class="nc" id="L786">              setResourceType(key.`type`().id())))</span>
+<span class="nc" id="L787">          brokerLoggerResponses.forEach(r =&gt; response.responses().add(r))</span>
+<span class="nc" id="L788">          requestHelper.sendResponseMaybeThrottle(request, throttleMs =&gt;</span>
+<span class="nc" id="L789">            new IncrementalAlterConfigsResponse(response.setThrottleTimeMs(throttleMs)))</span>
+        }
+      }
+  }
+
+  private def handleCreatePartitions(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    def filterAlterAuthorizedTopics(topics: Iterable[String]): Set[String] = {
+<span class="nc" id="L796">      authHelper.filterByAuthorized(request.context, ALTER, TOPIC, topics)(n =&gt; n)</span>
+    }
+<span class="nc" id="L798">    val createPartitionsRequest = request.body[CreatePartitionsRequest]</span>
+<span class="nc" id="L799">    val controllerMutationQuota = quotas.controllerMutation.newQuotaFor(request.session, request.header, 3)</span>
+<span class="nc" id="L800">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="nc" id="L801">      requestTimeoutMsToDeadlineNs(time, createPartitionsRequest.data.timeoutMs),</span>
+<span class="nc" id="L802">      controllerMutationQuotaRecorderFor(controllerMutationQuota))</span>
+<span class="nc" id="L803">    val future = createPartitions(context,</span>
+<span class="nc" id="L804">      createPartitionsRequest.data(),</span>
+<span class="nc" id="L805">      filterAlterAuthorizedTopics)</span>
+<span class="nc" id="L806">    future.handle[Unit] { (responses, exception) =&gt;</span>
+<span class="nc bnc" id="L807" title="All 2 branches missed.">      val response = if (exception != null) {</span>
+<span class="nc" id="L808">        createPartitionsRequest.getErrorResponse(exception)</span>
+      } else {
+<span class="nc" id="L810">        val responseData = new CreatePartitionsResponseData().setResults(responses)</span>
+<span class="nc" id="L811">        new CreatePartitionsResponse(responseData)</span>
+      }
+<span class="nc" id="L813">      requestHelper.sendResponseMaybeThrottleWithControllerQuota(controllerMutationQuota, request, response)</span>
+    }
+  }
+
+  def handleDescribeConfigsRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L818">    val responseData = configHelper.handleDescribeConfigsRequest(request, authHelper)</span>
+<span class="nc" id="L819">    requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L820">      new DescribeConfigsResponse(responseData.setThrottleTimeMs(requestThrottleMs)))</span>
+<span class="nc" id="L821">    CompletableFuture.completedFuture[Unit](())</span>
+  }
+
+  def createPartitions(
+    context: ControllerRequestContext,
+    request: CreatePartitionsRequestData,
+    getAlterAuthorizedTopics: Iterable[String] =&gt; Set[String]
+  ): CompletableFuture[util.List[CreatePartitionsTopicResult]] = {
+<span class="nc" id="L829">    val responses = new util.ArrayList[CreatePartitionsTopicResult]()</span>
+<span class="nc" id="L830">    val duplicateTopicNames = new util.HashSet[String]()</span>
+<span class="nc" id="L831">    val topicNames = new util.HashSet[String]()</span>
+<span class="nc" id="L832">    request.topics().forEach {</span>
+<span class="nc" id="L833">      topic =&gt;</span>
+<span class="nc bnc" id="L834" title="All 2 branches missed.">        if (!topicNames.add(topic.name())) {</span>
+<span class="nc" id="L835">          duplicateTopicNames.add(topic.name())</span>
+        }
+    }
+<span class="nc" id="L838">    duplicateTopicNames.forEach { topicName =&gt;</span>
+<span class="nc" id="L839">      responses.add(new CreatePartitionsTopicResult().</span>
+<span class="nc" id="L840">        setName(topicName).</span>
+<span class="nc" id="L841">        setErrorCode(INVALID_REQUEST.code).</span>
+<span class="nc" id="L842">        setErrorMessage(&quot;Duplicate topic name.&quot;))</span>
+<span class="nc" id="L843">        topicNames.remove(topicName)</span>
+    }
+<span class="nc" id="L845">    val authorizedTopicNames = getAlterAuthorizedTopics(topicNames.asScala)</span>
+<span class="nc" id="L846">    val topics = new util.ArrayList[CreatePartitionsTopic]</span>
+<span class="nc" id="L847">    topicNames.forEach { topicName =&gt;</span>
+<span class="nc bnc" id="L848" title="All 2 branches missed.">      if (authorizedTopicNames.contains(topicName)) {</span>
+<span class="nc" id="L849">        topics.add(request.topics().find(topicName))</span>
+      } else {
+<span class="nc" id="L851">        responses.add(new CreatePartitionsTopicResult().</span>
+<span class="nc" id="L852">          setName(topicName).</span>
+<span class="nc" id="L853">          setErrorCode(TOPIC_AUTHORIZATION_FAILED.code))</span>
+      }
+    }
+<span class="nc" id="L856">    controller.createPartitions(context, topics, request.validateOnly).thenApply { results =&gt;</span>
+<span class="nc" id="L857">      results.forEach(response =&gt; responses.add(response))</span>
+<span class="nc" id="L858">      responses</span>
+    }
+  }
+
+  def handleControllerRegistration(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="fc" id="L863">    val registrationRequest = request.body[ControllerRegistrationRequest]</span>
+<span class="fc" id="L864">    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)</span>
+<span class="fc" id="L865">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="fc" id="L866">      OptionalLong.empty())</span>
+
+<span class="fc" id="L868">    controller.registerController(context, registrationRequest.data)</span>
+<span class="fc" id="L869">      .thenApply[Unit] { _ =&gt;</span>
+<span class="fc" id="L870">        requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="fc" id="L871">          new ControllerRegistrationResponse(new ControllerRegistrationResponseData().</span>
+<span class="fc" id="L872">            setThrottleTimeMs(requestThrottleMs)))</span>
+      }
+  }
+
+  def handleAlterPartitionReassignments(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L877">    val alterRequest = request.body[AlterPartitionReassignmentsRequest]</span>
+<span class="nc" id="L878">    authHelper.authorizeClusterOperation(request, ALTER)</span>
+<span class="nc" id="L879">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="nc" id="L880">      requestTimeoutMsToDeadlineNs(time, alterRequest.data.timeoutMs))</span>
+<span class="nc" id="L881">    controller.alterPartitionReassignments(context, alterRequest.data)</span>
+<span class="nc" id="L882">      .thenApply[Unit] { response =&gt;</span>
+<span class="nc" id="L883">        requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L884">          new AlterPartitionReassignmentsResponse(response.setThrottleTimeMs(requestThrottleMs)))</span>
+      }
+  }
+
+  private def handleAlterUserScramCredentials(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L889">    val alterRequest = request.body[AlterUserScramCredentialsRequest]</span>
+<span class="nc" id="L890">    authHelper.authorizeClusterOperation(request, ALTER)</span>
+<span class="nc" id="L891">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="nc" id="L892">      OptionalLong.empty())</span>
+<span class="nc" id="L893">    controller.alterUserScramCredentials(context, alterRequest.data)</span>
+<span class="nc" id="L894">      .thenApply[Unit] { response =&gt;</span>
+<span class="nc" id="L895">         requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L896">           new AlterUserScramCredentialsResponse(response.setThrottleTimeMs(requestThrottleMs)))</span>
+      }
+  }
+
+  // The principal is carried through in the forwarded case.
+  // The security protocol in the context is for the current connection (hop)
+  // We need to always disallow a tokenAuthenticated principal
+  // We need to allow special protocols but only in the forwarded case for testing.
+  def allowTokenRequests(request: RequestChannel.Request): Boolean = {
+<span class="nc" id="L905">    val protocol = request.context.securityProtocol</span>
+<span class="nc bnc" id="L906" title="All 2 branches missed.">    if (request.context.principal.tokenAuthenticated ||</span>
+      // We allow forwarded requests to use PLAINTEXT for testing purposes
+<span class="nc bnc" id="L908" title="All 8 branches missed.">      (request.isForwarded == false &amp;&amp; protocol == SecurityProtocol.PLAINTEXT) ||</span>
+      // disallow requests from 1-way SSL
+<span class="nc bnc" id="L910" title="All 14 branches missed.">      (request.isForwarded == false &amp;&amp; protocol == SecurityProtocol.SSL &amp;&amp; request.context.principal == KafkaPrincipal.ANONYMOUS))</span>
+<span class="nc" id="L911">      false</span>
+    else
+<span class="nc" id="L913">      true</span>
+  }
+
+  private def handleCreateDelegationTokenRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L917">    val createTokenRequest = request.body[CreateDelegationTokenRequest]</span>
+
+<span class="nc" id="L919">    val requester = request.context.principal</span>
+<span class="nc" id="L920">    val ownerPrincipalName = createTokenRequest.data.ownerPrincipalName</span>
+<span class="nc" id="L921">    val ownerPrincipalType = createTokenRequest.data.ownerPrincipalType</span>
+<span class="nc bnc" id="L922" title="All 4 branches missed.">    val owner = if (ownerPrincipalName == null || ownerPrincipalName.isEmpty) {</span>
+<span class="nc" id="L923">      request.context.principal</span>
+    } else {
+<span class="nc" id="L925">      new KafkaPrincipal(ownerPrincipalType, ownerPrincipalName)</span>
+    }
+
+<span class="nc bnc" id="L928" title="All 2 branches missed.">    if (!allowTokenRequests(request)) {</span>
+<span class="nc" id="L929">      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L930">        CreateDelegationTokenResponse.prepareResponse(request.context.requestVersion, requestThrottleMs,</span>
+<span class="nc" id="L931">          Errors.DELEGATION_TOKEN_REQUEST_NOT_ALLOWED, owner, requester))</span>
+<span class="nc" id="L932">      CompletableFuture.completedFuture[Unit](())</span>
+<span class="nc bnc" id="L933" title="All 2 branches missed.">    } else if (!owner.equals(requester) &amp;&amp;</span>
+<span class="nc bnc" id="L934" title="All 2 branches missed.">      !authHelper.authorize(request.context, CREATE_TOKENS, USER, owner.toString)) {</span>
+      // Requester is always allowed to create token for self
+<span class="nc" id="L936">      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L937">        CreateDelegationTokenResponse.prepareResponse(request.context.requestVersion, requestThrottleMs,</span>
+<span class="nc" id="L938">          Errors.DELEGATION_TOKEN_AUTHORIZATION_FAILED, owner, requester))</span>
+<span class="nc" id="L939">        CompletableFuture.completedFuture[Unit](())</span>
+    } else {
+
+<span class="nc" id="L942">      val context = new ControllerRequestContext(request.context.header.data,</span>
+<span class="nc" id="L943">        request.context.principal, OptionalLong.empty())</span>
+
+      // Copy the response data to a new response so we can apply the request version
+<span class="nc" id="L946">      controller.createDelegationToken(context, createTokenRequest.data)</span>
+<span class="nc" id="L947">        .thenApply[Unit] { response =&gt;</span>
+<span class="nc" id="L948">           requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+             CreateDelegationTokenResponse.prepareResponse(
+<span class="nc" id="L950">               request.context.requestVersion,</span>
+<span class="nc" id="L951">               requestThrottleMs,</span>
+<span class="nc" id="L952">               Errors.forCode(response.errorCode()),</span>
+<span class="nc" id="L953">               new KafkaPrincipal(response.principalType(), response.principalName()),</span>
+<span class="nc" id="L954">               new KafkaPrincipal(response.tokenRequesterPrincipalType(), response.tokenRequesterPrincipalName()),</span>
+<span class="nc" id="L955">               response.issueTimestampMs(),</span>
+<span class="nc" id="L956">               response.expiryTimestampMs(),</span>
+<span class="nc" id="L957">               response.maxTimestampMs(),</span>
+<span class="nc" id="L958">               response.tokenId(),</span>
+<span class="nc" id="L959">               ByteBuffer.wrap(response.hmac())))</span>
+      }
+    }
+  }
+
+  private def handleRenewDelegationTokenRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L965">    val renewTokenRequest = request.body[RenewDelegationTokenRequest]</span>
+
+<span class="nc bnc" id="L967" title="All 2 branches missed.">    if (!allowTokenRequests(request)) {</span>
+<span class="nc" id="L968">      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L969">        new RenewDelegationTokenResponse(</span>
+<span class="nc" id="L970">          new RenewDelegationTokenResponseData()</span>
+<span class="nc" id="L971">              .setThrottleTimeMs(requestThrottleMs)</span>
+<span class="nc" id="L972">              .setErrorCode(Errors.DELEGATION_TOKEN_REQUEST_NOT_ALLOWED.code)</span>
+<span class="nc" id="L973">              .setExpiryTimestampMs(DelegationTokenManager.ERROR_TIMESTAMP)))</span>
+<span class="nc" id="L974">        CompletableFuture.completedFuture[Unit](())</span>
+    } else {
+<span class="nc" id="L976">      val context = new ControllerRequestContext(</span>
+<span class="nc" id="L977">        request.context.header.data,</span>
+<span class="nc" id="L978">        request.context.principal,</span>
+<span class="nc" id="L979">        OptionalLong.empty())</span>
+<span class="nc" id="L980">      controller.renewDelegationToken(context, renewTokenRequest.data)</span>
+<span class="nc" id="L981">        .thenApply[Unit] { response =&gt;</span>
+<span class="nc" id="L982">          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L983">            new RenewDelegationTokenResponse(response.setThrottleTimeMs(requestThrottleMs)))</span>
+      }
+    }
+  }
+
+  private def handleExpireDelegationTokenRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L989">    val expireTokenRequest = request.body[ExpireDelegationTokenRequest]</span>
+
+<span class="nc bnc" id="L991" title="All 2 branches missed.">    if (!allowTokenRequests(request)) {</span>
+<span class="nc" id="L992">      requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L993">        new ExpireDelegationTokenResponse(</span>
+<span class="nc" id="L994">          new ExpireDelegationTokenResponseData()</span>
+<span class="nc" id="L995">              .setThrottleTimeMs(requestThrottleMs)</span>
+<span class="nc" id="L996">              .setErrorCode(Errors.DELEGATION_TOKEN_REQUEST_NOT_ALLOWED.code)</span>
+<span class="nc" id="L997">              .setExpiryTimestampMs(DelegationTokenManager.ERROR_TIMESTAMP)))</span>
+<span class="nc" id="L998">      CompletableFuture.completedFuture[Unit](())</span>
+    } else {
+<span class="nc" id="L1000">      val context = new ControllerRequestContext(</span>
+<span class="nc" id="L1001">        request.context.header.data,</span>
+<span class="nc" id="L1002">        request.context.principal,</span>
+<span class="nc" id="L1003">        OptionalLong.empty())</span>
+<span class="nc" id="L1004">      controller.expireDelegationToken(context, expireTokenRequest.data)</span>
+<span class="nc" id="L1005">        .thenApply[Unit] { response =&gt;</span>
+<span class="nc" id="L1006">          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L1007">            new ExpireDelegationTokenResponse(response.setThrottleTimeMs(requestThrottleMs)))</span>
+      }
+    }
+  }
+
+  def handleListPartitionReassignments(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L1013">    val listRequest = request.body[ListPartitionReassignmentsRequest]</span>
+<span class="nc" id="L1014">    authHelper.authorizeClusterOperation(request, DESCRIBE)</span>
+<span class="nc" id="L1015">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="nc" id="L1016">      OptionalLong.empty())</span>
+<span class="nc" id="L1017">    controller.listPartitionReassignments(context, listRequest.data)</span>
+<span class="nc" id="L1018">      .thenApply[Unit] { response =&gt;</span>
+<span class="nc" id="L1019">        requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L1020">          new ListPartitionReassignmentsResponse(response.setThrottleTimeMs(requestThrottleMs)))</span>
+      }
+  }
+
+  def handleAllocateProducerIdsRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="fc" id="L1025">    val allocatedProducerIdsRequest = request.body[AllocateProducerIdsRequest]</span>
+<span class="fc" id="L1026">    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)</span>
+<span class="fc" id="L1027">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="fc" id="L1028">        OptionalLong.empty())</span>
+<span class="fc" id="L1029">    controller.allocateProducerIds(context, allocatedProducerIdsRequest.data)</span>
+<span class="fc" id="L1030">      .handle[Unit] { (results, exception) =&gt;</span>
+<span class="pc bpc" id="L1031" title="1 of 2 branches missed.">        if (exception != null) {</span>
+<span class="nc" id="L1032">          requestHelper.handleError(request, exception)</span>
+        } else {
+<span class="fc" id="L1034">          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt; {</span>
+<span class="fc" id="L1035">            results.setThrottleTimeMs(requestThrottleMs)</span>
+<span class="fc" id="L1036">            new AllocateProducerIdsResponse(results)</span>
+          })
+        }
+      }
+  }
+
+  def handleUpdateFeatures(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L1043">    val updateFeaturesRequest = request.body[UpdateFeaturesRequest]</span>
+<span class="nc" id="L1044">    authHelper.authorizeClusterOperation(request, ALTER)</span>
+<span class="nc" id="L1045">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="nc" id="L1046">      OptionalLong.empty())</span>
+<span class="nc" id="L1047">    controller.updateFeatures(context, updateFeaturesRequest.data)</span>
+<span class="nc" id="L1048">      .handle[Unit] { (response, exception) =&gt;</span>
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">        if (exception != null) {</span>
+<span class="nc" id="L1050">          requestHelper.handleError(request, exception)</span>
+        } else {
+<span class="nc" id="L1052">          requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L1053">            new UpdateFeaturesResponse(response.setThrottleTimeMs(requestThrottleMs)))</span>
+        }
+      }
+  }
+
+  def handleDescribeCluster(request: RequestChannel.Request): CompletableFuture[Unit] = {
+    // Nearly all RPCs should check MetadataVersion inside the QuorumController. However, this
+    // RPC is consulting a cache which lives outside the QC. So we check MetadataVersion here.
+<span class="nc bnc" id="L1061" title="All 2 branches missed.">    if (!apiVersionManager.features.metadataVersion().isControllerRegistrationSupported) {</span>
+<span class="nc" id="L1062">      throw new UnsupportedVersionException(&quot;Direct-to-controller communication is not &quot; +</span>
+        &quot;supported with the current MetadataVersion.&quot;)
+    }
+    // Unlike on the broker, DESCRIBE_CLUSTER on the controller requires a high level of
+    // permissions (ALTER on CLUSTER).
+<span class="nc" id="L1067">    authHelper.authorizeClusterOperation(request, ALTER)</span>
+<span class="nc" id="L1068">    val response = authHelper.computeDescribeClusterResponse(</span>
+<span class="nc" id="L1069">      request,</span>
+<span class="nc" id="L1070">      EndpointType.CONTROLLER,</span>
+<span class="nc" id="L1071">      clusterId,</span>
+<span class="nc" id="L1072">      () =&gt; registrationsPublisher.describeClusterControllers(request.context.listenerName()),</span>
+<span class="nc" id="L1073">      () =&gt; raftManager.client.leaderAndEpoch.leaderId().orElse(-1)</span>
+    )
+<span class="nc" id="L1075">    requestHelper.sendResponseMaybeThrottle(request, requestThrottleMs =&gt;</span>
+<span class="nc" id="L1076">      new DescribeClusterResponse(response.setThrottleTimeMs(requestThrottleMs)))</span>
+<span class="nc" id="L1077">    CompletableFuture.completedFuture[Unit](())</span>
+  }
+
+  private def handleAssignReplicasToDirs(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L1081">    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)</span>
+<span class="nc" id="L1082">    val assignReplicasToDirsRequest = request.body[AssignReplicasToDirsRequest]</span>
+<span class="nc" id="L1083">    val context = new ControllerRequestContext(request.context.header.data, request.context.principal,</span>
+<span class="nc" id="L1084">      OptionalLong.empty())</span>
+<span class="nc" id="L1085">    controller.assignReplicasToDirs(context, assignReplicasToDirsRequest.data).thenApply { reply =&gt;</span>
+<span class="nc" id="L1086">      requestHelper.sendResponseMaybeThrottle(request,</span>
+<span class="nc" id="L1087">        requestThrottleMs =&gt; new AssignReplicasToDirsResponse(reply.setThrottleTimeMs(requestThrottleMs)))</span>
+    }
+  }
+
+  def handleAddRaftVoter(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L1092">    authHelper.authorizeClusterOperation(request, ALTER)</span>
+<span class="nc" id="L1093">    handleRaftRequest(request, response =&gt; new AddRaftVoterResponse(response.asInstanceOf[AddRaftVoterResponseData]))</span>
+  }
+
+  def handleRemoveRaftVoter(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L1097">    authHelper.authorizeClusterOperation(request, ALTER)</span>
+<span class="nc" id="L1098">    handleRaftRequest(request, response =&gt; new RemoveRaftVoterResponse(response.asInstanceOf[RemoveRaftVoterResponseData]))</span>
+  }
+
+  def handleUpdateRaftVoter(request: RequestChannel.Request): CompletableFuture[Unit] = {
+<span class="nc" id="L1102">    authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)</span>
+<span class="nc" id="L1103">    handleRaftRequest(request, response =&gt; new UpdateRaftVoterResponse(response.asInstanceOf[UpdateRaftVoterResponseData]))</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,2156 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamThread.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals</a> &gt; <span class="el_source">StreamThread.java</span></div><h1>StreamThread.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.consumer.CloseOptions;
+import org.apache.kafka.clients.consumer.CloseOptions.GroupMembershipOperation;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.InvalidOffsetException;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
+import org.apache.kafka.clients.consumer.internals.AsyncKafkaConsumer;
+import org.apache.kafka.clients.consumer.internals.AutoOffsetResetStrategy;
+import org.apache.kafka.clients.consumer.internals.StreamsRebalanceData;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.Metric;
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.internals.KafkaFutureImpl;
+import org.apache.kafka.common.message.StreamsGroupHeartbeatResponseData;
+import org.apache.kafka.common.metrics.MetricConfig;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.WindowedSum;
+import org.apache.kafka.common.requests.StreamsGroupHeartbeatResponse;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.streams.GroupProtocol;
+import org.apache.kafka.streams.KafkaClientSupplier;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.StreamsConfig.InternalConfig;
+import org.apache.kafka.streams.TaskMetadata;
+import org.apache.kafka.streams.ThreadMetadata;
+import org.apache.kafka.streams.errors.MissingSourceTopicException;
+import org.apache.kafka.streams.errors.StreamsException;
+import org.apache.kafka.streams.errors.TaskCorruptedException;
+import org.apache.kafka.streams.errors.TaskMigratedException;
+import org.apache.kafka.streams.errors.TopologyException;
+import org.apache.kafka.streams.internals.ConsumerWrapper;
+import org.apache.kafka.streams.internals.metrics.ClientMetrics;
+import org.apache.kafka.streams.internals.metrics.StreamsThreadMetricsDelegatingReporter;
+import org.apache.kafka.streams.processor.StandbyUpdateListener;
+import org.apache.kafka.streams.processor.StateRestoreListener;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.assignment.ProcessId;
+import org.apache.kafka.streams.processor.internals.assignment.AssignorError;
+import org.apache.kafka.streams.processor.internals.assignment.ReferenceContainer;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+import org.apache.kafka.streams.processor.internals.metrics.ThreadMetrics;
+import org.apache.kafka.streams.processor.internals.tasks.DefaultTaskManager;
+import org.apache.kafka.streams.processor.internals.tasks.DefaultTaskManager.DefaultTaskExecutorCreator;
+import org.apache.kafka.streams.state.HostInfo;
+import org.apache.kafka.streams.state.internals.ThreadCache;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Queue;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.clients.consumer.CloseOptions.GroupMembershipOperation.LEAVE_GROUP;
+import static org.apache.kafka.clients.consumer.CloseOptions.GroupMembershipOperation.REMAIN_IN_GROUP;
+import static org.apache.kafka.streams.internals.StreamsConfigUtils.eosEnabled;
+import static org.apache.kafka.streams.processor.internals.ClientUtils.adminClientId;
+import static org.apache.kafka.streams.processor.internals.ClientUtils.consumerClientId;
+import static org.apache.kafka.streams.processor.internals.ClientUtils.restoreConsumerClientId;
+
+@SuppressWarnings(&quot;ClassDataAbstractionCoupling&quot;)
+public class StreamThread extends Thread implements ProcessingThread {
+
+    private static final String THREAD_ID_SUBSTRING = &quot;-StreamThread-&quot;;
+    private static final String STATE_UPDATER_ID_SUBSTRING = &quot;-StateUpdater-&quot;;
+
+    /**
+     * Stream thread states are the possible states that a stream thread can be in.
+     * A thread must only be in one state at a time
+     * The expected state transitions with the following defined states is:
+     *
+     * &lt;pre&gt;
+     *                 +-------------+
+     *          +&lt;---- | Created (0) |
+     *          |      +-----+-------+
+     *          |            |
+     *          |            v
+     *          |      +-----+-------+
+     *          +&lt;---- | Starting (1)|-----&gt;+
+     *          |      +-----+-------+      |
+     *          |                           |
+     *          |            +&lt;----------+  |
+     *          |            |           |  |
+     *          |            v           |  |
+     *          |      +-----+-------+   |  |
+     *          +&lt;---- | Partitions  | --+  |
+     *          |      | Revoked (2) | &lt;----+
+     *          |      +-----+-------+      |
+     *          |           |  ^            |
+     *          |           v  |            |
+     *          |      +-----+-------+      |
+     *          +&lt;---- | Partitions  |      |
+     *          |      | Assigned (3)| &lt;----+
+     *          |      +-----+-------+      |
+     *          |            |              |
+     *          |            +&lt;----------+  |
+     *          |            |           |  |
+     *          |            v           |  |
+     *          |      +-----+-------+   |  |
+     *          |      |             | --+  |
+     *          |      | Running (4) | ----&gt;+
+     *          |      +-----+-------+
+     *          |            |
+     *          |            v
+     *          |      +-----+-------+
+     *          +----&gt; | Pending     |
+     *                 | Shutdown (5)|
+     *                 +-----+-------+
+     *                       |
+     *                       v
+     *                 +-----+-------+
+     *                 | Dead (6)    |
+     *                 +-------------+
+     * &lt;/pre&gt;
+     *
+     * Note the following:
+     * &lt;ul&gt;
+     *     &lt;li&gt;Any state can go to PENDING_SHUTDOWN. That is because streams can be closed at any time.&lt;/li&gt;
+     *     &lt;li&gt;
+     *         State PENDING_SHUTDOWN may want to transit to some other states other than DEAD,
+     *         in the corner case when the shutdown is triggered while the thread is still in the rebalance loop.
+     *         In this case we will forbid the transition but will not treat as an error.
+     *     &lt;/li&gt;
+     *     &lt;li&gt;
+     *         State PARTITIONS_REVOKED may want transit to itself indefinitely, in the corner case when
+     *         the coordinator repeatedly fails in-between revoking partitions and assigning new partitions.
+     *         Also during streams instance start up PARTITIONS_REVOKED may want to transit to itself as well.
+     *         In this case we will allow the transition but it will be a no-op as the set of revoked partitions
+     *         should be empty.
+     *     &lt;/li&gt;
+     * &lt;/ul&gt;
+     */
+<span class="nc" id="L182">    public enum State implements ThreadStateTransitionValidator {</span>
+
+<span class="nc" id="L184">        CREATED(1, 5),                    // 0</span>
+<span class="nc" id="L185">        STARTING(2, 3, 5),                // 1</span>
+<span class="nc" id="L186">        PARTITIONS_REVOKED(2, 3, 5),      // 2</span>
+<span class="nc" id="L187">        PARTITIONS_ASSIGNED(2, 3, 4, 5),  // 3</span>
+<span class="nc" id="L188">        RUNNING(2, 3, 4, 5),              // 4</span>
+<span class="nc" id="L189">        PENDING_SHUTDOWN(6),              // 5</span>
+<span class="nc" id="L190">        DEAD;                             // 6</span>
+
+<span class="nc" id="L192">        private final Set&lt;Integer&gt; validTransitions = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L194">        State(final Integer... validTransitions) {</span>
+<span class="nc" id="L195">            this.validTransitions.addAll(Arrays.asList(validTransitions));</span>
+<span class="nc" id="L196">        }</span>
+
+        public boolean isAlive() {
+<span class="nc bnc" id="L199" title="All 8 branches missed.">            return equals(RUNNING) || equals(STARTING) || equals(PARTITIONS_REVOKED) || equals(PARTITIONS_ASSIGNED);</span>
+        }
+
+        @Override
+        public boolean isValidTransition(final ThreadStateTransitionValidator newState) {
+<span class="nc" id="L204">            final State tmpState = (State) newState;</span>
+<span class="nc" id="L205">            return validTransitions.contains(tmpState.ordinal());</span>
+        }
+    }
+
+    /**
+     * Listen to state change events
+     */
+    public interface StateListener {
+
+        /**
+         * Called when state changes
+         *
+         * @param thread   thread changing state
+         * @param newState current state
+         * @param oldState previous state
+         */
+        void onChange(final Thread thread, final ThreadStateTransitionValidator newState, final ThreadStateTransitionValidator oldState);
+    }
+
+    /**
+     * Set the {@link StreamThread.StateListener} to be notified when state changes. Note this API is internal to
+     * Kafka Streams and is not intended to be used by an external application.
+     */
+    public void setStateListener(final StreamThread.StateListener listener) {
+<span class="nc" id="L229">        stateListener = listener;</span>
+<span class="nc" id="L230">    }</span>
+
+    public StreamThread.StateListener getStateListener() {
+<span class="nc" id="L233">        return stateListener;</span>
+    }
+
+    /**
+     * @return The state this instance is in
+     */
+    public State state() {
+        // we do not need to use the state lock since the variable is volatile
+<span class="nc" id="L241">        return state;</span>
+    }
+
+    void setPartitionAssignedTime(final long lastPartitionAssignedMs) {
+<span class="nc" id="L245">        this.lastPartitionAssignedMs = lastPartitionAssignedMs;</span>
+<span class="nc" id="L246">    }</span>
+
+    /**
+     * Sets the state
+     *
+     * @param newState New state
+     * @return The state prior to the call to setState, or null if the transition is invalid
+     */
+    State setState(final State newState) {
+        final State oldState;
+
+<span class="nc" id="L257">        synchronized (stateLock) {</span>
+<span class="nc" id="L258">            oldState = state;</span>
+
+<span class="nc bnc" id="L260" title="All 4 branches missed.">            if (state == State.PENDING_SHUTDOWN &amp;&amp; newState != State.DEAD) {</span>
+<span class="nc" id="L261">                log.debug(&quot;Ignoring request to transit from PENDING_SHUTDOWN to {}: &quot; +</span>
+                              &quot;only DEAD state is a valid next state&quot;, newState);
+                // when the state is already in PENDING_SHUTDOWN, all other transitions will be
+                // refused but we do not throw exception here
+<span class="nc" id="L265">                return null;</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">            } else if (state == State.DEAD) {</span>
+<span class="nc" id="L267">                log.debug(&quot;Ignoring request to transit from DEAD to {}: &quot; +</span>
+                              &quot;no valid next state after DEAD&quot;, newState);
+                // when the state is already in NOT_RUNNING, all its transitions
+                // will be refused but we do not throw exception here
+<span class="nc" id="L271">                return null;</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            } else if (!state.isValidTransition(newState)) {</span>
+<span class="nc" id="L273">                log.error(&quot;Unexpected state transition from {} to {}&quot;, oldState, newState);</span>
+<span class="nc" id="L274">                throw new StreamsException(logPrefix + &quot;Unexpected state transition from &quot; + oldState + &quot; to &quot; + newState);</span>
+            } else {
+<span class="nc" id="L276">                log.info(&quot;State transition from {} to {}&quot;, oldState, newState);</span>
+            }
+
+<span class="nc" id="L279">            state = newState;</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">            if (newState == State.RUNNING) {</span>
+<span class="nc" id="L281">                updateThreadMetadata(taskManager.activeTaskMap(), taskManager.standbyTaskMap());</span>
+            }
+
+<span class="nc" id="L284">            stateLock.notifyAll();</span>
+<span class="nc" id="L285">        }</span>
+
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        if (stateListener != null) {</span>
+<span class="nc" id="L288">            stateListener.onChange(this, state, oldState);</span>
+        }
+
+<span class="nc" id="L291">        return oldState;</span>
+    }
+
+    public boolean isRunning() {
+<span class="nc" id="L295">        synchronized (stateLock) {</span>
+<span class="nc" id="L296">            return state.isAlive();</span>
+        }
+    }
+
+    public boolean isStartingRunningOrPartitionAssigned() {
+<span class="nc" id="L301">        synchronized (stateLock) {</span>
+<span class="nc bnc" id="L302" title="All 6 branches missed.">            return state.equals(State.RUNNING) || state.equals(State.STARTING) || state.equals(State.PARTITIONS_ASSIGNED);</span>
+        }
+    }
+
+    private final Time time;
+    private final Logger log;
+    private final String logPrefix;
+    public final Object stateLock;
+    private final Duration pollTime;
+    private final long commitTimeMs;
+    private final long purgeTimeMs;
+    private final int maxPollTimeMs;
+    private final String originalReset;
+    private final TaskManager taskManager;
+    private final StateUpdater stateUpdater;
+
+    private final StreamsMetricsImpl streamsMetrics;
+    private final Sensor commitSensor;
+    private final Sensor pollSensor;
+    private final Sensor pollRecordsSensor;
+    private final Sensor punctuateSensor;
+    private final Sensor processRecordsSensor;
+    private final Sensor processLatencySensor;
+    private final Sensor processRateSensor;
+    private final Sensor pollRatioSensor;
+    private final Sensor processRatioSensor;
+    private final Sensor punctuateRatioSensor;
+    private final Sensor commitRatioSensor;
+    private final Sensor failedStreamThreadSensor;
+
+    private final long logSummaryIntervalMs; // the count summary log output time interval
+<span class="nc" id="L333">    private long lastLogSummaryMs = -1L;</span>
+<span class="nc" id="L334">    private long totalRecordsProcessedSinceLastSummary = 0L;</span>
+<span class="nc" id="L335">    private long totalPunctuatorsSinceLastSummary = 0L;</span>
+<span class="nc" id="L336">    private long totalPolledSinceLastSummary = 0L;</span>
+<span class="nc" id="L337">    private long totalCommittedSinceLastSummary = 0L;</span>
+
+    private long now;
+    private long lastPollMs;
+    private long lastCommitMs;
+    private long lastPurgeMs;
+<span class="nc" id="L343">    private long lastPartitionAssignedMs = -1L;</span>
+    private int numIterations;
+<span class="nc" id="L345">    private boolean streamsGroupReady = false;</span>
+<span class="nc" id="L346">    private volatile State state = State.CREATED;</span>
+    private volatile ThreadMetadata threadMetadata;
+    private StreamThread.StateListener stateListener;
+    private final Optional&lt;String&gt; groupInstanceID;
+
+    private final ChangelogReader changelogReader;
+    private final ConsumerRebalanceListener rebalanceListener;
+    private final Optional&lt;DefaultStreamsRebalanceListener&gt; defaultStreamsRebalanceListener;
+    private final Consumer&lt;byte[], byte[]&gt; mainConsumer;
+    private final Consumer&lt;byte[], byte[]&gt; restoreConsumer;
+    private final Admin adminClient;
+    private final TopologyMetadata topologyMetadata;
+    private final java.util.function.Consumer&lt;Long&gt; cacheResizer;
+
+    private BiConsumer&lt;Throwable, Boolean&gt; streamsUncaughtExceptionHandler;
+    private final Runnable shutdownErrorHook;
+
+    // These must be Atomic references as they are shared and used to signal between the assignor and the stream thread
+    private final AtomicInteger assignmentErrorCode;
+    private final AtomicLong nextProbingRebalanceMs;
+    // recoverable errors (don't require killing thread) that we need to invoke the exception
+    // handler for, eg MissingSourceTopicException with named topologies
+    private final Queue&lt;StreamsException&gt; nonFatalExceptionsToHandle;
+
+    private final Optional&lt;StreamsRebalanceData&gt; streamsRebalanceData;
+    private final StreamsMetadataState streamsMetadataState;
+
+    // These are used to signal from outside the stream thread, but the variables themselves are internal to the thread
+<span class="nc" id="L374">    private final AtomicLong cacheResizeSize = new AtomicLong(-1L);</span>
+<span class="nc" id="L375">    private final AtomicReference&lt;org.apache.kafka.streams.CloseOptions.GroupMembershipOperation&gt; leaveGroupRequested =</span>
+        new AtomicReference&lt;&gt;(org.apache.kafka.streams.CloseOptions.GroupMembershipOperation.REMAIN_IN_GROUP);
+<span class="nc" id="L377">    private final AtomicLong lastShutdownWarningTimestamp = new AtomicLong(0L);</span>
+    private final boolean eosEnabled;
+    private final boolean processingThreadsEnabled;
+
+<span class="nc" id="L381">    private final WindowedSum pollLatencyWindowedSum = new WindowedSum();</span>
+<span class="nc" id="L382">    private final WindowedSum totalCommitLatencyWindowedSum = new WindowedSum();</span>
+<span class="nc" id="L383">    private final WindowedSum processLatencyWindowedSum = new WindowedSum();</span>
+<span class="nc" id="L384">    private final WindowedSum punctuateLatencyWindowedSum = new WindowedSum();</span>
+<span class="nc" id="L385">    private final WindowedSum runOnceLatencyWindowedSum = new WindowedSum();</span>
+    private final MetricConfig metricsConfig;
+    private final StreamsThreadMetricsDelegatingReporter metricsReporter;
+
+<span class="nc" id="L389">    private boolean latencyWindowsInitialized = false;</span>
+
+<span class="nc" id="L391">    private volatile long fetchDeadlineClientInstanceId = -1;</span>
+<span class="nc" id="L392">    private volatile KafkaFutureImpl&lt;Uuid&gt; mainConsumerInstanceIdFuture = new KafkaFutureImpl&lt;&gt;();</span>
+<span class="nc" id="L393">    private volatile KafkaFutureImpl&lt;Uuid&gt; restoreConsumerInstanceIdFuture = new KafkaFutureImpl&lt;&gt;();</span>
+<span class="nc" id="L394">    private volatile KafkaFutureImpl&lt;Uuid&gt; producerInstanceIdFuture = new KafkaFutureImpl&lt;&gt;();</span>
+
+    private Timer topicsReadyTimer;
+
+    public static StreamThread create(final TopologyMetadata topologyMetadata,
+                                      final StreamsConfig config,
+                                      final KafkaClientSupplier clientSupplier,
+                                      final Admin adminClient,
+                                      final UUID processId,
+                                      final String clientId,
+                                      final StreamsMetricsImpl streamsMetrics,
+                                      final Time time,
+                                      final StreamsMetadataState streamsMetadataState,
+                                      final long cacheSizeBytes,
+                                      final StateDirectory stateDirectory,
+                                      final StateRestoreListener userStateRestoreListener,
+                                      final StandbyUpdateListener userStandbyUpdateListener,
+                                      final int threadIdx,
+                                      final Runnable shutdownErrorHook,
+                                      final BiConsumer&lt;Throwable, Boolean&gt; streamsUncaughtExceptionHandler) {
+
+<span class="nc" id="L415">        final String threadId = clientId + THREAD_ID_SUBSTRING + threadIdx;</span>
+<span class="nc" id="L416">        final String stateUpdaterId = threadId.replace(THREAD_ID_SUBSTRING, STATE_UPDATER_ID_SUBSTRING);</span>
+
+<span class="nc" id="L418">        final String logPrefix = String.format(&quot;stream-thread [%s] &quot;, threadId);</span>
+<span class="nc" id="L419">        final LogContext logContext = new LogContext(logPrefix);</span>
+<span class="nc" id="L420">        final LogContext restorationLogContext = new LogContext(String.format(&quot;state-updater [%s] &quot;, stateUpdaterId));</span>
+<span class="nc" id="L421">        final Logger log = LoggerFactory.getLogger(StreamThread.class);</span>
+
+<span class="nc" id="L423">        final ReferenceContainer referenceContainer = new ReferenceContainer();</span>
+<span class="nc" id="L424">        referenceContainer.adminClient = adminClient;</span>
+<span class="nc" id="L425">        referenceContainer.streamsMetadataState = streamsMetadataState;</span>
+<span class="nc" id="L426">        referenceContainer.time = time;</span>
+<span class="nc" id="L427">        referenceContainer.clientTags = config.getClientTags();</span>
+
+<span class="nc" id="L429">        log.info(&quot;Creating restore consumer client for thread {}&quot;, threadId);</span>
+<span class="nc" id="L430">        final Map&lt;String, Object&gt; restoreConsumerConfigs = config.getRestoreConsumerConfigs(restoreConsumerClientId(stateUpdaterId));</span>
+<span class="nc" id="L431">        final Consumer&lt;byte[], byte[]&gt; restoreConsumer = clientSupplier.getRestoreConsumer(restoreConsumerConfigs);</span>
+
+<span class="nc" id="L433">        final StoreChangelogReader changelogReader = new StoreChangelogReader(</span>
+            time,
+            config,
+            restorationLogContext,
+            adminClient,
+            restoreConsumer,
+            userStateRestoreListener,
+            userStandbyUpdateListener
+        );
+
+<span class="nc" id="L443">        final ThreadCache cache = new ThreadCache(logContext, cacheSizeBytes, streamsMetrics);</span>
+
+<span class="nc" id="L445">        final boolean proceessingThreadsEnabled = InternalConfig.processingThreadsEnabled(config.originals());</span>
+<span class="nc" id="L446">        final ActiveTaskCreator activeTaskCreator = new ActiveTaskCreator(</span>
+            topologyMetadata,
+            config,
+            streamsMetrics,
+            stateDirectory,
+            cache,
+            time,
+            clientSupplier,
+            threadId,
+            threadIdx,
+            processId,
+            logContext,
+            proceessingThreadsEnabled
+        );
+<span class="nc" id="L460">        final StandbyTaskCreator standbyTaskCreator = new StandbyTaskCreator(</span>
+            topologyMetadata,
+            config,
+            streamsMetrics,
+            stateDirectory,
+            threadId,
+            logContext);
+
+<span class="nc" id="L468">        final Tasks tasks = new Tasks(logContext);</span>
+<span class="nc" id="L469">        final boolean processingThreadsEnabled =</span>
+<span class="nc" id="L470">            InternalConfig.processingThreadsEnabled(config.originals());</span>
+
+<span class="nc" id="L472">        final DefaultTaskManager schedulingTaskManager =</span>
+<span class="nc" id="L473">            maybeCreateSchedulingTaskManager(processingThreadsEnabled, topologyMetadata, time, threadId, tasks);</span>
+<span class="nc" id="L474">        final StateUpdater stateUpdater =</span>
+<span class="nc" id="L475">            createStateUpdater(</span>
+                streamsMetrics,
+                config,
+                restoreConsumer,
+                changelogReader,
+                topologyMetadata,
+                time,
+                clientId,
+                threadIdx
+            );
+
+<span class="nc" id="L486">        final TaskManager taskManager = new TaskManager(</span>
+            time,
+            changelogReader,
+            new ProcessId(processId),
+            logPrefix,
+            activeTaskCreator,
+            standbyTaskCreator,
+            tasks,
+            topologyMetadata,
+            adminClient,
+            stateDirectory,
+            stateUpdater,
+            schedulingTaskManager
+        );
+<span class="nc" id="L500">        referenceContainer.taskManager = taskManager;</span>
+
+<span class="nc" id="L502">        log.info(&quot;Creating consumer client for thread {}&quot;, threadId);</span>
+<span class="nc" id="L503">        final String applicationId = config.getString(StreamsConfig.APPLICATION_ID_CONFIG);</span>
+<span class="nc" id="L504">        final Map&lt;String, Object&gt; consumerConfigs = config.getMainConsumerConfigs(applicationId, consumerClientId(threadId), threadIdx);</span>
+<span class="nc" id="L505">        consumerConfigs.put(StreamsConfig.InternalConfig.REFERENCE_CONTAINER_PARTITION_ASSIGNOR, referenceContainer);</span>
+
+<span class="nc" id="L507">        final String originalReset = (String) consumerConfigs.get(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG);</span>
+        // If there are any overrides, we never fall through to the consumer, but only handle offset management ourselves.
+<span class="nc bnc" id="L509" title="All 2 branches missed.">        if (topologyMetadata.hasOffsetResetOverrides()) {</span>
+<span class="nc" id="L510">            consumerConfigs.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, &quot;none&quot;);</span>
+        }
+
+<span class="nc" id="L513">        final MainConsumerSetup mainConsumerSetup = setupMainConsumer(topologyMetadata, config, clientSupplier, processId, consumerConfigs);</span>
+
+<span class="nc" id="L515">        taskManager.setMainConsumer(mainConsumerSetup.mainConsumer);</span>
+<span class="nc" id="L516">        referenceContainer.mainConsumer = mainConsumerSetup.mainConsumer;</span>
+
+<span class="nc" id="L518">        final StreamsThreadMetricsDelegatingReporter metricsReporter = new StreamsThreadMetricsDelegatingReporter(mainConsumerSetup.mainConsumer, threadId, Optional.of(stateUpdaterId));</span>
+<span class="nc" id="L519">        streamsMetrics.metricsRegistry().addReporter(metricsReporter);</span>
+
+<span class="nc" id="L521">        final StreamThread streamThread = new StreamThread(</span>
+            time,
+            config,
+            adminClient,
+            mainConsumerSetup.mainConsumer,
+            restoreConsumer,
+            changelogReader,
+            originalReset,
+            taskManager,
+            stateUpdater,
+            streamsMetrics,
+            topologyMetadata,
+            processId,
+            threadId,
+            logContext,
+            referenceContainer.assignmentErrorCode,
+            referenceContainer.nextScheduledRebalanceMs,
+            referenceContainer.nonFatalExceptionsToHandle,
+            shutdownErrorHook,
+            streamsUncaughtExceptionHandler,
+<span class="nc" id="L541">            cache::resize,</span>
+            mainConsumerSetup.streamsRebalanceData,
+            streamsMetadataState,
+            metricsReporter
+        );
+
+<span class="nc" id="L547">        return streamThread.updateThreadMetadata(adminClientId(clientId));</span>
+    }
+
+    private static MainConsumerSetup setupMainConsumer(final TopologyMetadata topologyMetadata,
+                                                       final StreamsConfig config,
+                                                       final KafkaClientSupplier clientSupplier,
+                                                       final UUID processId,
+                                                       final Map&lt;String, Object&gt; consumerConfigs) {
+<span class="nc bnc" id="L555" title="All 2 branches missed.">        if (config.getString(StreamsConfig.GROUP_PROTOCOL_CONFIG).equalsIgnoreCase(GroupProtocol.STREAMS.name)) {</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">            if (topologyMetadata.hasNamedTopologies()) {</span>
+<span class="nc" id="L557">                throw new IllegalStateException(&quot;Named topologies and the STREAMS protocol cannot be used at the same time.&quot;);</span>
+            }
+<span class="nc" id="L559">            final Optional&lt;StreamsRebalanceData&gt; streamsRebalanceData = Optional.of(</span>
+<span class="nc" id="L560">                initStreamsRebalanceData(</span>
+                    processId,
+                    config,
+<span class="nc" id="L563">                    parseHostInfo(config.getString(StreamsConfig.APPLICATION_SERVER_CONFIG)),</span>
+<span class="nc" id="L564">                    parseRackId((String) config.originals().get(CommonClientConfigs.CLIENT_RACK_CONFIG)),</span>
+                    topologyMetadata
+                )
+            );
+<span class="nc" id="L568">            final ByteArrayDeserializer keyDeserializer = new ByteArrayDeserializer();</span>
+<span class="nc" id="L569">            final ByteArrayDeserializer valueDeserializer = new ByteArrayDeserializer();</span>
+
+<span class="nc" id="L571">            return new MainConsumerSetup(</span>
+<span class="nc" id="L572">                maybeWrapConsumer(</span>
+                    consumerConfigs,
+                    new AsyncKafkaConsumer&lt;&gt;(
+<span class="nc" id="L575">                        new ConsumerConfig(ConsumerConfig.appendDeserializerToConfig(consumerConfigs, keyDeserializer, valueDeserializer)),</span>
+                        keyDeserializer,
+                        valueDeserializer,
+                        streamsRebalanceData
+                    ),
+                    streamsRebalanceData
+                ),
+                streamsRebalanceData
+            );
+        } else {
+<span class="nc" id="L585">            return new MainConsumerSetup(</span>
+<span class="nc" id="L586">                clientSupplier.getConsumer(consumerConfigs),</span>
+<span class="nc" id="L587">                Optional.empty()</span>
+            );
+        }
+    }
+
+    private static Consumer&lt;byte[], byte[]&gt; maybeWrapConsumer(final Map&lt;String, Object&gt; config,
+                                                              final AsyncKafkaConsumer&lt;byte[], byte[]&gt; consumer,
+                                                              final Optional&lt;StreamsRebalanceData&gt; streamsRebalanceData) {
+<span class="nc" id="L595">        final Object o = config.get(InternalConfig.INTERNAL_CONSUMER_WRAPPER);</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">        if (o == null) {</span>
+<span class="nc" id="L597">            return consumer;</span>
+        }
+
+        final ConsumerWrapper wrapper;
+<span class="nc bnc" id="L601" title="All 2 branches missed.">        if (o instanceof String) {</span>
+            try {
+<span class="nc" id="L603">                wrapper = Utils.newInstance((String) o, ConsumerWrapper.class);</span>
+<span class="nc" id="L604">            } catch (final ClassNotFoundException e) {</span>
+<span class="nc" id="L605">                throw new IllegalArgumentException(e);</span>
+<span class="nc" id="L606">            }</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">        } else if (o instanceof Class&lt;?&gt;) {</span>
+<span class="nc" id="L608">            wrapper = (ConsumerWrapper) Utils.newInstance((Class&lt;?&gt;) o);</span>
+        } else {
+<span class="nc" id="L610">            throw new IllegalArgumentException(&quot;Internal config &quot; + InternalConfig.INTERNAL_CONSUMER_WRAPPER + &quot; must be a class or class name&quot;);</span>
+        }
+
+<span class="nc" id="L613">        wrapper.wrapConsumer(consumer, config, streamsRebalanceData);</span>
+
+<span class="nc" id="L615">        return wrapper;</span>
+    }
+
+    private static class MainConsumerSetup {
+        public final Consumer&lt;byte[], byte[]&gt; mainConsumer;
+        public final Optional&lt;StreamsRebalanceData&gt; streamsRebalanceData;
+
+        public MainConsumerSetup(final Consumer&lt;byte[], byte[]&gt; mainConsumer,
+<span class="nc" id="L623">                                 final Optional&lt;StreamsRebalanceData&gt; streamsRebalanceData) {</span>
+<span class="nc" id="L624">            this.mainConsumer = mainConsumer;</span>
+<span class="nc" id="L625">            this.streamsRebalanceData = streamsRebalanceData;</span>
+<span class="nc" id="L626">        }</span>
+    }
+
+    private static DefaultTaskManager maybeCreateSchedulingTaskManager(final boolean processingThreadsEnabled,
+                                                                       final TopologyMetadata topologyMetadata,
+                                                                       final Time time,
+                                                                       final String threadId,
+                                                                       final Tasks tasks) {
+<span class="nc bnc" id="L634" title="All 2 branches missed.">        if (processingThreadsEnabled) {</span>
+<span class="nc" id="L635">            final DefaultTaskManager defaultTaskManager = new DefaultTaskManager(</span>
+                time,
+                threadId,
+                tasks,
+                new DefaultTaskExecutorCreator(),
+<span class="nc" id="L640">                topologyMetadata.taskExecutionMetadata(),</span>
+                1
+            );
+<span class="nc" id="L643">            defaultTaskManager.startTaskExecutors();</span>
+<span class="nc" id="L644">            return defaultTaskManager;</span>
+        }
+<span class="nc" id="L646">        return null;</span>
+    }
+
+    private static StateUpdater createStateUpdater(final StreamsMetricsImpl streamsMetrics,
+                                                        final StreamsConfig streamsConfig,
+                                                        final Consumer&lt;byte[], byte[]&gt; restoreConsumer,
+                                                        final ChangelogReader changelogReader,
+                                                        final TopologyMetadata topologyMetadata,
+                                                        final Time time,
+                                                        final String clientId,
+                                                        final int threadIdx) {
+<span class="nc" id="L657">        final String name = clientId + STATE_UPDATER_ID_SUBSTRING + threadIdx;</span>
+<span class="nc" id="L658">        return new DefaultStateUpdater(</span>
+            name,
+            streamsMetrics,
+            streamsConfig,
+            restoreConsumer,
+            changelogReader,
+            topologyMetadata,
+            time
+        );
+    }
+
+    private static Optional&lt;StreamsRebalanceData.HostInfo&gt; parseHostInfo(final String endpoint) {
+<span class="nc" id="L670">        final HostInfo hostInfo = HostInfo.buildFromEndpoint(endpoint);</span>
+<span class="nc bnc" id="L671" title="All 2 branches missed.">        if (hostInfo == null) {</span>
+<span class="nc" id="L672">            return Optional.empty();</span>
+        } else {
+<span class="nc" id="L674">            return Optional.of(new StreamsRebalanceData.HostInfo(hostInfo.host(), hostInfo.port()));</span>
+        }
+    }
+
+    private static Optional&lt;String&gt; parseRackId(final String rackId) {
+<span class="nc bnc" id="L679" title="All 4 branches missed.">        if (rackId == null || rackId.isEmpty()) {</span>
+<span class="nc" id="L680">            return Optional.empty();</span>
+        }
+<span class="nc" id="L682">        return Optional.of(rackId);</span>
+    }
+
+    private static StreamsRebalanceData initStreamsRebalanceData(final UUID processId,
+                                                                 final StreamsConfig config,
+                                                                 final Optional&lt;StreamsRebalanceData.HostInfo&gt; endpoint,
+                                                                 final Optional&lt;String&gt; rackId,
+                                                                 final TopologyMetadata topologyMetadata) {
+<span class="nc" id="L690">        final InternalTopologyBuilder internalTopologyBuilder = topologyMetadata.lookupBuilderForNamedTopology(null);</span>
+
+<span class="nc" id="L692">        final Map&lt;String, StreamsRebalanceData.Subtopology&gt; subtopologies = initBrokerTopology(config, internalTopologyBuilder);</span>
+
+<span class="nc" id="L694">        return new StreamsRebalanceData(</span>
+            processId,
+            endpoint,
+            rackId,
+            subtopologies,
+<span class="nc" id="L699">            config.getClientTags()</span>
+        );
+    }
+
+    private static Map&lt;String, StreamsRebalanceData.Subtopology&gt; initBrokerTopology(final StreamsConfig config,
+                                                                                    final InternalTopologyBuilder internalTopologyBuilder) {
+<span class="nc" id="L705">        final Map&lt;String, String&gt; defaultTopicConfigs = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L706" title="All 2 branches missed.">        for (final Map.Entry&lt;String, Object&gt; entry : config.originalsWithPrefix(StreamsConfig.TOPIC_PREFIX).entrySet()) {</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">            if (entry.getValue() != null) {</span>
+<span class="nc" id="L708">                defaultTopicConfigs.put(entry.getKey(), entry.getValue().toString());</span>
+            }
+<span class="nc" id="L710">        }</span>
+<span class="nc" id="L711">        final long windowChangeLogAdditionalRetention = config.getLong(StreamsConfig.WINDOW_STORE_CHANGE_LOG_ADDITIONAL_RETENTION_MS_CONFIG);</span>
+
+<span class="nc" id="L713">        final Map&lt;String, StreamsRebalanceData.Subtopology&gt; subtopologies = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L714">        final Collection&lt;Set&lt;String&gt;&gt; copartitionGroups = internalTopologyBuilder.copartitionGroups();</span>
+
+<span class="nc" id="L716">        final Set&lt;String&gt; allRepartitionSourceTopics = internalTopologyBuilder.subtopologyToTopicsInfo().values().stream()</span>
+<span class="nc" id="L717">            .flatMap(t -&gt; t.repartitionSourceTopics.keySet().stream())</span>
+<span class="nc" id="L718">            .collect(Collectors.toSet());</span>
+
+<span class="nc bnc" id="L720" title="All 2 branches missed.">        for (final Map.Entry&lt;TopologyMetadata.Subtopology, InternalTopologyBuilder.TopicsInfo&gt; topicsInfoEntry : internalTopologyBuilder.subtopologyToTopicsInfo()</span>
+<span class="nc" id="L721">            .entrySet()) {</span>
+
+<span class="nc" id="L723">            final HashSet&lt;String&gt; allSourceTopics = new HashSet&lt;&gt;(topicsInfoEntry.getValue().sourceTopics);</span>
+<span class="nc" id="L724">            topicsInfoEntry.getValue().repartitionSourceTopics.forEach(</span>
+                (repartitionSourceTopic, repartitionTopicInfo) -&gt; {
+<span class="nc" id="L726">                    allSourceTopics.add(repartitionSourceTopic);</span>
+<span class="nc" id="L727">                });</span>
+
+<span class="nc" id="L729">            final Set&lt;String&gt; sourceTopics = topicsInfoEntry.getValue().sourceTopics.stream()</span>
+<span class="nc bnc" id="L730" title="All 2 branches missed.">                .filter(topic -&gt; !topicsInfoEntry.getValue().repartitionSourceTopics.containsKey(topic))</span>
+<span class="nc" id="L731">                .collect(Collectors.toSet());</span>
+<span class="nc" id="L732">            final Set&lt;String&gt; repartitionSinkTopics = topicsInfoEntry.getValue().sinkTopics.stream()</span>
+<span class="nc" id="L733">                .filter(allRepartitionSourceTopics::contains)</span>
+<span class="nc" id="L734">                .collect(Collectors.toSet());</span>
+<span class="nc" id="L735">            final Map&lt;String, StreamsRebalanceData.TopicInfo&gt; repartitionSourceTopics = topicsInfoEntry.getValue().repartitionSourceTopics.entrySet()</span>
+<span class="nc" id="L736">                .stream()</span>
+<span class="nc" id="L737">                .collect(Collectors.toMap(Map.Entry::getKey, e -&gt;</span>
+<span class="nc" id="L738">                    new StreamsRebalanceData.TopicInfo(e.getValue().numberOfPartitions(),</span>
+<span class="nc" id="L739">                        Optional.of(config.getInt(StreamsConfig.REPLICATION_FACTOR_CONFIG).shortValue()),</span>
+<span class="nc" id="L740">                        e.getValue().properties(defaultTopicConfigs, windowChangeLogAdditionalRetention))));</span>
+<span class="nc" id="L741">            final Map&lt;String, StreamsRebalanceData.TopicInfo&gt; stateChangelogTopics = topicsInfoEntry.getValue().stateChangelogTopics.entrySet()</span>
+<span class="nc" id="L742">                .stream()</span>
+<span class="nc" id="L743">                .collect(Collectors.toMap(Map.Entry::getKey, e -&gt;</span>
+<span class="nc" id="L744">                    new StreamsRebalanceData.TopicInfo(e.getValue().numberOfPartitions(),</span>
+<span class="nc" id="L745">                        Optional.of(config.getInt(StreamsConfig.REPLICATION_FACTOR_CONFIG).shortValue()),</span>
+<span class="nc" id="L746">                        e.getValue().properties(defaultTopicConfigs, windowChangeLogAdditionalRetention))));</span>
+
+<span class="nc" id="L748">            subtopologies.put(</span>
+<span class="nc" id="L749">                String.valueOf(topicsInfoEntry.getKey().nodeGroupId),</span>
+                new StreamsRebalanceData.Subtopology(
+                    sourceTopics,
+                    repartitionSinkTopics,
+                    repartitionSourceTopics,
+                    stateChangelogTopics,
+<span class="nc" id="L755">                    copartitionGroups.stream().filter(allSourceTopics::containsAll).collect(Collectors.toList())</span>
+                )
+            );
+<span class="nc" id="L758">        }</span>
+
+<span class="nc" id="L760">        if (subtopologies.values().stream().mapToInt(x -&gt; x.copartitionGroups().size()).sum()</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">            != copartitionGroups.size()) {</span>
+<span class="nc" id="L762">            throw new IllegalStateException(</span>
+                &quot;Not all copartition groups were converted to broker topology&quot;);
+        }
+
+<span class="nc" id="L766">        return subtopologies;</span>
+    }
+
+    @SuppressWarnings({&quot;this-escape&quot;})
+    public StreamThread(final Time time,
+                        final StreamsConfig config,
+                        final Admin adminClient,
+                        final Consumer&lt;byte[], byte[]&gt; mainConsumer,
+                        final Consumer&lt;byte[], byte[]&gt; restoreConsumer,
+                        final ChangelogReader changelogReader,
+                        final String originalReset,
+                        final TaskManager taskManager,
+                        final StateUpdater stateUpdater,
+                        final StreamsMetricsImpl streamsMetrics,
+                        final TopologyMetadata topologyMetadata,
+                        final UUID processId,
+                        final String threadId,
+                        final LogContext logContext,
+                        final AtomicInteger assignmentErrorCode,
+                        final AtomicLong nextProbingRebalanceMs,
+                        final Queue&lt;StreamsException&gt; nonFatalExceptionsToHandle,
+                        final Runnable shutdownErrorHook,
+                        final BiConsumer&lt;Throwable, Boolean&gt; streamsUncaughtExceptionHandler,
+                        final java.util.function.Consumer&lt;Long&gt; cacheResizer,
+                        final Optional&lt;StreamsRebalanceData&gt; streamsRebalanceData,
+                        final StreamsMetadataState streamsMetadataState,
+                        final StreamsThreadMetricsDelegatingReporter metricsReporter
+                        ) {
+<span class="nc" id="L794">        super(threadId);</span>
+<span class="nc" id="L795">        this.stateLock = new Object();</span>
+<span class="nc" id="L796">        this.adminClient = adminClient;</span>
+<span class="nc" id="L797">        this.streamsMetrics = streamsMetrics;</span>
+<span class="nc" id="L798">        this.commitSensor = ThreadMetrics.commitSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L799">        this.pollSensor = ThreadMetrics.pollSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L800">        this.pollRecordsSensor = ThreadMetrics.pollRecordsSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L801">        this.pollRatioSensor = ThreadMetrics.pollRatioSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L802">        this.processLatencySensor = ThreadMetrics.processLatencySensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L803">        this.processRecordsSensor = ThreadMetrics.processRecordsSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L804">        this.processRateSensor = ThreadMetrics.processRateSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L805">        this.processRatioSensor = ThreadMetrics.processRatioSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L806">        this.punctuateSensor = ThreadMetrics.punctuateSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L807">        this.punctuateRatioSensor = ThreadMetrics.punctuateRatioSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L808">        this.commitRatioSensor = ThreadMetrics.commitRatioSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L809">        this.failedStreamThreadSensor = ClientMetrics.failedStreamThreadSensor(streamsMetrics);</span>
+<span class="nc" id="L810">        this.assignmentErrorCode = assignmentErrorCode;</span>
+<span class="nc" id="L811">        this.shutdownErrorHook = shutdownErrorHook;</span>
+<span class="nc" id="L812">        this.streamsUncaughtExceptionHandler = streamsUncaughtExceptionHandler;</span>
+<span class="nc" id="L813">        this.cacheResizer = cacheResizer;</span>
+<span class="nc" id="L814">        this.metricsConfig = streamsMetrics.metricsRegistry().config();</span>
+<span class="nc" id="L815">        this.metricsReporter = metricsReporter;</span>
+
+        // The following sensors are created here but their references are not stored in this object, since within
+        // this object they are not recorded. The sensors are created here so that the stream threads starts with all
+        // its metrics initialised. Otherwise, those sensors would have been created during processing, which could
+        // lead to missing metrics. If no task were created, the metrics for created and closed
+        // tasks would never be added to the metrics.
+<span class="nc" id="L822">        ThreadMetrics.createTaskSensor(threadId, streamsMetrics);</span>
+<span class="nc" id="L823">        ThreadMetrics.closeTaskSensor(threadId, streamsMetrics);</span>
+
+<span class="nc" id="L825">        ThreadMetrics.addThreadStartTimeMetric(</span>
+            threadId,
+            streamsMetrics,
+<span class="nc" id="L828">            time.milliseconds()</span>
+        );
+<span class="nc" id="L830">        ThreadMetrics.addThreadStateTelemetryMetric(</span>
+<span class="nc" id="L831">            processId.toString(),</span>
+            threadId,
+            streamsMetrics,
+<span class="nc" id="L834">            (metricConfig, now) -&gt; this.state().ordinal());</span>
+<span class="nc" id="L835">        ThreadMetrics.addThreadStateMetric(</span>
+            threadId,
+            streamsMetrics,
+<span class="nc" id="L838">            (metricConfig, now) -&gt; this.state().name());</span>
+<span class="nc" id="L839">        ThreadMetrics.addThreadBlockedTimeMetric(</span>
+            threadId,
+            new StreamThreadTotalBlockedTime(
+                mainConsumer,
+                restoreConsumer,
+<span class="nc" id="L844">                taskManager::totalProducerBlockedTime</span>
+            ),
+            streamsMetrics
+        );
+
+<span class="nc" id="L849">        this.time = time;</span>
+<span class="nc" id="L850">        this.topologyMetadata = topologyMetadata;</span>
+<span class="nc" id="L851">        this.topologyMetadata.registerThread(getName());</span>
+<span class="nc" id="L852">        this.logPrefix = logContext.logPrefix();</span>
+<span class="nc" id="L853">        this.log = logContext.logger(StreamThread.class);</span>
+<span class="nc" id="L854">        this.rebalanceListener = new StreamsRebalanceListener(time, taskManager, this, this.log, this.assignmentErrorCode);</span>
+<span class="nc" id="L855">        this.defaultStreamsRebalanceListener = streamsRebalanceData.map(data -&gt;</span>
+<span class="nc" id="L856">            new DefaultStreamsRebalanceListener(</span>
+                this.log,
+                time,
+                data,
+                this,
+                taskManager,
+                streamsMetrics,
+<span class="nc" id="L863">                getName()</span>
+            )
+        );
+<span class="nc" id="L866">        this.taskManager = taskManager;</span>
+<span class="nc" id="L867">        this.stateUpdater = stateUpdater;</span>
+<span class="nc" id="L868">        this.restoreConsumer = restoreConsumer;</span>
+<span class="nc" id="L869">        this.mainConsumer = mainConsumer;</span>
+<span class="nc" id="L870">        this.changelogReader = changelogReader;</span>
+<span class="nc" id="L871">        this.originalReset = originalReset;</span>
+<span class="nc" id="L872">        this.nextProbingRebalanceMs = nextProbingRebalanceMs;</span>
+<span class="nc" id="L873">        this.nonFatalExceptionsToHandle = nonFatalExceptionsToHandle;</span>
+<span class="nc" id="L874">        this.groupInstanceID = mainConsumer.groupMetadata().groupInstanceId();</span>
+
+<span class="nc" id="L876">        this.pollTime = Duration.ofMillis(config.getLong(StreamsConfig.POLL_MS_CONFIG));</span>
+<span class="nc" id="L877">        final int dummyThreadIdx = 1;</span>
+<span class="nc" id="L878">        this.maxPollTimeMs = new InternalConsumerConfig(config.getMainConsumerConfigs(&quot;dummyGroupId&quot;, &quot;dummyClientId&quot;, dummyThreadIdx))</span>
+<span class="nc" id="L879">            .getInt(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG);</span>
+<span class="nc" id="L880">        this.commitTimeMs = config.getLong(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG);</span>
+<span class="nc" id="L881">        this.purgeTimeMs = config.getLong(StreamsConfig.REPARTITION_PURGE_INTERVAL_MS_CONFIG);</span>
+
+<span class="nc" id="L883">        this.numIterations = 1;</span>
+<span class="nc" id="L884">        this.eosEnabled = eosEnabled(config);</span>
+<span class="nc" id="L885">        this.processingThreadsEnabled = InternalConfig.processingThreadsEnabled(config.originals());</span>
+<span class="nc" id="L886">        this.logSummaryIntervalMs = config.getLong(StreamsConfig.LOG_SUMMARY_INTERVAL_MS_CONFIG);</span>
+
+<span class="nc" id="L888">        this.streamsRebalanceData = streamsRebalanceData;</span>
+<span class="nc" id="L889">        this.streamsMetadataState = streamsMetadataState;</span>
+<span class="nc" id="L890">    }</span>
+
+    private static final class InternalConsumerConfig extends ConsumerConfig {
+        private InternalConsumerConfig(final Map&lt;String, Object&gt; props) {
+<span class="nc" id="L894">            super(ConsumerConfig.appendDeserializerToConfig(props, new ByteArrayDeserializer(),</span>
+                    new ByteArrayDeserializer()), false);
+<span class="nc" id="L896">        }</span>
+    }
+
+    /**
+     * Execute the stream processors
+     *
+     * @throws KafkaException   for any Kafka-related exceptions
+     * @throws RuntimeException for any other non-Kafka exceptions
+     */
+    @Override
+    public void run() {
+<span class="nc" id="L907">        log.info(&quot;Starting&quot;);</span>
+<span class="nc bnc" id="L908" title="All 2 branches missed.">        if (setState(State.STARTING) == null) {</span>
+<span class="nc" id="L909">            log.info(&quot;StreamThread already shutdown. Not running&quot;);</span>
+<span class="nc" id="L910">            return;</span>
+        }
+<span class="nc" id="L912">        boolean cleanRun = false;</span>
+        try {
+<span class="nc" id="L914">            taskManager.init();</span>
+<span class="nc" id="L915">            initLatencyWindowsIfNeeded(time.milliseconds());</span>
+<span class="nc" id="L916">            cleanRun = runLoop();</span>
+<span class="nc" id="L917">        } catch (final Throwable e) {</span>
+<span class="nc" id="L918">            failedStreamThreadSensor.record();</span>
+<span class="nc" id="L919">            leaveGroupRequested.set(org.apache.kafka.streams.CloseOptions.GroupMembershipOperation.LEAVE_GROUP);</span>
+<span class="nc" id="L920">            streamsUncaughtExceptionHandler.accept(e, false);</span>
+            // Note: the above call currently rethrows the exception, so nothing below this line will be executed
+        } finally {
+<span class="nc" id="L923">            completeShutdown(cleanRun);</span>
+        }
+<span class="nc" id="L925">    }</span>
+
+    /**
+     * Main event loop for polling, and processing records through topologies.
+     *
+     * @throws IllegalStateException If store gets registered after initialized is already finished
+     * @throws StreamsException      if the store's change log does not contain the partition
+     */
+    boolean runLoop() {
+<span class="nc" id="L934">        subscribeConsumer();</span>
+
+        // if the thread is still in the middle of a rebalance, we should keep polling
+        // until the rebalance is completed before we close and commit the tasks
+<span class="nc bnc" id="L938" title="All 4 branches missed.">        while (isRunning() || taskManager.rebalanceInProgress()) {</span>
+            try {
+<span class="nc" id="L940">                checkForTopologyUpdates();</span>
+                // If we received the shutdown signal while waiting for a topology to be added, we can
+                // stop polling regardless of the rebalance status since we know there are no tasks left
+<span class="nc bnc" id="L943" title="All 4 branches missed.">                if (!isRunning() &amp;&amp; topologyMetadata.isEmpty()) {</span>
+<span class="nc" id="L944">                    log.info(&quot;Shutting down thread with empty topology.&quot;);</span>
+<span class="nc" id="L945">                    break;</span>
+                }
+
+<span class="nc" id="L948">                maybeSendShutdown();</span>
+<span class="nc" id="L949">                final long size = cacheResizeSize.getAndSet(-1L);</span>
+<span class="nc bnc" id="L950" title="All 2 branches missed.">                if (size != -1L) {</span>
+<span class="nc" id="L951">                    cacheResizer.accept(size);</span>
+                }
+<span class="nc bnc" id="L953" title="All 2 branches missed.">                if (processingThreadsEnabled) {</span>
+<span class="nc" id="L954">                    runOnceWithProcessingThreads();</span>
+                } else {
+<span class="nc" id="L956">                    runOnceWithoutProcessingThreads();</span>
+                }
+
+<span class="nc" id="L959">                maybeGetClientInstanceIds();</span>
+
+                // Check for a scheduled rebalance but don't trigger it until the current rebalance is done
+<span class="nc bnc" id="L962" title="All 4 branches missed.">                if (!taskManager.rebalanceInProgress() &amp;&amp; nextProbingRebalanceMs.get() &lt; time.milliseconds()) {</span>
+<span class="nc" id="L963">                    log.info(&quot;Triggering the followup rebalance scheduled for {}.&quot;, Utils.toLogDateTimeFormat(nextProbingRebalanceMs.get()));</span>
+<span class="nc" id="L964">                    mainConsumer.enforceRebalance(&quot;triggered followup rebalance scheduled for &quot; + nextProbingRebalanceMs.get());</span>
+<span class="nc" id="L965">                    nextProbingRebalanceMs.set(Long.MAX_VALUE);</span>
+                }
+<span class="nc" id="L967">            } catch (final TaskCorruptedException e) {</span>
+<span class="nc" id="L968">                log.warn(&quot;Detected the states of tasks &quot; + e.corruptedTasks() + &quot; are corrupted. &quot; +</span>
+                         &quot;Will close the task as dirty and re-create and bootstrap from scratch.&quot;, e);
+                try {
+                    // check if any active task got corrupted. We will trigger a rebalance in that case.
+                    // once the task corruptions have been handled
+<span class="nc" id="L973">                    final boolean enforceRebalance = taskManager.handleCorruption(e.corruptedTasks());</span>
+<span class="nc bnc" id="L974" title="All 4 branches missed.">                    if (enforceRebalance &amp;&amp; eosEnabled) {</span>
+<span class="nc" id="L975">                        log.info(&quot;Active task(s) got corrupted. Triggering a rebalance.&quot;);</span>
+<span class="nc" id="L976">                        mainConsumer.enforceRebalance(&quot;Active tasks corrupted&quot;);</span>
+                    }
+<span class="nc" id="L978">                } catch (final TaskMigratedException taskMigrated) {</span>
+<span class="nc" id="L979">                    handleTaskMigrated(taskMigrated);</span>
+<span class="nc" id="L980">                }</span>
+<span class="nc" id="L981">            } catch (final TaskMigratedException e) {</span>
+<span class="nc" id="L982">                handleTaskMigrated(e);</span>
+<span class="nc" id="L983">            } catch (final UnsupportedVersionException e) {</span>
+<span class="nc" id="L984">                final String errorMessage = e.getMessage();</span>
+<span class="nc bnc" id="L985" title="All 2 branches missed.">                if (errorMessage != null &amp;&amp;</span>
+<span class="nc bnc" id="L986" title="All 2 branches missed.">                    errorMessage.startsWith(&quot;Broker unexpectedly doesn't support requireStable flag on version &quot;)) {</span>
+
+<span class="nc" id="L988">                    log.error(&quot;Shutting down because the Kafka cluster seems to be on a too old version. &quot; +</span>
+                              &quot;Setting {}=\&quot;{}\&quot; requires broker version 2.5 or higher.&quot;,
+                          StreamsConfig.PROCESSING_GUARANTEE_CONFIG,
+                          StreamsConfig.EXACTLY_ONCE_V2);
+                }
+<span class="nc" id="L993">                failedStreamThreadSensor.record();</span>
+<span class="nc" id="L994">                this.streamsUncaughtExceptionHandler.accept(new StreamsException(e), false);</span>
+<span class="nc" id="L995">                return false;</span>
+<span class="nc" id="L996">            } catch (final StreamsException e) {</span>
+<span class="nc" id="L997">                throw e;</span>
+<span class="nc" id="L998">            } catch (final Exception e) {</span>
+<span class="nc" id="L999">                throw new StreamsException(e);</span>
+<span class="nc" id="L1000">            }</span>
+        }
+<span class="nc" id="L1002">        return true;</span>
+    }
+
+    // visible for testing
+    void maybeGetClientInstanceIds() {
+        // we pass in a timeout of zero into each `clientInstanceId()` call
+        // to just trigger the &quot;get instance id&quot; background RPC;
+        // we don't want to block the stream thread that can do useful work in the meantime
+
+<span class="nc bnc" id="L1011" title="All 2 branches missed.">        if (fetchDeadlineClientInstanceId != -1) {</span>
+<span class="nc bnc" id="L1012" title="All 2 branches missed.">            if (!mainConsumerInstanceIdFuture.isDone()) {</span>
+<span class="nc bnc" id="L1013" title="All 2 branches missed.">                if (fetchDeadlineClientInstanceId &gt;= time.milliseconds()) {</span>
+                    try {
+<span class="nc" id="L1015">                        mainConsumerInstanceIdFuture.complete(mainConsumer.clientInstanceId(Duration.ZERO));</span>
+<span class="nc" id="L1016">                    } catch (final IllegalStateException disabledError) {</span>
+                        // if telemetry is disabled on a client, we swallow the error,
+                        // to allow returning a partial result for all other clients
+<span class="nc" id="L1019">                        mainConsumerInstanceIdFuture.complete(null);</span>
+<span class="nc" id="L1020">                    } catch (final TimeoutException swallow) {</span>
+                        // swallow
+<span class="nc" id="L1022">                    } catch (final Exception error) {</span>
+<span class="nc" id="L1023">                        mainConsumerInstanceIdFuture.completeExceptionally(error);</span>
+<span class="nc" id="L1024">                    }</span>
+                } else {
+<span class="nc" id="L1026">                    mainConsumerInstanceIdFuture.completeExceptionally(</span>
+                        new TimeoutException(&quot;Could not retrieve main consumer client instance id.&quot;)
+                    );
+                }
+            }
+
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">            if (!producerInstanceIdFuture.isDone()) {</span>
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">                if (fetchDeadlineClientInstanceId &gt;= time.milliseconds()) {</span>
+                    try {
+<span class="nc" id="L1035">                        producerInstanceIdFuture.complete(</span>
+<span class="nc" id="L1036">                            taskManager.streamsProducer().kafkaProducer().clientInstanceId(Duration.ZERO)</span>
+                        );
+<span class="nc" id="L1038">                    } catch (final IllegalStateException disabledError) {</span>
+                        // if telemetry is disabled on a client, we swallow the error,
+                        // to allow returning a partial result for all other clients
+<span class="nc" id="L1041">                        producerInstanceIdFuture.complete(null);</span>
+<span class="nc" id="L1042">                    } catch (final TimeoutException swallow) {</span>
+                        // swallow
+<span class="nc" id="L1044">                    } catch (final Exception error) {</span>
+<span class="nc" id="L1045">                        producerInstanceIdFuture.completeExceptionally(error);</span>
+<span class="nc" id="L1046">                    }</span>
+                } else {
+<span class="nc" id="L1048">                    producerInstanceIdFuture.completeExceptionally(</span>
+                        new TimeoutException(&quot;Could not retrieve thread producer client instance id.&quot;)
+                    );
+                }
+            }
+
+<span class="nc bnc" id="L1054" title="All 4 branches missed.">            if (mainConsumerInstanceIdFuture.isDone() &amp;&amp; producerInstanceIdFuture.isDone()) {</span>
+<span class="nc" id="L1055">                fetchDeadlineClientInstanceId = -1L;</span>
+            }
+        }
+<span class="nc" id="L1058">    }</span>
+
+    /**
+     * Sets the streams uncaught exception handler.
+     *
+     * @param streamsUncaughtExceptionHandler the user handler wrapped in shell to execute the action
+     */
+    public void setStreamsUncaughtExceptionHandler(final BiConsumer&lt;Throwable, Boolean&gt; streamsUncaughtExceptionHandler) {
+<span class="nc" id="L1066">        this.streamsUncaughtExceptionHandler = streamsUncaughtExceptionHandler;</span>
+<span class="nc" id="L1067">    }</span>
+
+    public void maybeSendShutdown() {
+<span class="nc bnc" id="L1070" title="All 2 branches missed.">        if (assignmentErrorCode.get() == AssignorError.SHUTDOWN_REQUESTED.code()) {</span>
+<span class="nc" id="L1071">            final long now = time.milliseconds();</span>
+<span class="nc" id="L1072">            final long lastLogged = lastShutdownWarningTimestamp.get();</span>
+<span class="nc bnc" id="L1073" title="All 2 branches missed.">            if (now - lastLogged &gt;= 10_000L) {</span>
+<span class="nc bnc" id="L1074" title="All 2 branches missed.">                if (lastShutdownWarningTimestamp.compareAndSet(lastLogged, now)) {</span>
+<span class="nc" id="L1075">                    log.warn(&quot;Detected that shutdown was requested. &quot; +</span>
+                            &quot;All clients in this app will now begin to shutdown&quot;);
+                }
+            }
+<span class="nc" id="L1079">            mainConsumer.enforceRebalance(&quot;Shutdown requested&quot;);</span>
+        }
+<span class="nc" id="L1081">    }</span>
+
+    public boolean waitOnThreadState(final StreamThread.State targetState, final long timeoutMs) {
+<span class="nc" id="L1084">        final long begin = time.milliseconds();</span>
+<span class="nc" id="L1085">        synchronized (stateLock) {</span>
+<span class="nc" id="L1086">            boolean interrupted = false;</span>
+<span class="nc" id="L1087">            long elapsedMs = 0L;</span>
+            try {
+<span class="nc bnc" id="L1089" title="All 2 branches missed.">                while (state != targetState) {</span>
+<span class="nc bnc" id="L1090" title="All 2 branches missed.">                    if (timeoutMs &gt;= elapsedMs) {</span>
+<span class="nc" id="L1091">                        final long remainingMs = timeoutMs - elapsedMs;</span>
+                        try {
+<span class="nc" id="L1093">                            stateLock.wait(remainingMs);</span>
+<span class="nc" id="L1094">                        } catch (final InterruptedException e) {</span>
+<span class="nc" id="L1095">                            interrupted = true;</span>
+<span class="nc" id="L1096">                        }</span>
+<span class="nc" id="L1097">                    } else {</span>
+<span class="nc" id="L1098">                        log.debug(&quot;Cannot transit to {} within {}ms&quot;, targetState, timeoutMs);</span>
+<span class="nc" id="L1099">                        return false;</span>
+                    }
+<span class="nc" id="L1101">                    elapsedMs = time.milliseconds() - begin;</span>
+                }
+<span class="nc" id="L1103">                return true;</span>
+            } finally {
+                // Make sure to restore the interruption status before returning.
+                // We do not always own the current thread that executes this method, i.e., we do not know the
+                // interruption policy of the thread. The least we can do is restore the interruption status before
+                // the current thread exits this method.
+<span class="nc bnc" id="L1109" title="All 2 branches missed.">                if (interrupted) {</span>
+<span class="nc" id="L1110">                    Thread.currentThread().interrupt();</span>
+                }
+            }
+        }
+    }
+
+    public void shutdownToError() {
+<span class="nc" id="L1117">        shutdownErrorHook.run();</span>
+<span class="nc" id="L1118">    }</span>
+
+    public void sendShutdownRequest() {
+<span class="nc" id="L1121">        assignmentErrorCode.set(AssignorError.SHUTDOWN_REQUESTED.code());</span>
+<span class="nc" id="L1122">        streamsRebalanceData.ifPresent(StreamsRebalanceData::requestShutdown);</span>
+<span class="nc" id="L1123">    }</span>
+
+    private void handleTaskMigrated(final TaskMigratedException e) {
+<span class="nc" id="L1126">        log.warn(&quot;Detected that the thread is being fenced. &quot; +</span>
+                     &quot;This implies that this thread missed a rebalance and dropped out of the consumer group. &quot; +
+                     &quot;Will close out all assigned tasks and rejoin the consumer group.&quot;, e);
+
+<span class="nc" id="L1130">        taskManager.handleLostAll();</span>
+<span class="nc" id="L1131">        mainConsumer.unsubscribe();</span>
+<span class="nc" id="L1132">        subscribeConsumer();</span>
+<span class="nc" id="L1133">    }</span>
+
+    private void subscribeConsumer() {
+<span class="nc bnc" id="L1136" title="All 2 branches missed.">        if (topologyMetadata.usesPatternSubscription()) {</span>
+<span class="nc bnc" id="L1137" title="All 2 branches missed.">            if (streamsRebalanceData.isPresent()) {</span>
+<span class="nc" id="L1138">                throw new IllegalArgumentException(&quot;Pattern subscription is not yet supported with the Streams rebalance &quot; +</span>
+                    &quot;protocol&quot;);
+            }
+<span class="nc" id="L1141">            mainConsumer.subscribe(topologyMetadata.sourceTopicPattern(), rebalanceListener);</span>
+        } else {
+<span class="nc bnc" id="L1143" title="All 2 branches missed.">            if (streamsRebalanceData.isPresent()) {</span>
+<span class="nc bnc" id="L1144" title="All 2 branches missed.">                if (mainConsumer instanceof ConsumerWrapper) {</span>
+<span class="nc" id="L1145">                    ((ConsumerWrapper) mainConsumer).subscribe(</span>
+<span class="nc" id="L1146">                        topologyMetadata.allFullSourceTopicNames(),</span>
+<span class="nc" id="L1147">                        defaultStreamsRebalanceListener.get()</span>
+                    );
+                } else {
+<span class="nc" id="L1150">                    ((AsyncKafkaConsumer&lt;byte[], byte[]&gt;) mainConsumer).subscribe(</span>
+<span class="nc" id="L1151">                        topologyMetadata.allFullSourceTopicNames(),</span>
+<span class="nc" id="L1152">                        defaultStreamsRebalanceListener.get()</span>
+                    );
+                }
+            } else {
+<span class="nc" id="L1156">                mainConsumer.subscribe(topologyMetadata.allFullSourceTopicNames(), rebalanceListener);</span>
+            }
+        }
+<span class="nc" id="L1159">    }</span>
+
+    public void resizeCache(final long size) {
+<span class="nc" id="L1162">        cacheResizeSize.set(size);</span>
+<span class="nc" id="L1163">    }</span>
+
+    /**
+     * One iteration of a thread includes the following steps:
+     * &lt;p&gt;
+     * 1. poll records from main consumer and add to buffer;
+     * 2. restore from restore consumer and update standby tasks if necessary;
+     * 3. process active tasks from the buffers;
+     * 4. punctuate active tasks if necessary;
+     * 5. commit all tasks if necessary;
+     *
+     * &lt;p&gt; Among them, step 3/4/5 is done in batches in which we try to process as much as possible while trying to
+     * stop iteration to call the next iteration when it's close to the next main consumer's poll deadline
+     *
+     * @throws IllegalStateException If store gets registered after initialized is already finished
+     * @throws StreamsException      If the store's change log does not contain the partition
+     * @throws TaskMigratedException If another thread wrote to the changelog topic that is currently restored
+     *                               or if committing offsets failed (non-EOS)
+     *                               or if the task producer got fenced (EOS)
+     */
+    // Visible for testing
+    void runOnceWithoutProcessingThreads() {
+<span class="nc" id="L1185">        final long startMs = time.milliseconds();</span>
+<span class="nc" id="L1186">        now = startMs;</span>
+
+        final long pollLatency;
+<span class="nc" id="L1189">        taskManager.resumePollingForPartitionsWithAvailableSpace();</span>
+<span class="nc" id="L1190">        pollLatency = pollPhase();</span>
+<span class="nc" id="L1191">        totalPolledSinceLastSummary += 1;</span>
+
+<span class="nc bnc" id="L1193" title="All 2 branches missed.">        if (streamsRebalanceData.isPresent()) {</span>
+            // Always handle status codes (e.g., MISSING_SOURCE_TOPICS, INCORRECTLY_PARTITIONED_TOPICS)
+            // regardless of streamsGroupReady, as these may throw exceptions that need to be handled.
+<span class="nc" id="L1196">            handleStreamsRebalanceData();</span>
+
+<span class="nc bnc" id="L1198" title="All 2 branches missed.">            if (!streamsGroupReady) {</span>
+<span class="nc" id="L1199">                return;</span>
+            }
+        }
+
+        // Shutdown hook could potentially be triggered and transit the thread state to PENDING_SHUTDOWN during #pollRequests().
+        // The task manager internal states could be uninitialized if the state transition happens during #onPartitionsAssigned().
+        // Should only proceed when the thread is still running after #pollRequests(), because no external state mutation
+        // could affect the task manager state beyond this point within #runOnce().
+<span class="nc bnc" id="L1207" title="All 2 branches missed.">        if (!isRunning()) {</span>
+<span class="nc" id="L1208">            log.debug(&quot;Thread state is already {}, skipping the run once call after poll request&quot;, state);</span>
+<span class="nc" id="L1209">            return;</span>
+        }
+
+        // TODO: we should record the restore latency and its relative time spent ratio after
+        //       we figure out how to move this method out of the stream thread
+<span class="nc" id="L1214">        advanceNowAndComputeLatency();</span>
+
+<span class="nc" id="L1216">        int totalProcessed = 0;</span>
+<span class="nc" id="L1217">        long totalCommitLatency = 0L;</span>
+<span class="nc" id="L1218">        long totalProcessLatency = 0L;</span>
+<span class="nc" id="L1219">        long totalPunctuateLatency = 0L;</span>
+<span class="nc bnc" id="L1220" title="All 2 branches missed.">        if (isStartingRunningOrPartitionAssigned()) {</span>
+
+<span class="nc" id="L1222">            taskManager.updateLags();</span>
+
+            /*
+             * Within an iteration, after processing up to N (N initialized as 1 upon start up) records for each applicable tasks, check the current time:
+             *  1. If it is time to punctuate, do it;
+             *  2. If it is time to commit, do it, this should be after 1) since punctuate may trigger commit;
+             *  3. If there's no records processed, end the current iteration immediately;
+             *  4. If we are close to consumer's next poll deadline, end the current iteration immediately;
+             *  5. If any of 1), 2) and 4) happens, half N for next iteration;
+             *  6. Otherwise, increment N.
+             */
+            do {
+
+<span class="nc" id="L1235">                checkStateUpdater();</span>
+
+<span class="nc" id="L1237">                log.debug(&quot;Processing tasks with {} iterations.&quot;, numIterations);</span>
+<span class="nc" id="L1238">                final int processed = taskManager.process(numIterations, time);</span>
+<span class="nc" id="L1239">                final long processLatency = advanceNowAndComputeLatency();</span>
+<span class="nc" id="L1240">                totalProcessLatency += processLatency;</span>
+<span class="nc bnc" id="L1241" title="All 2 branches missed.">                if (processed &gt; 0) {</span>
+                    // It makes no difference to the outcome of these metrics when we record &quot;0&quot;,
+                    // so we can just avoid the method call when we didn't process anything.
+<span class="nc" id="L1244">                    processRateSensor.record(processed, now);</span>
+
+                    // This metric is scaled to represent the _average_ processing time of _each_
+                    // task. Note, it's hard to interpret this as defined; the per-task process-ratio
+                    // as well as total time ratio spent on processing compared with polling / committing etc
+                    // are reported on other metrics.
+<span class="nc" id="L1250">                    processLatencySensor.record(processLatency / (double) processed, now);</span>
+
+<span class="nc" id="L1252">                    totalProcessed += processed;</span>
+<span class="nc" id="L1253">                    totalRecordsProcessedSinceLastSummary += processed;</span>
+                }
+
+<span class="nc" id="L1256">                log.debug(&quot;Processed {} records with {} iterations; invoking punctuators if necessary&quot;,</span>
+<span class="nc" id="L1257">                          processed,</span>
+<span class="nc" id="L1258">                          numIterations);</span>
+
+<span class="nc" id="L1260">                final int punctuated = taskManager.punctuate();</span>
+<span class="nc" id="L1261">                totalPunctuatorsSinceLastSummary += punctuated;</span>
+<span class="nc" id="L1262">                final long punctuateLatency = advanceNowAndComputeLatency();</span>
+<span class="nc" id="L1263">                totalPunctuateLatency += punctuateLatency;</span>
+<span class="nc bnc" id="L1264" title="All 2 branches missed.">                if (punctuated &gt; 0) {</span>
+<span class="nc" id="L1265">                    punctuateSensor.record(punctuateLatency / (double) punctuated, now);</span>
+                }
+
+<span class="nc" id="L1268">                log.debug(&quot;{} punctuators ran.&quot;, punctuated);</span>
+
+<span class="nc" id="L1270">                final long beforeCommitMs = now;</span>
+<span class="nc" id="L1271">                final int committed = maybeCommit();</span>
+<span class="nc" id="L1272">                final long commitLatency = Math.max(now - beforeCommitMs, 0);</span>
+<span class="nc" id="L1273">                totalCommitLatency += commitLatency;</span>
+<span class="nc bnc" id="L1274" title="All 2 branches missed.">                if (committed &gt; 0) {</span>
+<span class="nc" id="L1275">                    totalCommittedSinceLastSummary += committed;</span>
+<span class="nc" id="L1276">                    commitSensor.record(commitLatency / (double) committed, now);</span>
+
+<span class="nc bnc" id="L1278" title="All 2 branches missed.">                    if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L1279">                        log.debug(&quot;Committed all active tasks {} and standby tasks {} in {}ms&quot;,</span>
+<span class="nc" id="L1280">                            taskManager.activeRunningTaskIds(), taskManager.standbyTaskIds(), commitLatency);</span>
+                    }
+                }
+
+<span class="nc bnc" id="L1284" title="All 2 branches missed.">                if (processed == 0) {</span>
+                    // if there are no records to be processed, exit after punctuate / commit
+<span class="nc" id="L1286">                    break;</span>
+<span class="nc bnc" id="L1287" title="All 2 branches missed.">                } else if (Math.max(now - lastPollMs, 0) &gt; maxPollTimeMs / 2) {</span>
+<span class="nc bnc" id="L1288" title="All 2 branches missed.">                    numIterations = numIterations &gt; 1 ? numIterations / 2 : numIterations;</span>
+<span class="nc" id="L1289">                    break;</span>
+<span class="nc bnc" id="L1290" title="All 4 branches missed.">                } else if (punctuated &gt; 0 || committed &gt; 0) {</span>
+<span class="nc bnc" id="L1291" title="All 2 branches missed.">                    numIterations = numIterations &gt; 1 ? numIterations / 2 : numIterations;</span>
+                } else {
+<span class="nc" id="L1293">                    numIterations++;</span>
+                }
+<span class="nc" id="L1295">            } while (true);</span>
+
+            // we record the ratio out of the while loop so that the accumulated latency spans over
+            // multiple iterations with reasonably large max.num.records and hence is less vulnerable to outliers
+<span class="nc" id="L1299">            taskManager.recordTaskProcessRatio(totalProcessLatency, now);</span>
+        }
+
+<span class="nc" id="L1302">        now = time.milliseconds();</span>
+<span class="nc" id="L1303">        final long runOnceLatency = now - startMs;</span>
+
+<span class="nc" id="L1305">        recordWindowedSum(now, pollLatency, totalCommitLatency, totalProcessLatency, totalPunctuateLatency, runOnceLatency);</span>
+<span class="nc" id="L1306">        recordRatio(now, pollLatencyWindowedSum, pollRatioSensor);</span>
+<span class="nc" id="L1307">        recordRatio(now, totalCommitLatencyWindowedSum, commitRatioSensor);</span>
+<span class="nc" id="L1308">        recordRatio(now, processLatencyWindowedSum, processRatioSensor);</span>
+<span class="nc" id="L1309">        recordRatio(now, punctuateLatencyWindowedSum, punctuateRatioSensor);</span>
+<span class="nc" id="L1310">        processRecordsSensor.record(totalProcessed, now);</span>
+
+<span class="nc" id="L1312">        final long timeSinceLastLog = now - lastLogSummaryMs;</span>
+<span class="nc bnc" id="L1313" title="All 4 branches missed.">        if (logSummaryIntervalMs &gt; 0 &amp;&amp; timeSinceLastLog &gt; logSummaryIntervalMs) {</span>
+<span class="nc" id="L1314">            log.info(&quot;Processed {} total records, ran {} punctuators, polled {} times and committed {} total tasks since the last update {}ms ago&quot;,</span>
+<span class="nc" id="L1315">                 totalRecordsProcessedSinceLastSummary, totalPunctuatorsSinceLastSummary, totalPolledSinceLastSummary, totalCommittedSinceLastSummary, timeSinceLastLog);</span>
+
+<span class="nc" id="L1317">            totalRecordsProcessedSinceLastSummary = 0L;</span>
+<span class="nc" id="L1318">            totalPunctuatorsSinceLastSummary = 0L;</span>
+<span class="nc" id="L1319">            totalPolledSinceLastSummary = 0L;</span>
+<span class="nc" id="L1320">            totalCommittedSinceLastSummary = 0L;</span>
+<span class="nc" id="L1321">            lastLogSummaryMs = now;</span>
+        }
+<span class="nc" id="L1323">    }</span>
+
+    /**
+     * One iteration of a thread includes the following steps:
+     * &lt;p&gt;
+     * 1. poll records from main consumer and add to buffer;
+     * 2. check the task manager for any exceptions to be handled
+     * 3. commit all tasks if necessary;
+     *
+     * @throws IllegalStateException If store gets registered after initialized is already finished
+     * @throws StreamsException      If the store's change log does not contain the partition
+     * @throws TaskMigratedException If another thread wrote to the changelog topic that is currently restored
+     *                               or if committing offsets failed (non-EOS)
+     *                               or if the task producer got fenced (EOS)
+     */
+    // Visible for testing
+    void runOnceWithProcessingThreads() {
+<span class="nc" id="L1340">        final long startMs = time.milliseconds();</span>
+<span class="nc" id="L1341">        now = startMs;</span>
+
+        final long pollLatency;
+<span class="nc" id="L1344">        taskManager.resumePollingForPartitionsWithAvailableSpace();</span>
+<span class="nc" id="L1345">        pollLatency = pollPhase();</span>
+
+<span class="nc bnc" id="L1347" title="All 2 branches missed.">        if (streamsRebalanceData.isPresent()) {</span>
+            // Always handle status codes (e.g., MISSING_SOURCE_TOPICS, INCORRECTLY_PARTITIONED_TOPICS)
+            // regardless of streamsGroupReady, as these may throw exceptions that need to be handled.
+<span class="nc" id="L1350">            handleStreamsRebalanceData();</span>
+
+<span class="nc bnc" id="L1352" title="All 2 branches missed.">            if (!streamsGroupReady) {</span>
+<span class="nc" id="L1353">                return;</span>
+            }
+        }
+
+        // Shutdown hook could potentially be triggered and transit the thread state to PENDING_SHUTDOWN during #pollRequests().
+        // The task manager internal states could be uninitialized if the state transition happens during #onPartitionsAssigned().
+        // Should only proceed when the thread is still running after #pollRequests(), because no external state mutation
+        // could affect the task manager state beyond this point within #runOnce().
+<span class="nc bnc" id="L1361" title="All 2 branches missed.">        if (!isRunning()) {</span>
+<span class="nc" id="L1362">            log.debug(&quot;Thread state is already {}, skipping the run once call after poll request&quot;, state);</span>
+<span class="nc" id="L1363">            return;</span>
+        }
+
+<span class="nc" id="L1366">        long totalCommitLatency = 0L;</span>
+<span class="nc bnc" id="L1367" title="All 2 branches missed.">        if (isRunning()) {</span>
+
+<span class="nc" id="L1369">            taskManager.updateLags();</span>
+
+<span class="nc" id="L1371">            checkStateUpdater();</span>
+
+<span class="nc" id="L1373">            taskManager.maybeThrowTaskExceptionsFromProcessingThreads();</span>
+<span class="nc" id="L1374">            taskManager.signalTaskExecutors();</span>
+
+<span class="nc" id="L1376">            final long beforeCommitMs = now;</span>
+<span class="nc" id="L1377">            final int committed = maybeCommit();</span>
+<span class="nc" id="L1378">            final long commitLatency = Math.max(now - beforeCommitMs, 0);</span>
+<span class="nc" id="L1379">            totalCommitLatency += commitLatency;</span>
+<span class="nc bnc" id="L1380" title="All 2 branches missed.">            if (committed &gt; 0) {</span>
+<span class="nc" id="L1381">                totalCommittedSinceLastSummary += committed;</span>
+<span class="nc" id="L1382">                commitSensor.record(commitLatency / (double) committed, now);</span>
+
+<span class="nc bnc" id="L1384" title="All 2 branches missed.">                if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L1385">                    log.debug(&quot;Committed all active tasks {} and standby tasks {} in {}ms&quot;,</span>
+<span class="nc" id="L1386">                        taskManager.activeTaskIds(), taskManager.standbyTaskIds(), commitLatency);</span>
+                }
+            }
+        }
+
+<span class="nc" id="L1391">        now = time.milliseconds();</span>
+<span class="nc" id="L1392">        final long runOnceLatency = now - startMs;</span>
+
+<span class="nc" id="L1394">        recordWindowedSum(now, pollLatency, totalCommitLatency, 0, 0, runOnceLatency);</span>
+<span class="nc" id="L1395">        recordRatio(now, pollLatencyWindowedSum, pollRatioSensor);</span>
+<span class="nc" id="L1396">        recordRatio(now, totalCommitLatencyWindowedSum, commitRatioSensor);</span>
+
+<span class="nc bnc" id="L1398" title="All 4 branches missed.">        if (logSummaryIntervalMs &gt; 0 &amp;&amp; now - lastLogSummaryMs &gt; logSummaryIntervalMs) {</span>
+<span class="nc" id="L1399">            log.info(&quot;Committed {} total tasks since the last update&quot;, totalCommittedSinceLastSummary);</span>
+
+<span class="nc" id="L1401">            totalCommittedSinceLastSummary = 0L;</span>
+<span class="nc" id="L1402">            lastLogSummaryMs = now;</span>
+        }
+<span class="nc" id="L1404">    }</span>
+
+    private void checkStateUpdater() {
+<span class="nc" id="L1407">        final java.util.function.Consumer&lt;Set&lt;TopicPartition&gt;&gt; offsetResetter = partitions -&gt; resetOffsets(partitions, null);</span>
+<span class="nc" id="L1408">        final State stateSnapshot = state;</span>
+<span class="nc" id="L1409">        final boolean allRunning = taskManager.checkStateUpdater(now, offsetResetter);</span>
+<span class="nc bnc" id="L1410" title="All 4 branches missed.">        if (allRunning &amp;&amp; stateSnapshot == State.PARTITIONS_ASSIGNED) {</span>
+<span class="nc" id="L1411">            setState(State.RUNNING);</span>
+        }
+<span class="nc" id="L1413">    }</span>
+
+    // Check if the topology has been updated since we last checked, ie via #addNamedTopology or #removeNamedTopology
+    private void checkForTopologyUpdates() {
+<span class="nc bnc" id="L1417" title="All 4 branches missed.">        if (topologyMetadata.isEmpty() || topologyMetadata.needsUpdate(getName())) {</span>
+<span class="nc" id="L1418">            log.info(&quot;StreamThread has detected an update to the topology&quot;);</span>
+
+<span class="nc" id="L1420">            taskManager.handleTopologyUpdates();</span>
+
+<span class="nc" id="L1422">            topologyMetadata.maybeWaitForNonEmptyTopology(() -&gt; state);</span>
+
+            // We don't need to manually trigger a rebalance to pick up tasks from the new topology, as
+            // a rebalance will always occur when the metadata is updated after a change in subscription
+<span class="nc" id="L1426">            log.info(&quot;Updating consumer subscription following topology update&quot;);</span>
+<span class="nc" id="L1427">            subscribeConsumer();</span>
+        }
+<span class="nc" id="L1429">    }</span>
+
+    private long pollPhase() {
+        final ConsumerRecords&lt;byte[], byte[]&gt; records;
+<span class="nc" id="L1433">        log.debug(&quot;Invoking poll on main Consumer&quot;);</span>
+
+<span class="nc bnc" id="L1435" title="All 2 branches missed.">        if (state == State.PARTITIONS_REVOKED) {</span>
+            // try to fetch some records with zero poll millis to unblock
+            // other useful work while waiting for the join response
+<span class="nc" id="L1438">            records = pollRequests(Duration.ZERO);</span>
+<span class="nc bnc" id="L1439" title="All 6 branches missed.">        } else if (state == State.RUNNING || state == State.STARTING || state == State.PARTITIONS_ASSIGNED) {</span>
+            // try to fetch some records with normal poll time
+            // in order to get long polling
+<span class="nc" id="L1442">            records = pollRequests(pollTime);</span>
+<span class="nc bnc" id="L1443" title="All 2 branches missed.">        } else if (state == State.PENDING_SHUTDOWN) {</span>
+            // we are only here because there's rebalance in progress,
+            // just poll with zero to complete it
+<span class="nc" id="L1446">            records = pollRequests(Duration.ZERO);</span>
+        } else {
+            // any other state should not happen
+<span class="nc" id="L1449">            log.error(&quot;Unexpected state {} during normal iteration&quot;, state);</span>
+<span class="nc" id="L1450">            throw new StreamsException(logPrefix + &quot;Unexpected state &quot; + state + &quot; during normal iteration&quot;);</span>
+        }
+
+<span class="nc" id="L1453">        final long pollLatency = advanceNowAndComputeLatency();</span>
+
+<span class="nc" id="L1455">        final int numRecords = records.count();</span>
+
+<span class="nc bnc" id="L1457" title="All 2 branches missed.">        for (final TopicPartition topicPartition: records.partitions()) {</span>
+<span class="nc" id="L1458">            records</span>
+<span class="nc" id="L1459">                .records(topicPartition)</span>
+<span class="nc" id="L1460">                .stream()</span>
+<span class="nc" id="L1461">                .max(Comparator.comparing(ConsumerRecord::offset))</span>
+<span class="nc" id="L1462">                .ifPresent(t -&gt; taskManager.updateTaskEndMetadata(topicPartition, t.offset()));</span>
+<span class="nc" id="L1463">        }</span>
+
+<span class="nc" id="L1465">        log.debug(&quot;Main Consumer poll completed in {} ms and fetched {} records from partitions {}&quot;,</span>
+<span class="nc" id="L1466">            pollLatency, numRecords, records.partitions());</span>
+
+<span class="nc" id="L1468">        pollSensor.record(pollLatency, now);</span>
+
+<span class="nc bnc" id="L1470" title="All 2 branches missed.">        if (!records.isEmpty()) {</span>
+<span class="nc" id="L1471">            pollRecordsSensor.record(numRecords, now);</span>
+<span class="nc" id="L1472">            taskManager.addRecordsToTasks(records);</span>
+        }
+<span class="nc bnc" id="L1474" title="All 2 branches missed.">        if (!records.nextOffsets().isEmpty()) {</span>
+<span class="nc" id="L1475">            taskManager.updateNextOffsets(records.nextOffsets());</span>
+        }
+
+<span class="nc bnc" id="L1478" title="All 2 branches missed.">        while (!nonFatalExceptionsToHandle.isEmpty()) {</span>
+<span class="nc" id="L1479">            streamsUncaughtExceptionHandler.accept(nonFatalExceptionsToHandle.poll(), true);</span>
+        }
+<span class="nc" id="L1481">        return pollLatency;</span>
+    }
+
+    /**
+     * Get the next batch of records by polling.
+     *
+     * @param pollTime how long to block in Consumer#poll
+     * @return Next batch of records or null if no records available.
+     * @throws TaskMigratedException if the task producer got fenced (EOS only)
+     */
+    private ConsumerRecords&lt;byte[], byte[]&gt; pollRequests(final Duration pollTime) {
+<span class="nc" id="L1492">        ConsumerRecords&lt;byte[], byte[]&gt; records = ConsumerRecords.empty();</span>
+
+<span class="nc" id="L1494">        lastPollMs = now;</span>
+
+        try {
+<span class="nc" id="L1497">            records = mainConsumer.poll(pollTime);</span>
+<span class="nc" id="L1498">        } catch (final InvalidOffsetException e) {</span>
+<span class="nc" id="L1499">            log.info(&quot;Found no valid offset for {} partitions, resetting.&quot;, e.partitions().size());</span>
+<span class="nc" id="L1500">            resetOffsets(e.partitions(), e);</span>
+<span class="nc" id="L1501">        }</span>
+
+<span class="nc" id="L1503">        return records;</span>
+    }
+
+    /**
+     * Sets the readiness state of the Streams group for this thread.
+     *
+     * @param ready {@code true} if the Streams group is ready to process records; {@code false} otherwise.
+     *              When set to {@code true}, this thread may transition to an active processing state.
+     *              When set to {@code false}, the thread will not process records until the group is ready.
+     */
+    public void setStreamsGroupReady(final boolean ready) {
+<span class="nc" id="L1514">        streamsGroupReady = ready;</span>
+<span class="nc" id="L1515">    }</span>
+
+    public void handleStreamsRebalanceData() {
+<span class="nc bnc" id="L1518" title="All 2 branches missed.">        if (streamsRebalanceData.isPresent()) {</span>
+<span class="nc" id="L1519">            boolean hasMissingSourceTopics = false;</span>
+<span class="nc" id="L1520">            String missingTopicsDetail = null;</span>
+
+<span class="nc bnc" id="L1522" title="All 2 branches missed.">            for (final StreamsGroupHeartbeatResponseData.Status status : streamsRebalanceData.get().statuses()) {</span>
+<span class="nc bnc" id="L1523" title="All 2 branches missed.">                if (status.statusCode() == StreamsGroupHeartbeatResponse.Status.SHUTDOWN_APPLICATION.code()) {</span>
+<span class="nc" id="L1524">                    shutdownErrorHook.run();</span>
+<span class="nc bnc" id="L1525" title="All 2 branches missed.">                } else if (status.statusCode() == StreamsGroupHeartbeatResponse.Status.MISSING_SOURCE_TOPICS.code()) {</span>
+<span class="nc" id="L1526">                    hasMissingSourceTopics = true;</span>
+<span class="nc" id="L1527">                    missingTopicsDetail = status.statusDetail();</span>
+<span class="nc bnc" id="L1528" title="All 2 branches missed.">                } else if (status.statusCode() == StreamsGroupHeartbeatResponse.Status.INCORRECTLY_PARTITIONED_TOPICS.code()) {</span>
+<span class="nc" id="L1529">                    final String errorMsg = status.statusDetail();</span>
+<span class="nc" id="L1530">                    log.error(errorMsg);</span>
+<span class="nc" id="L1531">                    throw new TopologyException(errorMsg);</span>
+                }
+<span class="nc" id="L1533">            }</span>
+
+<span class="nc bnc" id="L1535" title="All 2 branches missed.">            if (hasMissingSourceTopics) {</span>
+<span class="nc" id="L1536">                handleMissingSourceTopicsWithTimeout(missingTopicsDetail);</span>
+            } else {
+                // Reset timeout tracking when no missing source topics are reported
+<span class="nc" id="L1539">                topicsReadyTimer = null;</span>
+            }
+
+<span class="nc" id="L1542">            final Map&lt;StreamsRebalanceData.HostInfo, StreamsRebalanceData.EndpointPartitions&gt; partitionsByEndpoint =</span>
+<span class="nc" id="L1543">                    streamsRebalanceData.get().partitionsByHost();</span>
+<span class="nc" id="L1544">            final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; activeHostInfoMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1545">            final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; standbyHostInfoMap = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L1547">            partitionsByEndpoint.forEach((hostInfo, endpointPartitions) -&gt; {</span>
+<span class="nc" id="L1548">                activeHostInfoMap.put(new HostInfo(hostInfo.host(), hostInfo.port()), new HashSet&lt;&gt;(endpointPartitions.activePartitions()));</span>
+<span class="nc" id="L1549">                standbyHostInfoMap.put(new HostInfo(hostInfo.host(), hostInfo.port()), new HashSet&lt;&gt;(endpointPartitions.standbyPartitions()));</span>
+<span class="nc" id="L1550">            });</span>
+<span class="nc" id="L1551">            streamsMetadataState.onChange(</span>
+                    activeHostInfoMap,
+                    standbyHostInfoMap,
+<span class="nc" id="L1554">                    getTopicPartitionInfo(activeHostInfoMap)</span>
+            );
+        }
+<span class="nc" id="L1557">    }</span>
+
+    private void handleMissingSourceTopicsWithTimeout(final String missingTopicsDetail) {
+        // Use 2 * heartbeatIntervalMs as the timeout ensures at least one heartbeat is sent before raising the exception
+<span class="nc" id="L1561">        final int heartbeatIntervalMs = streamsRebalanceData.get().heartbeatIntervalMs();</span>
+<span class="nc" id="L1562">        final long timeoutMs = 2L * heartbeatIntervalMs;</span>
+
+        // Start timeout tracking on first encounter with missing topics
+<span class="nc bnc" id="L1565" title="All 2 branches missed.">        if (topicsReadyTimer == null) {</span>
+<span class="nc" id="L1566">            topicsReadyTimer = time.timer(timeoutMs);</span>
+<span class="nc" id="L1567">            log.info(&quot;Missing source topics detected: {}. Will wait up to {}ms before failing.&quot;,</span>
+<span class="nc" id="L1568">                missingTopicsDetail, timeoutMs);</span>
+        } else {
+<span class="nc" id="L1570">            topicsReadyTimer.update();</span>
+        }
+
+<span class="nc bnc" id="L1573" title="All 2 branches missed.">        if (topicsReadyTimer.isExpired()) {</span>
+<span class="nc" id="L1574">            final long elapsedTime = topicsReadyTimer.elapsedMs();</span>
+<span class="nc" id="L1575">            final String errorMsg = String.format(&quot;Missing source topics: %s. Timeout exceeded after %dms.&quot;,</span>
+<span class="nc" id="L1576">                missingTopicsDetail, elapsedTime);</span>
+<span class="nc" id="L1577">            log.error(errorMsg);</span>
+
+<span class="nc" id="L1579">            throw new MissingSourceTopicException(errorMsg);</span>
+        } else {
+<span class="nc" id="L1581">            log.debug(&quot;Missing source topics: {}. Elapsed time: {}ms, timeout in: {}ms&quot;,</span>
+<span class="nc" id="L1582">                missingTopicsDetail, topicsReadyTimer.elapsedMs(), topicsReadyTimer.remainingMs());</span>
+        }
+<span class="nc" id="L1584">    }</span>
+
+
+    static Map&lt;TopicPartition, PartitionInfo&gt; getTopicPartitionInfo(final Map&lt;HostInfo, Set&lt;TopicPartition&gt;&gt; partitionsByHost) {
+<span class="nc" id="L1588">        final Map&lt;TopicPartition, PartitionInfo&gt; topicToPartitionInfo = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1589" title="All 2 branches missed.">        for (final Set&lt;TopicPartition&gt; value : partitionsByHost.values()) {</span>
+<span class="nc bnc" id="L1590" title="All 2 branches missed.">            for (final TopicPartition topicPartition : value) {</span>
+<span class="nc" id="L1591">                topicToPartitionInfo.put(</span>
+                    topicPartition,
+                    new PartitionInfo(
+<span class="nc" id="L1594">                        topicPartition.topic(),</span>
+<span class="nc" id="L1595">                        topicPartition.partition(),</span>
+                        null,
+                        new Node[0],
+                        new Node[0]
+                    )
+                );
+<span class="nc" id="L1601">            }</span>
+<span class="nc" id="L1602">        }</span>
+<span class="nc" id="L1603">        return topicToPartitionInfo;</span>
+    }
+
+    private void resetOffsets(final Set&lt;TopicPartition&gt; partitions, final Exception cause) {
+<span class="nc" id="L1607">        final Set&lt;String&gt; loggedTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1608">        final Set&lt;TopicPartition&gt; seekToBeginning = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1609">        final Set&lt;TopicPartition&gt; seekToEnd = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1610">        final Map&lt;TopicPartition, Duration&gt; seekByDuration = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1611">        final Set&lt;TopicPartition&gt; notReset = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1613" title="All 2 branches missed.">        for (final TopicPartition partition : partitions) {</span>
+<span class="nc" id="L1614">            final Optional&lt;AutoOffsetResetStrategy&gt; offsetResetStrategy = topologyMetadata.offsetResetStrategy(partition.topic());</span>
+
+            // TODO
+            // This may be null if the task we are currently processing was part of a named topology that was just removed.
+            // After named topologies are removed, we can update `topologyMetadata.offsetResetStrateg()` so it
+            // will not return null any longer, and we can remove this check
+<span class="nc bnc" id="L1620" title="All 2 branches missed.">            if (offsetResetStrategy != null) {</span>
+<span class="nc bnc" id="L1621" title="All 2 branches missed.">                if (offsetResetStrategy.isPresent()) {</span>
+<span class="nc" id="L1622">                    final AutoOffsetResetStrategy resetPolicy = offsetResetStrategy.get();</span>
+
+<span class="nc bnc" id="L1624" title="All 2 branches missed.">                    if (resetPolicy == AutoOffsetResetStrategy.NONE) {</span>
+<span class="nc" id="L1625">                        notReset.add(partition);</span>
+<span class="nc bnc" id="L1626" title="All 2 branches missed.">                    } else if (resetPolicy == AutoOffsetResetStrategy.EARLIEST) {</span>
+<span class="nc" id="L1627">                        addToResetList(</span>
+                            partition,
+                            seekToBeginning,
+                            &quot;Setting topic '{}' to consume from 'earliest' offset&quot;,
+                            loggedTopics
+                        );
+<span class="nc bnc" id="L1633" title="All 2 branches missed.">                    } else if (resetPolicy == AutoOffsetResetStrategy.LATEST) {</span>
+<span class="nc" id="L1634">                        addToResetList(</span>
+                            partition,
+                            seekToEnd,
+                            &quot;Setting topic '{}' to consume from 'latest' offset&quot;,
+                            loggedTopics
+                        );
+<span class="nc bnc" id="L1640" title="All 2 branches missed.">                    } else if (resetPolicy.type() == AutoOffsetResetStrategy.StrategyType.BY_DURATION) {</span>
+<span class="nc" id="L1641">                        addToResetList(</span>
+                            partition,
+                            seekByDuration,
+<span class="nc" id="L1644">                            resetPolicy.duration().get(),</span>
+                            &quot;Setting topic '{}' to consume from 'by_duration:{}'&quot;,
+<span class="nc" id="L1646">                            resetPolicy.duration().get().toString(),</span>
+                            loggedTopics
+                        );
+                    } else {
+<span class="nc" id="L1650">                        throw new IllegalStateException(&quot;Unknown reset policy &quot; + resetPolicy);</span>
+                    }
+<span class="nc" id="L1652">                } else {</span>
+<span class="nc" id="L1653">                    final AutoOffsetResetStrategy resetPolicy = AutoOffsetResetStrategy.fromString(originalReset);</span>
+
+<span class="nc bnc" id="L1655" title="All 2 branches missed.">                    if (resetPolicy == AutoOffsetResetStrategy.NONE) {</span>
+<span class="nc" id="L1656">                        notReset.add(partition);</span>
+<span class="nc bnc" id="L1657" title="All 2 branches missed.">                    } else if (resetPolicy == AutoOffsetResetStrategy.EARLIEST) {</span>
+<span class="nc" id="L1658">                        addToResetList(</span>
+                            partition,
+                            seekToBeginning,
+                            &quot;No custom setting defined for topic '{}' using original config 'earliest' for offset reset&quot;,
+                            loggedTopics
+                        );
+<span class="nc bnc" id="L1664" title="All 2 branches missed.">                    } else if (resetPolicy == AutoOffsetResetStrategy.LATEST) {</span>
+<span class="nc" id="L1665">                        addToResetList(</span>
+                            partition,
+                            seekToEnd,
+                            &quot;No custom setting defined for topic '{}' using original config 'latest' for offset reset&quot;,
+                            loggedTopics
+                        );
+<span class="nc bnc" id="L1671" title="All 2 branches missed.">                    } else if (resetPolicy.type() == AutoOffsetResetStrategy.StrategyType.BY_DURATION) {</span>
+<span class="nc" id="L1672">                        addToResetList(</span>
+                            partition,
+                            seekByDuration,
+<span class="nc" id="L1675">                            resetPolicy.duration().get(),</span>
+                            &quot;No custom setting defined for topic '{}' using original config 'by_duration:{}' for offset reset&quot;,
+<span class="nc" id="L1677">                            resetPolicy.duration().get().toString(),</span>
+                            loggedTopics
+                        );
+                    } else {
+<span class="nc" id="L1681">                        throw new IllegalStateException(&quot;Unknown reset policy &quot; + resetPolicy);</span>
+                    }
+                }
+            }
+<span class="nc" id="L1685">        }</span>
+
+<span class="nc bnc" id="L1687" title="All 2 branches missed.">        if (notReset.isEmpty()) {</span>
+<span class="nc bnc" id="L1688" title="All 2 branches missed.">            if (!seekToBeginning.isEmpty()) {</span>
+<span class="nc" id="L1689">                mainConsumer.seekToBeginning(seekToBeginning);</span>
+            }
+
+<span class="nc bnc" id="L1692" title="All 2 branches missed.">            if (!seekToEnd.isEmpty()) {</span>
+<span class="nc" id="L1693">                mainConsumer.seekToEnd(seekToEnd);</span>
+            }
+
+<span class="nc bnc" id="L1696" title="All 2 branches missed.">            if (!seekByDuration.isEmpty()) {</span>
+<span class="nc" id="L1697">                final long nowMs = time.milliseconds();</span>
+<span class="nc" id="L1698">                final Map&lt;TopicPartition, Long&gt; seekToTimestamps = seekByDuration.entrySet().stream()</span>
+<span class="nc" id="L1699">                    .map(e -&gt; {</span>
+<span class="nc" id="L1700">                        long seekMs = nowMs - e.getValue().toMillis();</span>
+<span class="nc bnc" id="L1701" title="All 2 branches missed.">                        if (seekMs &lt; 0L) {</span>
+<span class="nc" id="L1702">                            log.debug(&quot;Cannot reset offset to negative timestamp {} for partition {}. Seeking to timestamp 0 instead.&quot;, seekMs, e.getKey());</span>
+<span class="nc" id="L1703">                            seekMs = 0L;</span>
+                        }
+<span class="nc" id="L1705">                        return Map.entry(e.getKey(), seekMs);</span>
+                    })
+<span class="nc" id="L1707">                    .collect(HashMap::new, (m, e) -&gt; m.put(e.getKey(), e.getValue()), Map::putAll);</span>
+
+                try {
+<span class="nc bnc" id="L1710" title="All 2 branches missed.">                    for (final Map.Entry&lt;TopicPartition, OffsetAndTimestamp&gt; partitionAndOffset : mainConsumer.offsetsForTimes(seekToTimestamps).entrySet()) {</span>
+<span class="nc" id="L1711">                        final TopicPartition partition = partitionAndOffset.getKey();</span>
+<span class="nc" id="L1712">                        final OffsetAndTimestamp seekOffset = partitionAndOffset.getValue();</span>
+<span class="nc bnc" id="L1713" title="All 2 branches missed.">                        if (seekOffset != null) {</span>
+<span class="nc" id="L1714">                            mainConsumer.seek(partition, new OffsetAndMetadata(seekOffset.offset()));</span>
+                        } else {
+<span class="nc" id="L1716">                            log.debug(</span>
+                                &quot;Cannot reset offset to non-existing timestamp {} (larger than timestamp of last record)&quot; +
+                                    &quot; for partition {}. Seeking to end instead.&quot;,
+<span class="nc" id="L1719">                                seekToTimestamps.get(partition),</span>
+                                partition
+                            );
+<span class="nc" id="L1722">                            mainConsumer.seekToEnd(Collections.singleton(partitionAndOffset.getKey()));</span>
+                        }
+<span class="nc" id="L1724">                    }</span>
+<span class="nc" id="L1725">                } catch (final TimeoutException timeoutException) {</span>
+<span class="nc" id="L1726">                    taskManager.maybeInitTaskTimeoutsOrThrow(seekByDuration.keySet(), timeoutException, now);</span>
+<span class="nc" id="L1727">                    log.debug(</span>
+<span class="nc" id="L1728">                        String.format(</span>
+                            &quot;Could not reset offset for %s due to the following exception; will retry.&quot;,
+<span class="nc" id="L1730">                            seekByDuration.keySet()),</span>
+                        timeoutException
+                    );
+<span class="nc" id="L1733">                }</span>
+<span class="nc" id="L1734">            }</span>
+        } else {
+<span class="nc" id="L1736">            final String notResetString =</span>
+<span class="nc" id="L1737">                notReset.stream()</span>
+<span class="nc" id="L1738">                        .map(TopicPartition::topic)</span>
+<span class="nc" id="L1739">                        .distinct()</span>
+<span class="nc" id="L1740">                        .collect(Collectors.joining(&quot;,&quot;));</span>
+
+<span class="nc" id="L1742">            final String format = String.format(</span>
+                &quot;No valid committed offset found for input [%s] and no valid reset policy configured.&quot; +
+                    &quot; You need to set configuration parameter \&quot;auto.offset.reset\&quot; or specify a topic specific reset &quot; +
+                    &quot;policy via StreamsBuilder#stream(..., Consumed.with(Topology.AutoOffsetReset)) or &quot; +
+                    &quot;StreamsBuilder#table(..., Consumed.with(Topology.AutoOffsetReset))&quot;,
+                notResetString
+            );
+
+<span class="nc bnc" id="L1750" title="All 2 branches missed.">            if (cause == null) {</span>
+<span class="nc" id="L1751">                throw new StreamsException(format);</span>
+            } else {
+<span class="nc" id="L1753">                throw new StreamsException(format, cause);</span>
+            }
+        }
+<span class="nc" id="L1756">    }</span>
+
+    private void addToResetList(
+        final TopicPartition partition,
+        final Set&lt;TopicPartition&gt; partitions,
+        final String logMessage,
+        final Set&lt;String&gt; loggedTopics
+    ) {
+<span class="nc" id="L1764">        final String topic = partition.topic();</span>
+<span class="nc bnc" id="L1765" title="All 2 branches missed.">        if (loggedTopics.add(topic)) {</span>
+<span class="nc" id="L1766">            log.info(logMessage, topic);</span>
+        }
+<span class="nc" id="L1768">        partitions.add(partition);</span>
+<span class="nc" id="L1769">    }</span>
+
+    private void addToResetList(
+        final TopicPartition partition,
+        final Map&lt;TopicPartition, Duration&gt; durationForPartitions,
+        final Duration durationTime,
+        final String logMessage,
+        final String durationString,
+        final Set&lt;String&gt; loggedTopics
+    ) {
+<span class="nc" id="L1779">        final String topic = partition.topic();</span>
+<span class="nc bnc" id="L1780" title="All 2 branches missed.">        if (loggedTopics.add(topic)) {</span>
+<span class="nc" id="L1781">            log.info(logMessage, topic, durationString);</span>
+        }
+<span class="nc" id="L1783">        durationForPartitions.put(partition, durationTime);</span>
+<span class="nc" id="L1784">    }</span>
+
+    // This method is added for usage in tests where mocking the underlying native call is not possible.
+    public boolean isThreadAlive() {
+<span class="nc" id="L1788">        return isAlive();</span>
+    }
+
+    // Call method when a topology is resumed
+    public void signalResume() {
+<span class="nc" id="L1793">        taskManager.signalResume();</span>
+<span class="nc" id="L1794">    }</span>
+
+    /**
+     * Try to commit all active tasks owned by this thread.
+     *
+     * @throws TaskMigratedException if committing offsets failed (non-EOS)
+     *                               or if the task producer got fenced (EOS)
+     */
+    // visible for testing
+    int maybeCommit() {
+        final int committed;
+<span class="nc bnc" id="L1805" title="All 2 branches missed.">        if (now - lastCommitMs &gt; commitTimeMs) {</span>
+<span class="nc bnc" id="L1806" title="All 2 branches missed.">            if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L1807">                log.debug(&quot;Committing all active tasks {} and standby tasks {} since {}ms has elapsed (commit interval is {}ms)&quot;,</span>
+<span class="nc" id="L1808">                          taskManager.activeRunningTaskIds(), taskManager.standbyTaskIds(), now - lastCommitMs, commitTimeMs);</span>
+            }
+
+<span class="nc" id="L1811">            committed = taskManager.commit(</span>
+<span class="nc" id="L1812">                taskManager.allRunningTasks()</span>
+<span class="nc" id="L1813">                    .values()</span>
+<span class="nc" id="L1814">                    .stream()</span>
+<span class="nc bnc" id="L1815" title="All 4 branches missed.">                    .filter(t -&gt; t.state() == Task.State.RUNNING || t.state() == Task.State.RESTORING)</span>
+<span class="nc" id="L1816">                    .collect(Collectors.toSet())</span>
+            );
+
+<span class="nc bnc" id="L1819" title="All 2 branches missed.">            if (committed == -1) {</span>
+<span class="nc" id="L1820">                log.debug(&quot;Unable to commit as we are in the middle of a rebalance, will try again when it completes.&quot;);</span>
+            } else {
+<span class="nc" id="L1822">                now = time.milliseconds();</span>
+<span class="nc" id="L1823">                lastCommitMs = now;</span>
+            }
+        } else {
+<span class="nc" id="L1826">            committed = taskManager.maybeCommitActiveTasksPerUserRequested();</span>
+        }
+
+<span class="nc bnc" id="L1829" title="All 2 branches missed.">        if ((now - lastPurgeMs) &gt; purgeTimeMs) {</span>
+            // try to purge the committed records for repartition topics if possible
+<span class="nc" id="L1831">            taskManager.maybePurgeCommittedRecords();</span>
+<span class="nc" id="L1832">            lastPurgeMs = now;</span>
+        }
+
+<span class="nc" id="L1835">        return committed;</span>
+    }
+
+    /**
+     * Compute the latency based on the current marked timestamp, and update the marked timestamp
+     * with the current system timestamp.
+     *
+     * @return latency
+     */
+    private long advanceNowAndComputeLatency() {
+<span class="nc" id="L1845">        final long previous = now;</span>
+<span class="nc" id="L1846">        now = time.milliseconds();</span>
+
+<span class="nc" id="L1848">        return Math.max(now - previous, 0);</span>
+    }
+
+    /**
+     * Shutdown this stream thread.
+     * &lt;p&gt;
+     * Note that there is nothing to prevent this function from being called multiple times
+     * (e.g., in testing), hence the state is set only the first time
+     *
+     * @param operation the group membership operation to apply on shutdown. Must be one of LEAVE_GROUP or REMAIN_IN_GROUP.
+     */
+    public void shutdown(final org.apache.kafka.streams.CloseOptions.GroupMembershipOperation operation) {
+<span class="nc" id="L1860">        log.info(&quot;Informed to shut down&quot;);</span>
+<span class="nc" id="L1861">        final State oldState = setState(State.PENDING_SHUTDOWN);</span>
+<span class="nc" id="L1862">        leaveGroupRequested.set(operation);</span>
+<span class="nc bnc" id="L1863" title="All 2 branches missed.">        if (oldState == State.CREATED) {</span>
+            // The thread may not have been started. Take responsibility for shutting down
+<span class="nc" id="L1865">            completeShutdown(true);</span>
+        }
+<span class="nc" id="L1867">    }</span>
+
+    private void completeShutdown(final boolean cleanRun) {
+        // set the state to pending shutdown first as it may be called due to error;
+        // its state may already be PENDING_SHUTDOWN so it will return false but we
+        // intentionally do not check the returned flag
+<span class="nc" id="L1873">        setState(State.PENDING_SHUTDOWN);</span>
+
+<span class="nc bnc" id="L1875" title="All 2 branches missed.">        log.info(&quot;Shutting down {}&quot;, cleanRun ? &quot;clean&quot; : &quot;unclean&quot;);</span>
+
+<span class="nc" id="L1877">        mainConsumerInstanceIdFuture.complete(null);</span>
+
+        try {
+<span class="nc" id="L1880">            taskManager.shutdown(cleanRun);</span>
+<span class="nc" id="L1881">        } catch (final Throwable e) {</span>
+<span class="nc" id="L1882">            log.error(&quot;Failed to close task manager due to the following error:&quot;, e);</span>
+<span class="nc" id="L1883">        }</span>
+        try {
+<span class="nc" id="L1885">            topologyMetadata.unregisterThread(threadMetadata.threadName());</span>
+<span class="nc" id="L1886">        } catch (final Throwable e) {</span>
+<span class="nc" id="L1887">            log.error(&quot;Failed to unregister thread due to the following error:&quot;, e);</span>
+<span class="nc" id="L1888">        }</span>
+        try {
+<span class="nc" id="L1890">            changelogReader.clear();</span>
+<span class="nc" id="L1891">        } catch (final Throwable e) {</span>
+<span class="nc" id="L1892">            log.error(&quot;Failed to close changelog reader due to the following error:&quot;, e);</span>
+<span class="nc" id="L1893">        }</span>
+        try {
+            final GroupMembershipOperation membershipOperation =
+<span class="nc bnc" id="L1896" title="All 2 branches missed.">                leaveGroupRequested.get() == org.apache.kafka.streams.CloseOptions.GroupMembershipOperation.LEAVE_GROUP ? LEAVE_GROUP : REMAIN_IN_GROUP;</span>
+<span class="nc bnc" id="L1897" title="All 4 branches missed.">            if (membershipOperation == REMAIN_IN_GROUP &amp;&amp; streamsRebalanceData.isPresent()) {</span>
+<span class="nc" id="L1898">                log.info(&quot;The consumer will leave the group since the streams group protocol is used&quot;);</span>
+            }
+<span class="nc" id="L1900">            mainConsumer.close(CloseOptions.groupMembershipOperation(membershipOperation));</span>
+<span class="nc" id="L1901">        } catch (final Throwable e) {</span>
+<span class="nc" id="L1902">            log.error(&quot;Failed to close consumer due to the following error:&quot;, e);</span>
+<span class="nc" id="L1903">        }</span>
+        try {
+            // restore consumer isn't part of a consumer group so we use REMAIN_IN_GROUP to skip any leaveGroup checks
+<span class="nc" id="L1906">            restoreConsumer.close();</span>
+<span class="nc" id="L1907">        } catch (final Throwable e) {</span>
+<span class="nc" id="L1908">            log.error(&quot;Failed to close restore consumer due to the following error:&quot;, e);</span>
+<span class="nc" id="L1909">        }</span>
+<span class="nc" id="L1910">        streamsMetrics.removeAllThreadLevelSensors(getName());</span>
+<span class="nc" id="L1911">        streamsMetrics.removeAllThreadLevelMetrics(getName());</span>
+<span class="nc" id="L1912">        streamsMetrics.metricsRegistry().removeReporter(metricsReporter);</span>
+
+<span class="nc" id="L1914">        setState(State.DEAD);</span>
+
+<span class="nc" id="L1916">        log.info(&quot;Shutdown complete&quot;);</span>
+<span class="nc" id="L1917">    }</span>
+
+    /**
+     * Return information about the current {@link StreamThread}.
+     *
+     * @return {@link ThreadMetadata}.
+     */
+    public final ThreadMetadata threadMetadata() {
+<span class="nc" id="L1925">        return threadMetadata;</span>
+    }
+
+    // package-private for testing only
+    StreamThread updateThreadMetadata(final String adminClientId) {
+
+<span class="nc" id="L1931">        threadMetadata = new ThreadMetadataImpl(</span>
+<span class="nc" id="L1932">            getName(),</span>
+<span class="nc" id="L1933">            state().name(),</span>
+<span class="nc" id="L1934">            consumerClientId(getName()),</span>
+<span class="nc" id="L1935">            restoreConsumerClientId(getName()),</span>
+<span class="nc" id="L1936">            taskManager.producerClientIds(),</span>
+            adminClientId,
+<span class="nc" id="L1938">            Collections.emptySet(),</span>
+<span class="nc" id="L1939">            Collections.emptySet());</span>
+
+<span class="nc" id="L1941">        return this;</span>
+    }
+
+    private void updateThreadMetadata(final Map&lt;TaskId, Task&gt; activeTasks,
+                                      final Map&lt;TaskId, StandbyTask&gt; standbyTasks) {
+<span class="nc" id="L1946">        final Set&lt;TaskMetadata&gt; activeTasksMetadata = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L1947" title="All 2 branches missed.">        for (final Map.Entry&lt;TaskId, Task&gt; task : activeTasks.entrySet()) {</span>
+<span class="nc" id="L1948">            activeTasksMetadata.add(new TaskMetadataImpl(</span>
+<span class="nc" id="L1949">                task.getValue().id(),</span>
+<span class="nc" id="L1950">                task.getValue().inputPartitions(),</span>
+<span class="nc" id="L1951">                task.getValue().committedOffsets(),</span>
+<span class="nc" id="L1952">                task.getValue().highWaterMark(),</span>
+<span class="nc" id="L1953">                task.getValue().timeCurrentIdlingStarted()</span>
+            ));
+<span class="nc" id="L1955">        }</span>
+<span class="nc" id="L1956">        final Set&lt;TaskMetadata&gt; standbyTasksMetadata = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L1957" title="All 2 branches missed.">        for (final Map.Entry&lt;TaskId, StandbyTask&gt; task : standbyTasks.entrySet()) {</span>
+<span class="nc" id="L1958">            standbyTasksMetadata.add(new TaskMetadataImpl(</span>
+<span class="nc" id="L1959">                task.getValue().id(),</span>
+<span class="nc" id="L1960">                task.getValue().inputPartitions(),</span>
+<span class="nc" id="L1961">                task.getValue().committedOffsets(),</span>
+<span class="nc" id="L1962">                task.getValue().highWaterMark(),</span>
+<span class="nc" id="L1963">                task.getValue().timeCurrentIdlingStarted()</span>
+            ));
+<span class="nc" id="L1965">        }</span>
+
+<span class="nc" id="L1967">        final String adminClientId = threadMetadata.adminClientId();</span>
+<span class="nc" id="L1968">        threadMetadata = new ThreadMetadataImpl(</span>
+<span class="nc" id="L1969">            getName(),</span>
+<span class="nc" id="L1970">            state().name(),</span>
+<span class="nc" id="L1971">            consumerClientId(getName()),</span>
+<span class="nc" id="L1972">            restoreConsumerClientId(getName()),</span>
+<span class="nc" id="L1973">            taskManager.producerClientIds(),</span>
+            adminClientId,
+            activeTasksMetadata,
+            standbyTasksMetadata
+        );
+<span class="nc" id="L1978">    }</span>
+
+    /**
+     * Getting the list of current active tasks of the thread;
+     * Note that the returned list may be used by other thread than the StreamThread itself,
+     * and hence need to be read-only
+     */
+    public Set&lt;Task&gt; readOnlyActiveTasks() {
+<span class="nc" id="L1986">        return readyOnlyAllTasks().stream()</span>
+<span class="nc" id="L1987">            .filter(Task::isActive).collect(Collectors.toSet());</span>
+    }
+
+    /**
+     * Getting the list of all owned tasks of the thread, including both active and standby;
+     * Note that the returned list may be used by other thread than the StreamThread itself,
+     * and hence need to be read-only
+     */
+    public Set&lt;Task&gt; readyOnlyAllTasks() {
+<span class="nc" id="L1996">        return taskManager.readOnlyAllTasks();</span>
+    }
+
+    /**
+     * Produces a string representation containing useful information about a StreamThread.
+     * This is useful in debugging scenarios.
+     *
+     * @return A string representation of the StreamThread instance.
+     */
+    @Override
+    public String toString() {
+<span class="nc" id="L2007">        return toString(&quot;&quot;);</span>
+    }
+
+    /**
+     * Produces a string representation containing useful information about a StreamThread, starting with the given indent.
+     * This is useful in debugging scenarios.
+     *
+     * @return A string representation of the StreamThread instance.
+     */
+    public String toString(final String indent) {
+<span class="nc" id="L2017">        return indent + &quot;\tStreamsThread threadId: &quot; + getName() + &quot;\n&quot; + taskManager.toString(indent);</span>
+    }
+
+    public Optional&lt;String&gt; groupInstanceID() {
+<span class="nc" id="L2021">        return groupInstanceID;</span>
+    }
+
+    public Map&lt;MetricName, Metric&gt; producerMetrics() {
+<span class="nc" id="L2025">        return taskManager.producerMetrics();</span>
+    }
+
+    public Map&lt;MetricName, Metric&gt; consumerMetrics() {
+<span class="nc" id="L2029">        return ClientUtils.consumerMetrics(mainConsumer, restoreConsumer);</span>
+    }
+
+    public Map&lt;MetricName, Metric&gt; adminClientMetrics() {
+<span class="nc" id="L2033">        return ClientUtils.adminClientMetrics(adminClient);</span>
+    }
+
+    public Object getStateLock() {
+<span class="nc" id="L2037">        return stateLock;</span>
+    }
+
+    // this method is NOT thread-safe (we rely on the callee to be `synchronized`)
+    public Map&lt;String, KafkaFuture&lt;Uuid&gt;&gt; clientInstanceIds(final Duration timeout) {
+<span class="nc" id="L2042">        boolean setDeadline = false;</span>
+
+<span class="nc" id="L2044">        final Map&lt;String, KafkaFuture&lt;Uuid&gt;&gt; result = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L2046" title="All 2 branches missed.">        if (mainConsumerInstanceIdFuture.isDone()) {</span>
+<span class="nc bnc" id="L2047" title="All 2 branches missed.">            if (mainConsumerInstanceIdFuture.isCompletedExceptionally()) {</span>
+<span class="nc" id="L2048">                mainConsumerInstanceIdFuture = new KafkaFutureImpl&lt;&gt;();</span>
+<span class="nc" id="L2049">                setDeadline = true;</span>
+            }
+        } else {
+<span class="nc" id="L2052">            setDeadline = true;</span>
+        }
+<span class="nc" id="L2054">        result.put(getName() + &quot;-consumer&quot;, mainConsumerInstanceIdFuture);</span>
+
+<span class="nc" id="L2056">        restoreConsumerInstanceIdFuture = stateUpdater.restoreConsumerInstanceId(timeout);</span>
+
+<span class="nc" id="L2058">        result.put(getName() + &quot;-restore-consumer&quot;, restoreConsumerInstanceIdFuture);</span>
+
+<span class="nc bnc" id="L2060" title="All 2 branches missed.">        if (producerInstanceIdFuture.isDone()) {</span>
+<span class="nc bnc" id="L2061" title="All 2 branches missed.">            if (producerInstanceIdFuture.isCompletedExceptionally()) {</span>
+<span class="nc" id="L2062">                producerInstanceIdFuture = new KafkaFutureImpl&lt;&gt;();</span>
+<span class="nc" id="L2063">                setDeadline = true;</span>
+            }
+        } else {
+<span class="nc" id="L2066">            setDeadline = true;</span>
+        }
+<span class="nc" id="L2068">        result.put(getName() + &quot;-producer&quot;, producerInstanceIdFuture);</span>
+
+<span class="nc bnc" id="L2070" title="All 2 branches missed.">        if (setDeadline) {</span>
+<span class="nc" id="L2071">            fetchDeadlineClientInstanceId = time.milliseconds() + timeout.toMillis();</span>
+        }
+
+<span class="nc" id="L2074">        return result;</span>
+    }
+
+    // the following are for testing only
+    void setNow(final long now) {
+<span class="nc" id="L2079">        this.now = now;</span>
+<span class="nc" id="L2080">    }</span>
+
+    TaskManager taskManager() {
+<span class="nc" id="L2083">        return taskManager;</span>
+    }
+
+    int currentNumIterations() {
+<span class="nc" id="L2087">        return numIterations;</span>
+    }
+
+    ConsumerRebalanceListener rebalanceListener() {
+<span class="nc" id="L2091">        return rebalanceListener;</span>
+    }
+
+    Consumer&lt;byte[], byte[]&gt; mainConsumer() {
+<span class="nc" id="L2095">        return mainConsumer;</span>
+    }
+
+    Consumer&lt;byte[], byte[]&gt; restoreConsumer() {
+<span class="nc" id="L2099">        return restoreConsumer;</span>
+    }
+
+    Admin adminClient() {
+<span class="nc" id="L2103">        return adminClient;</span>
+    }
+
+    Optional&lt;StreamsRebalanceData&gt; streamsRebalanceData() {
+<span class="nc" id="L2107">        return streamsRebalanceData;</span>
+    }
+
+    StreamsMetricsImpl streamsMetrics() {
+<span class="nc" id="L2111">        return streamsMetrics;</span>
+    }
+
+    /**
+     * Initialize both WindowedSum instances at exactly the same timestamp so
+     * their windows are aligned from the very beginning.
+     */
+    private void initLatencyWindowsIfNeeded(final long now) {
+<span class="nc bnc" id="L2119" title="All 2 branches missed.">        if (!latencyWindowsInitialized) {</span>
+            // Start both windows at the same instant with a zero record
+<span class="nc" id="L2121">            pollLatencyWindowedSum.record(metricsConfig, 0.0, now);</span>
+<span class="nc" id="L2122">            totalCommitLatencyWindowedSum.record(metricsConfig, 0, now);</span>
+<span class="nc" id="L2123">            processLatencyWindowedSum.record(metricsConfig, 0, now);</span>
+<span class="nc" id="L2124">            punctuateLatencyWindowedSum.record(metricsConfig, 0, now);</span>
+<span class="nc" id="L2125">            runOnceLatencyWindowedSum.record(metricsConfig, 0.0, now);</span>
+<span class="nc" id="L2126">            latencyWindowsInitialized = true;</span>
+        }
+<span class="nc" id="L2128">    }</span>
+
+    private void recordWindowedSum(final long now,
+                                   final double pollLatency,
+                                   final double totalCommitLatency,
+                                   final double processLatency,
+                                   final double punctuateLatency,
+                                   final double runOnceLatency) {
+<span class="nc" id="L2136">        pollLatencyWindowedSum.record(metricsConfig, pollLatency, now);</span>
+<span class="nc" id="L2137">        totalCommitLatencyWindowedSum.record(metricsConfig, totalCommitLatency, now);</span>
+<span class="nc" id="L2138">        processLatencyWindowedSum.record(metricsConfig, processLatency, now);</span>
+<span class="nc" id="L2139">        punctuateLatencyWindowedSum.record(metricsConfig, punctuateLatency, now);</span>
+<span class="nc" id="L2140">        runOnceLatencyWindowedSum.record(metricsConfig, runOnceLatency, now);</span>
+<span class="nc" id="L2141">    }</span>
+
+    private void recordRatio(final long now, final WindowedSum windowedSum, final Sensor ratioSensor) {
+<span class="nc" id="L2144">        final double runOnceLatencyWindow =</span>
+<span class="nc" id="L2145">            runOnceLatencyWindowedSum.measure(metricsConfig, now);</span>
+
+<span class="nc bnc" id="L2147" title="All 2 branches missed.">        if (runOnceLatencyWindow &gt; 0.0) {</span>
+<span class="nc" id="L2148">            final double latencyWindow =</span>
+<span class="nc" id="L2149">                windowedSum.measure(metricsConfig, now);</span>
+<span class="nc" id="L2150">            ratioSensor.record(latencyWindow / runOnceLatencyWindow);</span>
+<span class="nc" id="L2151">        } else {</span>
+<span class="nc" id="L2152">            ratioSensor.record(0.0, now);</span>
+        }
+<span class="nc" id="L2154">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

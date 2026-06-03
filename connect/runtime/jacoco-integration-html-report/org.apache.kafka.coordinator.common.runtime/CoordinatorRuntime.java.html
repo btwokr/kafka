@@ -1,0 +1,2456 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CoordinatorRuntime.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.coordinator.common.runtime</a> &gt; <span class="el_source">CoordinatorRuntime.java</span></div><h1>CoordinatorRuntime.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.coordinator.common.runtime;
+
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.errors.CoordinatorLoadInProgressException;
+import org.apache.kafka.common.errors.NotCoordinatorException;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.common.record.internal.AbstractRecords;
+import org.apache.kafka.common.record.internal.CompressionType;
+import org.apache.kafka.common.record.internal.ControlRecordType;
+import org.apache.kafka.common.record.internal.EndTransactionMarker;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.record.internal.MemoryRecordsBuilder;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.record.internal.SimpleRecord;
+import org.apache.kafka.common.requests.TransactionResult;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.BufferSupplier;
+import org.apache.kafka.deferred.DeferredEvent;
+import org.apache.kafka.deferred.DeferredEventQueue;
+import org.apache.kafka.server.common.TransactionVersion;
+import org.apache.kafka.server.util.timer.Timer;
+import org.apache.kafka.server.util.timer.TimerTask;
+import org.apache.kafka.storage.internals.log.VerificationGuard;
+import org.apache.kafka.timeline.SnapshotRegistry;
+
+import org.slf4j.Logger;
+
+import java.nio.ByteBuffer;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import static java.lang.Math.min;
+import static org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime.CoordinatorWriteEvent.NOT_QUEUED;
+
+/**
+ * The CoordinatorRuntime provides a framework to implement coordinators such as the group coordinator
+ * or the transaction coordinator.
+ *
+ * The runtime framework maps each underlying partitions (e.g. __consumer_offsets) that the broker is a
+ * leader of to a coordinator replicated state machine. A replicated state machine holds the hard and soft
+ * state of all the objects (e.g. groups or offsets) assigned to the partition. The hard state is stored in
+ * timeline datastructures backed by a SnapshotRegistry. The runtime supports two type of operations
+ * on state machines: (1) Writes and (2) Reads.
+ *
+ * (1) A write operation, aka a request, can read the full and potentially **uncommitted** state from state
+ * machine to handle the operation. A write operation typically generates a response and a list of
+ * records. The records are applied to the state machine and persisted to the partition. The response
+ * is parked until the records are committed and delivered when they are.
+ *
+ * (2) A read operation, aka a request, can only read the committed state from the state machine to handle
+ * the operation. A read operation typically generates a response that is immediately completed.
+ *
+ * The runtime framework exposes an asynchronous, future based, API to the world. All the operations
+ * are executed by an CoordinatorEventProcessor. The processor guarantees that operations for a
+ * single partition or state machine are not processed concurrently.
+ *
+ * @param &lt;S&gt; The type of the state machine.
+ * @param &lt;U&gt; The type of the record.
+ */
+public class CoordinatorRuntime&lt;S extends CoordinatorShard&lt;U&gt;, U&gt; implements AutoCloseable {
+
+    /**
+     * Builder to create a CoordinatorRuntime.
+     *
+     * @param &lt;S&gt; The type of the state machine.
+     * @param &lt;U&gt; The type of the record.
+     */
+<span class="fc" id="L104">    public static class Builder&lt;S extends CoordinatorShard&lt;U&gt;, U&gt; {</span>
+        private String logPrefix;
+        private LogContext logContext;
+        private CoordinatorEventProcessor eventProcessor;
+        private PartitionWriter partitionWriter;
+        private CoordinatorLoader&lt;U&gt; loader;
+        private CoordinatorShardBuilderSupplier&lt;S, U&gt; coordinatorShardBuilderSupplier;
+<span class="fc" id="L111">        private Time time = Time.SYSTEM;</span>
+        private Timer timer;
+        private Duration writeTimeout;
+        private CoordinatorRuntimeMetrics runtimeMetrics;
+        private CoordinatorMetrics coordinatorMetrics;
+        private Serializer&lt;U&gt; serializer;
+        private Compression compression;
+        private OptionalInt appendLingerMs;
+        private ExecutorService executorService;
+        private Supplier&lt;Integer&gt; cachedBufferMaxBytesSupplier;
+
+        public Builder&lt;S, U&gt; withLogPrefix(String logPrefix) {
+<span class="fc" id="L123">            this.logPrefix = logPrefix;</span>
+<span class="fc" id="L124">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withLogContext(LogContext logContext) {
+<span class="fc" id="L128">            this.logContext = logContext;</span>
+<span class="fc" id="L129">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withEventProcessor(CoordinatorEventProcessor eventProcessor) {
+<span class="fc" id="L133">            this.eventProcessor = eventProcessor;</span>
+<span class="fc" id="L134">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withPartitionWriter(PartitionWriter partitionWriter) {
+<span class="fc" id="L138">            this.partitionWriter = partitionWriter;</span>
+<span class="fc" id="L139">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withLoader(CoordinatorLoader&lt;U&gt; loader) {
+<span class="fc" id="L143">            this.loader = loader;</span>
+<span class="fc" id="L144">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withCoordinatorShardBuilderSupplier(CoordinatorShardBuilderSupplier&lt;S, U&gt; coordinatorShardBuilderSupplier) {
+<span class="fc" id="L148">            this.coordinatorShardBuilderSupplier = coordinatorShardBuilderSupplier;</span>
+<span class="fc" id="L149">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withTime(Time time) {
+<span class="fc" id="L153">            this.time = time;</span>
+<span class="fc" id="L154">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withTimer(Timer timer) {
+<span class="fc" id="L158">            this.timer = timer;</span>
+<span class="fc" id="L159">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withWriteTimeout(Duration writeTimeout) {
+<span class="fc" id="L163">            this.writeTimeout = writeTimeout;</span>
+<span class="fc" id="L164">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withCoordinatorRuntimeMetrics(CoordinatorRuntimeMetrics runtimeMetrics) {
+<span class="fc" id="L168">            this.runtimeMetrics = runtimeMetrics;</span>
+<span class="fc" id="L169">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withCoordinatorMetrics(CoordinatorMetrics coordinatorMetrics) {
+<span class="fc" id="L173">            this.coordinatorMetrics = coordinatorMetrics;</span>
+<span class="fc" id="L174">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withSerializer(Serializer&lt;U&gt; serializer) {
+<span class="fc" id="L178">            this.serializer = serializer;</span>
+<span class="fc" id="L179">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withCompression(Compression compression) {
+<span class="fc" id="L183">            this.compression = compression;</span>
+<span class="fc" id="L184">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withAppendLingerMs(OptionalInt appendLingerMs) {
+<span class="fc" id="L188">            this.appendLingerMs = appendLingerMs;</span>
+<span class="fc" id="L189">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withExecutorService(ExecutorService executorService) {
+<span class="fc" id="L193">            this.executorService = executorService;</span>
+<span class="fc" id="L194">            return this;</span>
+        }
+
+        public Builder&lt;S, U&gt; withCachedBufferMaxBytesSupplier(Supplier&lt;Integer&gt; cachedBufferMaxBytesSupplier) {
+<span class="fc" id="L198">            this.cachedBufferMaxBytesSupplier = cachedBufferMaxBytesSupplier;</span>
+<span class="fc" id="L199">            return this;</span>
+        }
+
+        @SuppressWarnings(&quot;checkstyle:CyclomaticComplexity&quot;)
+        public CoordinatorRuntime&lt;S, U&gt; build() {
+<span class="pc bpc" id="L204" title="1 of 2 branches missed.">            if (logPrefix == null)</span>
+<span class="nc" id="L205">                logPrefix = &quot;&quot;;</span>
+<span class="pc bpc" id="L206" title="1 of 2 branches missed.">            if (logContext == null)</span>
+<span class="nc" id="L207">                logContext = new LogContext(logPrefix);</span>
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">            if (eventProcessor == null)</span>
+<span class="nc" id="L209">                throw new IllegalArgumentException(&quot;Event processor must be set.&quot;);</span>
+<span class="pc bpc" id="L210" title="1 of 2 branches missed.">            if (partitionWriter == null)</span>
+<span class="nc" id="L211">                throw new IllegalArgumentException(&quot;Partition write must be set.&quot;);</span>
+<span class="pc bpc" id="L212" title="1 of 2 branches missed.">            if (loader == null)</span>
+<span class="nc" id="L213">                throw new IllegalArgumentException(&quot;Loader must be set.&quot;);</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">            if (coordinatorShardBuilderSupplier == null)</span>
+<span class="nc" id="L215">                throw new IllegalArgumentException(&quot;State machine supplier must be set.&quot;);</span>
+<span class="pc bpc" id="L216" title="1 of 2 branches missed.">            if (time == null)</span>
+<span class="nc" id="L217">                throw new IllegalArgumentException(&quot;Time must be set.&quot;);</span>
+<span class="pc bpc" id="L218" title="1 of 2 branches missed.">            if (timer == null)</span>
+<span class="nc" id="L219">                throw new IllegalArgumentException(&quot;Timer must be set.&quot;);</span>
+<span class="pc bpc" id="L220" title="1 of 2 branches missed.">            if (runtimeMetrics == null)</span>
+<span class="nc" id="L221">                throw new IllegalArgumentException(&quot;CoordinatorRuntimeMetrics must be set.&quot;);</span>
+<span class="pc bpc" id="L222" title="1 of 2 branches missed.">            if (coordinatorMetrics == null)</span>
+<span class="nc" id="L223">                throw new IllegalArgumentException(&quot;CoordinatorMetrics must be set.&quot;);</span>
+<span class="pc bpc" id="L224" title="1 of 2 branches missed.">            if (serializer == null)</span>
+<span class="nc" id="L225">                throw new IllegalArgumentException(&quot;Serializer must be set.&quot;);</span>
+<span class="pc bpc" id="L226" title="1 of 2 branches missed.">            if (compression == null)</span>
+<span class="nc" id="L227">                compression = Compression.NONE;</span>
+<span class="pc bpc" id="L228" title="1 of 2 branches missed.">            if (appendLingerMs == null)</span>
+<span class="nc" id="L229">                appendLingerMs = OptionalInt.empty();</span>
+<span class="pc bpc" id="L230" title="3 of 4 branches missed.">            if (appendLingerMs.isPresent() &amp;&amp; appendLingerMs.getAsInt() &lt; 0)</span>
+<span class="nc" id="L231">                throw new IllegalArgumentException(&quot;AppendLinger must be empty or &gt;= 0&quot;);</span>
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">            if (executorService == null)</span>
+<span class="nc" id="L233">                throw new IllegalArgumentException(&quot;ExecutorService must be set.&quot;);</span>
+<span class="pc bpc" id="L234" title="1 of 2 branches missed.">            if (cachedBufferMaxBytesSupplier == null)</span>
+<span class="nc" id="L235">                throw new IllegalArgumentException(&quot;Cached buffer max bytes supplier must be set.&quot;);</span>
+
+<span class="fc" id="L237">            return new CoordinatorRuntime&lt;&gt;(</span>
+                logPrefix,
+                logContext,
+                eventProcessor,
+                partitionWriter,
+                loader,
+                coordinatorShardBuilderSupplier,
+                time,
+                timer,
+                writeTimeout,
+                runtimeMetrics,
+                coordinatorMetrics,
+                serializer,
+                compression,
+                appendLingerMs,
+                executorService,
+                cachedBufferMaxBytesSupplier
+            );
+        }
+    }
+
+    /**
+     * The various state that a coordinator for a partition can be in.
+     */
+<span class="fc" id="L261">    public enum CoordinatorState {</span>
+        /**
+         * Initial state when a coordinator is created.
+         */
+<span class="fc" id="L265">        INITIAL {</span>
+            @Override
+            boolean canTransitionFrom(CoordinatorState state) {
+<span class="nc" id="L268">                return false;</span>
+            }
+        },
+
+        /**
+         * The coordinator is being loaded.
+         */
+<span class="fc" id="L275">        LOADING {</span>
+            @Override
+            boolean canTransitionFrom(CoordinatorState state) {
+<span class="pc bpc" id="L278" title="3 of 4 branches missed.">                return state == INITIAL || state == FAILED;</span>
+            }
+        },
+
+        /**
+         * The coordinator is active and can service requests.
+         */
+<span class="fc" id="L285">        ACTIVE {</span>
+            @Override
+            boolean canTransitionFrom(CoordinatorState state) {
+<span class="pc bpc" id="L288" title="2 of 4 branches missed.">                return state == ACTIVE || state == LOADING;</span>
+            }
+        },
+
+        /**
+         * The coordinator is closed.
+         */
+<span class="fc" id="L295">        CLOSED {</span>
+            @Override
+            boolean canTransitionFrom(CoordinatorState state) {
+<span class="fc" id="L298">                return true;</span>
+            }
+        },
+
+        /**
+         * The coordinator loading has failed.
+         */
+<span class="fc" id="L305">        FAILED {</span>
+            @Override
+            boolean canTransitionFrom(CoordinatorState state) {
+<span class="nc bnc" id="L308" title="All 4 branches missed.">                return state == LOADING || state == ACTIVE;</span>
+            }
+        };
+
+        abstract boolean canTransitionFrom(CoordinatorState state);
+    }
+
+    /**
+     * A simple container class to hold all the attributes
+     * related to a pending batch.
+     */
+    private static class CoordinatorBatch {
+        /**
+         * The base (or first) offset of the batch. If the batch fails
+         * for any reason, the state machines is rolled back to it.
+         */
+        final long baseOffset;
+
+        /**
+         * The time at which the batch was created.
+         */
+        final long appendTimeMs;
+
+        /**
+         * The verification guard associated to the batch if it is
+         * transactional.
+         */
+        final VerificationGuard verificationGuard;
+
+        /**
+         * The byte buffer backing the records builder.
+         */
+        final ByteBuffer buffer;
+
+        /**
+         * The records builder.
+         */
+        final MemoryRecordsBuilder builder;
+
+        /**
+         * The timer used to enforce the append linger time if
+         * it is non-zero.
+         */
+        final Optional&lt;TimerTask&gt; lingerTimeoutTask;
+
+        /**
+         * The deferred events associated with the batch.
+         */
+        final DeferredEventCollection deferredEvents;
+
+        /**
+         * The next offset. This is updated when records
+         * are added to the batch.
+         */
+        long nextOffset;
+
+        CoordinatorBatch(
+            Logger log,
+            long baseOffset,
+            long appendTimeMs,
+            VerificationGuard verificationGuard,
+            ByteBuffer buffer,
+            MemoryRecordsBuilder builder,
+            Optional&lt;TimerTask&gt; lingerTimeoutTask
+<span class="fc" id="L372">        ) {</span>
+<span class="fc" id="L373">            this.baseOffset = baseOffset;</span>
+<span class="fc" id="L374">            this.nextOffset = baseOffset;</span>
+<span class="fc" id="L375">            this.appendTimeMs = appendTimeMs;</span>
+<span class="fc" id="L376">            this.verificationGuard = verificationGuard;</span>
+<span class="fc" id="L377">            this.buffer = buffer;</span>
+<span class="fc" id="L378">            this.builder = builder;</span>
+<span class="fc" id="L379">            this.lingerTimeoutTask = lingerTimeoutTask;</span>
+<span class="fc" id="L380">            this.deferredEvents = new DeferredEventCollection(log);</span>
+<span class="fc" id="L381">        }</span>
+    }
+
+    /**
+     * CoordinatorContext holds all the metadata around a coordinator state machine.
+     */
+    class CoordinatorContext {
+        /**
+         * The lock which protects all data in the context. Note that the context
+         * is never accessed concurrently, but it is accessed by multiple threads.
+         */
+        final ReentrantLock lock;
+
+        /**
+         * The topic partition backing the coordinator.
+         */
+        final TopicPartition tp;
+
+        /**
+         * The log context.
+         */
+        final LogContext logContext;
+
+        /**
+         * The deferred event queue used to park events waiting
+         * on records to be committed.
+         */
+        final DeferredEventQueue deferredEventQueue;
+
+        /**
+         * The coordinator timer.
+         */
+        final CoordinatorTimerImpl&lt;U&gt; timer;
+
+        /**
+         * The coordinator executor.
+         */
+        final CoordinatorExecutorImpl&lt;U&gt; executor;
+
+        /**
+         * The current state.
+         */
+        volatile CoordinatorState state;
+
+        /**
+         * The current epoch of the coordinator. This represents
+         * the epoch of the partition leader.
+         */
+        int epoch;
+
+        /**
+         * The state machine and the metadata that can be accessed by
+         * other threads.
+         */
+        SnapshottableCoordinator&lt;S, U&gt; coordinator;
+
+        /**
+         * The high watermark listener registered to all the partitions
+         * backing the coordinators.
+         */
+        HighWatermarkListener highWatermarklistener;
+
+        /**
+         * The buffer supplier used to write records to the log.
+         */
+        BufferSupplier bufferSupplier;
+
+        /**
+         * The cached buffer size.
+         */
+        AtomicLong cachedBufferSize;
+
+        /**
+         * The current (or pending) batch.
+         */
+        CoordinatorBatch currentBatch;
+
+        /**
+         * The batch epoch. Incremented every time a new batch is started.
+         * Only valid for the lifetime of the CoordinatorContext. The first batch has an epoch of 1.
+         */
+        int batchEpoch;
+
+        /**
+         * Constructor.
+         *
+         * @param tp The topic partition of the coordinator.
+         */
+        private CoordinatorContext(
+            TopicPartition tp
+<span class="fc" id="L471">        ) {</span>
+<span class="fc" id="L472">            this.lock = new ReentrantLock();</span>
+<span class="fc" id="L473">            this.tp = tp;</span>
+<span class="fc" id="L474">            this.logContext = new LogContext(String.format(&quot;[%s topic=%s partition=%d] &quot;,</span>
+                logPrefix,
+<span class="fc" id="L476">                tp.topic(),</span>
+<span class="fc" id="L477">                tp.partition()</span>
+            ));
+<span class="fc" id="L479">            this.state = CoordinatorState.INITIAL;</span>
+<span class="fc" id="L480">            this.epoch = -1;</span>
+<span class="fc" id="L481">            this.deferredEventQueue = new DeferredEventQueue(logContext);</span>
+<span class="fc" id="L482">            this.timer = new CoordinatorTimerImpl&lt;&gt;(</span>
+                logContext,
+                CoordinatorRuntime.this.timer,
+<span class="fc" id="L485">                (operationName, operation) -&gt; scheduleWriteOperation(</span>
+                    operationName,
+                    tp,
+<span class="fc" id="L488">                    coordinator -&gt; operation.generate()</span>
+                )
+            );
+<span class="fc" id="L491">            this.executor = new CoordinatorExecutorImpl&lt;&gt;(</span>
+                logContext,
+                executorService,
+<span class="nc" id="L494">                (operationName, operation) -&gt; scheduleWriteOperation(</span>
+                    operationName,
+                    tp,
+<span class="nc" id="L497">                    coordinator -&gt; operation.generate()</span>
+                )
+            );
+<span class="fc" id="L500">            this.bufferSupplier = new BufferSupplier.GrowableBufferSupplier();</span>
+<span class="fc" id="L501">            this.cachedBufferSize = new AtomicLong(0);</span>
+<span class="fc" id="L502">        }</span>
+
+        /**
+         * Transitions to the new state.
+         *
+         * @param newState The new state.
+         */
+        private void transitionTo(
+            CoordinatorState newState
+        ) {
+<span class="pc bpc" id="L512" title="1 of 2 branches missed.">            if (!newState.canTransitionFrom(state)) {</span>
+<span class="nc" id="L513">                throw new IllegalStateException(&quot;Cannot transition from &quot; + state + &quot; to &quot; + newState);</span>
+            }
+<span class="fc" id="L515">            CoordinatorState oldState = state;</span>
+
+<span class="fc" id="L517">            log.debug(&quot;Transition from {} to {}.&quot;, state, newState);</span>
+<span class="pc bpc" id="L518" title="2 of 5 branches missed.">            switch (newState) {</span>
+                case LOADING:
+<span class="fc" id="L520">                    state = CoordinatorState.LOADING;</span>
+<span class="fc" id="L521">                    SnapshotRegistry snapshotRegistry = new SnapshotRegistry(logContext);</span>
+<span class="fc" id="L522">                    coordinator = new SnapshottableCoordinator&lt;&gt;(</span>
+                        logContext,
+                        snapshotRegistry,
+                        coordinatorShardBuilderSupplier
+<span class="fc" id="L526">                            .get()</span>
+<span class="fc" id="L527">                            .withLogContext(logContext)</span>
+<span class="fc" id="L528">                            .withSnapshotRegistry(snapshotRegistry)</span>
+<span class="fc" id="L529">                            .withTime(time)</span>
+<span class="fc" id="L530">                            .withTimer(timer)</span>
+<span class="fc" id="L531">                            .withExecutor(executor)</span>
+<span class="fc" id="L532">                            .withCoordinatorMetrics(coordinatorMetrics)</span>
+<span class="fc" id="L533">                            .withTopicPartition(tp)</span>
+<span class="fc" id="L534">                            .build(),</span>
+                        tp
+                    );
+<span class="fc" id="L537">                    load();</span>
+<span class="fc" id="L538">                    break;</span>
+
+                case ACTIVE:
+<span class="fc" id="L541">                    state = CoordinatorState.ACTIVE;</span>
+<span class="fc" id="L542">                    highWatermarklistener = new HighWatermarkListener();</span>
+<span class="fc" id="L543">                    partitionWriter.registerListener(tp, highWatermarklistener);</span>
+<span class="fc" id="L544">                    coordinator.onLoaded(metadataImage);</span>
+<span class="fc" id="L545">                    break;</span>
+
+                case FAILED:
+<span class="nc" id="L548">                    state = CoordinatorState.FAILED;</span>
+<span class="nc" id="L549">                    unload();</span>
+<span class="nc" id="L550">                    break;</span>
+
+                case CLOSED:
+<span class="fc" id="L553">                    state = CoordinatorState.CLOSED;</span>
+<span class="fc" id="L554">                    unload();</span>
+<span class="fc" id="L555">                    break;</span>
+
+                default:
+<span class="nc" id="L558">                    throw new IllegalArgumentException(&quot;Transitioning to &quot; + newState + &quot; is not supported.&quot;);</span>
+            }
+
+<span class="fc" id="L561">            runtimeMetrics.recordPartitionStateChange(oldState, state);</span>
+<span class="fc" id="L562">        }</span>
+
+        /**
+         * Loads the coordinator.
+         */
+        private void load() {
+<span class="pc bpc" id="L568" title="1 of 2 branches missed.">            if (state != CoordinatorState.LOADING) {</span>
+<span class="nc" id="L569">                throw new IllegalStateException(&quot;Coordinator must be in loading state&quot;);</span>
+            }
+
+<span class="fc" id="L572">            loader.load(tp, coordinator).whenComplete((summary, exception) -&gt; {</span>
+<span class="fc" id="L573">                scheduleInternalOperation(&quot;CompleteLoad(tp=&quot; + tp + &quot;, epoch=&quot; + epoch + &quot;)&quot;, tp, () -&gt; {</span>
+<span class="fc" id="L574">                    CoordinatorContext context = coordinators.get(tp);</span>
+<span class="pc bpc" id="L575" title="1 of 2 branches missed.">                    if (context != null)  {</span>
+<span class="pc bpc" id="L576" title="1 of 2 branches missed.">                        if (context.state != CoordinatorState.LOADING) {</span>
+<span class="nc" id="L577">                            log.info(&quot;Ignored load completion from {} because context is in {} state.&quot;,</span>
+                                context.tp, context.state);
+<span class="nc" id="L579">                            return;</span>
+                        }
+                        try {
+<span class="pc bpc" id="L582" title="1 of 2 branches missed.">                            if (exception != null) throw exception;</span>
+<span class="fc" id="L583">                            context.transitionTo(CoordinatorState.ACTIVE);</span>
+<span class="pc bpc" id="L584" title="1 of 2 branches missed.">                            if (summary != null) {</span>
+<span class="fc" id="L585">                                runtimeMetrics.recordPartitionLoadSensor(summary.startTimeMs(), summary.endTimeMs());</span>
+<span class="fc" id="L586">                                log.info(&quot;Finished loading of metadata from {} with epoch {} in {}ms where {}ms &quot; +</span>
+                                        &quot;was spent in the scheduler. Loaded {} records which total to {} bytes.&quot;,
+<span class="fc" id="L588">                                    tp, epoch, summary.endTimeMs() - summary.startTimeMs(),</span>
+<span class="fc" id="L589">                                    summary.schedulerQueueTimeMs(), summary.numRecords(), summary.numBytes());</span>
+                            }
+<span class="nc" id="L591">                        } catch (Throwable ex) {</span>
+<span class="nc" id="L592">                            log.error(&quot;Failed to load metadata from {} with epoch {} due to {}.&quot;,</span>
+<span class="nc" id="L593">                                tp, epoch, ex.getMessage(), ex);</span>
+<span class="nc" id="L594">                            context.transitionTo(CoordinatorState.FAILED);</span>
+<span class="pc" id="L595">                        }</span>
+                    } else {
+<span class="nc" id="L597">                        log.debug(&quot;Failed to complete the loading of metadata for {} in epoch {} since the coordinator does not exist.&quot;,</span>
+<span class="nc" id="L598">                            tp, epoch);</span>
+                    }
+<span class="fc" id="L600">                });</span>
+<span class="fc" id="L601">            });</span>
+<span class="fc" id="L602">        }</span>
+
+        /**
+         * Unloads the coordinator.
+         */
+        private void unload() {
+<span class="pc bpc" id="L608" title="1 of 2 branches missed.">            if (highWatermarklistener != null) {</span>
+<span class="fc" id="L609">                partitionWriter.deregisterListener(tp, highWatermarklistener);</span>
+<span class="fc" id="L610">                highWatermarklistener = null;</span>
+            }
+<span class="fc" id="L612">            timer.cancelAll();</span>
+<span class="fc" id="L613">            executor.cancelAll();</span>
+<span class="fc" id="L614">            deferredEventQueue.failAll(Errors.NOT_COORDINATOR.exception());</span>
+<span class="fc" id="L615">            failCurrentBatch(Errors.NOT_COORDINATOR.exception());</span>
+<span class="pc bpc" id="L616" title="1 of 2 branches missed.">            if (coordinator != null) {</span>
+                try {
+<span class="fc" id="L618">                    coordinator.onUnloaded();</span>
+<span class="nc" id="L619">                } catch (Throwable ex) {</span>
+<span class="nc" id="L620">                    log.error(&quot;Failed to unload coordinator for {} due to {}.&quot;, tp, ex.getMessage(), ex);</span>
+<span class="fc" id="L621">                }</span>
+            }
+<span class="fc" id="L623">            coordinator = null;</span>
+<span class="fc" id="L624">        }</span>
+
+        /**
+         * Frees the current batch.
+         */
+        private void freeCurrentBatch() {
+            // Cancel the linger timeout.
+<span class="fc" id="L631">            currentBatch.lingerTimeoutTask.ifPresent(TimerTask::cancel);</span>
+
+            // Release the buffer only if it is not larger than the cachedBufferMaxBytes.
+<span class="fc" id="L634">            int cachedBufferMaxBytes = cachedBufferMaxBytesSupplier.get();</span>
+
+<span class="pc bpc" id="L636" title="1 of 2 branches missed.">            if (currentBatch.builder.buffer().capacity() &lt;= cachedBufferMaxBytes) {</span>
+<span class="fc" id="L637">                bufferSupplier.release(currentBatch.builder.buffer());</span>
+<span class="fc" id="L638">                cachedBufferSize.set(currentBatch.builder.buffer().capacity());</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">            } else if (currentBatch.buffer.capacity() &lt;= cachedBufferMaxBytes) {</span>
+<span class="nc" id="L640">                bufferSupplier.release(currentBatch.buffer);</span>
+<span class="nc" id="L641">                cachedBufferSize.set(currentBatch.buffer.capacity());</span>
+                // If the builder expands the buffer beyond the cachedBufferMaxBytes, that should also increase the discard counter.
+<span class="nc" id="L643">                runtimeMetrics.recordBufferCacheDiscarded();</span>
+            } else {
+<span class="nc" id="L645">                runtimeMetrics.recordBufferCacheDiscarded();</span>
+<span class="nc" id="L646">                cachedBufferSize.set(0L);</span>
+            }
+
+<span class="fc" id="L649">            currentBatch = null;</span>
+<span class="fc" id="L650">        }</span>
+
+        /**
+         * Adds a flush event to the end of the event queue, after any existing writes in the queue.
+         *
+         * @param expectedBatchEpoch The epoch of the batch to flush.
+         */
+        private void enqueueAdaptiveFlush(int expectedBatchEpoch) {
+<span class="fc" id="L658">            enqueueLast(new CoordinatorInternalEvent(&quot;FlushBatch&quot;, tp, () -&gt; {</span>
+<span class="fc" id="L659">                withActiveContextOrThrow(tp, context -&gt; {</span>
+                    // The batch could have already been flushed because it reached the maximum
+                    // batch size or a transactional write came in. When this happens, we want
+                    // to avoid flushing the next batch early.
+<span class="pc bpc" id="L663" title="2 of 4 branches missed.">                    if (context.currentBatch != null &amp;&amp; context.batchEpoch == expectedBatchEpoch) {</span>
+<span class="fc" id="L664">                        context.flushCurrentBatch();</span>
+                    }
+<span class="fc" id="L666">                });</span>
+<span class="fc" id="L667">            }));</span>
+<span class="fc" id="L668">        }</span>
+
+        /**
+         * Flushes the current (or pending) batch to the log. When the batch is written
+         * locally, a new snapshot is created in the snapshot registry and the events
+         * associated with the batch are added to the deferred event queue.
+         */
+        private void flushCurrentBatch() {
+<span class="pc bpc" id="L676" title="1 of 2 branches missed.">            if (currentBatch != null) {</span>
+                try {
+<span class="pc bpc" id="L678" title="1 of 2 branches missed.">                    if (currentBatch.builder.numRecords() == 0) {</span>
+                        // The only way we can get here is if append() has failed in an unexpected
+                        // way and left an empty batch. Try to clean it up.
+<span class="nc" id="L681">                        log.debug(&quot;Tried to flush an empty batch for {}.&quot;, tp);</span>
+                        // There should not be any deferred events attached to the batch. We fail
+                        // the batch just in case. As a side effect, coordinator state is also
+                        // reverted, but there should be no changes since the batch was empty.
+<span class="nc" id="L685">                        failCurrentBatch(new IllegalStateException(&quot;Record batch was empty&quot;));</span>
+<span class="nc" id="L686">                        return;</span>
+                    }
+
+<span class="fc" id="L689">                    long flushStartMs = time.milliseconds();</span>
+<span class="fc" id="L690">                    runtimeMetrics.recordLingerTime(flushStartMs - currentBatch.appendTimeMs);</span>
+                    // Write the records to the log and update the last written offset.
+                    // Regular coordinator records use TV_UNKNOWN since they're not transaction markers.
+<span class="fc" id="L693">                    long offset = partitionWriter.append(</span>
+                        tp,
+                        currentBatch.verificationGuard,
+<span class="fc" id="L696">                        currentBatch.builder.build(),</span>
+                        TransactionVersion.TV_UNKNOWN
+                    );
+<span class="fc" id="L699">                    runtimeMetrics.recordFlushTime(time.milliseconds() - flushStartMs);</span>
+<span class="fc" id="L700">                    coordinator.updateLastWrittenOffset(offset);</span>
+
+<span class="pc bpc" id="L702" title="1 of 2 branches missed.">                    if (offset != currentBatch.nextOffset) {</span>
+<span class="nc" id="L703">                        log.error(&quot;The state machine of the coordinator {} is out of sync with the underlying log. &quot; +</span>
+                            &quot;The last written offset returned is {} while the coordinator expected {}. The coordinator &quot; +
+                            &quot;will be reloaded in order to re-synchronize the state machine.&quot;,
+<span class="nc" id="L706">                            tp, offset, currentBatch.nextOffset);</span>
+                        // Transition to FAILED state to unload the state machine and complete
+                        // exceptionally all the pending operations.
+<span class="nc" id="L709">                        transitionTo(CoordinatorState.FAILED);</span>
+                        // Transition to LOADING to trigger the restoration of the state.
+<span class="nc" id="L711">                        transitionTo(CoordinatorState.LOADING);</span>
+                        // Thrown NotCoordinatorException to fail the operation that
+                        // triggered the write. We use NotCoordinatorException to be
+                        // consistent with the transition to FAILED.
+<span class="nc" id="L715">                        throw Errors.NOT_COORDINATOR.exception();</span>
+                    }
+
+                    // Add all the pending deferred events to the deferred event queue.
+<span class="fc" id="L719">                    deferredEventQueue.add(offset, currentBatch.deferredEvents);</span>
+
+                    // Free up the current batch.
+<span class="fc" id="L722">                    freeCurrentBatch();</span>
+<span class="nc" id="L723">                } catch (Throwable t) {</span>
+<span class="nc" id="L724">                    log.error(&quot;Writing records to {} failed due to: {}.&quot;, tp, t.getMessage(), t);</span>
+<span class="nc" id="L725">                    failCurrentBatch(t);</span>
+                    // We rethrow the exception for the caller to handle it too.
+<span class="nc" id="L727">                    throw t;</span>
+<span class="fc" id="L728">                }</span>
+            }
+<span class="fc" id="L730">        }</span>
+
+        /**
+         * Flushes the current batch if it is transactional, if it has passed the append linger time, or if it is full.
+         */
+        private void maybeFlushCurrentBatch(long currentTimeMs) {
+<span class="pc bpc" id="L736" title="1 of 2 branches missed.">            if (currentBatch != null) {</span>
+<span class="pc bpc" id="L737" title="1 of 2 branches missed.">                if (currentBatch.builder.isTransactional() ||</span>
+                    // When adaptive linger time is enabled, we avoid flushing here.
+                    // Instead, we rely on the flush event enqueued at the back of the event queue.
+<span class="pc bpc" id="L740" title="3 of 4 branches missed.">                    (appendLingerMs.isPresent() &amp;&amp; (currentTimeMs - currentBatch.appendTimeMs) &gt;= appendLingerMs.getAsInt()) ||</span>
+<span class="pc bpc" id="L741" title="1 of 2 branches missed.">                    !currentBatch.builder.hasRoomFor(0)) {</span>
+<span class="nc" id="L742">                    flushCurrentBatch();</span>
+                }
+            }
+<span class="fc" id="L745">        }</span>
+
+        /**
+         * Fails the current batch, reverts to the snapshot to the base/start offset of the
+         * batch, fails all the associated events.
+         */
+        private void failCurrentBatch(Throwable t) {
+<span class="pc bpc" id="L752" title="1 of 2 branches missed.">            if (currentBatch != null) {</span>
+<span class="nc" id="L753">                coordinator.revertLastWrittenOffset(currentBatch.baseOffset);</span>
+<span class="nc" id="L754">                currentBatch.deferredEvents.complete(t);</span>
+<span class="nc" id="L755">                freeCurrentBatch();</span>
+            }
+<span class="fc" id="L757">        }</span>
+
+        /**
+         * Allocates a new batch if none already exists.
+         */
+        private void maybeAllocateNewBatch(
+            long producerId,
+            short producerEpoch,
+            VerificationGuard verificationGuard,
+            long currentTimeMs
+        ) {
+<span class="fc bfc" id="L768" title="All 2 branches covered.">            if (currentBatch == null) {</span>
+<span class="fc" id="L769">                int maxBatchSize = partitionWriter.config(tp).maxMessageSize();</span>
+<span class="fc" id="L770">                long prevLastWrittenOffset = coordinator.lastWrittenOffset();</span>
+<span class="fc" id="L771">                ByteBuffer buffer = bufferSupplier.get(min(INITIAL_BUFFER_SIZE, maxBatchSize));</span>
+
+<span class="pc bpc" id="L773" title="1 of 2 branches missed.">                MemoryRecordsBuilder builder = new MemoryRecordsBuilder(</span>
+                    buffer,
+                    RecordBatch.CURRENT_MAGIC_VALUE,
+                    compression,
+                    TimestampType.CREATE_TIME,
+                    0L,
+                    currentTimeMs,
+                    producerId,
+                    producerEpoch,
+                    0,
+                    producerId != RecordBatch.NO_PRODUCER_ID,
+                    false,
+                    RecordBatch.NO_PARTITION_LEADER_EPOCH,
+                    maxBatchSize
+                );
+
+<span class="fc" id="L789">                batchEpoch++;</span>
+
+<span class="fc" id="L791">                Optional&lt;TimerTask&gt; lingerTimeoutTask = Optional.empty();</span>
+<span class="pc bpc" id="L792" title="1 of 2 branches missed.">                if (appendLingerMs.isPresent()) {</span>
+<span class="nc bnc" id="L793" title="All 2 branches missed.">                    if (appendLingerMs.getAsInt() &gt; 0) {</span>
+<span class="nc" id="L794">                        lingerTimeoutTask = Optional.of(new TimerTask(appendLingerMs.getAsInt()) {</span>
+                            @Override
+                            public void run() {
+                                // An event to flush the batch is pushed to the front of the queue
+                                // to ensure that the linger time is respected.
+<span class="nc" id="L799">                                enqueueFirst(new CoordinatorInternalEvent(&quot;FlushBatch&quot;, tp, () -&gt; {</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">                                    if (this.isCancelled()) return;</span>
+<span class="nc" id="L801">                                    withActiveContextOrThrow(tp, CoordinatorContext::flushCurrentBatch);</span>
+<span class="nc" id="L802">                                }));</span>
+<span class="nc" id="L803">                            }</span>
+                        });
+<span class="nc" id="L805">                        CoordinatorRuntime.this.timer.add(lingerTimeoutTask.get());</span>
+                    }
+                } else {
+                    // Always queue a flush immediately at the end of the queue, unless the batch is
+                    // transactional. Transactional batches are flushed immediately at the end of
+                    // the write, so a flush event is never needed.
+<span class="pc bpc" id="L811" title="1 of 2 branches missed.">                    if (!builder.isTransactional()) {</span>
+<span class="fc" id="L812">                        enqueueAdaptiveFlush(batchEpoch);</span>
+                    }
+                }
+
+<span class="fc" id="L816">                currentBatch = new CoordinatorBatch(</span>
+                    log,
+                    prevLastWrittenOffset,
+                    currentTimeMs,
+                    verificationGuard,
+                    buffer,
+                    builder,
+                    lingerTimeoutTask
+                );
+            }
+<span class="fc" id="L826">        }</span>
+
+        /**
+         * Completes the given event once all pending writes are completed. 
+         *
+         * @param event             The event to complete once all pending 
+         *                          writes are completed.
+         */
+        private void waitForPendingWrites(DeferredEvent event) {
+<span class="pc bpc" id="L835" title="1 of 4 branches missed.">            if (currentBatch != null &amp;&amp; currentBatch.builder.numRecords() &gt; 0) {</span>
+<span class="fc" id="L836">                currentBatch.deferredEvents.add(event);</span>
+            } else {
+<span class="pc bpc" id="L838" title="1 of 2 branches missed.">                if (coordinator.lastCommittedOffset() &lt; coordinator.lastWrittenOffset()) {</span>
+<span class="nc" id="L839">                    deferredEventQueue.add(coordinator.lastWrittenOffset(), DeferredEventCollection.of(log, event));</span>
+                } else {
+<span class="fc" id="L841">                    event.complete(null);</span>
+                }
+            }
+<span class="fc" id="L844">        }</span>
+
+        /**
+         * Appends records to the log and replay them to the state machine.
+         *
+         * @param producerId        The producer id.
+         * @param producerEpoch     The producer epoch.
+         * @param verificationGuard The verification guard.
+         * @param records           The records to append.
+         * @param replay            A boolean indicating whether the records
+         *                          must be replayed or not.
+         * @param isAtomic          A boolean indicating whether the records
+         *                          must be written atomically or not.
+         * @param event             The event that must be completed when the
+         *                          records are written.
+         */
+        private void append(
+            long producerId,
+            short producerEpoch,
+            VerificationGuard verificationGuard,
+            List&lt;U&gt; records,
+            boolean replay,
+            boolean isAtomic,
+            DeferredEvent event
+        ) {
+<span class="pc bpc" id="L869" title="1 of 2 branches missed.">            if (state != CoordinatorState.ACTIVE) {</span>
+<span class="nc" id="L870">                throw new IllegalStateException(&quot;Coordinator must be active to append records&quot;);</span>
+            }
+
+<span class="fc bfc" id="L873" title="All 2 branches covered.">            if (records.isEmpty()) {</span>
+                // If the records are empty, it was a read operation after all. In this case,
+                // the response can be returned once any pending write operations complete.
+<span class="fc" id="L876">                waitForPendingWrites(event);</span>
+            } else {
+                // If the records are not empty, first, they are applied to the state machine,
+                // second, they are appended to the opened batch.
+<span class="fc" id="L880">                long currentTimeMs = time.milliseconds();</span>
+
+                // If the current write operation is transactional, the current batch
+                // is written before proceeding with it.
+<span class="pc bpc" id="L884" title="1 of 2 branches missed.">                if (producerId != RecordBatch.NO_PRODUCER_ID) {</span>
+<span class="nc" id="L885">                    isAtomic = true;</span>
+                    // If flushing fails, we don't catch the exception in order to let
+                    // the caller fail the current operation.
+<span class="nc" id="L888">                    flushCurrentBatch();</span>
+                }
+
+                // Allocate a new batch if none exists.
+<span class="fc" id="L892">                maybeAllocateNewBatch(</span>
+                    producerId,
+                    producerEpoch,
+                    verificationGuard,
+                    currentTimeMs
+                );
+
+                // Prepare the records.
+<span class="fc" id="L900">                List&lt;SimpleRecord&gt; recordsToAppend = new ArrayList&lt;&gt;(records.size());</span>
+<span class="fc bfc" id="L901" title="All 2 branches covered.">                for (U record : records) {</span>
+<span class="fc" id="L902">                    recordsToAppend.add(new SimpleRecord(</span>
+                        currentTimeMs,
+<span class="fc" id="L904">                        serializer.serializeKey(record),</span>
+<span class="fc" id="L905">                        serializer.serializeValue(record)</span>
+                    ));
+<span class="fc" id="L907">                }</span>
+
+<span class="pc bpc" id="L909" title="1 of 2 branches missed.">                if (isAtomic) {</span>
+                    // Compute the size of the records.
+<span class="fc" id="L911">                    int estimatedSizeUpperBound = AbstractRecords.estimateSizeInBytes(</span>
+<span class="fc" id="L912">                        currentBatch.builder.magic(),</span>
+                        CompressionType.NONE,
+                        recordsToAppend
+                    );
+
+<span class="pc bpc" id="L917" title="1 of 2 branches missed.">                    if (!currentBatch.builder.hasRoomFor(estimatedSizeUpperBound)) {</span>
+                        // Start a new batch when the total uncompressed data size would exceed
+                        // the max batch size. We still allow atomic writes with an uncompressed size
+                        // larger than the max batch size as long as they compress down to under the max
+                        // batch size. These large writes go into a batch by themselves.
+<span class="nc" id="L922">                        flushCurrentBatch();</span>
+<span class="nc" id="L923">                        maybeAllocateNewBatch(</span>
+                            producerId,
+                            producerEpoch,
+                            verificationGuard,
+                            currentTimeMs
+                        );
+                    }
+                }
+
+
+<span class="fc bfc" id="L933" title="All 2 branches covered.">                for (int i = 0; i &lt; records.size(); i++) {</span>
+<span class="fc" id="L934">                    U recordToReplay = records.get(i);</span>
+<span class="fc" id="L935">                    SimpleRecord recordToAppend = recordsToAppend.get(i);</span>
+
+<span class="pc bpc" id="L937" title="1 of 2 branches missed.">                    if (!isAtomic) {</span>
+                        // Check if the current batch has enough space. We check this before
+                        // replaying the record in order to avoid having to revert back
+                        // changes if the record do not fit within a batch.
+<span class="nc" id="L941">                        boolean hasRoomFor = currentBatch.builder.hasRoomFor(</span>
+<span class="nc" id="L942">                            recordToAppend.timestamp(),</span>
+<span class="nc" id="L943">                            recordToAppend.key(),</span>
+<span class="nc" id="L944">                            recordToAppend.value(),</span>
+<span class="nc" id="L945">                            recordToAppend.headers()</span>
+                        );
+
+<span class="nc bnc" id="L948" title="All 2 branches missed.">                        if (!hasRoomFor) {</span>
+                            // If flushing fails, we don't catch the exception in order to let
+                            // the caller fail the current operation.
+<span class="nc" id="L951">                            flushCurrentBatch();</span>
+<span class="nc" id="L952">                            maybeAllocateNewBatch(</span>
+                                producerId,
+                                producerEpoch,
+                                verificationGuard,
+                                currentTimeMs
+                            );
+                        }
+                    }
+
+                    try {
+<span class="fc bfc" id="L962" title="All 2 branches covered.">                        if (replay) {</span>
+<span class="fc" id="L963">                            coordinator.replay(</span>
+                                currentBatch.nextOffset,
+                                producerId,
+                                producerEpoch,
+                                recordToReplay
+                            );
+                        }
+
+<span class="fc" id="L971">                        currentBatch.builder.append(recordToAppend);</span>
+<span class="fc" id="L972">                        currentBatch.nextOffset++;</span>
+<span class="nc" id="L973">                    } catch (Throwable t) {</span>
+<span class="nc" id="L974">                        log.error(&quot;Replaying record {} to {} failed due to: {}.&quot;, recordToReplay, tp, t.getMessage(), t);</span>
+
+                        // Add the event to the list of pending events associated with the last
+                        // batch in order to fail it too.
+<span class="nc" id="L978">                        currentBatch.deferredEvents.add(event);</span>
+
+                        // If an exception is thrown, we fail the entire batch. Exceptions should be
+                        // really exceptional in this code path and they would usually be the results
+                        // of bugs preventing records to be replayed.
+<span class="nc" id="L983">                        failCurrentBatch(t);</span>
+
+<span class="nc" id="L985">                        return;</span>
+<span class="fc" id="L986">                    }</span>
+                }
+
+                // Add the event to the list of pending events associated with the batch.
+<span class="fc" id="L990">                currentBatch.deferredEvents.add(event);</span>
+
+                // Write the current batch if it is transactional, if the linger timeout
+                // has expired, or if it is full. 
+                // If flushing fails, we don't catch the exception in order to let
+                // the caller fail the current operation.
+<span class="fc" id="L996">                maybeFlushCurrentBatch(currentTimeMs);</span>
+            }
+<span class="fc" id="L998">        }</span>
+
+        /**
+         * Completes a transaction.
+         *
+         * @param producerId        The producer id.
+         * @param producerEpoch     The producer epoch.
+         * @param coordinatorEpoch  The coordinator epoch of the transaction coordinator.
+         * @param result            The transaction result.
+         * @param transactionVersion The transaction version (1 = TV1, 2 = TV2, etc.).
+         * @param event             The event that must be completed when the
+         *                          control record is written.
+         */
+        private void completeTransaction(
+            long producerId,
+            short producerEpoch,
+            int coordinatorEpoch,
+            TransactionResult result,
+            short transactionVersion,
+            DeferredEvent event
+        ) {
+<span class="nc bnc" id="L1019" title="All 2 branches missed.">            if (state != CoordinatorState.ACTIVE) {</span>
+<span class="nc" id="L1020">                throw new IllegalStateException(&quot;Coordinator must be active to complete a transaction&quot;);</span>
+            }
+
+            // The current batch must be written before the transaction marker is written
+            // in order to respect the order.
+<span class="nc" id="L1025">            flushCurrentBatch();</span>
+
+<span class="nc" id="L1027">            long prevLastWrittenOffset = coordinator.lastWrittenOffset();</span>
+            try {
+<span class="nc" id="L1029">                coordinator.replayEndTransactionMarker(</span>
+                    producerId,
+                    producerEpoch,
+                    result
+                );
+
+<span class="nc" id="L1035">                long flushStartMs = time.milliseconds();</span>
+<span class="nc" id="L1036">                long offset = partitionWriter.append(</span>
+                    tp,
+                    VerificationGuard.SENTINEL,
+<span class="nc" id="L1039">                    MemoryRecords.withEndTransactionMarker(</span>
+<span class="nc" id="L1040">                        time.milliseconds(),</span>
+                        producerId,
+                        producerEpoch,
+                        new EndTransactionMarker(
+<span class="nc bnc" id="L1044" title="All 2 branches missed.">                            result == TransactionResult.COMMIT ? ControlRecordType.COMMIT : ControlRecordType.ABORT,</span>
+                            coordinatorEpoch
+                        )
+                    ),
+                    transactionVersion
+                );
+<span class="nc" id="L1050">                runtimeMetrics.recordFlushTime(time.milliseconds() - flushStartMs);</span>
+<span class="nc" id="L1051">                coordinator.updateLastWrittenOffset(offset);</span>
+
+<span class="nc" id="L1053">                deferredEventQueue.add(offset, DeferredEventCollection.of(log, event));</span>
+<span class="nc" id="L1054">            } catch (Throwable t) {</span>
+<span class="nc" id="L1055">                coordinator.revertLastWrittenOffset(prevLastWrittenOffset);</span>
+<span class="nc" id="L1056">                event.complete(t);</span>
+<span class="nc" id="L1057">            }</span>
+<span class="nc" id="L1058">        }</span>
+    }
+
+    class OperationTimeout extends TimerTask {
+        private final TopicPartition tp;
+        private final DeferredEvent event;
+
+        public OperationTimeout(
+            TopicPartition tp,
+            DeferredEvent event,
+            long delayMs
+<span class="fc" id="L1069">        ) {</span>
+<span class="fc" id="L1070">            super(delayMs);</span>
+<span class="fc" id="L1071">            this.event = event;</span>
+<span class="fc" id="L1072">            this.tp = tp;</span>
+<span class="fc" id="L1073">        }</span>
+
+        @Override
+        public void run() {
+<span class="nc" id="L1077">            String name = event.toString();</span>
+<span class="nc" id="L1078">            scheduleInternalOperation(&quot;OperationTimeout(name=&quot; + name + &quot;, tp=&quot; + tp + &quot;)&quot;, tp,</span>
+<span class="nc" id="L1079">                () -&gt; event.complete(new TimeoutException(name + &quot; timed out after &quot; + delayMs + &quot;ms&quot;)));</span>
+<span class="nc" id="L1080">        }</span>
+    }
+
+    /**
+     * A coordinator write operation.
+     *
+     * @param &lt;S&gt; The type of the coordinator state machine.
+     * @param &lt;T&gt; The type of the response.
+     * @param &lt;U&gt; The type of the records.
+     */
+    public interface CoordinatorWriteOperation&lt;S, T, U&gt; {
+        /**
+         * Generates the records needed to implement this coordinator write operation. In general,
+         * this operation should not modify the hard state of the coordinator. That modifications
+         * will happen later on, when the records generated by this function are applied to the
+         * coordinator.
+         *
+         * @param coordinator The coordinator state machine.
+         * @return A result containing a list of records and the RPC result.
+         * @throws KafkaException
+         */
+        CoordinatorResult&lt;T, U&gt; generateRecordsAndResult(S coordinator) throws KafkaException;
+    }
+
+    /**
+     * A coordinator event that modifies the coordinator state.
+     *
+     * @param &lt;T&gt; The type of the response.
+     */
+    class CoordinatorWriteEvent&lt;T&gt; implements CoordinatorEvent, DeferredEvent {
+
+        /**
+         * Indicates that the event was not appended to the deferred event queue.
+         */
+        public static final long NOT_QUEUED = -1L;
+
+        /**
+         * The topic partition that this write event is applied to.
+         */
+        final TopicPartition tp;
+
+        /**
+         * The operation name.
+         */
+        final String name;
+
+        /**
+         * The transactional id.
+         */
+        final String transactionalId;
+
+        /**
+         * The producer id.
+         */
+        final long producerId;
+
+        /**
+         * The producer epoch.
+         */
+        final short producerEpoch;
+
+        /**
+         * The verification guard.
+         */
+        final VerificationGuard verificationGuard;
+
+        /**
+         * The write operation to execute.
+         */
+        final CoordinatorWriteOperation&lt;S, T, U&gt; op;
+
+        /**
+         * The future that will be completed with the response
+         * generated by the write operation or an error.
+         */
+        final CompletableFuture&lt;T&gt; future;
+
+        /**
+         * Timeout value for the write operation.
+         */
+        final Duration writeTimeout;
+
+        /**
+         * The operation timeout.
+         */
+<span class="fc" id="L1165">        private OperationTimeout operationTimeout = null;</span>
+
+        /**
+         * The result of the write operation. It could be null
+         * if an exception is thrown before it is assigned.
+         */
+        CoordinatorResult&lt;T, U&gt; result;
+
+        /**
+         * The time this event was created.
+         */
+        private final long createdTimeMs;
+
+        /**
+         * The time the event was added to the deferred queue.
+         */
+        private long deferredEventQueuedTimestamp;
+
+        /**
+         * Constructor.
+         *
+         * @param name                  The operation name.
+         * @param tp                    The topic partition that the operation is applied to.
+         * @param writeTimeout          The write operation timeout
+         * @param op                    The write operation.
+         */
+        CoordinatorWriteEvent(
+            String name,
+            TopicPartition tp,
+            Duration writeTimeout,
+            CoordinatorWriteOperation&lt;S, T, U&gt; op
+        ) {
+<span class="fc" id="L1197">            this(</span>
+                name,
+                tp,
+                null,
+                RecordBatch.NO_PRODUCER_ID,
+                RecordBatch.NO_PRODUCER_EPOCH,
+                VerificationGuard.SENTINEL,
+                writeTimeout,
+                op
+            );
+<span class="fc" id="L1207">        }</span>
+
+        /**
+         * Constructor.
+         *
+         * @param name                      The operation name.
+         * @param tp                        The topic partition that the operation is applied to.
+         * @param transactionalId           The transactional id.
+         * @param producerId                The producer id.
+         * @param producerEpoch             The producer epoch.
+         * @param verificationGuard         The verification guard.
+         * @param writeTimeout              The write operation timeout
+         * @param op                        The write operation.
+         */
+        CoordinatorWriteEvent(
+            String name,
+            TopicPartition tp,
+            String transactionalId,
+            long producerId,
+            short producerEpoch,
+            VerificationGuard verificationGuard,
+            Duration writeTimeout,
+            CoordinatorWriteOperation&lt;S, T, U&gt; op
+<span class="fc" id="L1230">        ) {</span>
+<span class="fc" id="L1231">            this.tp = tp;</span>
+<span class="fc" id="L1232">            this.name = name;</span>
+<span class="fc" id="L1233">            this.op = op;</span>
+<span class="fc" id="L1234">            this.transactionalId = transactionalId;</span>
+<span class="fc" id="L1235">            this.producerId = producerId;</span>
+<span class="fc" id="L1236">            this.producerEpoch = producerEpoch;</span>
+<span class="fc" id="L1237">            this.verificationGuard = verificationGuard;</span>
+<span class="fc" id="L1238">            this.future = new CompletableFuture&lt;&gt;();</span>
+<span class="fc" id="L1239">            this.createdTimeMs = time.milliseconds();</span>
+<span class="fc" id="L1240">            this.writeTimeout = writeTimeout;</span>
+<span class="fc" id="L1241">            this.deferredEventQueuedTimestamp = NOT_QUEUED;</span>
+<span class="fc" id="L1242">        }</span>
+
+        /**
+         * @return The key used by the CoordinatorEventProcessor to ensure
+         * that events with the same key are not processed concurrently.
+         */
+        @Override
+        public TopicPartition key() {
+<span class="fc" id="L1250">            return tp;</span>
+        }
+
+        /**
+         * Called by the CoordinatorEventProcessor when the event is executed.
+         */
+        @Override
+        public void run() {
+            try {
+                // Get the context of the coordinator or fail if the coordinator is not in active state.
+<span class="fc" id="L1260">                withActiveContextOrThrow(tp, context -&gt; {</span>
+                    // Execute the operation.
+<span class="fc" id="L1262">                    result = op.generateRecordsAndResult(context.coordinator.coordinator());</span>
+
+                    // Append the records and replay them to the state machine.
+<span class="fc" id="L1265">                    context.append(</span>
+                        producerId,
+                        producerEpoch,
+                        verificationGuard,
+<span class="fc" id="L1269">                        result.records(),</span>
+<span class="fc" id="L1270">                        result.replayRecords(),</span>
+<span class="fc" id="L1271">                        result.isAtomic(),</span>
+                        this
+                    );
+
+                    // If the operation is not done, create an operation timeout.
+<span class="fc bfc" id="L1276" title="All 2 branches covered.">                    if (!future.isDone()) {</span>
+<span class="fc" id="L1277">                        operationTimeout = new OperationTimeout(tp, this, writeTimeout.toMillis());</span>
+<span class="fc" id="L1278">                        timer.add(operationTimeout);</span>
+
+                        // Only update when this event was appended to the deferred queue.
+<span class="fc" id="L1281">                        deferredEventQueuedTimestamp = time.milliseconds();</span>
+                    }
+<span class="fc" id="L1283">                });</span>
+<span class="fc" id="L1284">            } catch (Throwable t) {</span>
+<span class="fc" id="L1285">                complete(t);</span>
+<span class="fc" id="L1286">            }</span>
+<span class="fc" id="L1287">        }</span>
+
+        /**
+         * Completes the future with either the result of the write operation
+         * or the provided exception.
+         *
+         * @param exception The exception to complete the future with.
+         */
+        @Override
+        public void complete(Throwable exception) {
+<span class="pc bpc" id="L1297" title="1 of 2 branches missed.">            if (future.isDone()) {</span>
+<span class="nc" id="L1298">                return;</span>
+            }
+
+<span class="fc" id="L1301">            final long purgatoryTimeMs = time.milliseconds() - deferredEventQueuedTimestamp;</span>
+<span class="fc bfc" id="L1302" title="All 2 branches covered.">            CompletableFuture&lt;Void&gt; appendFuture = result != null ? result.appendFuture() : null;</span>
+
+<span class="fc bfc" id="L1304" title="All 2 branches covered.">            if (exception == null) {</span>
+<span class="fc bfc" id="L1305" title="All 2 branches covered.">                if (appendFuture != null) result.appendFuture().complete(null);</span>
+<span class="fc" id="L1306">                future.complete(result.response());</span>
+            } else {
+<span class="pc bpc" id="L1308" title="1 of 2 branches missed.">                if (appendFuture != null) result.appendFuture().completeExceptionally(exception);</span>
+<span class="fc" id="L1309">                future.completeExceptionally(exception);</span>
+            }
+
+<span class="fc bfc" id="L1312" title="All 2 branches covered.">            if (operationTimeout != null) {</span>
+<span class="fc" id="L1313">                operationTimeout.cancel();</span>
+<span class="fc" id="L1314">                operationTimeout = null;</span>
+            }
+
+<span class="fc bfc" id="L1317" title="All 2 branches covered.">            if (deferredEventQueuedTimestamp != NOT_QUEUED) {</span>
+                // Only record the purgatory time if the event was deferred.
+<span class="fc" id="L1319">                runtimeMetrics.recordEventPurgatoryTime(purgatoryTimeMs);</span>
+            }
+<span class="fc" id="L1321">        }</span>
+
+        @Override
+        public long createdTimeMs() {
+<span class="fc" id="L1325">            return this.createdTimeMs;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1330">            return &quot;CoordinatorWriteEvent(name=&quot; + name + &quot;)&quot;;</span>
+        }
+    }
+
+    /**
+     * A coordinator read operation.
+     *
+     * @param &lt;S&gt; The type of the coordinator state machine.
+     * @param &lt;T&gt; The type of the response.
+     */
+    public interface CoordinatorReadOperation&lt;S, T&gt; {
+        /**
+         * Generates the response to implement this coordinator read operation. A read
+         * operation received the last committed offset. It must use it to ensure that
+         * it does not read uncommitted data from the timeline data structures.
+         *
+         * @param state     The coordinator state machine.
+         * @param offset    The last committed offset.
+         * @return A response.
+         * @throws KafkaException
+         */
+        T generateResponse(S state, long offset) throws KafkaException;
+    }
+
+    /**
+     * A coordinator that reads the committed coordinator state.
+     *
+     * @param &lt;T&gt; The type of the response.
+     */
+    class CoordinatorReadEvent&lt;T&gt; implements CoordinatorEvent {
+        /**
+         * The topic partition that this read event is applied to.
+         */
+        final TopicPartition tp;
+
+        /**
+         * The operation name.
+         */
+        final String name;
+
+        /**
+         * The read operation to execute.
+         */
+        final CoordinatorReadOperation&lt;S, T&gt; op;
+
+        /**
+         * The future that will be completed with the response
+         * generated by the read operation or an error.
+         */
+        final CompletableFuture&lt;T&gt; future;
+
+        /**
+         * The result of the read operation. It could be null
+         * if an exception is thrown before it is assigned.
+         */
+        T response;
+
+        /**
+         * The time this event was created.
+         */
+        private final long createdTimeMs;
+
+        /**
+         * Constructor.
+         *
+         * @param name  The operation name.
+         * @param tp    The topic partition that the operation is applied to.
+         * @param op    The read operation.
+         */
+        CoordinatorReadEvent(
+            String name,
+            TopicPartition tp,
+            CoordinatorReadOperation&lt;S, T&gt; op
+<span class="nc" id="L1403">        ) {</span>
+<span class="nc" id="L1404">            this.tp = tp;</span>
+<span class="nc" id="L1405">            this.name = name;</span>
+<span class="nc" id="L1406">            this.op = op;</span>
+<span class="nc" id="L1407">            this.future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L1408">            this.createdTimeMs = time.milliseconds();</span>
+<span class="nc" id="L1409">        }</span>
+
+        /**
+         * @return The key used by the CoordinatorEventProcessor to ensure
+         * that events with the same key are not processed concurrently.
+         */
+        @Override
+        public TopicPartition key() {
+<span class="nc" id="L1417">            return tp;</span>
+        }
+
+        /**
+         * Called by the CoordinatorEventProcessor when the event is executed.
+         */
+        @Override
+        public void run() {
+            try {
+                // Get the context of the coordinator or fail if the coordinator is not in active state.
+<span class="nc" id="L1427">                withActiveContextOrThrow(tp, context -&gt; {</span>
+                    // Execute the read operation.
+<span class="nc" id="L1429">                    response = op.generateResponse(</span>
+<span class="nc" id="L1430">                        context.coordinator.coordinator(),</span>
+<span class="nc" id="L1431">                        context.coordinator.lastCommittedOffset()</span>
+                    );
+
+                    // The response can be completed immediately.
+<span class="nc" id="L1435">                    complete(null);</span>
+<span class="nc" id="L1436">                });</span>
+<span class="nc" id="L1437">            } catch (Throwable t) {</span>
+<span class="nc" id="L1438">                complete(t);</span>
+<span class="nc" id="L1439">            }</span>
+<span class="nc" id="L1440">        }</span>
+
+        /**
+         * Completes the future with either the result of the read operation
+         * or the provided exception.
+         *
+         * @param exception The exception to complete the future with.
+         */
+        @Override
+        public void complete(Throwable exception) {
+<span class="nc bnc" id="L1450" title="All 2 branches missed.">            if (exception == null) {</span>
+<span class="nc" id="L1451">                future.complete(response);</span>
+            } else {
+<span class="nc" id="L1453">                future.completeExceptionally(exception);</span>
+            }
+<span class="nc" id="L1455">        }</span>
+
+        @Override
+        public long createdTimeMs() {
+<span class="nc" id="L1459">            return this.createdTimeMs;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1464">            return &quot;CoordinatorReadEvent(name=&quot; + name + &quot;)&quot;;</span>
+        }
+    }
+
+    /**
+     * A coordinator event that applies and writes a transaction end marker.
+     */
+    class CoordinatorCompleteTransactionEvent implements CoordinatorEvent, DeferredEvent {
+        /**
+         * The topic partition that this write event is applied to.
+         */
+        final TopicPartition tp;
+
+        /**
+         * The operation name.
+         */
+        final String name;
+
+        /**
+         * The producer id.
+         */
+        final long producerId;
+
+        /**
+         * The producer epoch.
+         */
+        final short producerEpoch;
+
+        /**
+         * The coordinator epoch of the transaction coordinator.
+         */
+        final int coordinatorEpoch;
+
+        /**
+         * The transaction result.
+         */
+        final TransactionResult result;
+
+        /**
+         * The transaction version (1 = TV1, 2 = TV2 etc.).
+         */
+        final short transactionVersion;
+
+        /**
+         * Timeout value for the write operation.
+         */
+        final Duration writeTimeout;
+
+        /**
+         * The operation timeout.
+         */
+<span class="nc" id="L1515">        private OperationTimeout operationTimeout = null;</span>
+
+        /**
+         * The future that will be completed with the response
+         * generated by the write operation or an error.
+         */
+        final CompletableFuture&lt;Void&gt; future;
+
+        /**
+         * The time this event was created.
+         */
+        private final long createdTimeMs;
+
+        /**
+         * The time the records were appended to the log.
+         */
+        private long deferredEventQueuedTimestamp;
+
+        CoordinatorCompleteTransactionEvent(
+            String name,
+            TopicPartition tp,
+            long producerId,
+            short producerEpoch,
+            int coordinatorEpoch,
+            TransactionResult result,
+            short transactionVersion,
+            Duration writeTimeout
+<span class="nc" id="L1542">        ) {</span>
+<span class="nc" id="L1543">            this.name = name;</span>
+<span class="nc" id="L1544">            this.tp = tp;</span>
+<span class="nc" id="L1545">            this.producerId = producerId;</span>
+<span class="nc" id="L1546">            this.producerEpoch = producerEpoch;</span>
+<span class="nc" id="L1547">            this.coordinatorEpoch = coordinatorEpoch;</span>
+<span class="nc" id="L1548">            this.result = result;</span>
+<span class="nc" id="L1549">            this.transactionVersion = transactionVersion;</span>
+<span class="nc" id="L1550">            this.writeTimeout = writeTimeout;</span>
+<span class="nc" id="L1551">            this.future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L1552">            this.createdTimeMs = time.milliseconds();</span>
+<span class="nc" id="L1553">            this.deferredEventQueuedTimestamp = NOT_QUEUED;</span>
+<span class="nc" id="L1554">        }</span>
+
+        /**
+         * @return The key used by the CoordinatorEventProcessor to ensure
+         * that events with the same key are not processed concurrently.
+         */
+        @Override
+        public TopicPartition key() {
+<span class="nc" id="L1562">            return tp;</span>
+        }
+
+        /**
+         * Called by the CoordinatorEventProcessor when the event is executed.
+         */
+        @Override
+        public void run() {
+            try {
+<span class="nc" id="L1571">                withActiveContextOrThrow(tp, context -&gt; {</span>
+<span class="nc" id="L1572">                    context.completeTransaction(</span>
+                        producerId,
+                        producerEpoch,
+                        coordinatorEpoch,
+                        result,
+                        transactionVersion,
+                        this
+                    );
+
+<span class="nc bnc" id="L1581" title="All 2 branches missed.">                    if (!future.isDone()) {</span>
+<span class="nc" id="L1582">                        operationTimeout = new OperationTimeout(tp, this, writeTimeout.toMillis());</span>
+<span class="nc" id="L1583">                        timer.add(operationTimeout);</span>
+
+                        // Only update when this event was appended to the deferred queue.
+<span class="nc" id="L1586">                        deferredEventQueuedTimestamp = time.milliseconds();</span>
+                    }
+<span class="nc" id="L1588">                });</span>
+<span class="nc" id="L1589">            } catch (Throwable t) {</span>
+<span class="nc" id="L1590">                complete(t);</span>
+<span class="nc" id="L1591">            }</span>
+<span class="nc" id="L1592">        }</span>
+
+        /**
+         * Completes the future with either the result of the write operation
+         * or the provided exception.
+         *
+         * @param exception The exception to complete the future with.
+         */
+        @Override
+        public void complete(Throwable exception) {
+<span class="nc bnc" id="L1602" title="All 2 branches missed.">            if (future.isDone()) {</span>
+<span class="nc" id="L1603">                return;</span>
+            }
+
+<span class="nc" id="L1606">            final long purgatoryTimeMs = time.milliseconds() - deferredEventQueuedTimestamp;</span>
+<span class="nc bnc" id="L1607" title="All 2 branches missed.">            if (exception == null) {</span>
+<span class="nc" id="L1608">                future.complete(null);</span>
+            } else {
+<span class="nc" id="L1610">                future.completeExceptionally(exception);</span>
+            }
+
+<span class="nc bnc" id="L1613" title="All 2 branches missed.">            if (operationTimeout != null) {</span>
+<span class="nc" id="L1614">                operationTimeout.cancel();</span>
+<span class="nc" id="L1615">                operationTimeout = null;</span>
+            }
+
+<span class="nc bnc" id="L1618" title="All 2 branches missed.">            if (deferredEventQueuedTimestamp != NOT_QUEUED) {</span>
+                // Only record the purgatory time if the event was deferred.
+<span class="nc" id="L1620">                runtimeMetrics.recordEventPurgatoryTime(purgatoryTimeMs);</span>
+            }
+<span class="nc" id="L1622">        }</span>
+
+        @Override
+        public long createdTimeMs() {
+<span class="nc" id="L1626">            return createdTimeMs;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1631">            return &quot;CoordinatorCompleteTransactionEvent(name=&quot; + name + &quot;)&quot;;</span>
+        }
+    }
+
+    /**
+     * A coordinator internal event.
+     */
+    class CoordinatorInternalEvent implements CoordinatorEvent {
+        /**
+         * The topic partition that this internal event is applied to.
+         */
+        final TopicPartition tp;
+
+        /**
+         * The operation name.
+         */
+        final String name;
+
+        /**
+         * The internal operation to execute.
+         */
+        final Runnable op;
+
+        /**
+         * The time this event was created.
+         */
+        private final long createdTimeMs;
+
+        /**
+         * Constructor.
+         *
+         * @param name  The operation name.
+         * @param tp    The topic partition that the operation is applied to.
+         * @param op    The operation.
+         */
+        CoordinatorInternalEvent(
+            String name,
+            TopicPartition tp,
+            Runnable op
+<span class="fc" id="L1670">        ) {</span>
+<span class="fc" id="L1671">            this.tp = tp;</span>
+<span class="fc" id="L1672">            this.name = name;</span>
+<span class="fc" id="L1673">            this.op = op;</span>
+<span class="fc" id="L1674">            this.createdTimeMs = time.milliseconds();</span>
+<span class="fc" id="L1675">        }</span>
+
+        /**
+         * @return The key used by the CoordinatorEventProcessor to ensure
+         * that events with the same key are not processed concurrently.
+         */
+        @Override
+        public TopicPartition key() {
+<span class="fc" id="L1683">            return tp;</span>
+        }
+
+        /**
+         * Called by the CoordinatorEventProcessor when the event is executed.
+         */
+        @Override
+        public void run() {
+            try {
+<span class="fc" id="L1692">                op.run();</span>
+<span class="nc" id="L1693">            } catch (Throwable t) {</span>
+<span class="nc" id="L1694">                complete(t);</span>
+<span class="fc" id="L1695">            }</span>
+<span class="fc" id="L1696">        }</span>
+
+        /**
+         * Logs any exceptions thrown while the event is executed.
+         *
+         * @param exception The exception.
+         */
+        @Override
+        public void complete(Throwable exception) {
+<span class="nc bnc" id="L1705" title="All 2 branches missed.">            if (exception != null) {</span>
+<span class="nc" id="L1706">                log.error(&quot;Execution of {} failed due to {}.&quot;, name, exception.getMessage(), exception);</span>
+            }
+<span class="nc" id="L1708">        }</span>
+
+        @Override
+        public long createdTimeMs() {
+<span class="fc" id="L1712">            return this.createdTimeMs;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1717">            return &quot;InternalEvent(name=&quot; + name + &quot;)&quot;;</span>
+        }
+    }
+
+    /**
+     * Partition listener to be notified when the high watermark of the partitions
+     * backing the coordinator are updated.
+     */
+<span class="fc" id="L1725">    class HighWatermarkListener implements PartitionWriter.Listener {</span>
+
+        static final long NO_OFFSET = -1L;
+
+        /**
+         * The atomic long is used to store the last and unprocessed high watermark
+         * received from the partition. The atomic value is replaced by -1L when
+         * the high watermark is taken to update the context.
+         */
+<span class="fc" id="L1734">        private final AtomicLong lastHighWatermark = new AtomicLong(NO_OFFSET);</span>
+
+        /**
+         * @return The last high watermark received or NO_OFFSET if none is pending.
+         */
+        public long lastHighWatermark() {
+<span class="nc" id="L1740">            return lastHighWatermark.get();</span>
+        }
+
+        /**
+         * Updates the high watermark of the corresponding coordinator.
+         *
+         * @param tp        The topic partition.
+         * @param offset    The new high watermark.
+         */
+        @Override
+        public void onHighWatermarkUpdated(
+            TopicPartition tp,
+            long offset
+        ) {
+<span class="fc" id="L1754">            log.debug(&quot;High watermark of {} incremented to {}.&quot;, tp, offset);</span>
+<span class="pc bpc" id="L1755" title="1 of 2 branches missed.">            if (lastHighWatermark.getAndSet(offset) == NO_OFFSET) {</span>
+                // An event to apply the new high watermark is pushed to the front of the
+                // queue only if the previous value was -1L. If it was not, it means that
+                // there is already an event waiting to process the last value.
+<span class="fc" id="L1759">                enqueueFirst(new CoordinatorInternalEvent(&quot;HighWatermarkUpdate&quot;, tp, () -&gt; {</span>
+<span class="fc" id="L1760">                    long newHighWatermark = lastHighWatermark.getAndSet(NO_OFFSET);</span>
+
+<span class="fc" id="L1762">                    CoordinatorContext context = coordinators.get(tp);</span>
+<span class="pc bpc" id="L1763" title="1 of 2 branches missed.">                    if (context != null) {</span>
+<span class="fc" id="L1764">                        context.lock.lock();</span>
+                        try {
+<span class="pc bpc" id="L1766" title="1 of 2 branches missed.">                            if (context.state == CoordinatorState.ACTIVE) {</span>
+                                // The updated high watermark can be applied to the coordinator only if the coordinator
+                                // exists and is in the active state.
+<span class="fc" id="L1769">                                log.debug(&quot;Updating high watermark of {} to {}.&quot;, tp, newHighWatermark);</span>
+<span class="fc" id="L1770">                                context.coordinator.updateLastCommittedOffset(newHighWatermark);</span>
+<span class="fc" id="L1771">                                context.deferredEventQueue.completeUpTo(newHighWatermark);</span>
+<span class="fc" id="L1772">                                coordinatorMetrics.onUpdateLastCommittedOffset(tp, newHighWatermark);</span>
+                            } else {
+<span class="nc" id="L1774">                                log.debug(&quot;Ignored high watermark updated for {} to {} because the coordinator is not active.&quot;,</span>
+<span class="nc" id="L1775">                                    tp, newHighWatermark);</span>
+                            }
+                        } finally {
+<span class="fc" id="L1778">                            context.lock.unlock();</span>
+<span class="fc" id="L1779">                        }</span>
+                    } else {
+<span class="nc" id="L1781">                        log.debug(&quot;Ignored high watermark updated for {} to {} because the coordinator does not exist.&quot;,</span>
+<span class="nc" id="L1782">                            tp, newHighWatermark);</span>
+                    }
+<span class="fc" id="L1784">                }));</span>
+            }
+<span class="fc" id="L1786">        }</span>
+    }
+
+    /**
+     * 512KB. Used for initial buffer size for write operations.
+     */
+    static final int INITIAL_BUFFER_SIZE = 512 * 1024;
+
+    /**
+     * The log prefix.
+     */
+    private final String logPrefix;
+
+    /**
+     * The logger.
+     */
+    private final Logger log;
+
+    /**
+     * The system time.
+     */
+    private final Time time;
+
+    /**
+     * The system timer.
+     */
+    private final Timer timer;
+
+    /**
+     * The write operation timeout
+     */
+    private final Duration writeTimeout;
+
+    /**
+     * The coordinators keyed by topic partition.
+     */
+    private final ConcurrentHashMap&lt;TopicPartition, CoordinatorContext&gt; coordinators;
+
+    /**
+     * The event processor used by the runtime.
+     */
+    private final CoordinatorEventProcessor processor;
+
+    /**
+     * The partition writer used by the runtime to persist records.
+     */
+    private final PartitionWriter partitionWriter;
+
+    /**
+     * The coordinator loaded used by the runtime.
+     */
+    private final CoordinatorLoader&lt;U&gt; loader;
+
+    /**
+     * The coordinator state machine builder used by the runtime
+     * to instantiate a coordinator.
+     */
+    private final CoordinatorShardBuilderSupplier&lt;S, U&gt; coordinatorShardBuilderSupplier;
+
+    /**
+     * The coordinator runtime metrics.
+     */
+    private final CoordinatorRuntimeMetrics runtimeMetrics;
+
+    /**
+     * The coordinator metrics.
+     */
+    private final CoordinatorMetrics coordinatorMetrics;
+
+    /**
+     * The serializer used to serialize records.
+     */
+    private final Serializer&lt;U&gt; serializer;
+
+    /**
+     * The compression codec used when writing records.
+     */
+    private final Compression compression;
+
+    /**
+     * The duration in milliseconds that the coordinator will wait for writes to
+     * accumulate before flushing them to disk. {@code OptionalInt.empty()} indicates
+     * an adaptive linger time based on the workload.
+     */
+    private final OptionalInt appendLingerMs;
+
+    /**
+     * The executor service used by the coordinator runtime to schedule
+     * asynchronous tasks.
+     */
+    private final ExecutorService executorService;
+
+    /**
+     * The maximum buffer size that the coordinator can cache.
+     */
+    private final Supplier&lt;Integer&gt; cachedBufferMaxBytesSupplier;
+
+    /**
+     * Atomic boolean indicating whether the runtime is running.
+     */
+<span class="fc" id="L1886">    private final AtomicBoolean isRunning = new AtomicBoolean(true);</span>
+
+    /**
+     * The latest known metadata image.
+     */
+<span class="fc" id="L1891">    private volatile CoordinatorMetadataImage metadataImage = CoordinatorMetadataImage.EMPTY;</span>
+
+    /**
+     * Constructor.
+     *
+     * @param logPrefix                         The log prefix.
+     * @param logContext                        The log context.
+     * @param processor                         The event processor.
+     * @param partitionWriter                   The partition writer.
+     * @param loader                            The coordinator loader.
+     * @param coordinatorShardBuilderSupplier   The coordinator builder.
+     * @param time                              The system time.
+     * @param timer                             The system timer.
+     * @param writeTimeout                      The write operation timeout.
+     * @param runtimeMetrics                    The runtime metrics.
+     * @param coordinatorMetrics                The coordinator metrics.
+     * @param serializer                        The serializer.
+     * @param compression                       The compression codec.
+     * @param appendLingerMs                    The append linger time in ms.
+     * @param executorService                   The executor service.
+     * @param cachedBufferMaxBytesSupplier      The cached buffer max bytes supplier.
+     */
+    @SuppressWarnings(&quot;checkstyle:ParameterNumber&quot;)
+    private CoordinatorRuntime(
+        String logPrefix,
+        LogContext logContext,
+        CoordinatorEventProcessor processor,
+        PartitionWriter partitionWriter,
+        CoordinatorLoader&lt;U&gt; loader,
+        CoordinatorShardBuilderSupplier&lt;S, U&gt; coordinatorShardBuilderSupplier,
+        Time time,
+        Timer timer,
+        Duration writeTimeout,
+        CoordinatorRuntimeMetrics runtimeMetrics,
+        CoordinatorMetrics coordinatorMetrics,
+        Serializer&lt;U&gt; serializer,
+        Compression compression,
+        OptionalInt appendLingerMs,
+        ExecutorService executorService,
+        Supplier&lt;Integer&gt; cachedBufferMaxBytesSupplier
+<span class="fc" id="L1931">    ) {</span>
+<span class="fc" id="L1932">        this.logPrefix = logPrefix;</span>
+<span class="fc" id="L1933">        this.log = logContext.logger(CoordinatorRuntime.class);</span>
+<span class="fc" id="L1934">        this.time = time;</span>
+<span class="fc" id="L1935">        this.timer = timer;</span>
+<span class="fc" id="L1936">        this.writeTimeout = writeTimeout;</span>
+<span class="fc" id="L1937">        this.coordinators = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L1938">        this.processor = processor;</span>
+<span class="fc" id="L1939">        this.partitionWriter = partitionWriter;</span>
+<span class="fc" id="L1940">        this.loader = loader;</span>
+<span class="fc" id="L1941">        this.coordinatorShardBuilderSupplier = coordinatorShardBuilderSupplier;</span>
+<span class="fc" id="L1942">        this.runtimeMetrics = runtimeMetrics;</span>
+<span class="fc" id="L1943">        this.coordinatorMetrics = coordinatorMetrics;</span>
+<span class="fc" id="L1944">        this.serializer = serializer;</span>
+<span class="fc" id="L1945">        this.compression = compression;</span>
+<span class="fc" id="L1946">        this.appendLingerMs = appendLingerMs;</span>
+<span class="fc" id="L1947">        this.executorService = executorService;</span>
+<span class="fc" id="L1948">        this.cachedBufferMaxBytesSupplier = cachedBufferMaxBytesSupplier;</span>
+<span class="fc" id="L1949">        this.runtimeMetrics.registerBufferCacheSizeGauge(</span>
+<span class="nc" id="L1950">            () -&gt; coordinators.values().stream().mapToLong(c -&gt; c.cachedBufferSize.get()).sum()</span>
+        );
+<span class="fc" id="L1952">    }</span>
+
+    /**
+     * Throws a NotCoordinatorException exception if the runtime is not
+     * running.
+     */
+    private void throwIfNotRunning() {
+<span class="pc bpc" id="L1959" title="1 of 2 branches missed.">        if (!isRunning.get()) {</span>
+<span class="nc" id="L1960">            throw Errors.NOT_COORDINATOR.exception();</span>
+        }
+<span class="fc" id="L1962">    }</span>
+
+    /**
+     * Enqueues a new event at the end of the processing queue.
+     *
+     * @param event The event.
+     * @throws NotCoordinatorException If the event processor is closed.
+     */
+    private void enqueueLast(CoordinatorEvent event) {
+        try {
+<span class="fc" id="L1972">            processor.enqueueLast(event);</span>
+<span class="nc" id="L1973">        } catch (RejectedExecutionException ex) {</span>
+<span class="nc" id="L1974">            throw new NotCoordinatorException(&quot;Can't accept an event because the processor is closed&quot;, ex);</span>
+<span class="fc" id="L1975">        }</span>
+<span class="fc" id="L1976">    }</span>
+
+    /**
+     * Enqueues a new event at the front of the processing queue.
+     *
+     * @param event The event.
+     * @throws NotCoordinatorException If the event processor is closed.
+     */
+    private void enqueueFirst(CoordinatorEvent event) {
+        try {
+<span class="fc" id="L1986">            processor.enqueueFirst(event);</span>
+<span class="nc" id="L1987">        } catch (RejectedExecutionException ex) {</span>
+<span class="nc" id="L1988">            throw new NotCoordinatorException(&quot;Can't accept an event because the processor is closed&quot;, ex);</span>
+<span class="fc" id="L1989">        }</span>
+<span class="fc" id="L1990">    }</span>
+
+    /**
+     * @return The coordinator context or a new context if it does not exist.
+     * Package private for testing.
+     */
+    CoordinatorContext maybeCreateContext(TopicPartition tp) {
+<span class="fc" id="L1997">        return coordinators.computeIfAbsent(tp, CoordinatorContext::new);</span>
+    }
+
+    /**
+     * @return The coordinator context or thrown an exception if it does
+     * not exist.
+     * @throws NotCoordinatorException
+     * Package private for testing.
+     */
+    CoordinatorContext contextOrThrow(TopicPartition tp) throws NotCoordinatorException {
+<span class="fc" id="L2007">        CoordinatorContext context = coordinators.get(tp);</span>
+
+<span class="fc bfc" id="L2009" title="All 2 branches covered.">        if (context == null) {</span>
+<span class="fc" id="L2010">            throw Errors.NOT_COORDINATOR.exception();</span>
+        } else {
+<span class="fc" id="L2012">            return context;</span>
+        }
+    }
+
+    /**
+     * Calls the provided function with the context iff the context is active; throws
+     * an exception otherwise. This method ensures that the context lock is acquired
+     * before calling the function and releases afterwards.
+     *
+     * @param tp    The topic partition.
+     * @param func  The function that will receive the context.
+     * @throws NotCoordinatorException
+     * @throws CoordinatorLoadInProgressException
+     */
+    private void withActiveContextOrThrow(
+        TopicPartition tp,
+        Consumer&lt;CoordinatorContext&gt; func
+    ) throws NotCoordinatorException, CoordinatorLoadInProgressException {
+<span class="fc" id="L2030">        CoordinatorContext context = contextOrThrow(tp);</span>
+
+        try {
+<span class="fc" id="L2033">            context.lock.lock();</span>
+<span class="fc bfc" id="L2034" title="All 2 branches covered.">            if (context.state == CoordinatorState.ACTIVE) {</span>
+<span class="fc" id="L2035">                func.accept(context);</span>
+<span class="pc bpc" id="L2036" title="1 of 2 branches missed.">            } else if (context.state == CoordinatorState.LOADING) {</span>
+<span class="fc" id="L2037">                throw Errors.COORDINATOR_LOAD_IN_PROGRESS.exception();</span>
+            } else {
+<span class="nc" id="L2039">                throw Errors.NOT_COORDINATOR.exception();</span>
+            }
+        } finally {
+<span class="fc" id="L2042">            context.lock.unlock();</span>
+        }
+<span class="fc" id="L2044">    }</span>
+
+    /**
+     * Schedules a write operation.
+     *
+     * @param name      The name of the write operation.
+     * @param tp        The address of the coordinator (aka its topic-partitions).
+     * @param op        The write operation.
+     *
+     * @return A future that will be completed with the result of the write operation
+     * when the operation is completed or an exception if the write operation failed.
+     *
+     * @param &lt;T&gt; The type of the result.
+     */
+    public &lt;T&gt; CompletableFuture&lt;T&gt; scheduleWriteOperation(
+        String name,
+        TopicPartition tp,
+        CoordinatorWriteOperation&lt;S, T, U&gt; op
+    ) {
+        try {
+<span class="fc" id="L2064">            throwIfNotRunning();</span>
+<span class="fc" id="L2065">            log.debug(&quot;Scheduled execution of write operation {}.&quot;, name);</span>
+<span class="fc" id="L2066">            CoordinatorWriteEvent&lt;T&gt; event = new CoordinatorWriteEvent&lt;&gt;(name, tp, writeTimeout, op);</span>
+<span class="fc" id="L2067">            enqueueLast(event);</span>
+<span class="fc" id="L2068">            return event.future;</span>
+<span class="nc" id="L2069">        } catch (Throwable t) {</span>
+<span class="nc" id="L2070">            return CompletableFuture.failedFuture(t);</span>
+        }
+    }
+
+    /**
+     * Schedule a write operation for each coordinator.
+     *
+     * @param name      The name of the write operation.
+     * @param op        The write operation.
+     *
+     * @return A list of futures where each future will be completed with the result of the write operation
+     * when the operation is completed or an exception if the write operation failed.
+     *
+     * @param &lt;T&gt; The type of the result.
+     */
+    public &lt;T&gt; List&lt;CompletableFuture&lt;T&gt;&gt; scheduleWriteAllOperation(
+        String name,
+        CoordinatorWriteOperation&lt;S, T, U&gt; op
+    ) {
+<span class="fc" id="L2089">        log.debug(&quot;Scheduled execution of write all operation {}.&quot;, name);</span>
+<span class="fc" id="L2090">        return coordinators</span>
+<span class="fc" id="L2091">            .keySet()</span>
+<span class="fc" id="L2092">            .stream()</span>
+<span class="fc" id="L2093">            .map(tp -&gt; scheduleWriteOperation(name, tp, op))</span>
+<span class="fc" id="L2094">            .collect(Collectors.toList());</span>
+    }
+
+    /**
+     * Schedules a transactional write operation.
+     *
+     * @param name              The name of the write operation.
+     * @param tp                The address of the coordinator (aka its topic-partitions).
+     * @param transactionalId   The transactional id.
+     * @param producerId        The producer id.
+     * @param producerEpoch     The producer epoch.
+     * @param op                The write operation.
+     * @param apiVersion        The Version of the Txn_Offset_Commit request
+     *
+     * @return A future that will be completed with the result of the write operation
+     * when the operation is completed or an exception if the write operation failed.
+     *
+     * @param &lt;T&gt; The type of the result.
+     */
+    public &lt;T&gt; CompletableFuture&lt;T&gt; scheduleTransactionalWriteOperation(
+        String name,
+        TopicPartition tp,
+        String transactionalId,
+        long producerId,
+        short producerEpoch,
+        CoordinatorWriteOperation&lt;S, T, U&gt; op,
+        int apiVersion
+    ) {
+        try {
+<span class="nc" id="L2123">            throwIfNotRunning();</span>
+<span class="nc" id="L2124">            log.debug(&quot;Scheduled execution of transactional write operation {}.&quot;, name);</span>
+<span class="nc" id="L2125">            return partitionWriter.maybeStartTransactionVerification(</span>
+                tp,
+                transactionalId,
+                producerId,
+                producerEpoch,
+                apiVersion
+<span class="nc" id="L2131">            ).thenCompose(verificationGuard -&gt; {</span>
+<span class="nc" id="L2132">                CoordinatorWriteEvent&lt;T&gt; event = new CoordinatorWriteEvent&lt;&gt;(</span>
+                    name,
+                    tp,
+                    transactionalId,
+                    producerId,
+                    producerEpoch,
+                    verificationGuard,
+                    writeTimeout,
+                    op
+                );
+<span class="nc" id="L2142">                enqueueLast(event);</span>
+<span class="nc" id="L2143">                return event.future;</span>
+            });
+<span class="nc" id="L2145">        } catch (Throwable t) {</span>
+<span class="nc" id="L2146">            return CompletableFuture.failedFuture(t);</span>
+        }
+    }
+
+    /**
+     * Schedules the transaction completion.
+     *
+     * @param name              The name of the operation.
+     * @param tp                The address of the coordinator (aka its topic-partitions).
+     * @param producerId        The producer id.
+     * @param producerEpoch     The producer epoch.
+     * @param coordinatorEpoch  The epoch of the transaction coordinator.
+     * @param result            The transaction result.
+     * @param transactionVersion The transaction version (1 = TV1, 2 = TV2, etc.).
+     *
+     * @return A future that will be completed with null when the operation is
+     * completed or an exception if the operation failed.
+     */
+    public CompletableFuture&lt;Void&gt; scheduleTransactionCompletion(
+        String name,
+        TopicPartition tp,
+        long producerId,
+        short producerEpoch,
+        int coordinatorEpoch,
+        TransactionResult result,
+        short transactionVersion
+    ) {
+        try {
+<span class="nc" id="L2174">            throwIfNotRunning();</span>
+<span class="nc" id="L2175">            log.debug(&quot;Scheduled execution of transaction completion for {} with producer id={}, producer epoch={}, &quot; +</span>
+<span class="nc" id="L2176">                &quot;coordinator epoch={}, transaction version={} and transaction result={}.&quot;, tp, producerId, producerEpoch, coordinatorEpoch, transactionVersion, result);</span>
+<span class="nc" id="L2177">            CoordinatorCompleteTransactionEvent event = new CoordinatorCompleteTransactionEvent(</span>
+                name,
+                tp,
+                producerId,
+                producerEpoch,
+                coordinatorEpoch,
+                result,
+                transactionVersion,
+                writeTimeout
+            );
+<span class="nc" id="L2187">            enqueueLast(event);</span>
+<span class="nc" id="L2188">            return event.future;</span>
+<span class="nc" id="L2189">        } catch (Throwable t) {</span>
+<span class="nc" id="L2190">            return CompletableFuture.failedFuture(t);</span>
+        }
+    }
+
+    /**
+     * Schedules a read operation.
+     *
+     * @param name  The name of the read operation.
+     * @param tp    The address of the coordinator (aka its topic-partitions).
+     * @param op    The read operation.
+     *
+     * @return A future that will be completed with the result of the read operation
+     * when the operation is completed or an exception if the read operation failed.
+     *
+     * @param &lt;T&gt; The type of the result.
+     */
+    public &lt;T&gt; CompletableFuture&lt;T&gt; scheduleReadOperation(
+        String name,
+        TopicPartition tp,
+        CoordinatorReadOperation&lt;S, T&gt; op
+    ) {
+        try {
+<span class="nc" id="L2212">            throwIfNotRunning();</span>
+<span class="nc" id="L2213">            log.debug(&quot;Scheduled execution of read operation {}.&quot;, name);</span>
+<span class="nc" id="L2214">            CoordinatorReadEvent&lt;T&gt; event = new CoordinatorReadEvent&lt;&gt;(name, tp, op);</span>
+<span class="nc" id="L2215">            enqueueLast(event);</span>
+<span class="nc" id="L2216">            return event.future;</span>
+<span class="nc" id="L2217">        } catch (Throwable t) {</span>
+<span class="nc" id="L2218">            return CompletableFuture.failedFuture(t);</span>
+        }
+    }
+
+    /**
+     * Schedules a read operation for each coordinator.
+     *
+     * @param name  The name of the read operation.
+     * @param op    The read operation.
+     *
+     * @return A list of futures where each future will be completed with the result of the read operation
+     * when the operation is completed or an exception if the read operation failed.
+     *
+     * @param &lt;T&gt; The type of the result.
+     */
+    public &lt;T&gt; List&lt;CompletableFuture&lt;T&gt;&gt; scheduleReadAllOperation(
+        String name,
+        CoordinatorReadOperation&lt;S, T&gt; op
+    ) {
+<span class="nc" id="L2237">        log.debug(&quot;Scheduled execution of read all operation {}.&quot;, name);</span>
+<span class="nc" id="L2238">        return coordinators</span>
+<span class="nc" id="L2239">            .keySet()</span>
+<span class="nc" id="L2240">            .stream()</span>
+<span class="nc" id="L2241">            .map(tp -&gt; scheduleReadOperation(name, tp, op))</span>
+<span class="nc" id="L2242">            .collect(Collectors.toList());</span>
+    }
+
+    /**
+     * Schedules an internal event.
+     *
+     * @param name  The name of the write operation.
+     * @param tp    The address of the coordinator (aka its topic-partitions).
+     * @param op    The operation.
+     */
+    private void scheduleInternalOperation(
+        String name,
+        TopicPartition tp,
+        Runnable op
+    ) {
+<span class="fc" id="L2257">        log.debug(&quot;Scheduled execution of internal operation {}.&quot;, name);</span>
+<span class="fc" id="L2258">        enqueueLast(new CoordinatorInternalEvent(name, tp, op));</span>
+<span class="fc" id="L2259">    }</span>
+
+    /**
+     * Schedules the loading of a coordinator. This is called when the broker is elected as
+     * the leader for a partition.
+     *
+     * @param tp                The topic partition of the coordinator. Records from this
+     *                          partitions will be read and applied to the coordinator.
+     * @param partitionEpoch    The epoch of the partition.
+     */
+    public void scheduleLoadOperation(
+        TopicPartition tp,
+        int partitionEpoch
+    ) {
+<span class="fc" id="L2273">        throwIfNotRunning();</span>
+<span class="fc" id="L2274">        log.info(&quot;Scheduling loading of metadata from {} with epoch {}&quot;, tp, partitionEpoch);</span>
+
+        // Touch the state to make the runtime immediately aware of the new coordinator.
+<span class="fc" id="L2277">        maybeCreateContext(tp);</span>
+
+<span class="fc" id="L2279">        scheduleInternalOperation(&quot;Load(tp=&quot; + tp + &quot;, epoch=&quot; + partitionEpoch + &quot;)&quot;, tp, () -&gt; {</span>
+            // The context is re-created if it does not exist.
+<span class="fc" id="L2281">            CoordinatorContext context = maybeCreateContext(tp);</span>
+
+<span class="fc" id="L2283">            context.lock.lock();</span>
+            try {
+<span class="pc bpc" id="L2285" title="1 of 2 branches missed.">                if (context.epoch &lt; partitionEpoch) {</span>
+<span class="fc" id="L2286">                    context.epoch = partitionEpoch;</span>
+
+<span class="pc bpc" id="L2288" title="3 of 4 branches missed.">                    switch (context.state) {</span>
+                        case FAILED:
+                        case INITIAL:
+<span class="fc" id="L2291">                            context.transitionTo(CoordinatorState.LOADING);</span>
+<span class="fc" id="L2292">                            break;</span>
+
+                        case LOADING:
+<span class="nc" id="L2295">                            log.info(&quot;The coordinator {} is already loading metadata.&quot;, tp);</span>
+<span class="nc" id="L2296">                            break;</span>
+
+                        case ACTIVE:
+<span class="nc" id="L2299">                            log.info(&quot;The coordinator {} is already active.&quot;, tp);</span>
+<span class="nc" id="L2300">                            break;</span>
+
+                        default:
+<span class="nc" id="L2303">                            log.error(&quot;Cannot load coordinator {} in state {}.&quot;, tp, context.state);</span>
+                    }
+                } else {
+<span class="nc" id="L2306">                    log.info(&quot;Ignored loading metadata from {} since current epoch {} is larger than or equals to {}.&quot;,</span>
+<span class="nc" id="L2307">                        context.tp, context.epoch, partitionEpoch);</span>
+                }
+            } finally {
+<span class="fc" id="L2310">                context.lock.unlock();</span>
+            }
+<span class="fc" id="L2312">        });</span>
+<span class="fc" id="L2313">    }</span>
+
+    /**
+     * Schedules the unloading of a coordinator. This is called when the broker is not the
+     * leader anymore.
+     *
+     * @param tp                The topic partition of the coordinator.
+     * @param partitionEpoch    The partition epoch as an optional value.
+     *                          An empty value means that the topic was deleted.
+     */
+    public void scheduleUnloadOperation(
+        TopicPartition tp,
+        OptionalInt partitionEpoch
+    ) {
+<span class="fc" id="L2327">        throwIfNotRunning();</span>
+<span class="fc" id="L2328">        log.info(&quot;Scheduling unloading of metadata for {} with epoch {}&quot;, tp, partitionEpoch);</span>
+
+<span class="fc" id="L2330">        scheduleInternalOperation(&quot;UnloadCoordinator(tp=&quot; + tp + &quot;, epoch=&quot; + partitionEpoch + &quot;)&quot;, tp, () -&gt; {</span>
+<span class="fc" id="L2331">            CoordinatorContext context = coordinators.get(tp);</span>
+<span class="pc bpc" id="L2332" title="1 of 2 branches missed.">            if (context != null) {</span>
+<span class="fc" id="L2333">                context.lock.lock();</span>
+                try {
+<span class="pc bpc" id="L2335" title="2 of 4 branches missed.">                    if (partitionEpoch.isEmpty() || context.epoch &lt; partitionEpoch.getAsInt()) {</span>
+<span class="fc" id="L2336">                        log.info(&quot;Started unloading metadata for {} with epoch {}.&quot;, tp, partitionEpoch);</span>
+                        try {
+<span class="fc" id="L2338">                            context.transitionTo(CoordinatorState.CLOSED);</span>
+<span class="fc" id="L2339">                            log.info(&quot;Finished unloading metadata for {} with epoch {}.&quot;, tp, partitionEpoch);</span>
+<span class="nc" id="L2340">                        } catch (Throwable ex) {</span>
+                            // It's very unlikely that we will ever see an exception here, since we
+                            // already make an effort to catch exceptions in the unload method.
+<span class="nc" id="L2343">                            log.error(&quot;Failed to unload metadata for {} with epoch {} due to {}.&quot;,</span>
+<span class="nc" id="L2344">                                tp, partitionEpoch, ex.getMessage(), ex);</span>
+                        } finally {
+                            // Always remove the coordinator context, otherwise the coordinator
+                            // shard could be permanently stuck.
+<span class="fc" id="L2348">                            coordinators.remove(tp, context);</span>
+<span class="fc" id="L2349">                        }</span>
+                    } else {
+<span class="nc" id="L2351">                        log.info(&quot;Ignored unloading metadata for {} in epoch {} since current epoch is {}.&quot;,</span>
+<span class="nc" id="L2352">                            tp, partitionEpoch, context.epoch);</span>
+                    }
+                } finally {
+<span class="fc" id="L2355">                    context.lock.unlock();</span>
+<span class="fc" id="L2356">                }</span>
+            } else {
+<span class="nc" id="L2358">                log.info(&quot;Ignored unloading metadata for {} in epoch {} since metadata was never loaded.&quot;,</span>
+                    tp, partitionEpoch);
+            }
+<span class="fc" id="L2361">        });</span>
+<span class="fc" id="L2362">    }</span>
+
+    /**
+     * A new metadata image is available.
+     *
+     * @param delta    The metadata delta.
+     * @param newImage The new metadata image.
+     */
+    public void onMetadataUpdate(
+        CoordinatorMetadataDelta delta,
+        CoordinatorMetadataImage newImage
+    ) {
+<span class="fc" id="L2374">        throwIfNotRunning();</span>
+<span class="fc" id="L2375">        log.debug(&quot;Scheduling applying of a new metadata image with version {}.&quot;, newImage.version());</span>
+
+        // Update global image.
+<span class="fc" id="L2378">        metadataImage = newImage;</span>
+
+        // Push an event for each coordinator.
+<span class="fc" id="L2381">        coordinators.keySet().forEach(tp -&gt; {</span>
+<span class="fc" id="L2382">            scheduleInternalOperation(&quot;UpdateImage(tp=&quot; + tp + &quot;, version=&quot; + newImage.version() + &quot;)&quot;, tp, () -&gt; {</span>
+<span class="fc" id="L2383">                CoordinatorContext context = coordinators.get(tp);</span>
+<span class="fc bfc" id="L2384" title="All 2 branches covered.">                if (context != null) {</span>
+<span class="fc" id="L2385">                    context.lock.lock();</span>
+                    try {
+<span class="fc bfc" id="L2387" title="All 2 branches covered.">                        if (context.state == CoordinatorState.ACTIVE) {</span>
+                            // The new image can be applied to the coordinator only if the coordinator
+                            // exists and is in the active state.
+<span class="fc" id="L2390">                            log.debug(&quot;Applying new metadata image with version {} to {}.&quot;, newImage.version(), tp);</span>
+<span class="fc" id="L2391">                            context.coordinator.onMetadataUpdate(delta, newImage);</span>
+                        } else {
+<span class="fc" id="L2393">                            log.debug(&quot;Ignored new metadata image with version {} for {} because the coordinator is not active.&quot;,</span>
+<span class="fc" id="L2394">                                newImage.version(), tp);</span>
+                        }
+                    } finally {
+<span class="fc" id="L2397">                        context.lock.unlock();</span>
+<span class="fc" id="L2398">                    }</span>
+                } else {
+<span class="fc" id="L2400">                    log.debug(&quot;Ignored new metadata image with version {} for {} because the coordinator does not exist.&quot;,</span>
+<span class="fc" id="L2401">                        newImage.version(), tp);</span>
+                }
+<span class="fc" id="L2403">            });</span>
+<span class="fc" id="L2404">        });</span>
+<span class="fc" id="L2405">    }</span>
+
+    /**
+     * Closes the runtime. This closes all the coordinators currently registered
+     * in the runtime.
+     *
+     * @throws Exception
+     */
+    public void close() throws Exception {
+<span class="pc bpc" id="L2414" title="1 of 2 branches missed.">        if (!isRunning.compareAndSet(true, false)) {</span>
+<span class="nc" id="L2415">            log.warn(&quot;Coordinator runtime is already shutting down.&quot;);</span>
+<span class="nc" id="L2416">            return;</span>
+        }
+
+<span class="fc" id="L2419">        log.info(&quot;Closing coordinator runtime.&quot;);</span>
+<span class="fc" id="L2420">        Utils.closeQuietly(loader, &quot;loader&quot;);</span>
+<span class="fc" id="L2421">        Utils.closeQuietly(timer, &quot;timer&quot;);</span>
+        // This close the processor, drain all the pending events and
+        // reject any new events.
+<span class="fc" id="L2424">        Utils.closeQuietly(processor, &quot;event processor&quot;);</span>
+        // Unload all the coordinators.
+<span class="fc" id="L2426">        coordinators.forEach((tp, context) -&gt; {</span>
+<span class="nc" id="L2427">            context.lock.lock();</span>
+            try {
+<span class="nc" id="L2429">                context.transitionTo(CoordinatorState.CLOSED);</span>
+<span class="nc" id="L2430">            } catch (Throwable ex) {</span>
+<span class="nc" id="L2431">                log.warn(&quot;Failed to unload metadata for {} due to {}.&quot;, tp, ex.getMessage(), ex);</span>
+            } finally {
+<span class="nc" id="L2433">                context.lock.unlock();</span>
+            }
+<span class="nc" id="L2435">        });</span>
+<span class="fc" id="L2436">        coordinators.clear();</span>
+<span class="fc" id="L2437">        executorService.shutdown();</span>
+<span class="fc" id="L2438">        Utils.closeQuietly(runtimeMetrics, &quot;runtime metrics&quot;);</span>
+<span class="fc" id="L2439">        log.info(&quot;Coordinator runtime closed.&quot;);</span>
+<span class="fc" id="L2440">    }</span>
+
+    /**
+     * @return List of {@link TopicPartition} whose coordinators are active.
+     */
+    public List&lt;TopicPartition&gt; activeCoordinators() {
+<span class="nc bnc" id="L2446" title="All 4 branches missed.">        if (coordinators == null || coordinators.isEmpty()) {</span>
+<span class="nc" id="L2447">            return List.of();</span>
+        }
+
+<span class="nc" id="L2450">        return coordinators.entrySet().stream()</span>
+<span class="nc" id="L2451">            .filter(entry -&gt; entry.getValue().state.equals(CoordinatorState.ACTIVE))</span>
+<span class="nc" id="L2452">            .map(Map.Entry::getKey)</span>
+<span class="nc" id="L2453">            .toList();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

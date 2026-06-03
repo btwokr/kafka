@@ -1,0 +1,951 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>WorkerSinkTask.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">WorkerSinkTask.java</span></div><h1>WorkerSinkTask.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.OffsetCommitCallback;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.WakeupException;
+import org.apache.kafka.common.internals.Plugin;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.Avg;
+import org.apache.kafka.common.metrics.stats.CumulativeSum;
+import org.apache.kafka.common.metrics.stats.Max;
+import org.apache.kafka.common.metrics.stats.Rate;
+import org.apache.kafka.common.metrics.stats.Value;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.Utils.UncheckedCloseable;
+import org.apache.kafka.connect.data.SchemaAndValue;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.errors.RetriableException;
+import org.apache.kafka.connect.header.ConnectHeaders;
+import org.apache.kafka.connect.header.Headers;
+import org.apache.kafka.connect.runtime.ConnectMetrics.MetricGroup;
+import org.apache.kafka.connect.runtime.errors.ErrorHandlingMetrics;
+import org.apache.kafka.connect.runtime.errors.ErrorReporter;
+import org.apache.kafka.connect.runtime.errors.ProcessingContext;
+import org.apache.kafka.connect.runtime.errors.RetryWithToleranceOperator;
+import org.apache.kafka.connect.runtime.errors.Stage;
+import org.apache.kafka.connect.runtime.errors.WorkerErrantRecordReporter;
+import org.apache.kafka.connect.runtime.isolation.LoaderSwap;
+import org.apache.kafka.connect.sink.SinkRecord;
+import org.apache.kafka.connect.sink.SinkTask;
+import org.apache.kafka.connect.storage.ClusterConfigState;
+import org.apache.kafka.connect.storage.Converter;
+import org.apache.kafka.connect.storage.HeaderConverter;
+import org.apache.kafka.connect.storage.StatusBackingStore;
+import org.apache.kafka.connect.util.ConnectUtils;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.connect.runtime.WorkerConfig.TOPIC_TRACKING_ENABLE_CONFIG;
+
+/**
+ * {@link WorkerTask} that uses a {@link SinkTask} to export data from Kafka.
+ */
+class WorkerSinkTask extends WorkerTask&lt;ConsumerRecord&lt;byte[], byte[]&gt;, SinkRecord&gt; {
+<span class="fc" id="L81">    private static final Logger log = LoggerFactory.getLogger(WorkerSinkTask.class);</span>
+
+    private final WorkerConfig workerConfig;
+    private final SinkTask task;
+    private final ClusterConfigState configState;
+    private Map&lt;String, String&gt; taskConfig;
+    private final Plugin&lt;Converter&gt; keyConverterPlugin;
+    private final Plugin&lt;Converter&gt; valueConverterPlugin;
+    private final Plugin&lt;HeaderConverter&gt; headerConverterPlugin;
+    private final SinkTaskMetricsGroup sinkTaskMetricsGroup;
+    private final boolean isTopicTrackingEnabled;
+    private final Consumer&lt;byte[], byte[]&gt; consumer;
+    private WorkerSinkTaskContext context;
+    private final List&lt;SinkRecord&gt; messageBatch;
+    private final Map&lt;TopicPartition, OffsetAndMetadata&gt; lastCommittedOffsets;
+    private final Map&lt;TopicPartition, OffsetAndMetadata&gt; currentOffsets;
+    private final Map&lt;TopicPartition, OffsetAndMetadata&gt; origOffsets;
+    private RuntimeException rebalanceException;
+    private long nextCommit;
+    private int commitSeqno;
+    private long commitStarted;
+    private int commitFailures;
+    private boolean pausedForRedelivery;
+    private boolean committing;
+    private boolean taskStopped;
+    private final WorkerErrantRecordReporter workerErrantRecordReporter;
+    private final String version;
+
+    public WorkerSinkTask(ConnectorTaskId id,
+                          SinkTask task,
+                          TaskStatus.Listener statusListener,
+                          TargetState initialState,
+                          WorkerConfig workerConfig,
+                          ClusterConfigState configState,
+                          ConnectMetrics connectMetrics,
+                          Plugin&lt;Converter&gt; keyConverterPlugin,
+                          Plugin&lt;Converter&gt; valueConverterPlugin,
+                          ErrorHandlingMetrics errorMetrics,
+                          Plugin&lt;HeaderConverter&gt; headerConverterPlugin,
+                          TransformationChain&lt;ConsumerRecord&lt;byte[], byte[]&gt;, SinkRecord&gt; transformationChain,
+                          Consumer&lt;byte[], byte[]&gt; consumer,
+                          ClassLoader loader,
+                          Time time,
+                          RetryWithToleranceOperator&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; retryWithToleranceOperator,
+                          WorkerErrantRecordReporter workerErrantRecordReporter,
+                          StatusBackingStore statusBackingStore,
+                          Supplier&lt;List&lt;ErrorReporter&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt;&gt;&gt; errorReportersSupplier,
+                          TaskPluginsMetadata pluginsMetadata,
+                          Function&lt;ClassLoader, LoaderSwap&gt; pluginLoaderSwapper) {
+<span class="fc" id="L130">        super(id, statusListener, initialState, loader, connectMetrics, errorMetrics,</span>
+                retryWithToleranceOperator, transformationChain, errorReportersSupplier, time, statusBackingStore, pluginsMetadata, pluginLoaderSwapper);
+
+<span class="fc" id="L133">        this.workerConfig = workerConfig;</span>
+<span class="fc" id="L134">        this.task = task;</span>
+<span class="fc" id="L135">        this.configState = configState;</span>
+<span class="fc" id="L136">        this.keyConverterPlugin = keyConverterPlugin;</span>
+<span class="fc" id="L137">        this.valueConverterPlugin = valueConverterPlugin;</span>
+<span class="fc" id="L138">        this.headerConverterPlugin = headerConverterPlugin;</span>
+<span class="fc" id="L139">        this.messageBatch = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L140">        this.lastCommittedOffsets = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L141">        this.currentOffsets = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L142">        this.origOffsets = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L143">        this.pausedForRedelivery = false;</span>
+<span class="fc" id="L144">        this.rebalanceException = null;</span>
+<span class="fc" id="L145">        this.nextCommit = time.milliseconds() +</span>
+<span class="fc" id="L146">                workerConfig.getLong(WorkerConfig.OFFSET_COMMIT_INTERVAL_MS_CONFIG);</span>
+<span class="fc" id="L147">        this.committing = false;</span>
+<span class="fc" id="L148">        this.commitSeqno = 0;</span>
+<span class="fc" id="L149">        this.commitStarted = -1;</span>
+<span class="fc" id="L150">        this.commitFailures = 0;</span>
+<span class="fc" id="L151">        this.sinkTaskMetricsGroup = new SinkTaskMetricsGroup(id, connectMetrics);</span>
+<span class="fc" id="L152">        this.sinkTaskMetricsGroup.recordOffsetSequenceNumber(commitSeqno);</span>
+<span class="fc" id="L153">        this.consumer = consumer;</span>
+<span class="fc" id="L154">        this.isTopicTrackingEnabled = workerConfig.getBoolean(TOPIC_TRACKING_ENABLE_CONFIG);</span>
+<span class="fc" id="L155">        this.taskStopped = false;</span>
+<span class="fc" id="L156">        this.workerErrantRecordReporter = workerErrantRecordReporter;</span>
+<span class="fc" id="L157">        this.version = task.version();</span>
+<span class="fc" id="L158">    }</span>
+
+    @Override
+    public void initialize(TaskConfig taskConfig) {
+        try {
+<span class="fc" id="L163">            this.taskConfig = taskConfig.originalsStrings();</span>
+<span class="fc" id="L164">            this.context = new WorkerSinkTaskContext(consumer, this, configState);</span>
+<span class="nc" id="L165">        } catch (Throwable t) {</span>
+<span class="nc" id="L166">            log.error(&quot;{} Task failed initialization and will not be started.&quot;, this, t);</span>
+<span class="nc" id="L167">            onFailure(t);</span>
+<span class="fc" id="L168">        }</span>
+<span class="fc" id="L169">    }</span>
+
+    @Override
+    public void stop() {
+        // Offset commit is handled upon exit in work thread
+<span class="fc" id="L174">        super.stop();</span>
+<span class="fc" id="L175">        consumer.wakeup();</span>
+<span class="fc" id="L176">    }</span>
+
+    @Override
+    protected void close() {
+        // FIXME Kafka needs to add a timeout parameter here for us to properly obey the timeout
+        // passed in
+        try {
+<span class="fc" id="L183">            task.stop();</span>
+<span class="nc" id="L184">        } catch (Throwable t) {</span>
+<span class="nc" id="L185">            log.warn(&quot;Could not stop task&quot;, t);</span>
+<span class="fc" id="L186">        }</span>
+<span class="fc" id="L187">        taskStopped = true;</span>
+<span class="fc" id="L188">        Utils.closeQuietly(consumer, &quot;consumer&quot;);</span>
+<span class="fc" id="L189">        Utils.closeQuietly(headerConverterPlugin, &quot;header converter&quot;);</span>
+<span class="fc" id="L190">        Utils.closeQuietly(keyConverterPlugin, &quot;key converter&quot;);</span>
+<span class="fc" id="L191">        Utils.closeQuietly(valueConverterPlugin, &quot;value converter&quot;);</span>
+<span class="fc" id="L192">        Utils.closeQuietly(pluginMetrics, &quot;plugin metrics&quot;);</span>
+        /*
+            Setting partition count explicitly to 0 to handle the case,
+            when the task fails, which would cause its consumer to leave the group.
+            This would cause onPartitionsRevoked to be invoked in the rebalance listener, but not onPartitionsAssigned,
+            so the metrics for the task (which are still available for failed tasks until they are explicitly revoked
+            from the worker) would become inaccurate.
+        */
+<span class="fc" id="L200">        sinkTaskMetricsGroup.recordPartitionCount(0);</span>
+<span class="fc" id="L201">    }</span>
+
+    @Override
+    public void removeMetrics() {
+        try {
+<span class="fc" id="L206">            sinkTaskMetricsGroup.close();</span>
+        } finally {
+<span class="fc" id="L208">            super.removeMetrics();</span>
+        }
+<span class="fc" id="L210">    }</span>
+
+    @Override
+    public void transitionTo(TargetState state) {
+<span class="nc" id="L214">        super.transitionTo(state);</span>
+<span class="nc" id="L215">        consumer.wakeup();</span>
+<span class="nc" id="L216">    }</span>
+
+    @Override
+    public void execute() {
+<span class="fc" id="L220">        log.info(&quot;{} Executing sink task&quot;, this);</span>
+        // Make sure any uncommitted data has been committed and the task has
+        // a chance to clean up its state
+<span class="fc" id="L223">        try (UncheckedCloseable suppressible = this::closeAllPartitions) {</span>
+<span class="fc bfc" id="L224" title="All 2 branches covered.">            while (!isStopping())</span>
+<span class="fc" id="L225">                iteration();</span>
+<span class="nc" id="L226">        } catch (WakeupException e) {</span>
+<span class="nc" id="L227">            log.trace(&quot;Consumer woken up during initial offset commit attempt, &quot; </span>
+                + &quot;but succeeded during a later attempt&quot;);
+<span class="fc" id="L229">        }</span>
+<span class="fc" id="L230">    }</span>
+
+    @Override
+    public String taskVersion() {
+<span class="fc" id="L234">        return version;</span>
+    }
+
+    protected void iteration() {
+<span class="fc" id="L238">        final long offsetCommitIntervalMs = workerConfig.getLong(WorkerConfig.OFFSET_COMMIT_INTERVAL_MS_CONFIG);</span>
+
+        try {
+<span class="fc" id="L241">            long now = time.milliseconds();</span>
+
+            // Maybe commit
+<span class="pc bpc" id="L244" title="1 of 6 branches missed.">            if (!committing &amp;&amp; (context.isCommitRequested() || now &gt;= nextCommit)) {</span>
+<span class="fc" id="L245">                commitOffsets(now);</span>
+<span class="fc" id="L246">                nextCommit = now + offsetCommitIntervalMs;</span>
+<span class="fc" id="L247">                context.clearCommitRequest();</span>
+            }
+
+<span class="fc" id="L250">            final long commitTimeoutMs = commitStarted + workerConfig.getLong(WorkerConfig.OFFSET_COMMIT_TIMEOUT_MS_CONFIG);</span>
+
+            // Check for timed out commits
+<span class="pc bpc" id="L253" title="1 of 4 branches missed.">            if (committing &amp;&amp; now &gt;= commitTimeoutMs) {</span>
+<span class="nc" id="L254">                log.warn(&quot;{} Commit of offsets timed out&quot;, this);</span>
+<span class="nc" id="L255">                commitFailures++;</span>
+<span class="nc" id="L256">                committing = false;</span>
+            }
+
+            // And process messages
+<span class="fc" id="L260">            long timeoutMs = Math.max(nextCommit - now, 0);</span>
+<span class="fc" id="L261">            poll(timeoutMs);</span>
+<span class="fc" id="L262">        } catch (WakeupException we) {</span>
+<span class="fc" id="L263">            log.trace(&quot;{} Consumer woken up&quot;, this);</span>
+
+<span class="pc bpc" id="L265" title="1 of 2 branches missed.">            if (isStopping())</span>
+<span class="fc" id="L266">                return;</span>
+
+<span class="nc bnc" id="L268" title="All 2 branches missed.">            if (shouldPause()) {</span>
+<span class="nc" id="L269">                pauseAll();</span>
+<span class="nc" id="L270">                onPause();</span>
+<span class="nc" id="L271">                context.requestCommit();</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            } else if (!pausedForRedelivery) {</span>
+<span class="nc" id="L273">                resumeAll();</span>
+<span class="nc" id="L274">                onResume();</span>
+            }
+<span class="fc" id="L276">        }</span>
+<span class="fc" id="L277">    }</span>
+
+    /**
+     * Respond to a previous commit attempt that may or may not have succeeded. Note that due to our use of async commits,
+     * these invocations may come out of order and thus the need for the commit sequence number.
+     *
+     * @param error            the error resulting from the commit, or null if the commit succeeded without error
+     * @param seqno            the sequence number at the time the commit was requested
+     * @param committedOffsets the offsets that were committed; may be null if the commit did not complete successfully
+     *                         or if no new offsets were committed
+     */
+    private void onCommitCompleted(Throwable error, long seqno, Map&lt;TopicPartition, OffsetAndMetadata&gt; committedOffsets) {
+<span class="pc bpc" id="L289" title="1 of 2 branches missed.">        if (commitSeqno != seqno) {</span>
+<span class="nc" id="L290">            log.debug(&quot;{} Received out of order commit callback for sequence number {}, but most recent sequence number is {}&quot;,</span>
+<span class="nc" id="L291">                    this, seqno, commitSeqno);</span>
+<span class="nc" id="L292">            sinkTaskMetricsGroup.recordOffsetCommitSkip();</span>
+        } else {
+<span class="fc" id="L294">            long durationMillis = time.milliseconds() - commitStarted;</span>
+<span class="pc bpc" id="L295" title="1 of 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L296">                log.error(&quot;{} Commit of offsets threw an unexpected exception for sequence number {}: {}&quot;,</span>
+<span class="nc" id="L297">                        this, seqno, committedOffsets, error);</span>
+<span class="nc" id="L298">                commitFailures++;</span>
+<span class="nc" id="L299">                recordCommitFailure(durationMillis);</span>
+            } else {
+<span class="fc" id="L301">                log.debug(&quot;{} Finished offset commit successfully in {} ms for sequence number {}: {}&quot;,</span>
+<span class="fc" id="L302">                        this, durationMillis, seqno, committedOffsets);</span>
+<span class="fc bfc" id="L303" title="All 2 branches covered.">                if (committedOffsets != null) {</span>
+<span class="fc" id="L304">                    log.trace(&quot;{} Adding to last committed offsets: {}&quot;, this, committedOffsets);</span>
+<span class="fc" id="L305">                    lastCommittedOffsets.putAll(committedOffsets);</span>
+<span class="fc" id="L306">                    log.debug(&quot;{} Last committed offsets are now {}&quot;, this, committedOffsets);</span>
+<span class="fc" id="L307">                    sinkTaskMetricsGroup.recordCommittedOffsets(committedOffsets);</span>
+                }
+<span class="fc" id="L309">                commitFailures = 0;</span>
+<span class="fc" id="L310">                recordCommitSuccess(durationMillis);</span>
+            }
+<span class="fc" id="L312">            committing = false;</span>
+        }
+<span class="fc" id="L314">    }</span>
+
+    public int commitFailures() {
+<span class="nc" id="L317">        return commitFailures;</span>
+    }
+
+    /**
+     * Initializes and starts the SinkTask.
+     */
+    @Override
+    protected void initializeAndStart() {
+<span class="fc" id="L325">        SinkConnectorConfig.validate(taskConfig);</span>
+<span class="pc bpc" id="L326" title="1 of 2 branches missed.">        if (SinkConnectorConfig.hasTopicsConfig(taskConfig)) {</span>
+<span class="fc" id="L327">            List&lt;String&gt; topics = SinkConnectorConfig.parseTopicsList(taskConfig);</span>
+<span class="fc" id="L328">            consumer.subscribe(topics, new HandleRebalance());</span>
+<span class="fc" id="L329">            log.debug(&quot;{} Initializing and starting task for topics {}&quot;, this, String.join(&quot;, &quot;, topics));</span>
+<span class="fc" id="L330">        } else {</span>
+<span class="nc" id="L331">            String topicsRegexStr = taskConfig.get(SinkTask.TOPICS_REGEX_CONFIG);</span>
+<span class="nc" id="L332">            Pattern pattern = Pattern.compile(topicsRegexStr);</span>
+<span class="nc" id="L333">            consumer.subscribe(pattern, new HandleRebalance());</span>
+<span class="nc" id="L334">            log.debug(&quot;{} Initializing and starting task for topics regex {}&quot;, this, topicsRegexStr);</span>
+        }
+
+<span class="fc" id="L337">        task.initialize(context);</span>
+<span class="fc" id="L338">        task.start(taskConfig);</span>
+<span class="fc" id="L339">        log.info(&quot;{} Sink task finished initialization and start&quot;, this);</span>
+<span class="fc" id="L340">    }</span>
+
+    /**
+     * Poll for new messages with the given timeout. Should only be invoked by the worker thread.
+     */
+    protected void poll(long timeoutMs) {
+<span class="fc" id="L346">        rewind();</span>
+<span class="fc" id="L347">        long retryTimeout = context.timeout();</span>
+<span class="pc bpc" id="L348" title="1 of 2 branches missed.">        if (retryTimeout &gt; 0) {</span>
+<span class="nc" id="L349">            timeoutMs = Math.min(timeoutMs, retryTimeout);</span>
+<span class="nc" id="L350">            context.timeout(-1L);</span>
+        }
+
+<span class="fc" id="L353">        log.trace(&quot;{} Polling consumer with timeout {} ms&quot;, this, timeoutMs);</span>
+<span class="fc" id="L354">        ConsumerRecords&lt;byte[], byte[]&gt; msgs = pollConsumer(timeoutMs);</span>
+<span class="pc bpc" id="L355" title="3 of 4 branches missed.">        assert messageBatch.isEmpty() || msgs.isEmpty();</span>
+<span class="fc" id="L356">        log.trace(&quot;{} Polling returned {} messages&quot;, this, msgs.count());</span>
+
+<span class="fc" id="L358">        convertMessages(msgs);</span>
+<span class="fc" id="L359">        deliverMessages();</span>
+<span class="fc" id="L360">    }</span>
+
+    // VisibleForTesting
+    boolean isCommitting() {
+<span class="nc" id="L364">        return committing;</span>
+    }
+
+    //VisibleForTesting
+    Map&lt;TopicPartition, OffsetAndMetadata&gt; lastCommittedOffsets() {
+<span class="nc" id="L369">        return Map.copyOf(lastCommittedOffsets);</span>
+    }
+
+    //VisibleForTesting
+    Map&lt;TopicPartition, OffsetAndMetadata&gt; currentOffsets() {
+<span class="nc" id="L374">        return Map.copyOf(currentOffsets);</span>
+    }
+
+    private void doCommitSync(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets, int seqno) {
+<span class="nc" id="L378">        log.debug(&quot;{} Committing offsets synchronously using sequence number {}: {}&quot;, this, seqno, offsets);</span>
+        try {
+<span class="nc" id="L380">            consumer.commitSync(offsets);</span>
+<span class="nc" id="L381">            onCommitCompleted(null, seqno, offsets);</span>
+<span class="nc" id="L382">        } catch (WakeupException e) {</span>
+            // retry the commit to ensure offsets get pushed, then propagate the wakeup up to poll
+<span class="nc" id="L384">            doCommitSync(offsets, seqno);</span>
+<span class="nc" id="L385">            throw e;</span>
+<span class="nc" id="L386">        } catch (KafkaException e) {</span>
+<span class="nc" id="L387">            onCommitCompleted(e, seqno, offsets);</span>
+<span class="nc" id="L388">        }</span>
+<span class="nc" id="L389">    }</span>
+
+    private void doCommitAsync(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets, final int seqno) {
+<span class="fc" id="L392">        log.debug(&quot;{} Committing offsets asynchronously using sequence number {}: {}&quot;, this, seqno, offsets);</span>
+<span class="fc" id="L393">        OffsetCommitCallback cb = (tpOffsets, error) -&gt; onCommitCompleted(error, seqno, tpOffsets);</span>
+<span class="fc" id="L394">        consumer.commitAsync(offsets, cb);</span>
+<span class="fc" id="L395">    }</span>
+
+    /**
+     * Starts an offset commit by flushing outstanding messages from the task and then starting
+     * the write commit.
+     */
+    private void doCommit(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets, boolean closing, int seqno) {
+<span class="pc bpc" id="L402" title="1 of 2 branches missed.">        if (isCancelled()) {</span>
+<span class="nc" id="L403">            log.debug(&quot;Skipping final offset commit as task has been cancelled&quot;);</span>
+<span class="nc" id="L404">            return;</span>
+        }
+<span class="pc bpc" id="L406" title="1 of 2 branches missed.">        if (closing) {</span>
+<span class="nc" id="L407">            doCommitSync(offsets, seqno);</span>
+        } else {
+<span class="fc" id="L409">            doCommitAsync(offsets, seqno);</span>
+        }
+<span class="fc" id="L411">    }</span>
+
+    private void commitOffsets(long now) {
+<span class="fc" id="L414">        commitOffsets(now, false, consumer.assignment());</span>
+<span class="fc" id="L415">    }</span>
+
+    private void commitOffsets(long now, boolean closing, Collection&lt;TopicPartition&gt; topicPartitions) {
+<span class="fc" id="L418">        log.trace(&quot;Committing offsets for partitions {}&quot;, topicPartitions);</span>
+<span class="pc bpc" id="L419" title="1 of 2 branches missed.">        if (workerErrantRecordReporter != null) {</span>
+<span class="nc" id="L420">            log.trace(&quot;Awaiting reported errors to be completed&quot;);</span>
+<span class="nc" id="L421">            workerErrantRecordReporter.awaitFutures(topicPartitions);</span>
+<span class="nc" id="L422">            log.trace(&quot;Completed reported errors&quot;);</span>
+        }
+
+<span class="fc" id="L425">        Map&lt;TopicPartition, OffsetAndMetadata&gt; offsetsToCommit = currentOffsets.entrySet().stream()</span>
+<span class="fc" id="L426">            .filter(e -&gt; topicPartitions.contains(e.getKey()))</span>
+<span class="fc" id="L427">            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+
+<span class="pc bpc" id="L429" title="1 of 2 branches missed.">        if (offsetsToCommit.isEmpty())</span>
+<span class="nc" id="L430">            return;</span>
+
+<span class="fc" id="L432">        committing = true;</span>
+<span class="fc" id="L433">        commitSeqno += 1;</span>
+<span class="fc" id="L434">        commitStarted = now;</span>
+<span class="fc" id="L435">        sinkTaskMetricsGroup.recordOffsetSequenceNumber(commitSeqno);</span>
+
+<span class="fc" id="L437">        Map&lt;TopicPartition, OffsetAndMetadata&gt; lastCommittedOffsetsForPartitions = this.lastCommittedOffsets.entrySet().stream()</span>
+<span class="fc" id="L438">            .filter(e -&gt; offsetsToCommit.containsKey(e.getKey()))</span>
+<span class="fc" id="L439">            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+
+        final Map&lt;TopicPartition, OffsetAndMetadata&gt; taskProvidedOffsets;
+        try {
+<span class="fc" id="L443">            log.trace(&quot;{} Calling task.preCommit with current offsets: {}&quot;, this, offsetsToCommit);</span>
+<span class="fc" id="L444">            taskProvidedOffsets = task.preCommit(new HashMap&lt;&gt;(offsetsToCommit));</span>
+<span class="nc" id="L445">        } catch (Throwable t) {</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">            if (closing) {</span>
+<span class="nc" id="L447">                log.warn(&quot;{} Offset commit failed during close&quot;, this);</span>
+            } else {
+<span class="nc" id="L449">                log.error(&quot;{} Offset commit failed, rewinding to last committed offsets&quot;, this, t);</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">                for (Map.Entry&lt;TopicPartition, OffsetAndMetadata&gt; entry : lastCommittedOffsetsForPartitions.entrySet()) {</span>
+<span class="nc" id="L451">                    log.debug(&quot;{} Rewinding topic partition {} to offset {}&quot;, this, entry.getKey(), entry.getValue().offset());</span>
+<span class="nc" id="L452">                    consumer.seek(entry.getKey(), entry.getValue().offset());</span>
+<span class="nc" id="L453">                }</span>
+<span class="nc" id="L454">                currentOffsets.putAll(lastCommittedOffsetsForPartitions);</span>
+            }
+<span class="nc" id="L456">            onCommitCompleted(t, commitSeqno, null);</span>
+<span class="nc" id="L457">            return;</span>
+        } finally {
+<span class="fc bfc" id="L459" title="All 2 branches covered.">            if (closing) {</span>
+<span class="fc" id="L460">                log.trace(&quot;{} Closing the task before committing the offsets: {}&quot;, this, offsetsToCommit);</span>
+<span class="fc" id="L461">                task.close(topicPartitions);</span>
+            }
+        }
+
+<span class="pc bpc" id="L465" title="1 of 2 branches missed.">        if (taskProvidedOffsets.isEmpty()) {</span>
+<span class="nc" id="L466">            log.debug(&quot;{} Skipping offset commit, task opted-out by returning no offsets from preCommit&quot;, this);</span>
+<span class="nc" id="L467">            onCommitCompleted(null, commitSeqno, null);</span>
+<span class="nc" id="L468">            return;</span>
+        }
+
+<span class="fc" id="L471">        Collection&lt;TopicPartition&gt; allAssignedTopicPartitions = consumer.assignment();</span>
+<span class="fc" id="L472">        final Map&lt;TopicPartition, OffsetAndMetadata&gt; committableOffsets = new HashMap&lt;&gt;(lastCommittedOffsetsForPartitions);</span>
+<span class="fc bfc" id="L473" title="All 2 branches covered.">        for (Map.Entry&lt;TopicPartition, OffsetAndMetadata&gt; taskProvidedOffsetEntry : taskProvidedOffsets.entrySet()) {</span>
+<span class="fc" id="L474">            final TopicPartition partition = taskProvidedOffsetEntry.getKey();</span>
+<span class="fc" id="L475">            final OffsetAndMetadata taskProvidedOffset = taskProvidedOffsetEntry.getValue();</span>
+<span class="pc bpc" id="L476" title="1 of 2 branches missed.">            if (committableOffsets.containsKey(partition)) {</span>
+<span class="fc" id="L477">                long taskOffset = taskProvidedOffset.offset();</span>
+<span class="fc" id="L478">                long currentOffset = offsetsToCommit.get(partition).offset();</span>
+<span class="pc bpc" id="L479" title="1 of 2 branches missed.">                if (taskOffset &lt;= currentOffset) {</span>
+<span class="fc" id="L480">                    committableOffsets.put(partition, taskProvidedOffset);</span>
+                } else {
+<span class="nc" id="L482">                    log.warn(&quot;{} Ignoring invalid task provided offset {}/{} -- not yet consumed, taskOffset={} currentOffset={}&quot;,</span>
+<span class="nc" id="L483">                        this, partition, taskProvidedOffset, taskOffset, currentOffset);</span>
+                }
+<span class="pc bnc" id="L485" title="All 2 branches missed.">            } else if (!allAssignedTopicPartitions.contains(partition)) {</span>
+<span class="nc" id="L486">                log.warn(&quot;{} Ignoring invalid task provided offset {}/{} -- partition not assigned, assignment={}&quot;,</span>
+                        this, partition, taskProvidedOffset, allAssignedTopicPartitions);
+            } else {
+<span class="nc" id="L489">                log.debug(&quot;{} Ignoring task provided offset {}/{} -- partition not requested, requested={}&quot;,</span>
+<span class="nc" id="L490">                        this, partition, taskProvidedOffset, committableOffsets.keySet());</span>
+            }
+<span class="fc" id="L492">        }</span>
+
+<span class="fc bfc" id="L494" title="All 2 branches covered.">        if (committableOffsets.equals(lastCommittedOffsetsForPartitions)) {</span>
+<span class="fc" id="L495">            log.debug(&quot;{} Skipping offset commit, no change since last commit&quot;, this);</span>
+<span class="fc" id="L496">            onCommitCompleted(null, commitSeqno, null);</span>
+<span class="fc" id="L497">            return;</span>
+        }
+
+<span class="fc" id="L500">        doCommit(committableOffsets, closing, commitSeqno);</span>
+<span class="fc" id="L501">    }</span>
+
+
+    @Override
+    public String toString() {
+<span class="fc" id="L506">        return &quot;WorkerSinkTask{&quot; +</span>
+                &quot;id=&quot; + id +
+                '}';
+    }
+
+    private ConsumerRecords&lt;byte[], byte[]&gt; pollConsumer(long timeoutMs) {
+<span class="fc" id="L512">        ConsumerRecords&lt;byte[], byte[]&gt; msgs = consumer.poll(Duration.ofMillis(timeoutMs));</span>
+
+        // Exceptions raised from the task during a rebalance should be rethrown to stop the task and mark it as failed
+<span class="pc bpc" id="L515" title="1 of 2 branches missed.">        if (rebalanceException != null) {</span>
+<span class="nc" id="L516">            RuntimeException e = rebalanceException;</span>
+<span class="nc" id="L517">            rebalanceException = null;</span>
+<span class="nc" id="L518">            throw e;</span>
+        }
+
+<span class="fc" id="L521">        sinkTaskMetricsGroup.recordRead(msgs.count());</span>
+<span class="fc" id="L522">        return msgs;</span>
+    }
+
+    private void convertMessages(ConsumerRecords&lt;byte[], byte[]&gt; msgs) {
+<span class="fc bfc" id="L526" title="All 2 branches covered.">        for (ConsumerRecord&lt;byte[], byte[]&gt; msg : msgs) {</span>
+<span class="fc" id="L527">            log.trace(&quot;{} Consuming and converting message in topic '{}' partition {} at offset {} and timestamp {}&quot;,</span>
+<span class="fc" id="L528">                    this, msg.topic(), msg.partition(), msg.offset(), msg.timestamp());</span>
+
+<span class="fc" id="L530">            ProcessingContext&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; context = new ProcessingContext&lt;&gt;(msg);</span>
+
+<span class="fc" id="L532">            SinkRecord transRecord = convertAndTransformRecord(context, msg);</span>
+
+<span class="fc" id="L534">            origOffsets.put(</span>
+<span class="fc" id="L535">                    new TopicPartition(msg.topic(), msg.partition()),</span>
+<span class="fc" id="L536">                    new OffsetAndMetadata(msg.offset() + 1)</span>
+            );
+<span class="pc bpc" id="L538" title="1 of 2 branches missed.">            if (transRecord != null) {</span>
+<span class="fc" id="L539">                messageBatch.add(transRecord);</span>
+            } else {
+<span class="nc" id="L541">                log.trace(</span>
+                        &quot;{} Converters and transformations returned null, possibly because of too many retries, so &quot; +
+                                &quot;dropping record in topic '{}' partition {} at offset {}&quot;,
+<span class="nc" id="L544">                        this, msg.topic(), msg.partition(), msg.offset()</span>
+                );
+            }
+<span class="fc" id="L547">        }</span>
+<span class="fc" id="L548">        sinkTaskMetricsGroup.recordConsumedOffsets(origOffsets);</span>
+<span class="fc" id="L549">    }</span>
+
+    private SinkRecord convertAndTransformRecord(ProcessingContext&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; context, final ConsumerRecord&lt;byte[], byte[]&gt; msg) {
+<span class="fc" id="L552">        SchemaAndValue keyAndSchema = retryWithToleranceOperator.execute(context, () -&gt; {</span>
+<span class="fc" id="L553">            try (LoaderSwap swap = pluginLoaderSwapper.apply(keyConverterPlugin.get().getClass().getClassLoader())) {</span>
+<span class="fc" id="L554">                return keyConverterPlugin.get().toConnectData(msg.topic(), msg.headers(), msg.key());</span>
+            }
+<span class="fc" id="L556">        }, Stage.KEY_CONVERTER, keyConverterPlugin.get().getClass());</span>
+
+<span class="fc" id="L558">        SchemaAndValue valueAndSchema = retryWithToleranceOperator.execute(context, () -&gt; {</span>
+<span class="fc" id="L559">            try (LoaderSwap swap = pluginLoaderSwapper.apply(valueConverterPlugin.get().getClass().getClassLoader())) {</span>
+<span class="fc" id="L560">                return valueConverterPlugin.get().toConnectData(msg.topic(), msg.headers(), msg.value());</span>
+            }
+<span class="fc" id="L562">        }, Stage.VALUE_CONVERTER, valueConverterPlugin.get().getClass());</span>
+
+<span class="fc" id="L564">        Headers headers = retryWithToleranceOperator.execute(context, () -&gt; convertHeadersFor(msg), Stage.HEADER_CONVERTER, headerConverterPlugin.get().getClass());</span>
+
+<span class="pc bpc" id="L566" title="1 of 2 branches missed.">        if (context.failed()) {</span>
+<span class="nc" id="L567">            return null;</span>
+        }
+
+<span class="fc" id="L570">        Long timestamp = ConnectUtils.checkAndConvertTimestamp(msg.timestamp());</span>
+<span class="fc" id="L571">        SinkRecord origRecord = new SinkRecord(msg.topic(), msg.partition(),</span>
+<span class="fc" id="L572">                keyAndSchema.schema(), keyAndSchema.value(),</span>
+<span class="fc" id="L573">                valueAndSchema.schema(), valueAndSchema.value(),</span>
+<span class="fc" id="L574">                msg.offset(),</span>
+                timestamp,
+<span class="fc" id="L576">                msg.timestampType(),</span>
+                headers);
+<span class="fc" id="L578">        log.trace(&quot;{} Applying transformations to record in topic '{}' partition {} at offset {} and timestamp {} with key {} and value {}&quot;,</span>
+<span class="fc" id="L579">                this, msg.topic(), msg.partition(), msg.offset(), timestamp, keyAndSchema.value(), valueAndSchema.value());</span>
+<span class="pc bpc" id="L580" title="1 of 2 branches missed.">        if (isTopicTrackingEnabled) {</span>
+<span class="fc" id="L581">            recordActiveTopic(origRecord.topic());</span>
+        }
+
+        // Apply the transformations
+<span class="fc" id="L585">        SinkRecord transformedRecord = transformationChain.apply(context, origRecord);</span>
+<span class="pc bpc" id="L586" title="1 of 2 branches missed.">        if (transformedRecord == null) {</span>
+<span class="nc" id="L587">            return null;</span>
+        }
+        // Error reporting will need to correlate each sink record with the original consumer record
+<span class="fc" id="L590">        return new InternalSinkRecord(context, transformedRecord);</span>
+    }
+
+    private Headers convertHeadersFor(ConsumerRecord&lt;byte[], byte[]&gt; record) {
+<span class="fc" id="L594">        Headers result = new ConnectHeaders();</span>
+<span class="fc" id="L595">        org.apache.kafka.common.header.Headers recordHeaders = record.headers();</span>
+<span class="pc bpc" id="L596" title="1 of 2 branches missed.">        if (recordHeaders != null) {</span>
+<span class="fc" id="L597">            String topic = record.topic();</span>
+<span class="pc bpc" id="L598" title="1 of 2 branches missed.">            for (org.apache.kafka.common.header.Header recordHeader : recordHeaders) {</span>
+<span class="nc" id="L599">                try (LoaderSwap swap = pluginLoaderSwapper.apply(headerConverterPlugin.get().getClass().getClassLoader())) {</span>
+<span class="nc" id="L600">                    SchemaAndValue schemaAndValue = headerConverterPlugin.get().toConnectHeader(topic, recordHeader.key(), recordHeader.value());</span>
+<span class="nc" id="L601">                    result.add(recordHeader.key(), schemaAndValue);</span>
+                }
+<span class="nc" id="L603">            }</span>
+        }
+<span class="fc" id="L605">        return result;</span>
+    }
+
+    protected WorkerErrantRecordReporter workerErrantRecordReporter() {
+<span class="nc" id="L609">        return workerErrantRecordReporter;</span>
+    }
+
+    private void resumeAll() {
+<span class="nc bnc" id="L613" title="All 2 branches missed.">        for (TopicPartition tp : consumer.assignment())</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">            if (!context.pausedPartitions().contains(tp))</span>
+<span class="nc" id="L615">                consumer.resume(Set.of(tp));</span>
+<span class="nc" id="L616">    }</span>
+
+    private void pauseAll() {
+<span class="nc" id="L619">        consumer.pause(consumer.assignment());</span>
+<span class="nc" id="L620">    }</span>
+
+    private void deliverMessages() {
+        // Finally, deliver this batch to the sink
+        try {
+            // Since we reuse the messageBatch buffer, ensure we give the task its own copy
+<span class="fc" id="L626">            log.trace(&quot;{} Delivering batch of {} messages to task&quot;, this, messageBatch.size());</span>
+<span class="fc" id="L627">            long start = time.milliseconds();</span>
+<span class="fc" id="L628">            task.put(new ArrayList&lt;&gt;(messageBatch));</span>
+            // if errors raised from the operator were swallowed by the task implementation, an
+            // exception needs to be thrown to kill the task indicating the tolerance was exceeded
+<span class="pc bpc" id="L631" title="1 of 2 branches missed.">            if (workerErrantRecordReporter != null) {</span>
+<span class="nc" id="L632">                workerErrantRecordReporter.maybeThrowAsyncError();</span>
+            }
+<span class="fc" id="L634">            recordBatch(messageBatch.size());</span>
+<span class="fc" id="L635">            sinkTaskMetricsGroup.recordPut(time.milliseconds() - start);</span>
+<span class="fc" id="L636">            currentOffsets.putAll(origOffsets);</span>
+<span class="fc" id="L637">            origOffsets.clear();</span>
+<span class="fc" id="L638">            messageBatch.clear();</span>
+            // If we had paused all consumer topic partitions to try to redeliver data, then we should resume any that
+            // the task had not explicitly paused
+<span class="pc bpc" id="L641" title="1 of 2 branches missed.">            if (pausedForRedelivery) {</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">                if (!shouldPause())</span>
+<span class="nc" id="L643">                    resumeAll();</span>
+<span class="nc" id="L644">                pausedForRedelivery = false;</span>
+            }
+<span class="nc" id="L646">        } catch (RetriableException e) {</span>
+<span class="nc" id="L647">            log.error(&quot;{} RetriableException from SinkTask:&quot;, this, e);</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">            if (!pausedForRedelivery) {</span>
+                // If we're retrying a previous batch, make sure we've paused all topic partitions so we don't get new data,
+                // but will still be able to poll in order to handle user-requested timeouts, keep group membership, etc.
+<span class="nc" id="L651">                pausedForRedelivery = true;</span>
+<span class="nc" id="L652">                pauseAll();</span>
+            }
+            // Let this exit normally, the batch will be reprocessed on the next loop.
+<span class="nc" id="L655">        } catch (Throwable t) {</span>
+<span class="nc" id="L656">            log.error(&quot;{} Task threw an uncaught and unrecoverable exception. Task is being killed and will not &quot;</span>
+<span class="nc" id="L657">                    + &quot;recover until manually restarted. Error: {}&quot;, this, t.getMessage(), t);</span>
+<span class="nc" id="L658">            throw new ConnectException(&quot;Exiting WorkerSinkTask due to unrecoverable exception.&quot;, t);</span>
+<span class="pc" id="L659">        }</span>
+<span class="fc" id="L660">    }</span>
+
+    private void rewind() {
+<span class="fc" id="L663">        Map&lt;TopicPartition, Long&gt; offsets = context.offsets();</span>
+<span class="pc bpc" id="L664" title="1 of 2 branches missed.">        if (offsets.isEmpty()) {</span>
+<span class="fc" id="L665">            return;</span>
+        }
+<span class="nc bnc" id="L667" title="All 2 branches missed.">        for (Map.Entry&lt;TopicPartition, Long&gt; entry: offsets.entrySet()) {</span>
+<span class="nc" id="L668">            TopicPartition tp = entry.getKey();</span>
+<span class="nc" id="L669">            Long offset = entry.getValue();</span>
+<span class="nc bnc" id="L670" title="All 2 branches missed.">            if (offset != null) {</span>
+<span class="nc" id="L671">                log.trace(&quot;{} Rewind {} to offset {}&quot;, this, tp, offset);</span>
+<span class="nc" id="L672">                consumer.seek(tp, offset);</span>
+<span class="nc" id="L673">                lastCommittedOffsets.put(tp, new OffsetAndMetadata(offset));</span>
+<span class="nc" id="L674">                currentOffsets.put(tp, new OffsetAndMetadata(offset));</span>
+            } else {
+<span class="nc" id="L676">                log.warn(&quot;{} Cannot rewind {} to null offset&quot;, this, tp);</span>
+            }
+<span class="nc" id="L678">        }</span>
+<span class="nc" id="L679">        context.clearOffsets();</span>
+<span class="nc" id="L680">    }</span>
+
+    private void openPartitions(Collection&lt;TopicPartition&gt; partitions) {
+<span class="fc" id="L683">        task.open(partitions);</span>
+<span class="fc" id="L684">    }</span>
+
+    private void closeAllPartitions() {
+<span class="fc" id="L687">        closePartitions(currentOffsets.keySet(), false);</span>
+<span class="fc" id="L688">    }</span>
+
+    private void closePartitions(Collection&lt;TopicPartition&gt; topicPartitions, boolean lost) {
+<span class="pc bpc" id="L691" title="1 of 2 branches missed.">        if (!lost) {</span>
+<span class="fc" id="L692">            commitOffsets(time.milliseconds(), true, topicPartitions);</span>
+        } else {
+<span class="nc" id="L694">            log.trace(&quot;{} Closing the task as partitions have been lost: {}&quot;, this, topicPartitions);</span>
+<span class="nc" id="L695">            task.close(topicPartitions);</span>
+<span class="nc bnc" id="L696" title="All 2 branches missed.">            if (workerErrantRecordReporter != null) {</span>
+<span class="nc" id="L697">                log.trace(&quot;Cancelling reported errors for {}&quot;, topicPartitions);</span>
+<span class="nc" id="L698">                workerErrantRecordReporter.cancelFutures(topicPartitions);</span>
+<span class="nc" id="L699">                log.trace(&quot;Cancelled all reported errors for {}&quot;, topicPartitions);</span>
+            }
+<span class="nc" id="L701">            origOffsets.keySet().removeAll(topicPartitions);</span>
+<span class="nc" id="L702">            currentOffsets.keySet().removeAll(topicPartitions);</span>
+        }
+<span class="fc" id="L704">        lastCommittedOffsets.keySet().removeAll(topicPartitions);</span>
+<span class="fc" id="L705">    }</span>
+
+    private void updatePartitionCount() {
+<span class="fc" id="L708">        sinkTaskMetricsGroup.recordPartitionCount(consumer.assignment().size());</span>
+<span class="fc" id="L709">    }</span>
+
+    @Override
+    protected void recordBatch(int size) {
+<span class="fc" id="L713">        super.recordBatch(size);</span>
+<span class="fc" id="L714">        sinkTaskMetricsGroup.recordSend(size);</span>
+<span class="fc" id="L715">    }</span>
+
+    @Override
+    protected void recordCommitSuccess(long duration) {
+<span class="fc" id="L719">        super.recordCommitSuccess(duration);</span>
+<span class="fc" id="L720">        sinkTaskMetricsGroup.recordOffsetCommitSuccess();</span>
+<span class="fc" id="L721">    }</span>
+
+    SinkTaskMetricsGroup sinkTaskMetricsGroup() {
+<span class="nc" id="L724">        return sinkTaskMetricsGroup;</span>
+    }
+
+    // Visible for testing
+    long getNextCommit() {
+<span class="nc" id="L729">        return nextCommit;</span>
+    }
+
+<span class="fc" id="L732">    private class HandleRebalance implements ConsumerRebalanceListener {</span>
+        @Override
+        public void onPartitionsAssigned(Collection&lt;TopicPartition&gt; partitions) {
+<span class="fc" id="L735">            log.debug(&quot;{} Partitions assigned {}&quot;, WorkerSinkTask.this, partitions);</span>
+
+<span class="fc bfc" id="L737" title="All 2 branches covered.">            for (TopicPartition tp : partitions) {</span>
+<span class="fc" id="L738">                long pos = consumer.position(tp);</span>
+<span class="fc" id="L739">                lastCommittedOffsets.put(tp, new OffsetAndMetadata(pos));</span>
+<span class="fc" id="L740">                currentOffsets.put(tp, new OffsetAndMetadata(pos));</span>
+<span class="fc" id="L741">                log.debug(&quot;{} Assigned topic partition {} with offset {}&quot;, WorkerSinkTask.this, tp, pos);</span>
+<span class="fc" id="L742">            }</span>
+<span class="fc" id="L743">            sinkTaskMetricsGroup.assignedOffsets(currentOffsets);</span>
+
+<span class="fc" id="L745">            boolean wasPausedForRedelivery = pausedForRedelivery;</span>
+<span class="pc bpc" id="L746" title="3 of 4 branches missed.">            pausedForRedelivery = wasPausedForRedelivery &amp;&amp; !messageBatch.isEmpty();</span>
+<span class="pc bpc" id="L747" title="1 of 2 branches missed.">            if (pausedForRedelivery) {</span>
+                // Re-pause here in case we picked up new partitions in the rebalance
+<span class="nc" id="L749">                pauseAll();</span>
+            } else {
+                // If we paused everything for redelivery and all partitions for the failed deliveries have been revoked, make
+                // sure anything we paused that the task didn't request to be paused *and* which we still own is resumed.
+                // Also make sure our tracking of paused partitions is updated to remove any partitions we no longer own.
+<span class="pc bpc" id="L754" title="1 of 2 branches missed.">                if (wasPausedForRedelivery) {</span>
+<span class="nc" id="L755">                    resumeAll();</span>
+                }
+                // Ensure that the paused partitions contains only assigned partitions and repause as necessary
+<span class="fc" id="L758">                context.pausedPartitions().retainAll(consumer.assignment());</span>
+<span class="pc bpc" id="L759" title="1 of 2 branches missed.">                if (shouldPause())</span>
+<span class="nc" id="L760">                    pauseAll();</span>
+<span class="pc bpc" id="L761" title="1 of 2 branches missed.">                else if (!context.pausedPartitions().isEmpty())</span>
+<span class="nc" id="L762">                    consumer.pause(context.pausedPartitions());</span>
+            }
+<span class="fc" id="L764">            updatePartitionCount();</span>
+<span class="pc bpc" id="L765" title="1 of 2 branches missed.">            if (partitions.isEmpty()) {</span>
+<span class="nc" id="L766">                return;</span>
+            }
+
+            // Instead of invoking the assignment callback on initialization, we guarantee the consumer is ready upon
+            // task start. Since this callback gets invoked during that initial setup before we've started the task, we
+            // need to guard against invoking the user's callback method during that period.
+<span class="pc bpc" id="L772" title="3 of 4 branches missed.">            if (rebalanceException == null || rebalanceException instanceof WakeupException) {</span>
+                try {
+<span class="fc" id="L774">                    openPartitions(partitions);</span>
+                    // Rewind should be applied only if openPartitions succeeds.
+<span class="fc" id="L776">                    rewind();</span>
+<span class="nc" id="L777">                } catch (RuntimeException e) {</span>
+                    // The consumer swallows exceptions raised in the rebalance listener, so we need to store
+                    // exceptions and rethrow when poll() returns.
+<span class="nc" id="L780">                    rebalanceException = e;</span>
+<span class="fc" id="L781">                }</span>
+            }
+<span class="fc" id="L783">        }</span>
+
+        @Override
+        public void onPartitionsRevoked(Collection&lt;TopicPartition&gt; partitions) {
+<span class="fc" id="L787">            onPartitionsRemoved(partitions, false);</span>
+<span class="fc" id="L788">        }</span>
+
+        @Override
+        public void onPartitionsLost(Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L792">            onPartitionsRemoved(partitions, true);</span>
+<span class="nc" id="L793">        }</span>
+
+        private void onPartitionsRemoved(Collection&lt;TopicPartition&gt; partitions, boolean lost) {
+<span class="pc bpc" id="L796" title="1 of 2 branches missed.">            if (taskStopped) {</span>
+<span class="fc" id="L797">                log.trace(&quot;Skipping partition revocation callback as task has already been stopped&quot;);</span>
+<span class="fc" id="L798">                return;</span>
+            }
+<span class="nc bnc" id="L800" title="All 2 branches missed.">            log.debug(&quot;{} Partitions {}: {}&quot;, WorkerSinkTask.this, lost ? &quot;lost&quot; : &quot;revoked&quot;, partitions);</span>
+
+<span class="nc bnc" id="L802" title="All 2 branches missed.">            if (partitions.isEmpty())</span>
+<span class="nc" id="L803">                return;</span>
+
+            try {
+<span class="nc" id="L806">                closePartitions(partitions, lost);</span>
+<span class="nc" id="L807">                sinkTaskMetricsGroup.clearOffsets(partitions);</span>
+<span class="nc" id="L808">            } catch (RuntimeException e) {</span>
+                // The consumer swallows exceptions raised in the rebalance listener, so we need to store
+                // exceptions and rethrow when poll() returns.
+<span class="nc" id="L811">                rebalanceException = e;</span>
+<span class="nc" id="L812">            }</span>
+
+            // Make sure we don't have any leftover data since offsets for these partitions will be reset to committed positions
+<span class="nc" id="L815">            messageBatch.removeIf(record -&gt; partitions.contains(new TopicPartition(record.topic(), record.kafkaPartition())));</span>
+<span class="nc" id="L816">        }</span>
+    }
+
+    static class SinkTaskMetricsGroup {
+        private final MetricGroup metricGroup;
+        private final Sensor sinkRecordRead;
+        private final Sensor sinkRecordSend;
+        private final Sensor partitionCount;
+        private final Sensor offsetSeqNum;
+        private final Sensor offsetCompletion;
+        private final Sensor offsetCompletionSkip;
+        private final Sensor putBatchTime;
+        private final Sensor sinkRecordActiveCount;
+<span class="fc" id="L829">        private Map&lt;TopicPartition, OffsetAndMetadata&gt; consumedOffsets = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L830">        private Map&lt;TopicPartition, OffsetAndMetadata&gt; committedOffsets = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L832">        public SinkTaskMetricsGroup(ConnectorTaskId id, ConnectMetrics connectMetrics) {</span>
+
+<span class="fc" id="L834">            ConnectMetricsRegistry registry = connectMetrics.registry();</span>
+<span class="fc" id="L835">            metricGroup = connectMetrics</span>
+<span class="fc" id="L836">                                  .group(registry.sinkTaskGroupName(), registry.connectorTagName(), id.connector(), registry.taskTagName(),</span>
+<span class="fc" id="L837">                                         Integer.toString(id.task()));</span>
+            // prevent collisions by removing any previously created metrics in this group.
+<span class="fc" id="L839">            metricGroup.close();</span>
+
+<span class="fc" id="L841">            sinkRecordRead = metricGroup.sensor(&quot;sink-record-read&quot;);</span>
+<span class="fc" id="L842">            sinkRecordRead.add(metricGroup.metricName(registry.sinkRecordReadRate), new Rate());</span>
+<span class="fc" id="L843">            sinkRecordRead.add(metricGroup.metricName(registry.sinkRecordReadTotal), new CumulativeSum());</span>
+
+<span class="fc" id="L845">            sinkRecordSend = metricGroup.sensor(&quot;sink-record-send&quot;);</span>
+<span class="fc" id="L846">            sinkRecordSend.add(metricGroup.metricName(registry.sinkRecordSendRate), new Rate());</span>
+<span class="fc" id="L847">            sinkRecordSend.add(metricGroup.metricName(registry.sinkRecordSendTotal), new CumulativeSum());</span>
+
+<span class="fc" id="L849">            sinkRecordActiveCount = metricGroup.sensor(&quot;sink-record-active-count&quot;);</span>
+<span class="fc" id="L850">            sinkRecordActiveCount.add(metricGroup.metricName(registry.sinkRecordActiveCount), new Value());</span>
+<span class="fc" id="L851">            sinkRecordActiveCount.add(metricGroup.metricName(registry.sinkRecordActiveCountMax), new Max());</span>
+<span class="fc" id="L852">            sinkRecordActiveCount.add(metricGroup.metricName(registry.sinkRecordActiveCountAvg), new Avg());</span>
+
+<span class="fc" id="L854">            partitionCount = metricGroup.sensor(&quot;partition-count&quot;);</span>
+<span class="fc" id="L855">            partitionCount.add(metricGroup.metricName(registry.sinkRecordPartitionCount), new Value());</span>
+
+<span class="fc" id="L857">            offsetSeqNum = metricGroup.sensor(&quot;offset-seq-number&quot;);</span>
+<span class="fc" id="L858">            offsetSeqNum.add(metricGroup.metricName(registry.sinkRecordOffsetCommitSeqNum), new Value());</span>
+
+<span class="fc" id="L860">            offsetCompletion = metricGroup.sensor(&quot;offset-commit-completion&quot;);</span>
+<span class="fc" id="L861">            offsetCompletion.add(metricGroup.metricName(registry.sinkRecordOffsetCommitCompletionRate), new Rate());</span>
+<span class="fc" id="L862">            offsetCompletion.add(metricGroup.metricName(registry.sinkRecordOffsetCommitCompletionTotal), new CumulativeSum());</span>
+
+<span class="fc" id="L864">            offsetCompletionSkip = metricGroup.sensor(&quot;offset-commit-completion-skip&quot;);</span>
+<span class="fc" id="L865">            offsetCompletionSkip.add(metricGroup.metricName(registry.sinkRecordOffsetCommitSkipRate), new Rate());</span>
+<span class="fc" id="L866">            offsetCompletionSkip.add(metricGroup.metricName(registry.sinkRecordOffsetCommitSkipTotal), new CumulativeSum());</span>
+
+<span class="fc" id="L868">            putBatchTime = metricGroup.sensor(&quot;put-batch-time&quot;);</span>
+<span class="fc" id="L869">            putBatchTime.add(metricGroup.metricName(registry.sinkRecordPutBatchTimeMax), new Max());</span>
+<span class="fc" id="L870">            putBatchTime.add(metricGroup.metricName(registry.sinkRecordPutBatchTimeAvg), new Avg());</span>
+<span class="fc" id="L871">        }</span>
+
+        void computeSinkRecordLag() {
+<span class="fc" id="L874">            Map&lt;TopicPartition, OffsetAndMetadata&gt; consumed = this.consumedOffsets;</span>
+<span class="fc" id="L875">            Map&lt;TopicPartition, OffsetAndMetadata&gt; committed = this.committedOffsets;</span>
+<span class="fc" id="L876">            long activeRecords = 0L;</span>
+<span class="fc bfc" id="L877" title="All 2 branches covered.">            for (Map.Entry&lt;TopicPartition, OffsetAndMetadata&gt; committedOffsetEntry : committed.entrySet()) {</span>
+<span class="fc" id="L878">                final TopicPartition partition = committedOffsetEntry.getKey();</span>
+<span class="fc" id="L879">                final OffsetAndMetadata consumedOffsetMeta = consumed.get(partition);</span>
+<span class="pc bpc" id="L880" title="1 of 2 branches missed.">                if (consumedOffsetMeta != null) {</span>
+<span class="fc" id="L881">                    final OffsetAndMetadata committedOffsetMeta = committedOffsetEntry.getValue();</span>
+<span class="fc" id="L882">                    long consumedOffset = consumedOffsetMeta.offset();</span>
+<span class="fc" id="L883">                    long committedOffset = committedOffsetMeta.offset();</span>
+<span class="fc" id="L884">                    long diff = consumedOffset - committedOffset;</span>
+                    // Connector tasks can return offsets, so make sure nothing wonky happens
+<span class="fc" id="L886">                    activeRecords += Math.max(diff, 0L);</span>
+                }
+<span class="fc" id="L888">            }</span>
+<span class="fc" id="L889">            sinkRecordActiveCount.record(activeRecords);</span>
+<span class="fc" id="L890">        }</span>
+
+        void close() {
+<span class="fc" id="L893">            metricGroup.close();</span>
+<span class="fc" id="L894">        }</span>
+
+        void recordRead(int batchSize) {
+<span class="fc" id="L897">            sinkRecordRead.record(batchSize);</span>
+<span class="fc" id="L898">        }</span>
+
+        void recordSend(int batchSize) {
+<span class="fc" id="L901">            sinkRecordSend.record(batchSize);</span>
+<span class="fc" id="L902">        }</span>
+
+        void recordPut(long duration) {
+<span class="fc" id="L905">            putBatchTime.record(duration);</span>
+<span class="fc" id="L906">        }</span>
+
+        void recordPartitionCount(int assignedPartitionCount) {
+<span class="fc" id="L909">            partitionCount.record(assignedPartitionCount);</span>
+<span class="fc" id="L910">        }</span>
+
+        void recordOffsetSequenceNumber(int seqNum) {
+<span class="fc" id="L913">            offsetSeqNum.record(seqNum);</span>
+<span class="fc" id="L914">        }</span>
+
+        void recordConsumedOffsets(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets) {
+<span class="fc" id="L917">            consumedOffsets.putAll(offsets);</span>
+<span class="fc" id="L918">            computeSinkRecordLag();</span>
+<span class="fc" id="L919">        }</span>
+
+        void recordCommittedOffsets(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets) {
+<span class="fc" id="L922">            committedOffsets = offsets;</span>
+<span class="fc" id="L923">            computeSinkRecordLag();</span>
+<span class="fc" id="L924">        }</span>
+
+        void assignedOffsets(Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets) {
+<span class="fc" id="L927">            consumedOffsets = new HashMap&lt;&gt;(offsets);</span>
+<span class="fc" id="L928">            committedOffsets = offsets;</span>
+<span class="fc" id="L929">            computeSinkRecordLag();</span>
+<span class="fc" id="L930">        }</span>
+
+        void clearOffsets(Collection&lt;TopicPartition&gt; topicPartitions) {
+<span class="nc" id="L933">            consumedOffsets.keySet().removeAll(topicPartitions);</span>
+<span class="nc" id="L934">            committedOffsets.keySet().removeAll(topicPartitions);</span>
+<span class="nc" id="L935">            computeSinkRecordLag();</span>
+<span class="nc" id="L936">        }</span>
+
+        void recordOffsetCommitSuccess() {
+<span class="fc" id="L939">            offsetCompletion.record(1.0);</span>
+<span class="fc" id="L940">        }</span>
+
+        void recordOffsetCommitSkip() {
+<span class="nc" id="L943">            offsetCompletionSkip.record(1.0);</span>
+<span class="nc" id="L944">        }</span>
+
+        protected MetricGroup metricGroup() {
+<span class="nc" id="L947">            return metricGroup;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

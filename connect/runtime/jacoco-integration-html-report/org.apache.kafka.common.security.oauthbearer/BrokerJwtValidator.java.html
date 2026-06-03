@@ -1,0 +1,207 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BrokerJwtValidator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.security.oauthbearer</a> &gt; <span class="el_source">BrokerJwtValidator.java</span></div><h1>BrokerJwtValidator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.common.security.oauthbearer;
+
+import org.apache.kafka.common.security.oauthbearer.internals.secured.BasicOAuthBearerToken;
+import org.apache.kafka.common.security.oauthbearer.internals.secured.ClaimValidationUtils;
+import org.apache.kafka.common.security.oauthbearer.internals.secured.CloseableVerificationKeyResolver;
+import org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtils;
+import org.apache.kafka.common.security.oauthbearer.internals.secured.SerializedJwt;
+import org.apache.kafka.common.security.oauthbearer.internals.secured.VerificationKeyResolverFactory;
+
+import org.jose4j.jwt.JwtClaims;
+import org.jose4j.jwt.MalformedClaimException;
+import org.jose4j.jwt.NumericDate;
+import org.jose4j.jwt.ReservedClaimNames;
+import org.jose4j.jwt.consumer.InvalidJwtException;
+import org.jose4j.jwt.consumer.JwtConsumer;
+import org.jose4j.jwt.consumer.JwtConsumerBuilder;
+import org.jose4j.jwt.consumer.JwtContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
+import javax.security.auth.login.AppConfigurationEntry;
+
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_CLOCK_SKEW_SECONDS;
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_EXPECTED_AUDIENCE;
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_EXPECTED_ISSUER;
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_SCOPE_CLAIM_NAME;
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_SUB_CLAIM_NAME;
+import static org.jose4j.jwa.AlgorithmConstraints.DISALLOW_NONE;
+
+/**
+ * {@code BrokerJwtValidator} is an implementation of {@link JwtValidator} that is used
+ * by the broker to perform more extensive validation of the JWT access token that is received
+ * from the client, but ultimately from posting the client credentials to the OAuth/OIDC provider's
+ * token endpoint.
+ *
+ * The validation steps performed (primarily by the jose4j library) are:
+ *
+ * &lt;ol&gt;
+ *     &lt;li&gt;
+ *         Basic structural validation of the &lt;code&gt;b64token&lt;/code&gt; value as defined in
+ *         &lt;a href=&quot;https://tools.ietf.org/html/rfc6750#section-2.1&quot;&gt;RFC 6750 Section 2.1&lt;/a&gt;
+ *     &lt;/li&gt;
+ *     &lt;li&gt;
+ *         Basic conversion of the token into an in-memory data structure
+ *     &lt;/li&gt;
+ *     &lt;li&gt;
+ *         Presence of &lt;code&gt;scope&lt;/code&gt;, &lt;code&gt;exp&lt;/code&gt;, &lt;code&gt;subject&lt;/code&gt;, &lt;code&gt;iss&lt;/code&gt;, and
+ *         &lt;code&gt;iat&lt;/code&gt; claims
+ *     &lt;/li&gt;
+ *     &lt;li&gt;
+ *         Signature matching validation against the &lt;code&gt;kid&lt;/code&gt; and those provided by
+ *         the OAuth/OIDC provider's JWKS
+ *     &lt;/li&gt;
+ * &lt;/ol&gt;
+ */
+public class BrokerJwtValidator implements JwtValidator {
+
+<span class="nc" id="L82">    private static final Logger log = LoggerFactory.getLogger(BrokerJwtValidator.class);</span>
+
+    private final Optional&lt;CloseableVerificationKeyResolver&gt; verificationKeyResolverOpt;
+
+    private JwtConsumer jwtConsumer;
+
+    private String scopeClaimName;
+
+    private String subClaimName;
+
+    /**
+     * A public, no-args constructor is necessary for instantiation via configuration.
+     */
+<span class="nc" id="L95">    public BrokerJwtValidator() {</span>
+<span class="nc" id="L96">        this.verificationKeyResolverOpt = Optional.empty();</span>
+<span class="nc" id="L97">    }</span>
+
+    /*
+     * Package-visible for testing.
+     */
+<span class="nc" id="L102">    BrokerJwtValidator(CloseableVerificationKeyResolver verificationKeyResolver) {</span>
+<span class="nc" id="L103">        this.verificationKeyResolverOpt = Optional.of(verificationKeyResolver);</span>
+<span class="nc" id="L104">    }</span>
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs, String saslMechanism, List&lt;AppConfigurationEntry&gt; jaasConfigEntries) {
+<span class="nc" id="L108">        ConfigurationUtils cu = new ConfigurationUtils(configs, saslMechanism);</span>
+<span class="nc" id="L109">        Set&lt;String&gt; expectedAudiences = Set.copyOf(cu.get(SASL_OAUTHBEARER_EXPECTED_AUDIENCE));</span>
+<span class="nc" id="L110">        Integer clockSkew = cu.validateInteger(SASL_OAUTHBEARER_CLOCK_SKEW_SECONDS, false);</span>
+<span class="nc" id="L111">        String expectedIssuer = cu.validateString(SASL_OAUTHBEARER_EXPECTED_ISSUER, false);</span>
+<span class="nc" id="L112">        String scopeClaimName = cu.validateString(SASL_OAUTHBEARER_SCOPE_CLAIM_NAME);</span>
+<span class="nc" id="L113">        String subClaimName = cu.validateString(SASL_OAUTHBEARER_SUB_CLAIM_NAME);</span>
+
+<span class="nc" id="L115">        CloseableVerificationKeyResolver verificationKeyResolver = verificationKeyResolverOpt.orElseGet(</span>
+<span class="nc" id="L116">            () -&gt; VerificationKeyResolverFactory.get(configs, saslMechanism, jaasConfigEntries)</span>
+        );
+
+<span class="nc" id="L119">        final JwtConsumerBuilder jwtConsumerBuilder = new JwtConsumerBuilder();</span>
+
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (clockSkew != null)</span>
+<span class="nc" id="L122">            jwtConsumerBuilder.setAllowedClockSkewInSeconds(clockSkew);</span>
+
+<span class="nc bnc" id="L124" title="All 2 branches missed.">        if (!expectedAudiences.isEmpty())</span>
+<span class="nc" id="L125">            jwtConsumerBuilder.setExpectedAudience(expectedAudiences.toArray(new String[0]));</span>
+
+<span class="nc bnc" id="L127" title="All 2 branches missed.">        if (expectedIssuer != null)</span>
+<span class="nc" id="L128">            jwtConsumerBuilder.setExpectedIssuer(expectedIssuer);</span>
+
+<span class="nc" id="L130">        this.jwtConsumer = jwtConsumerBuilder</span>
+<span class="nc" id="L131">            .setJwsAlgorithmConstraints(DISALLOW_NONE)</span>
+<span class="nc" id="L132">            .setRequireExpirationTime()</span>
+<span class="nc" id="L133">            .setRequireIssuedAt()</span>
+<span class="nc" id="L134">            .setVerificationKeyResolver(verificationKeyResolver)</span>
+<span class="nc" id="L135">            .build();</span>
+<span class="nc" id="L136">        this.scopeClaimName = scopeClaimName;</span>
+<span class="nc" id="L137">        this.subClaimName = subClaimName;</span>
+<span class="nc" id="L138">    }</span>
+
+    /**
+     * Accepts an OAuth JWT access token in base-64 encoded format, validates, and returns an
+     * OAuthBearerToken.
+     *
+     * @param accessToken Non-&lt;code&gt;null&lt;/code&gt; JWT access token
+     * @return {@link OAuthBearerToken}
+     * @throws JwtValidatorException Thrown on errors performing validation of given token
+     */
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public OAuthBearerToken validate(String accessToken) throws JwtValidatorException {
+<span class="nc" id="L151">        SerializedJwt serializedJwt = new SerializedJwt(accessToken);</span>
+
+        JwtContext jwt;
+
+        try {
+<span class="nc" id="L156">            jwt = jwtConsumer.process(serializedJwt.getToken());</span>
+<span class="nc" id="L157">        } catch (InvalidJwtException e) {</span>
+<span class="nc" id="L158">            throw new JwtValidatorException(String.format(&quot;Could not validate the access token: %s&quot;, e.getMessage()), e);</span>
+<span class="nc" id="L159">        }</span>
+
+<span class="nc" id="L161">        JwtClaims claims = jwt.getJwtClaims();</span>
+
+<span class="nc" id="L163">        Object scopeRaw = getClaim(() -&gt; claims.getClaimValue(scopeClaimName), scopeClaimName);</span>
+        Collection&lt;String&gt; scopeRawCollection;
+
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        if (scopeRaw instanceof String)</span>
+<span class="nc" id="L167">            scopeRawCollection = Collections.singletonList((String) scopeRaw);</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        else if (scopeRaw instanceof Collection)</span>
+<span class="nc" id="L169">            scopeRawCollection = (Collection&lt;String&gt;) scopeRaw;</span>
+        else
+<span class="nc" id="L171">            scopeRawCollection = Collections.emptySet();</span>
+
+<span class="nc" id="L173">        NumericDate expirationRaw = getClaim(claims::getExpirationTime, ReservedClaimNames.EXPIRATION_TIME);</span>
+<span class="nc" id="L174">        String subRaw = getClaim(() -&gt; claims.getStringClaimValue(subClaimName), subClaimName);</span>
+<span class="nc" id="L175">        NumericDate issuedAtRaw = getClaim(claims::getIssuedAt, ReservedClaimNames.ISSUED_AT);</span>
+
+<span class="nc" id="L177">        Set&lt;String&gt; scopes = ClaimValidationUtils.validateScopes(scopeClaimName, scopeRawCollection);</span>
+<span class="nc" id="L178">        long expiration = ClaimValidationUtils.validateExpiration(ReservedClaimNames.EXPIRATION_TIME,</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">            expirationRaw != null ? expirationRaw.getValueInMillis() : null);</span>
+<span class="nc" id="L180">        String sub = ClaimValidationUtils.validateSubject(subClaimName, subRaw);</span>
+<span class="nc" id="L181">        Long issuedAt = ClaimValidationUtils.validateIssuedAt(ReservedClaimNames.ISSUED_AT,</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">            issuedAtRaw != null ? issuedAtRaw.getValueInMillis() : null);</span>
+
+<span class="nc" id="L184">        return new BasicOAuthBearerToken(accessToken,</span>
+            scopes,
+            expiration,
+            sub,
+            issuedAt);
+    }
+
+    private &lt;T&gt; T getClaim(ClaimSupplier&lt;T&gt; supplier, String claimName) throws JwtValidatorException {
+        try {
+<span class="nc" id="L193">            T value = supplier.get();</span>
+<span class="nc" id="L194">            log.debug(&quot;getClaim - {}: {}&quot;, claimName, value);</span>
+<span class="nc" id="L195">            return value;</span>
+<span class="nc" id="L196">        } catch (MalformedClaimException e) {</span>
+<span class="nc" id="L197">            throw new JwtValidatorException(String.format(&quot;Could not extract the '%s' claim from the access token&quot;, claimName), e);</span>
+        }
+    }
+
+    public interface ClaimSupplier&lt;T&gt; {
+
+        T get() throws MalformedClaimException;
+
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

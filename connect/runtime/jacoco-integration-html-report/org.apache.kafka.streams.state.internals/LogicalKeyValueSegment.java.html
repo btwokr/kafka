@@ -1,0 +1,374 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LogicalKeyValueSegment.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">LogicalKeyValueSegment.java</span></div><h1>LogicalKeyValueSegment.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.BytesSerializer;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.internals.RocksDBVersionedStore.VersionedStoreSegment;
+
+import org.rocksdb.ReadOptions;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.Snapshot;
+import org.rocksdb.WriteBatchInterface;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.streams.state.internals.RocksDBStore.incrementWithoutOverflow;
+
+/**
+ * This &quot;logical segment&quot; is a segment which shares its underlying physical store with other
+ * logical segments. Each segment uses a unique, fixed-length key prefix derived from the
+ * segment ID when writing to the shared physical store. In other words, a logical segment
+ * stores a key into a shared physical store by prepending the key with a prefix (unique to
+ * the specific logical segment), and storing the combined key into the physical store.
+ */
+public class LogicalKeyValueSegment implements Segment, VersionedStoreSegment {
+<span class="nc" id="L57">    private static final Logger log = LoggerFactory.getLogger(LogicalKeyValueSegment.class);</span>
+
+    private final long id;
+    private final String name;
+    private final RocksDBStore physicalStore;
+    private final PrefixKeyFormatter prefixKeyFormatter;
+
+<span class="nc" id="L64">    final Set&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; openIterators = Collections.synchronizedSet(new HashSet&lt;&gt;());</span>
+
+    LogicalKeyValueSegment(final long id,
+                           final String name,
+<span class="nc" id="L68">                           final RocksDBStore physicalStore) {</span>
+<span class="nc" id="L69">        this.id = id;</span>
+<span class="nc" id="L70">        this.name = name;</span>
+<span class="nc" id="L71">        this.physicalStore = Objects.requireNonNull(physicalStore);</span>
+
+<span class="nc" id="L73">        this.prefixKeyFormatter = new PrefixKeyFormatter(serializeLongToBytes(id));</span>
+<span class="nc" id="L74">    }</span>
+
+    @Override
+    public long id() {
+<span class="nc" id="L78">        return id;</span>
+    }
+
+    @Override
+    public synchronized void destroy() {
+<span class="nc bnc" id="L83" title="All 2 branches missed.">        if (id &lt; 0) {</span>
+<span class="nc" id="L84">            throw new IllegalStateException(&quot;Negative segment ID indicates a reserved segment, &quot;</span>
+                + &quot;which should not be destroyed. Reserved segments are cleaned up only when &quot;
+                + &quot;an entire store is closed, via the close() method rather than destroy().&quot;);
+        }
+
+<span class="nc" id="L89">        final Bytes keyPrefix = prefixKeyFormatter.prefix();</span>
+
+        // this deleteRange() call deletes all entries with the given prefix, because the
+        // deleteRange() implementation calls Bytes.increment() in order to make keyTo inclusive
+<span class="nc" id="L93">        physicalStore.deleteRange(keyPrefix, keyPrefix);</span>
+<span class="nc" id="L94">    }</span>
+
+    @Override
+    public synchronized void deleteRange(final Bytes keyFrom, final Bytes keyTo) {
+<span class="nc" id="L98">        physicalStore.deleteRange(</span>
+<span class="nc" id="L99">            prefixKeyFormatter.addPrefix(keyFrom),</span>
+<span class="nc" id="L100">            prefixKeyFormatter.addPrefix(keyTo));</span>
+<span class="nc" id="L101">    }</span>
+
+    @Override
+    public synchronized void put(final Bytes key, final byte[] value) {
+<span class="nc" id="L105">        physicalStore.put(</span>
+<span class="nc" id="L106">            prefixKeyFormatter.addPrefix(key),</span>
+            value);
+<span class="nc" id="L108">    }</span>
+
+    @Override
+    public synchronized byte[] putIfAbsent(final Bytes key, final byte[] value) {
+<span class="nc" id="L112">        return physicalStore.putIfAbsent(</span>
+<span class="nc" id="L113">            prefixKeyFormatter.addPrefix(key),</span>
+            value);
+    }
+
+    @Override
+    public synchronized void putAll(final List&lt;KeyValue&lt;Bytes, byte[]&gt;&gt; entries) {
+<span class="nc" id="L119">        physicalStore.putAll(entries.stream()</span>
+<span class="nc" id="L120">            .map(kv -&gt; new KeyValue&lt;&gt;(</span>
+<span class="nc" id="L121">                prefixKeyFormatter.addPrefix(kv.key),</span>
+                kv.value))
+<span class="nc" id="L123">            .collect(Collectors.toList()));</span>
+<span class="nc" id="L124">    }</span>
+
+    @Override
+    public synchronized byte[] delete(final Bytes key) {
+<span class="nc" id="L128">        return physicalStore.delete(prefixKeyFormatter.addPrefix(key));</span>
+    }
+
+    @Override
+    public String name() {
+<span class="nc" id="L133">        return name;</span>
+    }
+
+    @Override
+    public void init(final StateStoreContext stateStoreContext, final StateStore root) {
+<span class="nc" id="L138">        throw new UnsupportedOperationException(&quot;cannot initialize a logical segment&quot;);</span>
+    }
+
+    @Override
+    public void commit(final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc" id="L143">        throw new UnsupportedOperationException(&quot;nothing to commit for logical segment&quot;);</span>
+    }
+
+    @Override
+    public void writePosition() {
+<span class="nc" id="L148">        physicalStore.writePosition();</span>
+<span class="nc" id="L149">    }</span>
+
+    @Override
+    public synchronized void close() {
+        // close open iterators
+        final HashSet&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; iterators;
+<span class="nc" id="L155">        synchronized (openIterators) {</span>
+<span class="nc" id="L156">            iterators = new HashSet&lt;&gt;(openIterators);</span>
+<span class="nc" id="L157">            openIterators.clear();</span>
+<span class="nc" id="L158">        }</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if (!iterators.isEmpty()) {</span>
+<span class="nc" id="L160">            log.warn(&quot;Closing {} open iterators for store {}&quot;, iterators.size(), name);</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">            for (final KeyValueIterator&lt;Bytes, byte[]&gt; iterator : iterators) {</span>
+<span class="nc" id="L162">                iterator.close();</span>
+<span class="nc" id="L163">            }</span>
+        }
+<span class="nc" id="L165">    }</span>
+
+    @Override
+    public boolean persistent() {
+<span class="nc" id="L169">        return true;</span>
+    }
+
+    @Override
+    public boolean isOpen() {
+<span class="nc" id="L174">        return true;</span>
+    }
+
+    @Override
+    public synchronized byte[] get(final Bytes key) {
+<span class="nc" id="L179">        return get(key, Optional.empty());</span>
+    }
+
+    public synchronized byte[] get(final Bytes key, final Snapshot snapshot) {
+<span class="nc" id="L183">        return get(key, Optional.of(snapshot));</span>
+    }
+
+    private synchronized byte[] get(final Bytes key, final Optional&lt;Snapshot&gt; snapshot) {
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        if (snapshot.isPresent()) {</span>
+<span class="nc" id="L188">            try (ReadOptions readOptions = new ReadOptions()) {</span>
+<span class="nc" id="L189">                readOptions.setSnapshot(snapshot.get());</span>
+<span class="nc" id="L190">                return physicalStore.get(prefixKeyFormatter.addPrefix(key), readOptions);</span>
+            }
+        } else {
+<span class="nc" id="L193">            return physicalStore.get(prefixKeyFormatter.addPrefix(key));</span>
+        }
+    }
+
+    public Snapshot snapshot() {
+<span class="nc" id="L198">        return physicalStore.snapshot();</span>
+    }
+
+    public void releaseSnapshot(final Snapshot snapshot) {
+<span class="nc" id="L202">        physicalStore.releaseSnapshot(snapshot);</span>
+<span class="nc" id="L203">    }</span>
+
+    @Override
+    public synchronized KeyValueIterator&lt;Bytes, byte[]&gt; range(final Bytes from, final Bytes to) {
+        // from bound is inclusive. if the provided bound is null, replace with prefix
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        final Bytes fromBound = from == null</span>
+<span class="nc" id="L209">            ? prefixKeyFormatter.prefix()</span>
+<span class="nc" id="L210">            : prefixKeyFormatter.addPrefix(from);</span>
+        // to bound is inclusive. if the provided bound is null, replace with the next prefix.
+        // this requires potentially filtering out the element corresponding to the next prefix
+        // with empty bytes from the returned iterator. this filtering is accomplished by
+        // passing the prefix filter into StrippedPrefixKeyValueIteratorAdapter().
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        final Bytes toBound = to == null</span>
+<span class="nc" id="L216">            ? incrementWithoutOverflow(prefixKeyFormatter.prefix())</span>
+<span class="nc" id="L217">            : prefixKeyFormatter.addPrefix(to);</span>
+<span class="nc" id="L218">        final KeyValueIterator&lt;Bytes, byte[]&gt; iteratorWithKeyPrefixes = physicalStore.range(</span>
+            fromBound,
+            toBound,
+            openIterators);
+<span class="nc" id="L222">        return new StrippedPrefixKeyValueIteratorAdapter(</span>
+            iteratorWithKeyPrefixes,
+<span class="nc" id="L224">            prefixKeyFormatter::removePrefix,</span>
+<span class="nc" id="L225">            prefixKeyFormatter::startsWithPrefix);</span>
+    }
+
+    @Override
+    public synchronized KeyValueIterator&lt;Bytes, byte[]&gt; all() {
+<span class="nc" id="L230">        final KeyValueIterator&lt;Bytes, byte[]&gt; iteratorWithKeyPrefixes = physicalStore.prefixScan(</span>
+<span class="nc" id="L231">            prefixKeyFormatter.prefix(),</span>
+            new BytesSerializer(),
+            openIterators);
+<span class="nc" id="L234">        return new StrippedPrefixKeyValueIteratorAdapter(</span>
+            iteratorWithKeyPrefixes,
+<span class="nc" id="L236">            prefixKeyFormatter::removePrefix);</span>
+    }
+
+    @Override
+    public long approximateNumEntries() {
+<span class="nc" id="L241">        throw new UnsupportedOperationException(&quot;Cannot estimate num entries for logical segment&quot;);</span>
+    }
+
+    @Override
+    public void addToBatch(final KeyValue&lt;byte[], byte[]&gt; record, final WriteBatchInterface batch) throws RocksDBException {
+<span class="nc" id="L246">        physicalStore.addToBatch(</span>
+            new KeyValue&lt;&gt;(
+<span class="nc" id="L248">                prefixKeyFormatter.addPrefix(record.key),</span>
+                record.value),
+            batch);
+<span class="nc" id="L251">    }</span>
+
+    @Override
+    public void write(final WriteBatchInterface batch) throws RocksDBException {
+        // no key transformations here since they should've already been done as part
+        // of adding to the write batch
+<span class="nc" id="L257">        physicalStore.write(batch);</span>
+<span class="nc" id="L258">    }</span>
+
+    /**
+     * Manages translation between raw key and the key to be stored into the physical store.
+     * The key for the physical store is the raw key prepended with a fixed-length prefix.
+     */
+    private static class PrefixKeyFormatter {
+        private final byte[] prefix;
+
+<span class="nc" id="L267">        PrefixKeyFormatter(final byte[] prefix) {</span>
+<span class="nc" id="L268">            this.prefix = prefix;</span>
+<span class="nc" id="L269">        }</span>
+
+        Bytes addPrefix(final Bytes key) {
+<span class="nc" id="L272">            return Bytes.wrap(addPrefix(key.get()));</span>
+        }
+
+        byte[] addPrefix(final byte[] key) {
+<span class="nc" id="L276">            final byte[] keyWithPrefix = new byte[prefix.length + key.length];</span>
+<span class="nc" id="L277">            System.arraycopy(prefix, 0, keyWithPrefix, 0, prefix.length);</span>
+<span class="nc" id="L278">            System.arraycopy(key, 0, keyWithPrefix, prefix.length, key.length);</span>
+<span class="nc" id="L279">            return keyWithPrefix;</span>
+        }
+
+        Bytes removePrefix(final Bytes keyWithPrefix) {
+<span class="nc" id="L283">            return Bytes.wrap(removePrefix(keyWithPrefix.get()));</span>
+        }
+
+        private byte[] removePrefix(final byte[] keyWithPrefix) {
+<span class="nc" id="L287">            final int rawKeyLength = keyWithPrefix.length - prefix.length;</span>
+<span class="nc" id="L288">            final byte[] rawKey = new byte[rawKeyLength];</span>
+<span class="nc" id="L289">            System.arraycopy(keyWithPrefix, prefix.length, rawKey, 0, rawKeyLength);</span>
+<span class="nc" id="L290">            return rawKey;</span>
+        }
+
+        Bytes prefix() {
+<span class="nc" id="L294">            return Bytes.wrap(prefix);</span>
+        }
+
+        boolean startsWithPrefix(final Bytes maybePrefixed) {
+<span class="nc bnc" id="L298" title="All 2 branches missed.">            if (maybePrefixed.get().length &lt; prefix.length) {</span>
+<span class="nc" id="L299">                return false;</span>
+            }
+
+<span class="nc" id="L302">            final byte[] maybePrefix = new byte[prefix.length];</span>
+<span class="nc" id="L303">            System.arraycopy(maybePrefixed.get(), 0, maybePrefix, 0, prefix.length);</span>
+<span class="nc" id="L304">            return Arrays.equals(prefix, maybePrefix);</span>
+        }
+    }
+
+    /**
+     * Converts a {@link KeyValueIterator} which returns keys with prefixes to one which
+     * returns un-prefixed keys.
+     */
+    private static class StrippedPrefixKeyValueIteratorAdapter implements KeyValueIterator&lt;Bytes, byte[]&gt; {
+
+        private final KeyValueIterator&lt;Bytes, byte[]&gt; iteratorWithKeyPrefixes;
+        private final Function&lt;Bytes, Bytes&gt; prefixRemover;
+        private final Function&lt;Bytes, Boolean&gt; prefixChecker;
+
+        StrippedPrefixKeyValueIteratorAdapter(final KeyValueIterator&lt;Bytes, byte[]&gt; iteratorWithKeyPrefixes,
+                                              final Function&lt;Bytes, Bytes&gt; prefixRemover) {
+<span class="nc" id="L320">            this(iteratorWithKeyPrefixes, prefixRemover, bytes -&gt; true);</span>
+<span class="nc" id="L321">        }</span>
+
+        StrippedPrefixKeyValueIteratorAdapter(final KeyValueIterator&lt;Bytes, byte[]&gt; iteratorWithKeyPrefixes,
+                                              final Function&lt;Bytes, Bytes&gt; prefixRemover,
+<span class="nc" id="L325">                                              final Function&lt;Bytes, Boolean&gt; prefixChecker) {</span>
+<span class="nc" id="L326">            this.iteratorWithKeyPrefixes = iteratorWithKeyPrefixes;</span>
+<span class="nc" id="L327">            this.prefixRemover = prefixRemover;</span>
+<span class="nc" id="L328">            this.prefixChecker = prefixChecker;</span>
+<span class="nc" id="L329">            pruneNonPrefixedElements();</span>
+<span class="nc" id="L330">        }</span>
+
+        @Override
+        public boolean hasNext() {
+<span class="nc" id="L334">            return iteratorWithKeyPrefixes.hasNext();</span>
+        }
+
+        @Override
+        public KeyValue&lt;Bytes, byte[]&gt; next() {
+<span class="nc" id="L339">            final KeyValue&lt;Bytes, byte[]&gt; nextWithKeyPrefix = iteratorWithKeyPrefixes.next();</span>
+<span class="nc" id="L340">            final KeyValue&lt;Bytes, byte[]&gt; next = new KeyValue&lt;&gt;(</span>
+<span class="nc" id="L341">                prefixRemover.apply(nextWithKeyPrefix.key),</span>
+                nextWithKeyPrefix.value);
+<span class="nc" id="L343">            pruneNonPrefixedElements();</span>
+<span class="nc" id="L344">            return next;</span>
+        }
+
+        @Override
+        public Bytes peekNextKey() {
+<span class="nc" id="L349">            return prefixRemover.apply(iteratorWithKeyPrefixes.peekNextKey());</span>
+        }
+
+        @Override
+        public void remove() {
+<span class="nc" id="L354">            iteratorWithKeyPrefixes.remove();</span>
+<span class="nc" id="L355">        }</span>
+
+        @Override
+        public void close() {
+<span class="nc" id="L359">            iteratorWithKeyPrefixes.close();</span>
+<span class="nc" id="L360">        }</span>
+
+        private void pruneNonPrefixedElements() {
+<span class="nc bnc" id="L363" title="All 2 branches missed.">            while (iteratorWithKeyPrefixes.hasNext()</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">                &amp;&amp; !prefixChecker.apply(iteratorWithKeyPrefixes.peekNextKey())) {</span>
+<span class="nc" id="L365">                iteratorWithKeyPrefixes.next();</span>
+            }
+<span class="nc" id="L367">        }</span>
+    }
+
+    private static byte[] serializeLongToBytes(final long l) {
+<span class="nc" id="L371">        return ByteBuffer.allocate(Long.BYTES).putLong(l).array();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

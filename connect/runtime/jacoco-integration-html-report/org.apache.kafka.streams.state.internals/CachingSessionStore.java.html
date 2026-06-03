@@ -1,0 +1,512 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CachingSessionStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">CachingSessionStore.java</span></div><h1>CachingSessionStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.kstream.Windowed;
+import org.apache.kafka.streams.kstream.internals.Change;
+import org.apache.kafka.streams.kstream.internals.SessionWindow;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.processor.api.Record;
+import org.apache.kafka.streams.processor.internals.InternalProcessorContext;
+import org.apache.kafka.streams.processor.internals.ProcessorRecordContext;
+import org.apache.kafka.streams.processor.internals.RecordQueue;
+import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.SessionStore;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Objects;
+
+import static org.apache.kafka.streams.processor.internals.ProcessorContextUtils.asInternalProcessorContext;
+import static org.apache.kafka.streams.state.internals.ExceptionUtils.executeAll;
+import static org.apache.kafka.streams.state.internals.ExceptionUtils.throwSuppressed;
+
+public class CachingSessionStore
+    extends WrappedStateStore&lt;SessionStore&lt;Bytes, byte[]&gt;, byte[], byte[]&gt;
+    implements SessionStore&lt;Bytes, byte[]&gt;, CachedStateStore&lt;byte[], byte[]&gt; {
+
+<span class="nc" id="L50">    private static final Logger LOG = LoggerFactory.getLogger(CachingSessionStore.class);</span>
+
+    private final SessionKeySchema keySchema;
+    private final SegmentedCacheFunction cacheFunction;
+    private static final String INVALID_RANGE_WARN_MSG = &quot;Returning empty iterator for fetch with invalid key range: from &gt; to. &quot; +
+        &quot;This may be due to range arguments set in the wrong order, &quot; +
+        &quot;or serdes that don't preserve ordering when lexicographically comparing the serialized bytes. &quot; +
+        &quot;Note that the built-in numerical serdes do not follow this for negative numbers&quot;;
+
+    private String cacheName;
+    private InternalProcessorContext&lt;?, ?&gt; internalContext;
+    private CacheFlushListener&lt;byte[], byte[]&gt; flushListener;
+    private boolean sendOldValues;
+
+    private long maxObservedTimestamp; // Refers to the window end time (determines segmentId)
+
+    CachingSessionStore(final SessionStore&lt;Bytes, byte[]&gt; bytesStore,
+                        final long segmentInterval) {
+<span class="nc" id="L68">        super(bytesStore);</span>
+<span class="nc" id="L69">        this.keySchema = new SessionKeySchema();</span>
+<span class="nc" id="L70">        this.cacheFunction = new SegmentedCacheFunction(keySchema, segmentInterval);</span>
+<span class="nc" id="L71">        this.maxObservedTimestamp = RecordQueue.UNKNOWN;</span>
+<span class="nc" id="L72">    }</span>
+
+    @Override
+    public void init(final StateStoreContext stateStoreContext, final StateStore root) {
+<span class="nc" id="L76">        internalContext = asInternalProcessorContext(stateStoreContext);</span>
+<span class="nc" id="L77">        cacheName = internalContext.taskId() + &quot;-&quot; + name();</span>
+<span class="nc" id="L78">        internalContext.registerCacheFlushListener(cacheName, entries -&gt; {</span>
+<span class="nc bnc" id="L79" title="All 2 branches missed.">            for (final ThreadCache.DirtyEntry entry : entries) {</span>
+<span class="nc" id="L80">                putAndMaybeForward(entry, internalContext);</span>
+<span class="nc" id="L81">            }</span>
+<span class="nc" id="L82">        });</span>
+<span class="nc" id="L83">        super.init(stateStoreContext, root);</span>
+<span class="nc" id="L84">    }</span>
+
+    private void putAndMaybeForward(final ThreadCache.DirtyEntry entry, final InternalProcessorContext&lt;?, ?&gt; context) {
+<span class="nc" id="L87">        final Bytes binaryKey = cacheFunction.key(entry.key());</span>
+<span class="nc" id="L88">        final Windowed&lt;Bytes&gt; bytesKey = SessionKeySchema.from(binaryKey);</span>
+<span class="nc bnc" id="L89" title="All 2 branches missed.">        if (flushListener != null) {</span>
+<span class="nc" id="L90">            final byte[] newValueBytes = entry.newValue();</span>
+<span class="nc bnc" id="L91" title="All 4 branches missed.">            final byte[] oldValueBytes = newValueBytes == null || sendOldValues ?</span>
+<span class="nc" id="L92">                wrapped().fetchSession(bytesKey.key(), bytesKey.window().start(), bytesKey.window().end()) : null;</span>
+
+            // this is an optimization: if this key did not exist in underlying store and also not in the cache,
+            // we can skip flushing to downstream as well as writing to underlying store
+<span class="nc bnc" id="L96" title="All 4 branches missed.">            if (newValueBytes != null || oldValueBytes != null) {</span>
+                // we need to get the old values if needed, and then put to store, and then flush
+
+<span class="nc" id="L99">                final ProcessorRecordContext current = context.recordContext();</span>
+                try {
+<span class="nc" id="L101">                    context.setRecordContext(entry.entry().context());</span>
+<span class="nc" id="L102">                    wrapped().put(bytesKey, entry.newValue());</span>
+<span class="nc" id="L103">                    flushListener.apply(</span>
+                        new Record&lt;&gt;(
+<span class="nc" id="L105">                            binaryKey.get(),</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">                            new Change&lt;&gt;(newValueBytes, sendOldValues ? oldValueBytes : null),</span>
+<span class="nc" id="L107">                            entry.entry().context().timestamp(),</span>
+<span class="nc" id="L108">                            entry.entry().context().headers()));</span>
+                } finally {
+<span class="nc" id="L110">                    context.setRecordContext(current);</span>
+                }
+            }
+<span class="nc" id="L113">        } else {</span>
+<span class="nc" id="L114">            final ProcessorRecordContext current = context.recordContext();</span>
+            try {
+<span class="nc" id="L116">                context.setRecordContext(entry.entry().context());</span>
+<span class="nc" id="L117">                wrapped().put(bytesKey, entry.newValue());</span>
+            } finally {
+<span class="nc" id="L119">                context.setRecordContext(current);</span>
+            }
+        }
+<span class="nc" id="L122">    }</span>
+
+    @Override
+    public boolean setFlushListener(final CacheFlushListener&lt;byte[], byte[]&gt; flushListener,
+                                    final boolean sendOldValues) {
+<span class="nc" id="L127">        this.flushListener = flushListener;</span>
+<span class="nc" id="L128">        this.sendOldValues = sendOldValues;</span>
+
+<span class="nc" id="L130">        return true;</span>
+    }
+
+    @Override
+    public void put(final Windowed&lt;Bytes&gt; key, final byte[] value) {
+<span class="nc" id="L135">        validateStoreOpen();</span>
+<span class="nc" id="L136">        final Bytes binaryKey = SessionKeySchema.toBinary(key);</span>
+<span class="nc" id="L137">        final LRUCacheEntry entry =</span>
+            new LRUCacheEntry(
+                value,
+<span class="nc" id="L140">                internalContext.recordContext().headers(),</span>
+                true,
+<span class="nc" id="L142">                internalContext.recordContext().offset(),</span>
+<span class="nc" id="L143">                internalContext.recordContext().timestamp(),</span>
+<span class="nc" id="L144">                internalContext.recordContext().partition(),</span>
+<span class="nc" id="L145">                internalContext.recordContext().topic(),</span>
+<span class="nc" id="L146">                internalContext.recordContext().sourceRawKey(),</span>
+<span class="nc" id="L147">                internalContext.recordContext().sourceRawValue()</span>
+            );
+<span class="nc" id="L149">        internalContext.cache().put(cacheName, cacheFunction.cacheKey(binaryKey), entry);</span>
+
+<span class="nc" id="L151">        maxObservedTimestamp = Math.max(keySchema.segmentTimestamp(binaryKey), maxObservedTimestamp);</span>
+<span class="nc" id="L152">    }</span>
+
+    @Override
+    public void remove(final Windowed&lt;Bytes&gt; sessionKey) {
+<span class="nc" id="L156">        validateStoreOpen();</span>
+<span class="nc" id="L157">        put(sessionKey, null);</span>
+<span class="nc" id="L158">    }</span>
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; findSessions(final Bytes key,
+                                                                  final long earliestSessionEndTime,
+                                                                  final long latestSessionStartTime) {
+<span class="nc" id="L164">        validateStoreOpen();</span>
+
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        final PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; cacheIterator = wrapped().persistent() ?</span>
+<span class="nc" id="L167">            new CacheIteratorWrapper(key, earliestSessionEndTime, latestSessionStartTime, true) :</span>
+<span class="nc" id="L168">            internalContext.cache().range(cacheName,</span>
+<span class="nc" id="L169">                        cacheFunction.cacheKey(keySchema.lowerRangeFixedSize(key, earliestSessionEndTime)),</span>
+<span class="nc" id="L170">                        cacheFunction.cacheKey(keySchema.upperRangeFixedSize(key, latestSessionStartTime))</span>
+            );
+
+<span class="nc" id="L173">        final KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; storeIterator = wrapped().findSessions(key,</span>
+                                                                                               earliestSessionEndTime,
+                                                                                               latestSessionStartTime);
+<span class="nc" id="L176">        final HasNextCondition hasNextCondition = keySchema.hasNextCondition(key,</span>
+                                                                             key,
+                                                                             earliestSessionEndTime,
+                                                                             latestSessionStartTime,
+                                                                             true);
+<span class="nc" id="L181">        final PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; filteredCacheIterator =</span>
+            new FilteredCacheIterator(cacheIterator, hasNextCondition, cacheFunction);
+<span class="nc" id="L183">        return new MergedSortedCacheSessionStoreIterator(filteredCacheIterator, storeIterator, cacheFunction, true);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardFindSessions(final Bytes key,
+                                                                          final long earliestSessionEndTime,
+                                                                          final long latestSessionStartTime) {
+<span class="nc" id="L190">        validateStoreOpen();</span>
+
+<span class="nc bnc" id="L192" title="All 2 branches missed.">        final PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; cacheIterator = wrapped().persistent() ?</span>
+<span class="nc" id="L193">            new CacheIteratorWrapper(key, earliestSessionEndTime, latestSessionStartTime, false) :</span>
+<span class="nc" id="L194">            internalContext.cache().reverseRange(</span>
+                cacheName,
+<span class="nc" id="L196">                cacheFunction.cacheKey(keySchema.lowerRangeFixedSize(key, earliestSessionEndTime)),</span>
+<span class="nc" id="L197">                cacheFunction.cacheKey(keySchema.upperRangeFixedSize(key, latestSessionStartTime)</span>
+                )
+            );
+
+<span class="nc" id="L201">        final KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; storeIterator = wrapped().backwardFindSessions(</span>
+            key,
+            earliestSessionEndTime,
+            latestSessionStartTime
+        );
+<span class="nc" id="L206">        final HasNextCondition hasNextCondition = keySchema.hasNextCondition(</span>
+            key,
+            key,
+            earliestSessionEndTime,
+            latestSessionStartTime,
+            false
+        );
+<span class="nc" id="L213">        final PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; filteredCacheIterator =</span>
+            new FilteredCacheIterator(cacheIterator, hasNextCondition, cacheFunction);
+<span class="nc" id="L215">        return new MergedSortedCacheSessionStoreIterator(filteredCacheIterator, storeIterator, cacheFunction, false);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; findSessions(final Bytes keyFrom,
+                                                                  final Bytes keyTo,
+                                                                  final long earliestSessionEndTime,
+                                                                  final long latestSessionStartTime) {
+<span class="nc bnc" id="L223" title="All 6 branches missed.">        if (keyFrom != null &amp;&amp; keyTo != null &amp;&amp; keyFrom.compareTo(keyTo) &gt; 0) {</span>
+<span class="nc" id="L224">            LOG.warn(INVALID_RANGE_WARN_MSG);</span>
+<span class="nc" id="L225">            return KeyValueIterators.emptyIterator();</span>
+        }
+
+<span class="nc" id="L228">        validateStoreOpen();</span>
+
+<span class="nc bnc" id="L230" title="All 2 branches missed.">        final Bytes cacheKeyFrom = keyFrom == null ? null : cacheFunction.cacheKey(keySchema.lowerRange(keyFrom, earliestSessionEndTime));</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">        final Bytes cacheKeyTo = keyTo == null ? null : cacheFunction.cacheKey(keySchema.upperRange(keyTo, latestSessionStartTime));</span>
+<span class="nc" id="L232">        final ThreadCache.MemoryLRUCacheBytesIterator cacheIterator = internalContext.cache().range(cacheName, cacheKeyFrom, cacheKeyTo);</span>
+
+<span class="nc" id="L234">        final KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; storeIterator = wrapped().findSessions(</span>
+            keyFrom, keyTo, earliestSessionEndTime, latestSessionStartTime
+        );
+<span class="nc" id="L237">        final HasNextCondition hasNextCondition = keySchema.hasNextCondition(keyFrom,</span>
+                                                                             keyTo,
+                                                                             earliestSessionEndTime,
+                                                                             latestSessionStartTime,
+                                                                     true);
+<span class="nc" id="L242">        final PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; filteredCacheIterator =</span>
+            new FilteredCacheIterator(cacheIterator, hasNextCondition, cacheFunction);
+<span class="nc" id="L244">        return new MergedSortedCacheSessionStoreIterator(filteredCacheIterator, storeIterator, cacheFunction, true);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardFindSessions(final Bytes keyFrom,
+                                                                          final Bytes keyTo,
+                                                                          final long earliestSessionEndTime,
+                                                                          final long latestSessionStartTime) {
+<span class="nc bnc" id="L252" title="All 6 branches missed.">        if (keyFrom != null &amp;&amp; keyTo != null &amp;&amp; keyFrom.compareTo(keyTo) &gt; 0) {</span>
+<span class="nc" id="L253">            LOG.warn(INVALID_RANGE_WARN_MSG);</span>
+<span class="nc" id="L254">            return KeyValueIterators.emptyIterator();</span>
+        }
+
+<span class="nc" id="L257">        validateStoreOpen();</span>
+
+<span class="nc bnc" id="L259" title="All 2 branches missed.">        final Bytes cacheKeyFrom = keyFrom == null ? null : cacheFunction.cacheKey(keySchema.lowerRange(keyFrom, earliestSessionEndTime));</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        final Bytes cacheKeyTo = keyTo == null ? null : cacheFunction.cacheKey(keySchema.upperRange(keyTo, latestSessionStartTime));</span>
+<span class="nc" id="L261">        final ThreadCache.MemoryLRUCacheBytesIterator cacheIterator = internalContext.cache().reverseRange(cacheName, cacheKeyFrom, cacheKeyTo);</span>
+
+<span class="nc" id="L263">        final KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; storeIterator =</span>
+<span class="nc" id="L264">            wrapped().backwardFindSessions(keyFrom, keyTo, earliestSessionEndTime, latestSessionStartTime);</span>
+<span class="nc" id="L265">        final HasNextCondition hasNextCondition = keySchema.hasNextCondition(</span>
+            keyFrom,
+            keyTo,
+            earliestSessionEndTime,
+            latestSessionStartTime,
+            false
+        );
+<span class="nc" id="L272">        final PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; filteredCacheIterator =</span>
+            new FilteredCacheIterator(cacheIterator, hasNextCondition, cacheFunction);
+<span class="nc" id="L274">        return new MergedSortedCacheSessionStoreIterator(filteredCacheIterator, storeIterator, cacheFunction, false);</span>
+    }
+
+    @Override
+    public byte[] fetchSession(final Bytes key, final long earliestSessionEndTime, final long latestSessionStartTime) {
+<span class="nc" id="L279">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L280">        validateStoreOpen();</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">        if (internalContext.cache() == null) {</span>
+<span class="nc" id="L282">            return wrapped().fetchSession(key, earliestSessionEndTime, latestSessionStartTime);</span>
+        } else {
+<span class="nc" id="L284">            final Bytes bytesKey = SessionKeySchema.toBinary(key, earliestSessionEndTime,</span>
+                latestSessionStartTime);
+<span class="nc" id="L286">            final Bytes cacheKey = cacheFunction.cacheKey(bytesKey);</span>
+<span class="nc" id="L287">            final LRUCacheEntry entry = internalContext.cache().get(cacheName, cacheKey);</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">            if (entry == null) {</span>
+<span class="nc" id="L289">                return wrapped().fetchSession(key, earliestSessionEndTime, latestSessionStartTime);</span>
+            } else {
+<span class="nc" id="L291">                return entry.value();</span>
+            }
+        }
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetch(final Bytes key) {
+<span class="nc" id="L298">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L299">        return findSessions(key, 0, Long.MAX_VALUE);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardFetch(final Bytes key) {
+<span class="nc" id="L304">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L305">        return backwardFindSessions(key, 0, Long.MAX_VALUE);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; fetch(final Bytes keyFrom,
+                                                           final Bytes keyTo) {
+<span class="nc" id="L311">        return findSessions(keyFrom, keyTo, 0, Long.MAX_VALUE);</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; backwardFetch(final Bytes keyFrom,
+                                                                   final Bytes keyTo) {
+<span class="nc" id="L317">        return backwardFindSessions(keyFrom, keyTo, 0, Long.MAX_VALUE);</span>
+    }
+
+    @Override
+    public void commit(final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc" id="L322">        internalContext.cache().flush(cacheName);</span>
+<span class="nc" id="L323">        wrapped().commit(changelogOffsets);</span>
+<span class="nc" id="L324">    }</span>
+
+    @Override
+    public void flushCache() {
+<span class="nc" id="L328">        internalContext.cache().flush(cacheName);</span>
+<span class="nc" id="L329">    }</span>
+
+    @Override
+    public void clearCache() {
+<span class="nc" id="L333">        internalContext.cache().clear(cacheName);</span>
+<span class="nc" id="L334">    }</span>
+
+    public void close() {
+<span class="nc" id="L337">        final LinkedList&lt;RuntimeException&gt; suppressed = executeAll(</span>
+<span class="nc" id="L338">            () -&gt; internalContext.cache().flush(cacheName),</span>
+<span class="nc" id="L339">            () -&gt; internalContext.cache().close(cacheName),</span>
+<span class="nc" id="L340">            wrapped()::close</span>
+        );
+<span class="nc bnc" id="L342" title="All 2 branches missed.">        if (!suppressed.isEmpty()) {</span>
+<span class="nc" id="L343">            throwSuppressed(&quot;Caught an exception while closing caching session store for store &quot; + name(),</span>
+                            suppressed);
+        }
+<span class="nc" id="L346">    }</span>
+
+    private class CacheIteratorWrapper implements PeekingKeyValueIterator&lt;Bytes, LRUCacheEntry&gt; {
+
+        private final long segmentInterval;
+
+        private final Bytes keyFrom;
+        private final Bytes keyTo;
+        private final long latestSessionStartTime;
+        private final boolean forward;
+
+        private long lastSegmentId;
+
+        private long currentSegmentId;
+        private Bytes cacheKeyFrom;
+        private Bytes cacheKeyTo;
+
+        private ThreadCache.MemoryLRUCacheBytesIterator current;
+
+        private CacheIteratorWrapper(final Bytes key,
+                                     final long earliestSessionEndTime,
+                                     final long latestSessionStartTime,
+                                     final boolean forward) {
+<span class="nc" id="L369">            this(key, key, earliestSessionEndTime, latestSessionStartTime, forward);</span>
+<span class="nc" id="L370">        }</span>
+
+        private CacheIteratorWrapper(final Bytes keyFrom,
+                                     final Bytes keyTo,
+                                     final long earliestSessionEndTime,
+                                     final long latestSessionStartTime,
+<span class="nc" id="L376">                                     final boolean forward) {</span>
+<span class="nc" id="L377">            this.keyFrom = keyFrom;</span>
+<span class="nc" id="L378">            this.keyTo = keyTo;</span>
+<span class="nc" id="L379">            this.latestSessionStartTime = latestSessionStartTime;</span>
+<span class="nc" id="L380">            this.segmentInterval = cacheFunction.getSegmentInterval();</span>
+<span class="nc" id="L381">            this.forward = forward;</span>
+
+
+<span class="nc bnc" id="L384" title="All 2 branches missed.">            if (forward) {</span>
+<span class="nc" id="L385">                this.currentSegmentId = cacheFunction.segmentId(earliestSessionEndTime);</span>
+<span class="nc" id="L386">                this.lastSegmentId = cacheFunction.segmentId(maxObservedTimestamp);</span>
+
+<span class="nc" id="L388">                setCacheKeyRange(earliestSessionEndTime, currentSegmentLastTime());</span>
+<span class="nc" id="L389">                this.current = internalContext.cache().range(cacheName, cacheKeyFrom, cacheKeyTo);</span>
+            } else {
+<span class="nc" id="L391">                this.lastSegmentId = cacheFunction.segmentId(earliestSessionEndTime);</span>
+<span class="nc" id="L392">                this.currentSegmentId = cacheFunction.segmentId(maxObservedTimestamp);</span>
+
+<span class="nc" id="L394">                setCacheKeyRange(currentSegmentBeginTime(), Math.min(latestSessionStartTime, maxObservedTimestamp));</span>
+<span class="nc" id="L395">                this.current = internalContext.cache().reverseRange(cacheName, cacheKeyFrom, cacheKeyTo);</span>
+            }
+<span class="nc" id="L397">        }</span>
+
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L401" title="All 2 branches missed.">            if (current == null) {</span>
+<span class="nc" id="L402">                return false;</span>
+            }
+
+<span class="nc bnc" id="L405" title="All 2 branches missed.">            if (current.hasNext()) {</span>
+<span class="nc" id="L406">                return true;</span>
+            }
+
+<span class="nc bnc" id="L409" title="All 2 branches missed.">            while (!current.hasNext()) {</span>
+<span class="nc" id="L410">                getNextSegmentIterator();</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">                if (current == null) {</span>
+<span class="nc" id="L412">                    return false;</span>
+                }
+            }
+<span class="nc" id="L415">            return true;</span>
+        }
+
+        @Override
+        public Bytes peekNextKey() {
+<span class="nc bnc" id="L420" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L421">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L423">            return current.peekNextKey();</span>
+        }
+
+        @Override
+        public KeyValue&lt;Bytes, LRUCacheEntry&gt; peekNext() {
+<span class="nc bnc" id="L428" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L429">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L431">            return current.peekNext();</span>
+        }
+
+        @Override
+        public KeyValue&lt;Bytes, LRUCacheEntry&gt; next() {
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L437">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L439">            return current.next();</span>
+        }
+
+        @Override
+        public void close() {
+<span class="nc" id="L444">            current.close();</span>
+<span class="nc" id="L445">        }</span>
+
+        private long currentSegmentBeginTime() {
+<span class="nc" id="L448">            return currentSegmentId * segmentInterval;</span>
+        }
+
+        private long currentSegmentLastTime() {
+<span class="nc" id="L452">            return currentSegmentBeginTime() + segmentInterval - 1;</span>
+        }
+
+        private void getNextSegmentIterator() {
+<span class="nc bnc" id="L456" title="All 2 branches missed.">            if (forward) {</span>
+<span class="nc" id="L457">                ++currentSegmentId;</span>
+<span class="nc" id="L458">                lastSegmentId = cacheFunction.segmentId(maxObservedTimestamp);</span>
+
+<span class="nc bnc" id="L460" title="All 2 branches missed.">                if (currentSegmentId &gt; lastSegmentId) {</span>
+<span class="nc" id="L461">                    current = null;</span>
+<span class="nc" id="L462">                    return;</span>
+                }
+
+<span class="nc" id="L465">                setCacheKeyRange(currentSegmentBeginTime(), currentSegmentLastTime());</span>
+
+<span class="nc" id="L467">                current.close();</span>
+
+<span class="nc" id="L469">                current = internalContext.cache().range(cacheName, cacheKeyFrom, cacheKeyTo);</span>
+            } else {
+<span class="nc" id="L471">                --currentSegmentId;</span>
+
+<span class="nc bnc" id="L473" title="All 2 branches missed.">                if (currentSegmentId &lt; lastSegmentId) {</span>
+<span class="nc" id="L474">                    current = null;</span>
+<span class="nc" id="L475">                    return;</span>
+                }
+
+<span class="nc" id="L478">                setCacheKeyRange(currentSegmentBeginTime(), currentSegmentLastTime());</span>
+
+<span class="nc" id="L480">                current.close();</span>
+
+<span class="nc" id="L482">                current = internalContext.cache().reverseRange(cacheName, cacheKeyFrom, cacheKeyTo);</span>
+            }
+
+<span class="nc" id="L485">        }</span>
+
+        private void setCacheKeyRange(final long lowerRangeEndTime, final long upperRangeEndTime) {
+<span class="nc bnc" id="L488" title="All 2 branches missed.">            if (cacheFunction.segmentId(lowerRangeEndTime) != cacheFunction.segmentId(upperRangeEndTime)) {</span>
+<span class="nc" id="L489">                throw new IllegalStateException(&quot;Error iterating over segments: segment interval has changed&quot;);</span>
+            }
+
+<span class="nc bnc" id="L492" title="All 2 branches missed.">            if (keyFrom.equals(keyTo)) {</span>
+<span class="nc" id="L493">                cacheKeyFrom = cacheFunction.cacheKey(segmentLowerRangeFixedSize(keyFrom, lowerRangeEndTime));</span>
+<span class="nc" id="L494">                cacheKeyTo = cacheFunction.cacheKey(segmentUpperRangeFixedSize(keyTo, upperRangeEndTime));</span>
+            } else {
+<span class="nc" id="L496">                cacheKeyFrom = cacheFunction.cacheKey(keySchema.lowerRange(keyFrom, lowerRangeEndTime), currentSegmentId);</span>
+<span class="nc" id="L497">                cacheKeyTo = cacheFunction.cacheKey(keySchema.upperRange(keyTo, latestSessionStartTime), currentSegmentId);</span>
+            }
+<span class="nc" id="L499">        }</span>
+
+        private Bytes segmentLowerRangeFixedSize(final Bytes key, final long segmentBeginTime) {
+<span class="nc" id="L502">            final Windowed&lt;Bytes&gt; sessionKey = new Windowed&lt;&gt;(key, new SessionWindow(0, Math.max(0, segmentBeginTime)));</span>
+<span class="nc" id="L503">            return SessionKeySchema.toBinary(sessionKey);</span>
+        }
+
+        private Bytes segmentUpperRangeFixedSize(final Bytes key, final long segmentEndTime) {
+<span class="nc" id="L507">            final Windowed&lt;Bytes&gt; sessionKey = new Windowed&lt;&gt;(key, new SessionWindow(Math.min(latestSessionStartTime, segmentEndTime), segmentEndTime));</span>
+<span class="nc" id="L508">            return SessionKeySchema.toBinary(sessionKey);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

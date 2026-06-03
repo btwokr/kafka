@@ -1,0 +1,226 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MaskField.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.transforms</a> &gt; <span class="el_source">MaskField.java</span></div><h1>MaskField.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.transforms;
+
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.utils.AppInfoParser;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.data.Values;
+import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.transforms.util.SimpleConfig;
+
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Function;
+
+import static org.apache.kafka.connect.transforms.util.Requirements.requireMap;
+import static org.apache.kafka.connect.transforms.util.Requirements.requireStruct;
+
+<span class="fc" id="L43">public abstract class MaskField&lt;R extends ConnectRecord&lt;R&gt;&gt; implements Transformation&lt;R&gt; {</span>
+
+<span class="fc" id="L45">    public static final String OVERVIEW_DOC =</span>
+            &quot;Mask specified fields with a valid null value for the field type (i.e. 0, false, empty string, and so on).&quot;
+                    + &quot;&lt;p/&gt;For numeric and string fields, an optional replacement value can be specified that is converted to the correct type.&quot;
+<span class="fc" id="L48">                    + &quot;&lt;p/&gt;Use the concrete transformation type designed for the record key (&lt;code&gt;&quot; + Key.class.getName()</span>
+<span class="fc" id="L49">                    + &quot;&lt;/code&gt;) or value (&lt;code&gt;&quot; + Value.class.getName() + &quot;&lt;/code&gt;).&quot;;</span>
+
+    private static final String FIELDS_CONFIG = &quot;fields&quot;;
+    private static final String REPLACEMENT_CONFIG = &quot;replacement&quot;;
+    private static final String REPLACE_NULL_WITH_DEFAULT_CONFIG = &quot;replace.null.with.default&quot;;
+
+<span class="fc" id="L55">    public static final ConfigDef CONFIG_DEF = new ConfigDef()</span>
+<span class="fc" id="L56">            .define(FIELDS_CONFIG, ConfigDef.Type.LIST, ConfigDef.NO_DEFAULT_VALUE, </span>
+<span class="fc" id="L57">                    ConfigDef.ValidList.anyNonDuplicateValues(false, false),</span>
+                    ConfigDef.Importance.HIGH, &quot;Names of fields to mask.&quot;)
+<span class="fc" id="L59">            .define(REPLACEMENT_CONFIG, ConfigDef.Type.STRING, null, new ConfigDef.NonEmptyString(),</span>
+                    ConfigDef.Importance.LOW, &quot;Custom value replacement, that will be applied to all&quot;
+                            + &quot; 'fields' values (numeric or non-empty string values only).&quot;)
+<span class="fc" id="L62">            .define(REPLACE_NULL_WITH_DEFAULT_CONFIG, ConfigDef.Type.BOOLEAN, true, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Whether to replace fields that have a default value and that are null to the default value. When set to true, the default value is used, otherwise null is used.&quot;);
+
+    private static final String PURPOSE = &quot;mask fields&quot;;
+
+<span class="fc" id="L67">    private static final Map&lt;Class&lt;?&gt;, Function&lt;String, ?&gt;&gt; REPLACEMENT_MAPPING_FUNC = Map.of(</span>
+<span class="nc" id="L68">        Byte.class, v -&gt; Values.convertToByte(null, v),</span>
+<span class="nc" id="L69">        Short.class, v -&gt; Values.convertToShort(null, v),</span>
+<span class="nc" id="L70">        Integer.class, v -&gt; Values.convertToInteger(null, v),</span>
+<span class="nc" id="L71">        Long.class, v -&gt; Values.convertToLong(null, v),</span>
+<span class="nc" id="L72">        Float.class, v -&gt; Values.convertToFloat(null, v),</span>
+<span class="nc" id="L73">        Double.class, v -&gt; Values.convertToDouble(null, v),</span>
+<span class="fc" id="L74">        String.class, Function.identity(),</span>
+        BigDecimal.class, BigDecimal::new,
+        BigInteger.class, BigInteger::new
+    );
+<span class="fc" id="L78">    private static final Map&lt;Class&lt;?&gt;, Object&gt; PRIMITIVE_VALUE_MAPPING = Map.ofEntries(</span>
+<span class="fc" id="L79">        Map.entry(Boolean.class, Boolean.FALSE),</span>
+<span class="fc" id="L80">        Map.entry(Byte.class, (byte) 0),</span>
+<span class="fc" id="L81">        Map.entry(Short.class, (short) 0),</span>
+<span class="fc" id="L82">        Map.entry(Integer.class, 0),</span>
+<span class="fc" id="L83">        Map.entry(Long.class, 0L),</span>
+<span class="fc" id="L84">        Map.entry(Float.class, 0f),</span>
+<span class="fc" id="L85">        Map.entry(Double.class, 0d),</span>
+<span class="fc" id="L86">        Map.entry(BigInteger.class, BigInteger.ZERO),</span>
+<span class="fc" id="L87">        Map.entry(BigDecimal.class, BigDecimal.ZERO),</span>
+<span class="fc" id="L88">        Map.entry(Date.class, new Date(0)),</span>
+<span class="fc" id="L89">        Map.entry(String.class, &quot;&quot;)</span>
+    );
+
+    private Set&lt;String&gt; maskedFields;
+    private String replacement;
+    private boolean replaceNullWithDefault;
+
+    @Override
+    public String version() {
+<span class="fc" id="L98">        return AppInfoParser.getVersion();</span>
+    }
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; props) {
+<span class="nc" id="L103">        final SimpleConfig config = new SimpleConfig(CONFIG_DEF, props);</span>
+<span class="nc" id="L104">        maskedFields = new HashSet&lt;&gt;(config.getList(FIELDS_CONFIG));</span>
+<span class="nc" id="L105">        replacement = config.getString(REPLACEMENT_CONFIG);</span>
+<span class="nc" id="L106">        replaceNullWithDefault = config.getBoolean(REPLACE_NULL_WITH_DEFAULT_CONFIG);</span>
+<span class="nc" id="L107">    }</span>
+
+    @Override
+    public R apply(R record) {
+<span class="nc bnc" id="L111" title="All 2 branches missed.">        if (operatingSchema(record) == null) {</span>
+<span class="nc" id="L112">            return applySchemaless(record);</span>
+        } else {
+<span class="nc" id="L114">            return applyWithSchema(record);</span>
+        }
+    }
+
+    private R applySchemaless(R record) {
+<span class="nc" id="L119">        final Map&lt;String, Object&gt; value = requireMap(operatingValue(record), PURPOSE);</span>
+<span class="nc" id="L120">        final HashMap&lt;String, Object&gt; updatedValue = new HashMap&lt;&gt;(value);</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        for (String field : maskedFields) {</span>
+<span class="nc" id="L122">            updatedValue.put(field, masked(value.get(field)));</span>
+<span class="nc" id="L123">        }</span>
+<span class="nc" id="L124">        return newRecord(record, updatedValue);</span>
+    }
+
+    private R applyWithSchema(R record) {
+<span class="nc" id="L128">        final Struct value = requireStruct(operatingValue(record), PURPOSE);</span>
+<span class="nc" id="L129">        final Struct updatedValue = new Struct(value.schema());</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">        for (Field field : value.schema().fields()) {</span>
+<span class="nc" id="L131">            final Object origFieldValue = getFieldValue(value, field);</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">            updatedValue.put(field, maskedFields.contains(field.name()) ? masked(origFieldValue) : origFieldValue);</span>
+<span class="nc" id="L133">        }</span>
+<span class="nc" id="L134">        return newRecord(record, updatedValue);</span>
+    }
+
+    private Object getFieldValue(Struct value, Field field) {
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        if (replaceNullWithDefault) {</span>
+<span class="nc" id="L139">            return value.get(field);</span>
+        }
+<span class="nc" id="L141">        return value.getWithoutDefault(field.name());</span>
+    }
+
+    private Object masked(Object value) {
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        if (value == null) {</span>
+<span class="nc" id="L146">            return null;</span>
+        }
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        return replacement == null ? maskWithNullValue(value) : maskWithCustomReplacement(value, replacement);</span>
+    }
+
+    private static Object maskWithCustomReplacement(Object value, String replacement) {
+<span class="nc" id="L152">        Function&lt;String, ?&gt; replacementMapper = REPLACEMENT_MAPPING_FUNC.get(value.getClass());</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        if (replacementMapper == null) {</span>
+<span class="nc" id="L154">            throw new DataException(&quot;Cannot mask value of type &quot; + value.getClass() + &quot; with custom replacement.&quot;);</span>
+        }
+        try {
+<span class="nc" id="L157">            return replacementMapper.apply(replacement);</span>
+<span class="nc" id="L158">        } catch (NumberFormatException ex) {</span>
+<span class="nc" id="L159">            throw new DataException(&quot;Unable to convert &quot; + replacement + &quot; (&quot; + replacement.getClass() + &quot;) to number&quot;, ex);</span>
+        }
+    }
+
+    private static Object maskWithNullValue(Object value) {
+<span class="nc" id="L164">        Object maskedValue = PRIMITIVE_VALUE_MAPPING.get(value.getClass());</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">        if (maskedValue == null) {</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">            if (value instanceof List)</span>
+<span class="nc" id="L167">                maskedValue = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">            else if (value instanceof Map)</span>
+<span class="nc" id="L169">                maskedValue = new HashMap&lt;&gt;();</span>
+            else
+<span class="nc" id="L171">                throw new DataException(&quot;Cannot mask value of type: &quot; + value.getClass());</span>
+        }
+<span class="nc" id="L173">        return maskedValue;</span>
+    }
+
+    @Override
+    public ConfigDef config() {
+<span class="nc" id="L178">        return CONFIG_DEF;</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L183">    }</span>
+
+    protected abstract Schema operatingSchema(R record);
+
+    protected abstract Object operatingValue(R record);
+
+    protected abstract R newRecord(R base, Object value);
+
+<span class="fc" id="L191">    public static final class Key&lt;R extends ConnectRecord&lt;R&gt;&gt; extends MaskField&lt;R&gt; {</span>
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L194">            return record.keySchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L199">            return record.key();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Object updatedValue) {
+<span class="nc" id="L204">            return record.newRecord(record.topic(), record.kafkaPartition(), record.keySchema(), updatedValue, record.valueSchema(), record.value(), record.timestamp());</span>
+        }
+    }
+
+<span class="fc" id="L208">    public static final class Value&lt;R extends ConnectRecord&lt;R&gt;&gt; extends MaskField&lt;R&gt; {</span>
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L211">            return record.valueSchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L216">            return record.value();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Object updatedValue) {
+<span class="nc" id="L221">            return record.newRecord(record.topic(), record.kafkaPartition(), record.keySchema(), record.key(), record.valueSchema(), updatedValue, record.timestamp());</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

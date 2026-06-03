@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>WorkerTransactionContext.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">WorkerTransactionContext.java</span></div><h1>WorkerTransactionContext.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.connect.source.SourceRecord;
+import org.apache.kafka.connect.source.TransactionContext;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashSet;
+import java.util.Objects;
+import java.util.Set;
+
+/**
+ * A {@link TransactionContext} that can be given to tasks and then queried by the worker to check on
+ * requests to abort and commit transactions. This class is thread safe and is designed to accommodate
+ * concurrent use without external synchronization.
+ */
+<span class="nc" id="L34">public class WorkerTransactionContext implements TransactionContext {</span>
+
+<span class="nc" id="L36">    private static final Logger log = LoggerFactory.getLogger(WorkerTransactionContext.class);</span>
+
+<span class="nc" id="L38">    private final Set&lt;SourceRecord&gt; committableRecords = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L39">    private final Set&lt;SourceRecord&gt; abortableRecords = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L40">    private boolean batchCommitRequested = false;</span>
+<span class="nc" id="L41">    private boolean batchAbortRequested = false;</span>
+
+    @Override
+    public synchronized void commitTransaction() {
+<span class="nc" id="L45">        batchCommitRequested = true;</span>
+<span class="nc" id="L46">    }</span>
+
+    @Override
+    public synchronized void commitTransaction(SourceRecord record) {
+<span class="nc" id="L50">        Objects.requireNonNull(record, &quot;Source record used to define transaction boundaries may not be null&quot;);</span>
+<span class="nc" id="L51">        committableRecords.add(record);</span>
+<span class="nc" id="L52">    }</span>
+
+    @Override
+    public synchronized void abortTransaction() {
+<span class="nc" id="L56">        batchAbortRequested = true;</span>
+<span class="nc" id="L57">    }</span>
+
+    @Override
+    public synchronized void abortTransaction(SourceRecord record) {
+<span class="nc" id="L61">        Objects.requireNonNull(record, &quot;Source record used to define transaction boundaries may not be null&quot;);</span>
+<span class="nc" id="L62">        abortableRecords.add(record);</span>
+<span class="nc" id="L63">    }</span>
+
+    public synchronized boolean shouldCommitBatch() {
+<span class="nc" id="L66">        checkBatchRequestsConsistency();</span>
+<span class="nc" id="L67">        boolean result = batchCommitRequested;</span>
+<span class="nc" id="L68">        batchCommitRequested = false;</span>
+<span class="nc" id="L69">        return result;</span>
+    }
+
+    public synchronized boolean shouldAbortBatch() {
+<span class="nc" id="L73">        checkBatchRequestsConsistency();</span>
+<span class="nc" id="L74">        boolean result = batchAbortRequested;</span>
+<span class="nc" id="L75">        batchAbortRequested = false;</span>
+<span class="nc" id="L76">        return result;</span>
+    }
+
+    public synchronized boolean shouldCommitOn(SourceRecord record) {
+        // We could perform this check in the connector-facing methods (such as commitTransaction(SourceRecord)),
+        // but the connector might swallow that exception.
+        // This way, we can fail the task unconditionally, which is warranted since the alternative may lead to data loss.
+        // Essentially, instead of telling the task that it screwed up and trusting it to do the right thing, we rat on it to the
+        // worker and let it get punished accordingly.
+<span class="nc" id="L85">        checkRecordRequestConsistency(record);</span>
+<span class="nc" id="L86">        return committableRecords.remove(record);</span>
+    }
+
+    public synchronized boolean shouldAbortOn(SourceRecord record) {
+<span class="nc" id="L90">        checkRecordRequestConsistency(record);</span>
+<span class="nc" id="L91">        return abortableRecords.remove(record);</span>
+    }
+
+    private void checkBatchRequestsConsistency() {
+<span class="nc bnc" id="L95" title="All 4 branches missed.">        if (batchCommitRequested &amp;&amp; batchAbortRequested) {</span>
+<span class="nc" id="L96">            throw new IllegalStateException(&quot;Connector requested both commit and abort of same transaction&quot;);</span>
+        }
+<span class="nc" id="L98">    }</span>
+
+    private void checkRecordRequestConsistency(SourceRecord record) {
+<span class="nc bnc" id="L101" title="All 4 branches missed.">        if (committableRecords.contains(record) &amp;&amp; abortableRecords.contains(record)) {</span>
+<span class="nc" id="L102">            log.trace(&quot;Connector will fail as it has requested both commit and abort of transaction for same record: {}&quot;, record);</span>
+<span class="nc" id="L103">            throw new IllegalStateException(String.format(</span>
+                    &quot;Connector requested both commit and abort of same record against topic/partition %s/%s&quot;,
+<span class="nc" id="L105">                    record.topic(), record.kafkaPartition()</span>
+            ));
+        }
+<span class="nc" id="L108">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

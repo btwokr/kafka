@@ -1,0 +1,393 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BrokerMetadataPublisher.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">kafka.server.metadata</a> &gt; <span class="el_source">BrokerMetadataPublisher.scala</span></div><h1>BrokerMetadataPublisher.scala</h1><pre class="source lang-java linenums">/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package kafka.server.metadata
+
+import java.util.OptionalInt
+import kafka.coordinator.transaction.TransactionCoordinator
+import kafka.server.share.SharePartitionManager
+import kafka.server.{KafkaConfig, ReplicaManager}
+import kafka.utils.Logging
+import org.apache.kafka.common.Uuid
+import org.apache.kafka.common.errors.TimeoutException
+import org.apache.kafka.common.internals.Topic
+import org.apache.kafka.coordinator.group.GroupCoordinator
+import org.apache.kafka.coordinator.share.ShareCoordinator
+import org.apache.kafka.coordinator.transaction.TransactionLogConfig
+import org.apache.kafka.image.loader.LoaderManifest
+import org.apache.kafka.image.publisher.MetadataPublisher
+import org.apache.kafka.image.{MetadataDelta, MetadataImage, TopicDelta}
+import org.apache.kafka.metadata.KRaftMetadataCache
+import org.apache.kafka.metadata.publisher.{AclPublisher, DelegationTokenPublisher, DynamicClientQuotaPublisher, DynamicTopicClusterQuotaPublisher, ScramPublisher}
+import org.apache.kafka.server.common.MetadataVersion.MINIMUM_VERSION
+import org.apache.kafka.server.common.{FinalizedFeatures, ShareVersion}
+import org.apache.kafka.server.fault.FaultHandler
+import org.apache.kafka.storage.internals.log.{UnifiedLog, LogManager =&gt; JLogManager}
+
+import java.util.concurrent.CompletableFuture
+
+
+<span class="pc bnc" id="L44" title="All 4 branches missed.">object BrokerMetadataPublisher extends Logging {</span>
+  /**
+   * Given a topic name, find out if it changed. Note: if a topic named X was deleted and
+   * then re-created, this method will return just the re-creation. The deletion will show
+   * up in deletedTopicIds and must be handled separately.
+   *
+   * @param topicName   The topic name.
+   * @param newImage    The new metadata image.
+   * @param delta       The metadata delta to search.
+   *
+   * @return            The delta, or None if appropriate.
+   */
+  def getTopicDelta(topicName: String,
+                    newImage: MetadataImage,
+                    delta: MetadataDelta): Option[TopicDelta] = {
+<span class="fc" id="L59">    Option(newImage.topics().getTopic(topicName)).flatMap {</span>
+<span class="fc" id="L60">      topicImage =&gt; Option(delta.topicsDelta()).flatMap {</span>
+<span class="fc" id="L61">        topicDelta =&gt; Option(topicDelta.changedTopic(topicImage.id()))</span>
+      }
+    }
+  }
+}
+
+<span class="pc bpc" id="L67" title="1 of 4 branches missed.">class BrokerMetadataPublisher(</span>
+<span class="fc" id="L68">  config: KafkaConfig,</span>
+<span class="fc" id="L69">  metadataCache: KRaftMetadataCache,</span>
+<span class="fc" id="L70">  logManager: JLogManager,</span>
+<span class="fc" id="L71">  replicaManager: ReplicaManager,</span>
+<span class="fc" id="L72">  groupCoordinator: GroupCoordinator,</span>
+<span class="fc" id="L73">  txnCoordinator: TransactionCoordinator,</span>
+<span class="fc" id="L74">  shareCoordinator: ShareCoordinator,</span>
+<span class="fc" id="L75">  sharePartitionManager: SharePartitionManager,</span>
+<span class="pc" id="L76">  var dynamicConfigPublisher: DynamicConfigPublisher,</span>
+<span class="fc" id="L77">  dynamicClientQuotaPublisher: DynamicClientQuotaPublisher,</span>
+<span class="fc" id="L78">  dynamicTopicClusterQuotaPublisher: DynamicTopicClusterQuotaPublisher,</span>
+<span class="fc" id="L79">  scramPublisher: ScramPublisher,</span>
+<span class="fc" id="L80">  delegationTokenPublisher: DelegationTokenPublisher,</span>
+<span class="fc" id="L81">  aclPublisher: AclPublisher,</span>
+<span class="fc" id="L82">  fatalFaultHandler: FaultHandler,</span>
+<span class="fc" id="L83">  metadataPublishingFaultHandler: FaultHandler</span>
+<span class="fc" id="L84">) extends MetadataPublisher with Logging {</span>
+<span class="fc" id="L85">  logIdent = s&quot;[BrokerMetadataPublisher id=${config.nodeId}] &quot;</span>
+
+  import BrokerMetadataPublisher._
+
+  /**
+   * The broker ID.
+   */
+<span class="fc" id="L92">  val brokerId: Int = config.nodeId</span>
+
+  /**
+   * True if this is the first time we have published metadata.
+   */
+<span class="fc" id="L97">  var _firstPublish = true</span>
+
+  /**
+   * A future that is completed when we first publish.
+   */
+<span class="fc" id="L102">  val firstPublishFuture = new CompletableFuture[Void]</span>
+
+  /**
+   * The share version being used in the broker metadata.
+   */
+<span class="fc" id="L107">  private var finalizedShareVersion: Short = FinalizedFeatures.fromKRaftVersion(MINIMUM_VERSION).finalizedFeatures().getOrDefault(ShareVersion.FEATURE_NAME, 0.toShort)</span>
+
+<span class="fc" id="L109">  override def name(): String = &quot;BrokerMetadataPublisher&quot;</span>
+
+  override def onMetadataUpdate(
+    delta: MetadataDelta,
+    newImage: MetadataImage,
+    manifest: LoaderManifest
+  ): Unit = {
+<span class="fc" id="L116">    val highestOffsetAndEpoch = newImage.highestOffsetAndEpoch()</span>
+
+<span class="fc bfc" id="L118" title="All 2 branches covered.">    val deltaName = if (_firstPublish) {</span>
+<span class="fc" id="L119">      s&quot;initial MetadataDelta up to ${highestOffsetAndEpoch.offset}&quot;</span>
+    } else {
+<span class="fc" id="L121">      s&quot;MetadataDelta up to ${highestOffsetAndEpoch.offset}&quot;</span>
+    }
+    try {
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">      if (isTraceEnabled) {</span>
+<span class="nc" id="L125">        trace(s&quot;Publishing delta $delta with highest offset $highestOffsetAndEpoch&quot;)</span>
+      }
+
+      // Publish the new metadata image to the metadata cache.
+<span class="fc" id="L129">      metadataCache.setImage(newImage)</span>
+
+<span class="nc" id="L131">      def metadataVersionLogMsg = s&quot;metadata.version ${newImage.features().metadataVersion()}&quot;</span>
+
+<span class="fc bfc" id="L133" title="All 2 branches covered.">      if (_firstPublish) {</span>
+<span class="pc" id="L134">        info(s&quot;Publishing initial metadata at offset $highestOffsetAndEpoch with $metadataVersionLogMsg.&quot;)</span>
+
+        // If this is the first metadata update we are applying, initialize the managers
+        // first (but after setting up the metadata cache).
+<span class="fc" id="L138">        initializeManagers(newImage)</span>
+<span class="pc bpc" id="L139" title="1 of 2 branches missed.">      } else if (isDebugEnabled) {</span>
+<span class="nc" id="L140">        debug(s&quot;Publishing metadata at offset $highestOffsetAndEpoch with $metadataVersionLogMsg.&quot;)</span>
+      }
+
+      // Apply topic deltas.
+<span class="fc" id="L144">      Option(delta.topicsDelta()).foreach { topicsDelta =&gt;</span>
+        try {
+          // Notify the replica manager about changes to topics.
+<span class="pc" id="L147">          replicaManager.applyDelta(topicsDelta, newImage)</span>
+        } catch {
+<span class="nc" id="L149">          case t: Throwable =&gt; metadataPublishingFaultHandler.handleFault(&quot;Error applying topics &quot; +</span>
+<span class="nc" id="L150">            s&quot;delta in $deltaName&quot;, t)</span>
+        }
+        try {
+          // Update the group coordinator of local changes
+<span class="pc" id="L154">          updateCoordinator(newImage,</span>
+<span class="fc" id="L155">            delta,</span>
+<span class="fc" id="L156">            Topic.GROUP_METADATA_TOPIC_NAME,</span>
+<span class="fc" id="L157">            groupCoordinator.onElection,</span>
+<span class="fc" id="L158">            (partitionIndex, leaderEpochOpt) =&gt; groupCoordinator.onResignation(partitionIndex, toOptionalInt(leaderEpochOpt))</span>
+          )
+        } catch {
+<span class="nc" id="L161">          case t: Throwable =&gt; metadataPublishingFaultHandler.handleFault(&quot;Error updating group &quot; +</span>
+<span class="nc" id="L162">            s&quot;coordinator with local changes in $deltaName&quot;, t)</span>
+        }
+        try {
+          // Update the transaction coordinator of local changes
+<span class="pc" id="L166">          updateCoordinator(newImage,</span>
+<span class="fc" id="L167">            delta,</span>
+<span class="fc" id="L168">            Topic.TRANSACTION_STATE_TOPIC_NAME,</span>
+<span class="pc" id="L169">            txnCoordinator.onElection,</span>
+<span class="pc" id="L170">            txnCoordinator.onResignation)</span>
+        } catch {
+<span class="nc" id="L172">          case t: Throwable =&gt; metadataPublishingFaultHandler.handleFault(&quot;Error updating txn &quot; +</span>
+<span class="nc" id="L173">            s&quot;coordinator with local changes in $deltaName&quot;, t)</span>
+        }
+        try {
+<span class="pc" id="L176">          updateCoordinator(newImage,</span>
+<span class="fc" id="L177">            delta,</span>
+<span class="fc" id="L178">            Topic.SHARE_GROUP_STATE_TOPIC_NAME,</span>
+<span class="pc" id="L179">            shareCoordinator.onElection,</span>
+<span class="pc" id="L180">            (partitionIndex, leaderEpochOpt) =&gt; shareCoordinator.onResignation(partitionIndex, toOptionalInt(leaderEpochOpt))</span>
+          )
+        } catch {
+<span class="nc" id="L183">          case t: Throwable =&gt; metadataPublishingFaultHandler.handleFault(&quot;Error updating share &quot; +</span>
+<span class="nc" id="L184">            s&quot;coordinator with local changes in $deltaName&quot;, t)</span>
+        }
+      }
+
+      // Apply configuration deltas.
+<span class="fc" id="L189">      dynamicConfigPublisher.onMetadataUpdate(delta, newImage)</span>
+
+      // Apply client quotas delta.
+<span class="fc" id="L192">      dynamicClientQuotaPublisher.onMetadataUpdate(delta, newImage, manifest)</span>
+
+      // Apply topic or cluster quotas delta.
+<span class="fc" id="L195">      dynamicTopicClusterQuotaPublisher.onMetadataUpdate(delta, newImage, manifest)</span>
+
+      // Apply SCRAM delta.
+<span class="fc" id="L198">      scramPublisher.onMetadataUpdate(delta, newImage, manifest)</span>
+
+      // Apply DelegationToken delta.
+<span class="fc" id="L201">      delegationTokenPublisher.onMetadataUpdate(delta, newImage, manifest)</span>
+
+      // Apply ACL delta.
+<span class="fc" id="L204">      aclPublisher.onMetadataUpdate(delta, newImage, manifest)</span>
+
+      try {
+        // Propagate the new image to the group coordinator.
+<span class="pc" id="L208">        groupCoordinator.onMetadataUpdate(delta, newImage)</span>
+      } catch {
+<span class="nc" id="L210">        case t: Throwable =&gt; metadataPublishingFaultHandler.handleFault(&quot;Error updating group &quot; +</span>
+<span class="nc" id="L211">          s&quot;coordinator with local changes in $deltaName&quot;, t)</span>
+      }
+
+      try {
+        // Propagate the new image to the share coordinator.
+<span class="pc" id="L216">        shareCoordinator.onMetadataUpdate(delta, newImage)</span>
+      } catch {
+<span class="nc" id="L218">        case t: Throwable =&gt; metadataPublishingFaultHandler.handleFault(&quot;Error updating share &quot; +</span>
+<span class="nc" id="L219">          s&quot;coordinator with local changes in $deltaName&quot;, t)</span>
+      }
+
+<span class="fc bfc" id="L222" title="All 2 branches covered.">      if (_firstPublish) {</span>
+<span class="fc" id="L223">        finishInitializingReplicaManager()</span>
+      }
+
+<span class="fc bfc" id="L226" title="All 2 branches covered.">      if (delta.featuresDelta != null) {</span>
+        try {
+<span class="fc" id="L228">          val newFinalizedFeatures = new FinalizedFeatures(newImage.features.metadataVersionOrThrow, newImage.features.finalizedVersions, newImage.provenance.lastContainedOffset)</span>
+<span class="fc" id="L229">          val newFinalizedShareVersion = newFinalizedFeatures.finalizedFeatures().getOrDefault(ShareVersion.FEATURE_NAME, 0.toShort)</span>
+          // Share version feature has been toggled.
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">          if (newFinalizedShareVersion != finalizedShareVersion) {</span>
+<span class="fc" id="L232">            finalizedShareVersion = newFinalizedShareVersion</span>
+<span class="fc" id="L233">            val shareVersion: ShareVersion = ShareVersion.fromFeatureLevel(finalizedShareVersion)</span>
+<span class="pc" id="L234">            info(s&quot;Feature share.version has been updated to version $finalizedShareVersion&quot;)</span>
+<span class="pc" id="L235">            sharePartitionManager.onShareVersionToggle(shareVersion)</span>
+          }
+        } catch {
+<span class="nc" id="L238">          case t: Throwable =&gt; metadataPublishingFaultHandler.handleFault(&quot;Error updating share partition manager &quot; +</span>
+<span class="nc" id="L239">            s&quot; with share version feature change in $deltaName&quot;, t)</span>
+        }
+      }
+
+    } catch {
+<span class="nc" id="L244">      case t: Throwable =&gt; metadataPublishingFaultHandler.handleFault(&quot;Uncaught exception while &quot; +</span>
+<span class="nc" id="L245">        s&quot;publishing broker metadata from $deltaName&quot;, t)</span>
+    } finally {
+<span class="fc" id="L247">      _firstPublish = false</span>
+<span class="fc" id="L248">      firstPublishFuture.complete(null)</span>
+    }
+  }
+
+  private def toOptionalInt(option: Option[Int]): OptionalInt = {
+<span class="nc" id="L253">    option match {</span>
+<span class="pc bpc" id="L254" title="1 of 2 branches missed.">      case Some(leaderEpoch) =&gt; OptionalInt.of(leaderEpoch)</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">      case None =&gt; OptionalInt.empty</span>
+    }
+  }
+
+  /**
+   * Update the coordinator of local replica changes: election and resignation.
+   *
+   * When the topic is deleted or a partition of the topic is deleted, {@param resignation}
+   * callback must be called with {@code None}. The coordinator expects the leader epoch to be
+   * incremented when the {@param resignation} callback is called but the leader epoch
+   * is not incremented when a topic is deleted.
+   *
+   * @param image latest metadata image
+   * @param delta metadata delta from the previous image and the latest image
+   * @param topicName name of the topic associated with the coordinator
+   * @param election function to call on election; the first parameter is the partition id;
+   *                 the second parameter is the leader epoch
+   * @param resignation function to call on resignation; the first parameter is the partition id;
+   *                    the second parameter is the leader epoch
+   */
+  def updateCoordinator(
+    image: MetadataImage,
+    delta: MetadataDelta,
+    topicName: String,
+    election: (Int, Int) =&gt; Unit,
+    resignation: (Int, Option[Int]) =&gt; Unit
+  ): Unit = {
+    // Handle the case where the topic was deleted
+<span class="fc" id="L283">    Option(delta.topicsDelta()).foreach { topicsDelta =&gt;</span>
+<span class="pc bpc" id="L284" title="1 of 2 branches missed.">      if (topicsDelta.topicWasDeleted(topicName)) {</span>
+<span class="pc" id="L285">        topicsDelta.image.getTopic(topicName).partitions.entrySet.forEach { entry =&gt;</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">          if (entry.getValue.leader == brokerId) {</span>
+<span class="nc" id="L287">            resignation(entry.getKey, None)</span>
+          }
+        }
+      }
+    }
+
+    // Handle the case where the replica was reassigned, made a leader or made a follower
+<span class="fc" id="L294">    getTopicDelta(topicName, image, delta).foreach { topicDelta =&gt;</span>
+<span class="fc" id="L295">      val changes = topicDelta.localChanges(brokerId)</span>
+
+<span class="fc" id="L297">      changes.deletes.forEach { topicPartition =&gt;</span>
+<span class="nc" id="L298">        resignation(topicPartition.partition, None)</span>
+      }
+<span class="fc" id="L300">      changes.electedLeaders.forEach { (topicPartition, partitionInfo) =&gt;</span>
+<span class="fc" id="L301">        election(topicPartition.partition, partitionInfo.partition.leaderEpoch)</span>
+      }
+<span class="fc" id="L303">      changes.followers.forEach { (topicPartition, partitionInfo) =&gt;</span>
+<span class="fc" id="L304">        resignation(topicPartition.partition, Some(partitionInfo.partition.leaderEpoch))</span>
+      }
+    }
+  }
+
+  private def initializeManagers(newImage: MetadataImage): Unit = {
+<span class="pc" id="L310">    try {</span>
+      // Start log manager, which will perform (potentially lengthy)
+      // recovery-from-unclean-shutdown if required.
+<span class="fc" id="L313">      logManager.startup(</span>
+<span class="fc" id="L314">        metadataCache.getAllTopics,</span>
+<span class="fc" id="L315">        (log: UnifiedLog) =&gt; {</span>
+
+<span class="nc bnc" id="L317" title="All 2 branches missed.">          if (log.topicId().isEmpty) {</span>
+            // Missing topic ID could result from storage failure or unclean shutdown after topic creation but before flushing
+            // data to the `partition.metadata` file. And before appending data to the log, the `partition.metadata` is always
+            // flushed to disk. So if the topic ID is missing, it mostly means no data was appended, and we can treat this as
+            // a stray log.
+<span class="nc" id="L322">            info(s&quot;The topicId does not exist in $log, treat it as a stray log.&quot;)</span>
+<span class="nc" id="L323">            true</span>
+          } else {
+<span class="nc" id="L325">            val replicas = newImage.topics.partitionReplicas(log.topicId.get, log.topicPartition.partition)</span>
+<span class="nc" id="L326">            JLogManager.isStrayReplica(replicas, brokerId, log)</span>
+          }
+        }
+      )
+
+      // Rename all future replicas which are in the same directory as the
+      // one assigned by the controller. This can only happen due to a disk
+      // failure and broker shutdown after the directory assignment has been
+      // updated in the controller but before the future replica could be
+      // promoted.
+      // See KAFKA-16082 for details.
+<span class="fc" id="L337">      logManager.recoverAbandonedFutureLogs(brokerId, (topicId: Uuid, partition: Int, brokerId: Int) =&gt;</span>
+<span class="nc" id="L338">        newImage.topics().getPartition(topicId, partition).directory(brokerId)</span>
+      )
+
+      // Make the LogCleaner available for reconfiguration. We can't do this prior to this
+      // point because LogManager#startup creates the LogCleaner object, if
+      // log.cleaner.enable is true. TODO: improve this (see KAFKA-13610)
+<span class="fc" id="L344">      Option(logManager.cleaner).foreach(config.dynamicConfig.addBrokerReconfigurable)</span>
+    } catch {
+<span class="nc" id="L346">      case t: Throwable =&gt; fatalFaultHandler.handleFault(&quot;Error starting LogManager&quot;, t)</span>
+    }
+    try {
+      // Start the replica manager.
+<span class="pc" id="L350">      replicaManager.startup()</span>
+    } catch {
+<span class="nc" id="L352">      case t: Throwable =&gt; fatalFaultHandler.handleFault(&quot;Error starting ReplicaManager&quot;, t)</span>
+    }
+    try {
+      // Start the group coordinator.
+<span class="pc" id="L356">      groupCoordinator.startup(() =&gt; metadataCache.numPartitions(Topic.GROUP_METADATA_TOPIC_NAME)</span>
+<span class="fc" id="L357">        .orElse(config.groupCoordinatorConfig.offsetsTopicPartitions))</span>
+    } catch {
+<span class="nc" id="L359">      case t: Throwable =&gt; fatalFaultHandler.handleFault(&quot;Error starting GroupCoordinator&quot;, t)</span>
+    }
+<span class="pc" id="L361">    try {</span>
+<span class="fc" id="L362">      val transactionLogConfig = new TransactionLogConfig(config)</span>
+      // Start the transaction coordinator.
+<span class="fc" id="L364">      txnCoordinator.startup(() =&gt; metadataCache.numPartitions(</span>
+<span class="fc" id="L365">        Topic.TRANSACTION_STATE_TOPIC_NAME).orElse(transactionLogConfig.transactionTopicPartitions))</span>
+    } catch {
+<span class="nc" id="L367">      case t: Throwable =&gt; fatalFaultHandler.handleFault(&quot;Error starting TransactionCoordinator&quot;, t)</span>
+    }
+    try {
+      // Start the share coordinator.
+<span class="pc" id="L371">      shareCoordinator.startup(() =&gt; metadataCache.numPartitions(Topic.SHARE_GROUP_STATE_TOPIC_NAME)</span>
+<span class="fc" id="L372">        .orElse(config.shareCoordinatorConfig.shareCoordinatorStateTopicNumPartitions()))</span>
+    } catch {
+<span class="nc" id="L374">      case t: Throwable =&gt; fatalFaultHandler.handleFault(&quot;Error starting Share coordinator&quot;, t)</span>
+    }
+  }
+
+  private def finishInitializingReplicaManager(): Unit = {
+    try {
+      // Make sure that the high water mark checkpoint thread is running for the replica
+      // manager.
+<span class="pc" id="L382">      replicaManager.startHighWatermarkCheckPointThread()</span>
+    } catch {
+<span class="nc" id="L384">      case t: Throwable =&gt; metadataPublishingFaultHandler.handleFault(&quot;Error starting high &quot; +</span>
+<span class="nc" id="L385">        &quot;watermark checkpoint thread during startup&quot;, t)</span>
+    }
+  }
+
+  override def close(): Unit = {
+<span class="fc" id="L390">    firstPublishFuture.completeExceptionally(new TimeoutException())</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

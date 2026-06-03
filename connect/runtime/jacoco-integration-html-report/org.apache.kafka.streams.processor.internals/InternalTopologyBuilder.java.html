@@ -1,0 +1,2356 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>InternalTopologyBuilder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals</a> &gt; <span class="el_source">InternalTopologyBuilder.java</span></div><h1>InternalTopologyBuilder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals;
+
+import org.apache.kafka.clients.consumer.internals.AutoOffsetResetStrategy;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.serialization.Deserializer;
+import org.apache.kafka.common.serialization.Serializer;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.TopologyConfig;
+import org.apache.kafka.streams.errors.TopologyException;
+import org.apache.kafka.streams.internals.ApiUtils;
+import org.apache.kafka.streams.internals.AutoOffsetResetInternal;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StreamPartitioner;
+import org.apache.kafka.streams.processor.TimestampExtractor;
+import org.apache.kafka.streams.processor.TopicNameExtractor;
+import org.apache.kafka.streams.processor.api.FixedKeyProcessorSupplier;
+import org.apache.kafka.streams.processor.api.ProcessorSupplier;
+import org.apache.kafka.streams.processor.api.ProcessorWrapper;
+import org.apache.kafka.streams.processor.api.WrappedFixedKeyProcessorSupplier;
+import org.apache.kafka.streams.processor.api.WrappedProcessorSupplier;
+import org.apache.kafka.streams.processor.internals.TopologyMetadata.Subtopology;
+import org.apache.kafka.streams.processor.internals.namedtopology.NamedTopology;
+import org.apache.kafka.streams.state.StoreBuilder;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.Serializable;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.streams.StreamsConfig.ENSURE_EXPLICIT_INTERNAL_RESOURCE_NAMING_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.PROCESSOR_WRAPPER_CLASS_CONFIG;
+
+public class InternalTopologyBuilder {
+
+<span class="nc" id="L74">    public InternalTopologyBuilder() {</span>
+<span class="nc" id="L75">        this.topologyName = null;</span>
+<span class="nc" id="L76">        this.ensureExplicitInternalResourceNaming = false;</span>
+<span class="nc" id="L77">        this.processorWrapper = new NoOpProcessorWrapper();</span>
+<span class="nc" id="L78">    }</span>
+
+<span class="nc" id="L80">    public InternalTopologyBuilder(final TopologyConfig topologyConfigs) {</span>
+<span class="nc" id="L81">        Objects.requireNonNull(topologyConfigs, &quot;topologyConfigs cannot be null&quot;);</span>
+
+<span class="nc" id="L83">        this.topologyConfigs = topologyConfigs;</span>
+<span class="nc" id="L84">        this.topologyName = topologyConfigs.topologyName;</span>
+<span class="nc" id="L85">        this.ensureExplicitInternalResourceNaming = topologyConfigs.ensureExplicitInternalResourceNaming;</span>
+        try {
+<span class="nc" id="L87">            processorWrapper = topologyConfigs.getConfiguredInstance(</span>
+                PROCESSOR_WRAPPER_CLASS_CONFIG,
+                ProcessorWrapper.class,
+<span class="nc" id="L90">                topologyConfigs.originals()</span>
+            );
+<span class="nc" id="L92">        } catch (final Exception e) {</span>
+<span class="nc" id="L93">            final String errorMessage = String.format(</span>
+                &quot;Unable to instantiate ProcessorWrapper from value of config %s. Please provide a valid class &quot;
+                    + &quot;that implements the ProcessorWrapper interface.&quot;, PROCESSOR_WRAPPER_CLASS_CONFIG);
+<span class="nc" id="L96">            log.error(errorMessage, e);</span>
+<span class="nc" id="L97">            throw new ConfigException(errorMessage, e);</span>
+<span class="nc" id="L98">        }</span>
+<span class="nc" id="L99">    }</span>
+
+<span class="nc" id="L101">    private static final Logger log = LoggerFactory.getLogger(InternalTopologyBuilder.class);</span>
+<span class="nc" id="L102">    private static final String[] NO_PREDECESSORS = {};</span>
+
+    // node factories in a topological order
+<span class="nc" id="L105">    private final Map&lt;String, NodeFactory&lt;?, ?, ?, ?&gt;&gt; nodeFactories = new LinkedHashMap&lt;&gt;();</span>
+
+<span class="nc" id="L107">    private final Map&lt;String, StoreFactory&gt; stateFactories = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L109">    private final Map&lt;String, StoreFactory&gt; globalStateBuilders = new LinkedHashMap&lt;&gt;();</span>
+
+    // built global state stores
+<span class="nc" id="L112">    private final Map&lt;String, StateStore&gt; globalStateStores = new LinkedHashMap&lt;&gt;();</span>
+
+    // Raw names of all source topics, without the application id/named topology prefix for repartition sources
+<span class="nc" id="L115">    private final Set&lt;String&gt; rawSourceTopicNames = new HashSet&lt;&gt;();</span>
+
+    // Full names of all source topics, including the application id/named topology prefix for repartition sources
+<span class="nc" id="L118">    private List&lt;String&gt; fullSourceTopicNames = null;</span>
+
+    // String representing pattern that matches all subscribed topics, including patterns and full source topic names
+<span class="nc" id="L121">    private String sourceTopicPatternString = null;</span>
+
+    // all internal topics with their corresponding properties auto-created by the topology builder and used in source / sink processors
+<span class="nc" id="L124">    private final Map&lt;String, InternalTopicProperties&gt; internalTopicNamesWithProperties = new HashMap&lt;&gt;();</span>
+
+    // groups of source processors that need to be copartitioned
+<span class="nc" id="L127">    private final List&lt;Set&lt;String&gt;&gt; copartitionSourceGroups = new ArrayList&lt;&gt;();</span>
+
+    // map from source processor names to subscribed topics (without application-id prefix for internal topics)
+<span class="nc" id="L130">    private final Map&lt;String, List&lt;String&gt;&gt; nodeToSourceTopics = new HashMap&lt;&gt;();</span>
+
+    // map from source processor names to regex subscription patterns
+<span class="nc" id="L133">    private final Map&lt;String, Pattern&gt; nodeToSourcePatterns = new LinkedHashMap&lt;&gt;();</span>
+
+    // map from sink processor names to sink topic (without application-id prefix for internal topics)
+<span class="nc" id="L136">    private final Map&lt;String, String&gt; nodeToSinkTopic = new HashMap&lt;&gt;();</span>
+
+    // map from state store names to raw name (without application id/topology name prefix) of all topics subscribed
+    // from source processors that are connected to these state stores
+<span class="nc" id="L140">    private final Map&lt;String, Set&lt;String&gt;&gt; stateStoreNameToRawSourceTopicNames = new HashMap&lt;&gt;();</span>
+
+    // map from state store names to all the regex subscribed topics from source processors that
+    // are connected to these state stores
+<span class="nc" id="L144">    private final Map&lt;String, Set&lt;Pattern&gt;&gt; stateStoreNameToSourceRegex = new HashMap&lt;&gt;();</span>
+
+    // map from state store names to this state store's corresponding changelog topic if possible
+<span class="nc" id="L147">    private final Map&lt;String, String&gt; storeToChangelogTopic = new HashMap&lt;&gt;();</span>
+
+    // map from changelog topic name to its corresponding state store.
+<span class="nc" id="L150">    private final Map&lt;String, String&gt; changelogTopicToStore = new HashMap&lt;&gt;();</span>
+
+    // map of store name to restore behavior
+<span class="nc" id="L153">    private final Map&lt;String, Optional&lt;ReprocessFactory&lt;?, ?, ?, ?&gt;&gt;&gt; storeNameToReprocessOnRestore = new HashMap&lt;&gt;();</span>
+
+    // all global topics
+<span class="nc" id="L156">    private final Set&lt;String&gt; globalTopics = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L158">    private final Set&lt;String&gt; noneResetTopics = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L160">    private final Set&lt;String&gt; earliestResetTopics = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L162">    private final Set&lt;String&gt; latestResetTopics = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L164">    private final Map&lt;String, Duration&gt; durationResetTopics = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L166">    private final Set&lt;Pattern&gt; noneResetPatterns = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L168">    private final Set&lt;Pattern&gt; earliestResetPatterns = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L170">    private final Set&lt;Pattern&gt; latestResetPatterns = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L172">    private final Map&lt;Pattern, Duration&gt; durationResetPatterns = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L174">    private final QuickUnion&lt;String&gt; nodeGrouper = new QuickUnion&lt;&gt;();</span>
+
+    // Used to capture subscribed topics via Patterns discovered during the partition assignment process.
+<span class="nc" id="L177">    private final Set&lt;String&gt; subscriptionUpdates = new HashSet&lt;&gt;();</span>
+
+    private final ProcessorWrapper processorWrapper;
+
+<span class="nc" id="L181">    private String applicationId = null;</span>
+
+    // keyed by subtopology id
+<span class="nc" id="L184">    private Map&lt;Integer, Set&lt;String&gt;&gt; nodeGroups = null;</span>
+
+    // keyed by subtopology id
+<span class="nc" id="L187">    private Map&lt;Integer, Set&lt;String&gt;&gt; subtopologyIdToStateStoreNames = null;</span>
+
+    // The name of the topology this builder belongs to, or null if this is not a NamedTopology
+    private final String topologyName;
+
+    @SuppressWarnings(&quot;deprecation&quot;)
+    private NamedTopology namedTopology;
+
+    // TODO KAFKA-13283: once we enforce all configs be passed in when constructing the topology builder then we can set
+    //  this up front and make it final, but for now we have to wait for the global app configs passed in to rewriteTopology
+    private TopologyConfig topologyConfigs;  // the configs for this topology, including overrides and global defaults
+
+<span class="nc" id="L199">    private boolean hasPersistentStores = false;</span>
+
+    private final boolean ensureExplicitInternalResourceNaming;
+
+<span class="nc" id="L203">    private final Set&lt;InternalResourcesNaming&gt; implicitInternalNames = new LinkedHashSet&lt;&gt;();</span>
+
+    public static class ReprocessFactory&lt;KIn, VIn, KOut, VOut&gt; {
+
+        private final ProcessorSupplier&lt;KIn, VIn, KOut, VOut&gt; processorSupplier;
+        private final Deserializer&lt;KIn&gt; keyDeserializer;
+        private final Deserializer&lt;VIn&gt; valueDeserializer;
+        private final String processorName;
+
+        private ReprocessFactory(final ProcessorSupplier&lt;KIn, VIn, KOut, VOut&gt; processorSupplier,
+                                 final Deserializer&lt;KIn&gt; key,
+                                 final Deserializer&lt;VIn&gt; value,
+<span class="nc" id="L215">                                 final String processorName) {</span>
+<span class="nc" id="L216">            this.processorSupplier = processorSupplier;</span>
+<span class="nc" id="L217">            this.keyDeserializer = key;</span>
+<span class="nc" id="L218">            this.valueDeserializer = value;</span>
+<span class="nc" id="L219">            this.processorName = processorName;</span>
+<span class="nc" id="L220">        }</span>
+        public ProcessorSupplier&lt;KIn, VIn, KOut, VOut&gt; processorSupplier() {
+<span class="nc" id="L222">            return processorSupplier;</span>
+        }
+
+        public Deserializer&lt;KIn&gt; keyDeserializer() {
+<span class="nc" id="L226">            return keyDeserializer;</span>
+        }
+
+        public Deserializer&lt;VIn&gt; valueDeserializer() {
+<span class="nc" id="L230">            return valueDeserializer;</span>
+        }
+
+        public String processorName() {
+<span class="nc" id="L234">            return processorName;</span>
+        }
+    }
+
+    private abstract static class NodeFactory&lt;KIn, VIn, KOut, VOut&gt; {
+        final String name;
+        final String[] predecessors;
+
+        NodeFactory(final String name,
+<span class="nc" id="L243">                    final String[] predecessors) {</span>
+<span class="nc" id="L244">            this.name = name;</span>
+<span class="nc" id="L245">            this.predecessors = predecessors;</span>
+<span class="nc" id="L246">        }</span>
+
+        public abstract ProcessorNode&lt;KIn, VIn, KOut, VOut&gt; build();
+
+        abstract AbstractNode describe();
+    }
+
+    private static class ProcessorNodeFactory&lt;KIn, VIn, KOut, VOut&gt; extends NodeFactory&lt;KIn, VIn, KOut, VOut&gt; {
+        private final ProcessorSupplier&lt;KIn, VIn, KOut, VOut&gt; supplier;
+<span class="nc" id="L255">        final Set&lt;String&gt; stateStoreNames = new HashSet&lt;&gt;();</span>
+
+        ProcessorNodeFactory(final String name,
+                             final String[] predecessors,
+                             final ProcessorSupplier&lt;KIn, VIn, KOut, VOut&gt; supplier) {
+<span class="nc" id="L260">            super(name, predecessors.clone());</span>
+<span class="nc" id="L261">            this.supplier = supplier;</span>
+<span class="nc" id="L262">        }</span>
+
+        public void addStateStore(final String stateStoreName) {
+<span class="nc" id="L265">            stateStoreNames.add(stateStoreName);</span>
+<span class="nc" id="L266">        }</span>
+
+        @Override
+        public ProcessorNode&lt;KIn, VIn, KOut, VOut&gt; build() {
+<span class="nc" id="L270">            return new ProcessorNode&lt;&gt;(name, supplier.get(), stateStoreNames);</span>
+        }
+
+        @Override
+        Processor describe() {
+<span class="nc" id="L275">            return new Processor(name, new HashSet&lt;&gt;(stateStoreNames));</span>
+        }
+    }
+
+    private static class FixedKeyProcessorNodeFactory&lt;KIn, VIn, VOut&gt; extends ProcessorNodeFactory&lt;KIn, VIn, KIn, VOut&gt; {
+        private final FixedKeyProcessorSupplier&lt;KIn, VIn, VOut&gt; supplier;
+
+        FixedKeyProcessorNodeFactory(final String name,
+                             final String[] predecessors,
+                             final FixedKeyProcessorSupplier&lt;KIn, VIn, VOut&gt; supplier) {
+<span class="nc" id="L285">            super(name, predecessors.clone(), null);</span>
+<span class="nc" id="L286">            this.supplier = supplier;</span>
+<span class="nc" id="L287">        }</span>
+
+        @Override
+        public ProcessorNode&lt;KIn, VIn, KIn, VOut&gt; build() {
+<span class="nc" id="L291">            return new ProcessorNode&lt;&gt;(name, supplier.get(), stateStoreNames);</span>
+        }
+
+        @Override
+        Processor describe() {
+<span class="nc" id="L296">            return new Processor(name, new HashSet&lt;&gt;(stateStoreNames));</span>
+        }
+    }
+
+    // Map from topics to their matched regex patterns, this is to ensure one topic is passed through on source node
+    // even if it can be matched by multiple regex patterns. Only used by SourceNodeFactory
+<span class="nc" id="L302">    private final Map&lt;String, Pattern&gt; topicToPatterns = new HashMap&lt;&gt;();</span>
+
+    private class SourceNodeFactory&lt;KIn, VIn&gt; extends NodeFactory&lt;KIn, VIn, KIn, VIn&gt; {
+        private final List&lt;String&gt; topics;
+        private final Pattern pattern;
+        private final Deserializer&lt;KIn&gt; keyDeserializer;
+        private final Deserializer&lt;VIn&gt; valDeserializer;
+        private final TimestampExtractor timestampExtractor;
+
+        private SourceNodeFactory(final String name,
+                                  final String[] topics,
+                                  final Pattern pattern,
+                                  final TimestampExtractor timestampExtractor,
+                                  final Deserializer&lt;KIn&gt; keyDeserializer,
+<span class="nc" id="L316">                                  final Deserializer&lt;VIn&gt; valDeserializer) {</span>
+<span class="nc" id="L317">            super(name, NO_PREDECESSORS);</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">            this.topics = topics != null ? Arrays.asList(topics) : new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L319">            this.pattern = pattern;</span>
+<span class="nc" id="L320">            this.keyDeserializer = keyDeserializer;</span>
+<span class="nc" id="L321">            this.valDeserializer = valDeserializer;</span>
+<span class="nc" id="L322">            this.timestampExtractor = timestampExtractor;</span>
+<span class="nc" id="L323">        }</span>
+
+        List&lt;String&gt; topics(final Collection&lt;String&gt; subscribedTopics) {
+            // if it is subscribed via patterns, it is possible that the topic metadata has not been updated
+            // yet and hence the map from source node to topics is stale, in this case we put the pattern as a place holder;
+            // this should only happen for debugging since during runtime this function should always be called after the metadata has updated.
+<span class="nc bnc" id="L329" title="All 2 branches missed.">            if (subscribedTopics.isEmpty()) {</span>
+<span class="nc" id="L330">                return Collections.singletonList(String.valueOf(pattern));</span>
+            }
+
+<span class="nc" id="L333">            final List&lt;String&gt; matchedTopics = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">            for (final String update : subscribedTopics) {</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">                if (pattern == topicToPatterns.get(update)) {</span>
+<span class="nc" id="L336">                    matchedTopics.add(update);</span>
+<span class="nc bnc" id="L337" title="All 4 branches missed.">                } else if (topicToPatterns.containsKey(update) &amp;&amp; isMatch(update)) {</span>
+                    // the same topic cannot be matched to more than one pattern
+                    // TODO: we should lift this requirement in the future
+<span class="nc" id="L340">                    throw new TopologyException(&quot;Topic &quot; + update +</span>
+<span class="nc" id="L341">                        &quot; is already matched for another regex pattern &quot; + topicToPatterns.get(update) +</span>
+                        &quot; and hence cannot be matched to this regex pattern &quot; + pattern + &quot; any more.&quot;);
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                } else if (isMatch(update)) {</span>
+<span class="nc" id="L344">                    topicToPatterns.put(update, pattern);</span>
+<span class="nc" id="L345">                    matchedTopics.add(update);</span>
+                }
+<span class="nc" id="L347">            }</span>
+<span class="nc" id="L348">            return matchedTopics;</span>
+        }
+
+        @Override
+        public ProcessorNode&lt;KIn, VIn, KIn, VIn&gt; build() {
+<span class="nc" id="L353">            return new SourceNode&lt;&gt;(name, timestampExtractor, keyDeserializer, valDeserializer);</span>
+        }
+
+        private boolean isMatch(final String topic) {
+<span class="nc" id="L357">            return pattern.matcher(topic).matches();</span>
+        }
+
+        @Override
+        Source describe() {
+<span class="nc bnc" id="L362" title="All 2 branches missed.">            return new Source(name, topics.isEmpty() ? null : new HashSet&lt;&gt;(topics), pattern);</span>
+        }
+    }
+
+    private class SinkNodeFactory&lt;KIn, VIn&gt; extends NodeFactory&lt;KIn, VIn, Void, Void&gt; {
+        private final Serializer&lt;KIn&gt; keySerializer;
+        private final Serializer&lt;VIn&gt; valSerializer;
+        private final StreamPartitioner&lt;? super KIn, ? super VIn&gt; partitioner;
+        private final TopicNameExtractor&lt;? super KIn, ? super VIn&gt; topicExtractor;
+
+        private SinkNodeFactory(final String name,
+                                final String[] predecessors,
+                                final TopicNameExtractor&lt;? super KIn, ? super VIn&gt; topicExtractor,
+                                final Serializer&lt;KIn&gt; keySerializer,
+                                final Serializer&lt;VIn&gt; valSerializer,
+<span class="nc" id="L377">                                final StreamPartitioner&lt;? super KIn, ? super VIn&gt; partitioner) {</span>
+<span class="nc" id="L378">            super(name, predecessors.clone());</span>
+<span class="nc" id="L379">            this.topicExtractor = topicExtractor;</span>
+<span class="nc" id="L380">            this.keySerializer = keySerializer;</span>
+<span class="nc" id="L381">            this.valSerializer = valSerializer;</span>
+<span class="nc" id="L382">            this.partitioner = partitioner;</span>
+<span class="nc" id="L383">        }</span>
+
+        @Override
+        public ProcessorNode&lt;KIn, VIn, Void, Void&gt; build() {
+<span class="nc bnc" id="L387" title="All 2 branches missed.">            if (topicExtractor instanceof StaticTopicNameExtractor) {</span>
+<span class="nc" id="L388">                final String topic = ((StaticTopicNameExtractor&lt;?, ?&gt;) topicExtractor).topicName;</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">                if (internalTopicNamesWithProperties.containsKey(topic)) {</span>
+                    // prefix the internal topic name with the application id
+<span class="nc" id="L391">                    return new SinkNode&lt;&gt;(name, new StaticTopicNameExtractor&lt;&gt;(decorateTopic(topic)), keySerializer, valSerializer, partitioner);</span>
+                } else {
+<span class="nc" id="L393">                    return new SinkNode&lt;&gt;(name, topicExtractor, keySerializer, valSerializer, partitioner);</span>
+                }
+            } else {
+<span class="nc" id="L396">                return new SinkNode&lt;&gt;(name, topicExtractor, keySerializer, valSerializer, partitioner);</span>
+            }
+        }
+
+        @Override
+        Sink&lt;KIn, VIn&gt; describe() {
+<span class="nc" id="L402">            return new Sink&lt;&gt;(name, topicExtractor);</span>
+        }
+    }
+
+    // public for testing only
+    public final InternalTopologyBuilder setApplicationId(final String applicationId) {
+<span class="nc" id="L408">        Objects.requireNonNull(applicationId, &quot;applicationId can't be null&quot;);</span>
+<span class="nc" id="L409">        this.applicationId = applicationId;</span>
+
+<span class="nc" id="L411">        return this;</span>
+    }
+
+    public final synchronized void setStreamsConfig(final StreamsConfig applicationConfig) {
+<span class="nc" id="L415">        Objects.requireNonNull(applicationConfig, &quot;config can't be null&quot;);</span>
+
+<span class="nc bnc" id="L417" title="All 2 branches missed.">        final Properties topologyOverrides = topologyConfigs == null</span>
+<span class="nc" id="L418">            ? new Properties()</span>
+<span class="nc" id="L419">            : topologyConfigs.topologyOverrides;</span>
+<span class="nc" id="L420">        topologyConfigs = new TopologyConfig(topologyName, applicationConfig, topologyOverrides);</span>
+<span class="nc" id="L421">    }</span>
+
+    @SuppressWarnings(&quot;deprecation&quot;)
+    public final synchronized void setNamedTopology(final NamedTopology namedTopology) {
+<span class="nc" id="L425">        this.namedTopology = namedTopology;</span>
+<span class="nc" id="L426">    }</span>
+
+    public synchronized TopologyConfig topologyConfigs() {
+<span class="nc" id="L429">        return topologyConfigs;</span>
+    }
+
+    public String topologyName() {
+<span class="nc" id="L433">        return topologyName;</span>
+    }
+
+    @SuppressWarnings(&quot;deprecation&quot;)
+    public NamedTopology namedTopology() {
+<span class="nc" id="L438">        return namedTopology;</span>
+    }
+
+    public final synchronized InternalTopologyBuilder rewriteTopology(final StreamsConfig config) {
+<span class="nc" id="L442">        Objects.requireNonNull(config, &quot;config can't be null&quot;);</span>
+
+<span class="nc" id="L444">        setApplicationId(config.getString(StreamsConfig.APPLICATION_ID_CONFIG));</span>
+<span class="nc" id="L445">        setStreamsConfig(config);</span>
+
+        // maybe strip out caching layers
+<span class="nc bnc" id="L448" title="All 2 branches missed.">        if (topologyConfigs.cacheSize == 0L) {</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">            for (final StoreFactory storeFactory : stateFactories.values()) {</span>
+<span class="nc" id="L450">                storeFactory.withCachingDisabled();</span>
+<span class="nc" id="L451">            }</span>
+
+<span class="nc bnc" id="L453" title="All 2 branches missed.">            for (final StoreFactory storeFactory : globalStateBuilders.values()) {</span>
+<span class="nc" id="L454">                storeFactory.withCachingDisabled();</span>
+<span class="nc" id="L455">            }</span>
+        }
+
+        // build global state stores
+<span class="nc bnc" id="L459" title="All 2 branches missed.">        for (final StoreFactory storeFactory : globalStateBuilders.values()) {</span>
+<span class="nc" id="L460">            storeFactory.configure(config);</span>
+<span class="nc" id="L461">            globalStateStores.put(storeFactory.storeName(), storeFactory.builder().build());</span>
+<span class="nc" id="L462">        }</span>
+
+<span class="nc" id="L464">        return this;</span>
+    }
+
+    private void verifyName(final String name) {
+<span class="nc" id="L468">        Objects.requireNonNull(name, &quot;name cannot be null&quot;);</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">        if (nodeFactories.containsKey(name)) {</span>
+<span class="nc" id="L470">            throw new TopologyException(&quot;Processor &quot; + name + &quot; is already added.&quot;);</span>
+        }
+<span class="nc" id="L472">    }</span>
+
+    public final void addSource(final AutoOffsetResetInternal offsetReset,
+                                final String name,
+                                final TimestampExtractor timestampExtractor,
+                                final Deserializer&lt;?&gt; keyDeserializer,
+                                final Deserializer&lt;?&gt; valDeserializer,
+                                final String... topics) {
+<span class="nc" id="L480">        verifyName(name);</span>
+<span class="nc" id="L481">        Objects.requireNonNull(topics, &quot;topics cannot be a null array&quot;);</span>
+<span class="nc bnc" id="L482" title="All 2 branches missed.">        if (topics.length == 0) {</span>
+<span class="nc" id="L483">            throw new TopologyException(&quot;topics cannot be empty&quot;);</span>
+        }
+
+<span class="nc bnc" id="L486" title="All 2 branches missed.">        for (final String topic : topics) {</span>
+<span class="nc" id="L487">            Objects.requireNonNull(topic, &quot;topic names cannot be null&quot;);</span>
+<span class="nc" id="L488">            validateTopicNotAlreadyRegistered(topic);</span>
+<span class="nc" id="L489">            maybeAddToResetList(noneResetTopics, earliestResetTopics, latestResetTopics, durationResetTopics, offsetReset, topic);</span>
+<span class="nc" id="L490">            rawSourceTopicNames.add(topic);</span>
+        }
+
+<span class="nc" id="L493">        nodeFactories.put(name, new SourceNodeFactory&lt;&gt;(name, topics, null, timestampExtractor, keyDeserializer, valDeserializer));</span>
+<span class="nc" id="L494">        nodeToSourceTopics.put(name, Arrays.asList(topics));</span>
+<span class="nc" id="L495">        nodeGrouper.add(name);</span>
+<span class="nc" id="L496">        nodeGroups = null;</span>
+<span class="nc" id="L497">    }</span>
+
+    public final void addSource(final AutoOffsetResetInternal offsetReset,
+                                final String name,
+                                final TimestampExtractor timestampExtractor,
+                                final Deserializer&lt;?&gt; keyDeserializer,
+                                final Deserializer&lt;?&gt; valDeserializer,
+                                final Pattern topicPattern) {
+<span class="nc" id="L505">        verifyName(name);</span>
+<span class="nc" id="L506">        Objects.requireNonNull(topicPattern, &quot;topicPattern cannot be null&quot;);</span>
+
+<span class="nc bnc" id="L508" title="All 2 branches missed.">        for (final String sourceTopicName : rawSourceTopicNames) {</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">            if (topicPattern.matcher(sourceTopicName).matches()) {</span>
+<span class="nc" id="L510">                throw new TopologyException(&quot;Pattern &quot; + topicPattern + &quot; will match a topic that has already been registered by another source.&quot;);</span>
+            }
+<span class="nc" id="L512">        }</span>
+
+<span class="nc" id="L514">        maybeAddToResetList(noneResetPatterns, earliestResetPatterns, latestResetPatterns, durationResetPatterns, offsetReset, topicPattern);</span>
+
+<span class="nc" id="L516">        nodeFactories.put(name, new SourceNodeFactory&lt;&gt;(name, null, topicPattern, timestampExtractor, keyDeserializer, valDeserializer));</span>
+<span class="nc" id="L517">        nodeToSourcePatterns.put(name, topicPattern);</span>
+<span class="nc" id="L518">        nodeGrouper.add(name);</span>
+<span class="nc" id="L519">        nodeGroups = null;</span>
+<span class="nc" id="L520">    }</span>
+
+    public final &lt;K, V&gt; void addSink(final String name,
+                                     final String topic,
+                                     final Serializer&lt;K&gt; keySerializer,
+                                     final Serializer&lt;V&gt; valSerializer,
+                                     final StreamPartitioner&lt;? super K, ? super V&gt; partitioner,
+                                     final String... predecessorNames) {
+<span class="nc" id="L528">        verifyName(name);</span>
+<span class="nc" id="L529">        Objects.requireNonNull(topic, &quot;topic cannot be null&quot;);</span>
+<span class="nc" id="L530">        verifyParents(name, predecessorNames);</span>
+
+<span class="nc" id="L532">        addSink(name, new StaticTopicNameExtractor&lt;&gt;(topic), keySerializer, valSerializer, partitioner, predecessorNames);</span>
+<span class="nc" id="L533">        nodeToSinkTopic.put(name, topic);</span>
+<span class="nc" id="L534">    }</span>
+
+    public final &lt;K, V&gt; void addSink(final String name,
+                                     final TopicNameExtractor&lt;? super K, ? super V&gt; topicExtractor,
+                                     final Serializer&lt;K&gt; keySerializer,
+                                     final Serializer&lt;V&gt; valSerializer,
+                                     final StreamPartitioner&lt;? super K, ? super V&gt; partitioner,
+                                     final String... predecessorNames) {
+<span class="nc" id="L542">        verifyName(name);</span>
+<span class="nc" id="L543">        Objects.requireNonNull(topicExtractor, &quot;topicExtractor cannot be null&quot;);</span>
+<span class="nc" id="L544">        verifyParents(name, predecessorNames);</span>
+
+<span class="nc" id="L546">        nodeFactories.put(name, new SinkNodeFactory&lt;&gt;(name, predecessorNames, topicExtractor, keySerializer, valSerializer, partitioner));</span>
+<span class="nc" id="L547">        nodeGrouper.add(name);</span>
+<span class="nc" id="L548">        nodeGrouper.unite(name, predecessorNames);</span>
+<span class="nc" id="L549">        nodeGroups = null;</span>
+<span class="nc" id="L550">    }</span>
+
+    public final void addProcessor(final String name,
+                                   final ProcessorSupplier&lt;?, ?, ?, ?&gt; processorSupplier,
+                                   final String... predecessorNames) {
+<span class="nc" id="L555">        verifyName(name);</span>
+<span class="nc" id="L556">        ApiUtils.checkSupplier(processorSupplier);</span>
+<span class="nc" id="L557">        verifyParents(name, predecessorNames);</span>
+
+<span class="nc" id="L559">        nodeFactories.put(name, new ProcessorNodeFactory&lt;&gt;(name, predecessorNames, processorSupplier));</span>
+<span class="nc" id="L560">        nodeGrouper.add(name);</span>
+<span class="nc" id="L561">        nodeGrouper.unite(name, predecessorNames);</span>
+<span class="nc" id="L562">        nodeGroups = null;</span>
+<span class="nc" id="L563">    }</span>
+
+    public final &lt;KIn, VIn, VOut&gt; void addProcessor(final String name,
+                                                    final FixedKeyProcessorSupplier&lt;KIn, VIn, VOut&gt; processorSupplier,
+                                                    final String... predecessorNames) {
+<span class="nc" id="L568">        verifyName(name);</span>
+<span class="nc" id="L569">        ApiUtils.checkSupplier(processorSupplier);</span>
+<span class="nc" id="L570">        verifyParents(name, predecessorNames);</span>
+
+<span class="nc" id="L572">        nodeFactories.put(name, new FixedKeyProcessorNodeFactory&lt;&gt;(name, predecessorNames, processorSupplier));</span>
+<span class="nc" id="L573">        nodeGrouper.add(name);</span>
+<span class="nc" id="L574">        nodeGrouper.unite(name, predecessorNames);</span>
+<span class="nc" id="L575">        nodeGroups = null;</span>
+<span class="nc" id="L576">    }</span>
+
+    private void verifyParents(final String processorName, final String... predecessorNames) {
+<span class="nc" id="L579">        Objects.requireNonNull(predecessorNames, &quot;predecessorNames cannot be a null array&quot;);</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">        if (predecessorNames.length == 0) {</span>
+<span class="nc" id="L581">            throw new TopologyException(&quot;predecessorNames cannot be empty&quot;);</span>
+        }
+
+<span class="nc bnc" id="L584" title="All 2 branches missed.">        for (final String predecessor : predecessorNames) {</span>
+<span class="nc" id="L585">            Objects.requireNonNull(predecessor, &quot;parent name cannot be null&quot;);</span>
+<span class="nc bnc" id="L586" title="All 2 branches missed.">            if (!nodeFactories.containsKey(predecessor)) {</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">                if (predecessor.equals(processorName)) {</span>
+<span class="nc" id="L588">                    throw new TopologyException(&quot;Parent node &quot; + predecessor + &quot; is unknown (self-reference).&quot;);</span>
+                }
+<span class="nc" id="L590">                throw new TopologyException(&quot;Parent node &quot; + predecessor + &quot; is unknown.&quot;);</span>
+            }
+<span class="nc bnc" id="L592" title="All 2 branches missed.">            if (nodeToSinkTopic.containsKey(predecessor)) {</span>
+<span class="nc" id="L593">                throw new TopologyException(&quot;Sink &quot; + predecessor + &quot; cannot be used a parent.&quot;);</span>
+            }
+        }
+<span class="nc" id="L596">    }</span>
+
+    public final void addStateStore(final StoreBuilder&lt;?&gt; storeBuilder,
+                                    final String... processorNames) {
+<span class="nc" id="L600">        Objects.requireNonNull(storeBuilder, &quot;storeBuilder cannot be null&quot;);</span>
+<span class="nc" id="L601">        addStateStore(StoreBuilderWrapper.wrapStoreBuilder(storeBuilder), false, processorNames);</span>
+<span class="nc" id="L602">    }</span>
+
+    public final void addStateStore(final StoreFactory storeFactory,
+                                    final String... processorNames) {
+<span class="nc" id="L606">        addStateStore(storeFactory, false, processorNames);</span>
+<span class="nc" id="L607">    }</span>
+
+    public final void addStateStore(final StoreFactory storeFactory,
+                                    final boolean allowOverride,
+                                    final String... processorNames) {
+<span class="nc" id="L612">        Objects.requireNonNull(storeFactory, &quot;stateStoreFactory cannot be null&quot;);</span>
+<span class="nc" id="L613">        final String storeName = storeFactory.storeName();</span>
+<span class="nc" id="L614">        Objects.requireNonNull(storeName, &quot;state store name cannot be null&quot;);</span>
+
+<span class="nc" id="L616">        final StoreFactory stateFactory = stateFactories.get(storeName);</span>
+<span class="nc bnc" id="L617" title="All 6 branches missed.">        if (!allowOverride &amp;&amp; stateFactory != null &amp;&amp; !stateFactory.isCompatibleWith(storeFactory)) {</span>
+<span class="nc" id="L618">            throw new TopologyException(&quot;A different StateStore has already been added with the name &quot; + storeName);</span>
+        }
+<span class="nc bnc" id="L620" title="All 2 branches missed.">        if (globalStateBuilders.containsKey(storeName)) {</span>
+<span class="nc" id="L621">            throw new TopologyException(&quot;A different GlobalStateStore has already been added with the name &quot; + storeName);</span>
+        }
+
+<span class="nc" id="L624">        stateFactories.put(storeName, storeFactory);</span>
+
+<span class="nc bnc" id="L626" title="All 2 branches missed.">        if (processorNames != null) {</span>
+<span class="nc bnc" id="L627" title="All 2 branches missed.">            for (final String processorName : processorNames) {</span>
+<span class="nc" id="L628">                Objects.requireNonNull(processorName, &quot;processor cannot be null&quot;);</span>
+<span class="nc" id="L629">                connectProcessorAndStateStore(processorName, storeName);</span>
+            }
+        }
+
+<span class="nc" id="L633">        nodeGroups = null;</span>
+<span class="nc" id="L634">    }</span>
+
+    public final &lt;KIn, VIn&gt; void addGlobalStore(final String sourceName,
+                                                final TimestampExtractor timestampExtractor,
+                                                final Deserializer&lt;KIn&gt; keyDeserializer,
+                                                final Deserializer&lt;VIn&gt; valueDeserializer,
+                                                final String topic,
+                                                final String processorName,
+                                                final ProcessorSupplier&lt;KIn, VIn, Void, Void&gt; stateUpdateSupplier,
+                                                final boolean reprocessOnRestore) {
+<span class="nc" id="L644">        verifyName(sourceName);</span>
+
+<span class="nc" id="L646">        Objects.requireNonNull(topic, &quot;topic cannot be null&quot;);</span>
+<span class="nc" id="L647">        validateTopicNotAlreadyRegistered(topic);</span>
+
+<span class="nc" id="L649">        verifyName(processorName);</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">        if (sourceName.equals(processorName)) {</span>
+<span class="nc" id="L651">            throw new TopologyException(&quot;sourceName and processorName must be different.&quot;);</span>
+        }
+
+<span class="nc" id="L654">        ApiUtils.checkSupplier(stateUpdateSupplier);</span>
+<span class="nc" id="L655">        final Set&lt;StoreBuilder&lt;?&gt;&gt; stores = stateUpdateSupplier.stores();</span>
+<span class="nc bnc" id="L656" title="All 4 branches missed.">        if (stores == null || stores.size() != 1) {</span>
+<span class="nc" id="L657">            throw new IllegalArgumentException(</span>
+                &quot;Global stores must pass in suppliers with exactly one store but got &quot; +
+<span class="nc bnc" id="L659" title="All 2 branches missed.">                    (stores != null ? stores.size() : 0));</span>
+        }
+<span class="nc" id="L661">        final StoreFactory storeFactory =</span>
+<span class="nc" id="L662">            StoreBuilderWrapper.wrapStoreBuilder(stores.iterator().next());</span>
+
+<span class="nc" id="L664">        final String storeName = storeFactory.storeName();</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">        if (stateFactories.containsKey(storeName)) {</span>
+<span class="nc" id="L666">            throw new TopologyException(&quot;A different StateStore has already been added with the name &quot; + storeName);</span>
+        }
+<span class="nc bnc" id="L668" title="All 2 branches missed.">        if (globalStateBuilders.containsKey(storeName)) {</span>
+<span class="nc" id="L669">            throw new TopologyException(&quot;A different GlobalStateStore has already been added with the name &quot; + storeName);</span>
+        }
+
+<span class="nc" id="L672">        final String[] topics = {topic};</span>
+<span class="nc" id="L673">        final String[] predecessors = {sourceName};</span>
+
+<span class="nc" id="L675">        final ProcessorNodeFactory&lt;KIn, VIn, Void, Void&gt; nodeFactory = new ProcessorNodeFactory&lt;&gt;(</span>
+            processorName,
+            predecessors,
+            stateUpdateSupplier
+        );
+
+<span class="nc" id="L681">        globalTopics.add(topic);</span>
+<span class="nc" id="L682">        nodeFactories.put(sourceName, new SourceNodeFactory&lt;&gt;(</span>
+            sourceName,
+            topics,
+            null,
+            timestampExtractor,
+            keyDeserializer,
+            valueDeserializer)
+        );
+<span class="nc" id="L690">        storeNameToReprocessOnRestore.put(storeFactory.storeName(),</span>
+<span class="nc bnc" id="L691" title="All 2 branches missed.">            reprocessOnRestore ?</span>
+<span class="nc" id="L692">                Optional.of(new ReprocessFactory&lt;&gt;(stateUpdateSupplier, keyDeserializer, valueDeserializer, processorName))</span>
+<span class="nc" id="L693">                : Optional.empty());</span>
+<span class="nc" id="L694">        nodeToSourceTopics.put(sourceName, Arrays.asList(topics));</span>
+<span class="nc" id="L695">        nodeGrouper.add(sourceName);</span>
+<span class="nc" id="L696">        nodeFactory.addStateStore(storeFactory.storeName());</span>
+<span class="nc" id="L697">        nodeFactories.put(processorName, nodeFactory);</span>
+<span class="nc" id="L698">        nodeGrouper.add(processorName);</span>
+<span class="nc" id="L699">        nodeGrouper.unite(processorName, predecessors);</span>
+<span class="nc" id="L700">        globalStateBuilders.put(storeFactory.storeName(), storeFactory);</span>
+        // connect the source topic as (read-only) changelog topic for fault-tolerance
+<span class="nc" id="L702">        storeFactory.withLoggingDisabled();</span>
+<span class="nc" id="L703">        connectSourceStoreAndTopic(storeFactory.storeName(), topic);</span>
+<span class="nc" id="L704">        nodeGroups = null;</span>
+<span class="nc" id="L705">    }</span>
+
+    private void validateTopicNotAlreadyRegistered(final String topic) {
+<span class="nc bnc" id="L708" title="All 4 branches missed.">        if (rawSourceTopicNames.contains(topic) || globalTopics.contains(topic)) {</span>
+<span class="nc" id="L709">            throw new TopologyException(&quot;Topic &quot; + topic + &quot; has already been registered by another source.&quot;);</span>
+        }
+
+<span class="nc bnc" id="L712" title="All 2 branches missed.">        for (final Pattern pattern : nodeToSourcePatterns.values()) {</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">            if (pattern.matcher(topic).matches()) {</span>
+<span class="nc" id="L714">                throw new TopologyException(&quot;Topic &quot; + topic + &quot; matches a Pattern already registered by another source.&quot;);</span>
+            }
+<span class="nc" id="L716">        }</span>
+<span class="nc" id="L717">    }</span>
+
+    public Long historyRetention(final String storeName) {
+<span class="nc" id="L720">        return stateFactories.get(storeName).historyRetention();</span>
+    }
+
+    public boolean isStoreVersioned(final String storeName) {
+<span class="nc" id="L724">        return stateFactories.get(storeName).isVersionedStore();</span>
+    }
+
+
+    public final void connectProcessorAndStateStores(final String processorName,
+                                                     final String... stateStoreNames) {
+<span class="nc" id="L730">        Objects.requireNonNull(processorName, &quot;processorName cannot be null&quot;);</span>
+<span class="nc" id="L731">        Objects.requireNonNull(stateStoreNames, &quot;stateStoreNames cannot be a null array&quot;);</span>
+<span class="nc bnc" id="L732" title="All 2 branches missed.">        if (stateStoreNames.length == 0) {</span>
+<span class="nc" id="L733">            throw new TopologyException(&quot;stateStoreNames cannot be empty&quot;);</span>
+        }
+
+<span class="nc bnc" id="L736" title="All 2 branches missed.">        if (nodeToSourceTopics.containsKey(processorName)</span>
+<span class="nc bnc" id="L737" title="All 2 branches missed.">            || nodeToSourcePatterns.containsKey(processorName)</span>
+<span class="nc bnc" id="L738" title="All 2 branches missed.">            || nodeToSinkTopic.containsKey(processorName)) {</span>
+<span class="nc" id="L739">            throw new TopologyException(&quot;State stores cannot be connect to sources or sinks.&quot;);</span>
+
+        }
+
+<span class="nc bnc" id="L743" title="All 2 branches missed.">        for (final String stateStoreName : stateStoreNames) {</span>
+<span class="nc" id="L744">            Objects.requireNonNull(stateStoreName, &quot;state store name cannot be null&quot;);</span>
+<span class="nc" id="L745">            connectProcessorAndStateStore(processorName, stateStoreName);</span>
+        }
+<span class="nc" id="L747">        nodeGroups = null;</span>
+<span class="nc" id="L748">    }</span>
+
+    public String storeForChangelogTopic(final String topicName) {
+<span class="nc" id="L751">        return changelogTopicToStore.get(topicName);</span>
+    }
+
+    public void connectSourceStoreAndTopic(final String sourceStoreName,
+                                           final String topic) {
+<span class="nc bnc" id="L756" title="All 2 branches missed.">        if (storeToChangelogTopic.containsKey(sourceStoreName)) {</span>
+<span class="nc" id="L757">            throw new TopologyException(&quot;Source store &quot; + sourceStoreName + &quot; is already added.&quot;);</span>
+        }
+<span class="nc" id="L759">        storeToChangelogTopic.put(sourceStoreName, topic);</span>
+<span class="nc" id="L760">        changelogTopicToStore.put(topic, sourceStoreName);</span>
+<span class="nc" id="L761">    }</span>
+
+    public final void addInternalTopic(final String topicName,
+                                       final InternalTopicProperties internalTopicProperties) {
+<span class="nc" id="L765">        Objects.requireNonNull(topicName, &quot;topicName can't be null&quot;);</span>
+<span class="nc" id="L766">        Objects.requireNonNull(internalTopicProperties, &quot;internalTopicProperties can't be null&quot;);</span>
+
+<span class="nc" id="L768">        internalTopicNamesWithProperties.put(topicName, internalTopicProperties);</span>
+<span class="nc" id="L769">    }</span>
+
+    public final void copartitionSources(final Collection&lt;String&gt; sourceNodes) {
+<span class="nc" id="L772">        copartitionSourceGroups.add(new HashSet&lt;&gt;(sourceNodes));</span>
+<span class="nc" id="L773">    }</span>
+
+    public final void maybeUpdateCopartitionSourceGroups(final String replacedNodeName,
+                                                         final String optimizedNodeName) {
+<span class="nc bnc" id="L777" title="All 2 branches missed.">        for (final Set&lt;String&gt; copartitionSourceGroup : copartitionSourceGroups) {</span>
+<span class="nc bnc" id="L778" title="All 2 branches missed.">            if (copartitionSourceGroup.contains(replacedNodeName)) {</span>
+<span class="nc" id="L779">                copartitionSourceGroup.remove(replacedNodeName);</span>
+<span class="nc" id="L780">                copartitionSourceGroup.add(optimizedNodeName);</span>
+            }
+<span class="nc" id="L782">        }</span>
+<span class="nc" id="L783">    }</span>
+
+    public void validateCopartition() {
+        // allCopartitionedSourceTopics take the list of co-partitioned nodes and
+        // replaces each processor name with the corresponding source topic name
+<span class="nc" id="L788">        final List&lt;Set&lt;String&gt;&gt; allCopartitionedSourceTopics =</span>
+                copartitionSourceGroups
+<span class="nc" id="L790">                        .stream()</span>
+<span class="nc" id="L791">                        .map(sourceGroup -&gt; sourceGroup</span>
+<span class="nc" id="L792">                                .stream()</span>
+<span class="nc" id="L793">                                .flatMap(sourceNodeName -&gt; nodeToSourceTopics.getOrDefault(sourceNodeName,</span>
+<span class="nc" id="L794">                                        Collections.emptyList()).stream())</span>
+<span class="nc" id="L795">                                .collect(Collectors.toSet())</span>
+<span class="nc" id="L796">                        ).collect(Collectors.toList());</span>
+<span class="nc bnc" id="L797" title="All 2 branches missed.">        for (final Set&lt;String&gt; copartition : allCopartitionedSourceTopics) {</span>
+<span class="nc" id="L798">            final Map&lt;String, Integer&gt; numberOfPartitionsPerTopic = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L799">            copartition.forEach(topic -&gt; {</span>
+<span class="nc" id="L800">                final InternalTopicProperties prop = internalTopicNamesWithProperties.get(topic);</span>
+<span class="nc bnc" id="L801" title="All 4 branches missed.">                if (prop != null &amp;&amp; prop.numberOfPartitions().isPresent()) {</span>
+<span class="nc" id="L802">                    numberOfPartitionsPerTopic.put(topic, prop.numberOfPartitions().get());</span>
+                }
+<span class="nc" id="L804">            });</span>
+<span class="nc bnc" id="L805" title="All 4 branches missed.">            if (!numberOfPartitionsPerTopic.isEmpty() &amp;&amp; copartition.equals(numberOfPartitionsPerTopic.keySet())) {</span>
+<span class="nc" id="L806">                final Collection&lt;Integer&gt; partitionNumbers = numberOfPartitionsPerTopic.values();</span>
+<span class="nc" id="L807">                final Integer first = partitionNumbers.iterator().next();</span>
+<span class="nc bnc" id="L808" title="All 2 branches missed.">                for (final Integer partitionNumber : partitionNumbers) {</span>
+<span class="nc bnc" id="L809" title="All 2 branches missed.">                    if (!partitionNumber.equals(first)) {</span>
+<span class="nc" id="L810">                        final String msg = String.format(&quot;Following topics do not have the same number of &quot; +</span>
+                                &quot;partitions: [%s]&quot;, new TreeMap&lt;&gt;(numberOfPartitionsPerTopic));
+<span class="nc" id="L812">                        throw new TopologyException(msg);</span>
+
+                    }
+<span class="nc" id="L815">                }</span>
+            }
+<span class="nc" id="L817">        }</span>
+<span class="nc" id="L818">    }</span>
+
+    private void connectProcessorAndStateStore(final String processorName,
+                                               final String stateStoreName) {
+<span class="nc bnc" id="L822" title="All 2 branches missed.">        if (globalStateBuilders.containsKey(stateStoreName)) {</span>
+<span class="nc" id="L823">            throw new TopologyException(&quot;Global StateStore &quot; + stateStoreName +</span>
+                    &quot; can be used by a Processor without being specified; it should not be explicitly passed.&quot;);
+        }
+<span class="nc bnc" id="L826" title="All 2 branches missed.">        if (!stateFactories.containsKey(stateStoreName)) {</span>
+<span class="nc" id="L827">            throw new TopologyException(&quot;StateStore &quot; + stateStoreName + &quot; is not added yet.&quot;);</span>
+        }
+<span class="nc bnc" id="L829" title="All 2 branches missed.">        if (!nodeFactories.containsKey(processorName)) {</span>
+<span class="nc" id="L830">            throw new TopologyException(&quot;Processor &quot; + processorName + &quot; is not added yet.&quot;);</span>
+        }
+
+<span class="nc" id="L833">        final StoreFactory storeFactory = stateFactories.get(stateStoreName);</span>
+<span class="nc" id="L834">        final Iterator&lt;String&gt; iter = storeFactory.connectedProcessorNames().iterator();</span>
+<span class="nc bnc" id="L835" title="All 2 branches missed.">        if (iter.hasNext()) {</span>
+<span class="nc" id="L836">            final String user = iter.next();</span>
+<span class="nc" id="L837">            nodeGrouper.unite(user, processorName);</span>
+        }
+<span class="nc" id="L839">        storeFactory.connectedProcessorNames().add(processorName);</span>
+
+<span class="nc" id="L841">        final NodeFactory&lt;?, ?, ?, ?&gt; nodeFactory = nodeFactories.get(processorName);</span>
+<span class="nc bnc" id="L842" title="All 2 branches missed.">        if (nodeFactory instanceof ProcessorNodeFactory) {</span>
+<span class="nc" id="L843">            final ProcessorNodeFactory&lt;?, ?, ?, ?&gt; processorNodeFactory = (ProcessorNodeFactory&lt;?, ?, ?, ?&gt;) nodeFactory;</span>
+<span class="nc" id="L844">            processorNodeFactory.addStateStore(stateStoreName);</span>
+<span class="nc" id="L845">            connectStateStoreNameToSourceTopicsOrPattern(stateStoreName, processorNodeFactory);</span>
+<span class="nc" id="L846">        } else {</span>
+<span class="nc" id="L847">            throw new TopologyException(&quot;cannot connect a state store &quot; + stateStoreName + &quot; to a source node or a sink node.&quot;);</span>
+        }
+<span class="nc" id="L849">    }</span>
+
+    private Set&lt;SourceNodeFactory&lt;?, ?&gt;&gt; findSourcesForProcessorPredecessors(final String[] predecessors) {
+<span class="nc" id="L852">        final Set&lt;SourceNodeFactory&lt;?, ?&gt;&gt; sourceNodes = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L853" title="All 2 branches missed.">        for (final String predecessor : predecessors) {</span>
+<span class="nc" id="L854">            final NodeFactory&lt;?, ?, ?, ?&gt; nodeFactory = nodeFactories.get(predecessor);</span>
+<span class="nc bnc" id="L855" title="All 2 branches missed.">            if (nodeFactory instanceof SourceNodeFactory) {</span>
+<span class="nc" id="L856">                sourceNodes.add((SourceNodeFactory&lt;?, ?&gt;) nodeFactory);</span>
+<span class="nc bnc" id="L857" title="All 2 branches missed.">            } else if (nodeFactory instanceof ProcessorNodeFactory) {</span>
+<span class="nc" id="L858">                sourceNodes.addAll(findSourcesForProcessorPredecessors(nodeFactory.predecessors));</span>
+            }
+        }
+<span class="nc" id="L861">        return sourceNodes;</span>
+    }
+
+    private &lt;KIn, VIn, KOut, VOut&gt; void connectStateStoreNameToSourceTopicsOrPattern(final String stateStoreName,
+                                                                                     final ProcessorNodeFactory&lt;KIn, VIn, KOut, VOut&gt; processorNodeFactory) {
+        // we should never update the mapping from state store names to source topics if the store name already exists
+        // in the map; this scenario is possible, for example, that a state store underlying a source KTable is
+        // connecting to a join operator whose source topic is not the original KTable's source topic but an internal repartition topic.
+
+<span class="nc bnc" id="L870" title="All 2 branches missed.">        if (stateStoreNameToRawSourceTopicNames.containsKey(stateStoreName)</span>
+<span class="nc bnc" id="L871" title="All 2 branches missed.">            || stateStoreNameToSourceRegex.containsKey(stateStoreName)) {</span>
+<span class="nc" id="L872">            return;</span>
+        }
+
+<span class="nc" id="L875">        final Set&lt;String&gt; sourceTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L876">        final Set&lt;Pattern&gt; sourcePatterns = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L877">        final Set&lt;SourceNodeFactory&lt;?, ?&gt;&gt; sourceNodesForPredecessor =</span>
+<span class="nc" id="L878">            findSourcesForProcessorPredecessors(processorNodeFactory.predecessors);</span>
+
+<span class="nc bnc" id="L880" title="All 2 branches missed.">        for (final SourceNodeFactory&lt;?, ?&gt; sourceNodeFactory : sourceNodesForPredecessor) {</span>
+<span class="nc bnc" id="L881" title="All 2 branches missed.">            if (sourceNodeFactory.pattern != null) {</span>
+<span class="nc" id="L882">                sourcePatterns.add(sourceNodeFactory.pattern);</span>
+            } else {
+<span class="nc" id="L884">                sourceTopics.addAll(sourceNodeFactory.topics);</span>
+            }
+<span class="nc" id="L886">        }</span>
+
+<span class="nc bnc" id="L888" title="All 2 branches missed.">        if (!sourceTopics.isEmpty()) {</span>
+<span class="nc" id="L889">            stateStoreNameToRawSourceTopicNames.put(</span>
+                stateStoreName,
+<span class="nc" id="L891">                Collections.unmodifiableSet(sourceTopics)</span>
+            );
+        }
+
+<span class="nc bnc" id="L895" title="All 2 branches missed.">        if (!sourcePatterns.isEmpty()) {</span>
+<span class="nc" id="L896">            stateStoreNameToSourceRegex.put(</span>
+                stateStoreName,
+<span class="nc" id="L898">                Collections.unmodifiableSet(sourcePatterns)</span>
+            );
+        }
+<span class="nc" id="L901">    }</span>
+
+    private &lt;T&gt; void maybeAddToResetList(final Collection&lt;T&gt; noneResets,
+                                         final Collection&lt;T&gt; earliestResets,
+                                         final Collection&lt;T&gt; latestResets,
+                                         final Map&lt;T, Duration&gt; durationReset,
+                                         final AutoOffsetResetInternal offsetReset,
+                                         final T item) {
+<span class="nc bnc" id="L909" title="All 2 branches missed.">        if (offsetReset != null) {</span>
+<span class="nc bnc" id="L910" title="All 5 branches missed.">            switch (offsetReset.offsetResetStrategy()) {</span>
+                case NONE:
+<span class="nc" id="L912">                    noneResets.add(item);</span>
+<span class="nc" id="L913">                    break;</span>
+                case EARLIEST:
+<span class="nc" id="L915">                    earliestResets.add(item);</span>
+<span class="nc" id="L916">                    break;</span>
+                case LATEST:
+<span class="nc" id="L918">                    latestResets.add(item);</span>
+<span class="nc" id="L919">                    break;</span>
+                case BY_DURATION:
+<span class="nc" id="L921">                    durationReset.put(item, offsetReset.duration());</span>
+<span class="nc" id="L922">                    break;</span>
+                default:
+<span class="nc" id="L924">                    throw new TopologyException(String.format(&quot;Unrecognized reset format %s&quot;, offsetReset));</span>
+            }
+        }
+<span class="nc" id="L927">    }</span>
+
+    public synchronized Map&lt;Integer, Set&lt;String&gt;&gt; nodeGroups() {
+<span class="nc bnc" id="L930" title="All 2 branches missed.">        if (nodeGroups == null) {</span>
+<span class="nc" id="L931">            nodeGroups = makeNodeGroups();</span>
+        }
+<span class="nc" id="L933">        return nodeGroups;</span>
+    }
+
+    // Order node groups by their position in the actual topology, ie upstream subtopologies come before downstream
+    private Map&lt;Integer, Set&lt;String&gt;&gt; makeNodeGroups() {
+<span class="nc" id="L938">        final Map&lt;Integer, Set&lt;String&gt;&gt; nodeGroups = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L939">        final Map&lt;String, Set&lt;String&gt;&gt; rootToNodeGroup = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L941">        int nodeGroupId = 0;</span>
+
+        // Traverse in topological order
+<span class="nc bnc" id="L944" title="All 2 branches missed.">        for (final String nodeName : nodeFactories.keySet()) {</span>
+<span class="nc" id="L945">            nodeGroupId = putNodeGroupName(nodeName, nodeGroupId, nodeGroups, rootToNodeGroup);</span>
+<span class="nc" id="L946">        }</span>
+
+<span class="nc" id="L948">        return nodeGroups;</span>
+    }
+
+    private int putNodeGroupName(final String nodeName,
+                                 final int nodeGroupId,
+                                 final Map&lt;Integer, Set&lt;String&gt;&gt; nodeGroups,
+                                 final Map&lt;String, Set&lt;String&gt;&gt; rootToNodeGroup) {
+<span class="nc" id="L955">        int newNodeGroupId = nodeGroupId;</span>
+<span class="nc" id="L956">        final String root = nodeGrouper.root(nodeName);</span>
+<span class="nc" id="L957">        Set&lt;String&gt; nodeGroup = rootToNodeGroup.get(root);</span>
+<span class="nc bnc" id="L958" title="All 2 branches missed.">        if (nodeGroup == null) {</span>
+<span class="nc" id="L959">            nodeGroup = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L960">            rootToNodeGroup.put(root, nodeGroup);</span>
+<span class="nc" id="L961">            nodeGroups.put(newNodeGroupId++, nodeGroup);</span>
+        }
+<span class="nc" id="L963">        nodeGroup.add(nodeName);</span>
+<span class="nc" id="L964">        return newNodeGroupId;</span>
+    }
+
+    /**
+     * @return the full topology minus any global state
+     */
+    public synchronized ProcessorTopology buildTopology() {
+<span class="nc" id="L971">        final Set&lt;String&gt; allNodes = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L972" title="All 2 branches missed.">        for (final Set&lt;String&gt; value : nodeGroups().values()) {</span>
+<span class="nc" id="L973">            allNodes.addAll(value);</span>
+<span class="nc" id="L974">        }</span>
+<span class="nc" id="L975">        allNodes.removeAll(globalNodeGroups());</span>
+
+<span class="nc" id="L977">        initializeSubscription();</span>
+<span class="nc" id="L978">        initializeSubtopologyIdToStateStoreNamesMap();</span>
+<span class="nc" id="L979">        return build(allNodes);</span>
+    }
+
+    /**
+     * @param topicGroupId group of topics corresponding to a single subtopology
+     * @return subset of the full topology
+     */
+    public synchronized ProcessorTopology buildSubtopology(final int topicGroupId) {
+<span class="nc" id="L987">        final Set&lt;String&gt; nodeGroup = nodeGroups().get(topicGroupId);</span>
+<span class="nc" id="L988">        return build(nodeGroup);</span>
+    }
+
+    /**
+     * Builds the topology for any global state stores
+     * @return ProcessorTopology of global state
+     */
+    public synchronized ProcessorTopology buildGlobalStateTopology() {
+<span class="nc" id="L996">        Objects.requireNonNull(applicationId, &quot;topology has not completed optimization&quot;);</span>
+
+<span class="nc" id="L998">        final Set&lt;String&gt; globalGroups = globalNodeGroups();</span>
+<span class="nc bnc" id="L999" title="All 2 branches missed.">        if (globalGroups.isEmpty()) {</span>
+<span class="nc" id="L1000">            return null;</span>
+        }
+<span class="nc" id="L1002">        return build(globalGroups);</span>
+    }
+
+    private Set&lt;String&gt; globalNodeGroups() {
+<span class="nc" id="L1006">        final Set&lt;String&gt; globalGroups = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L1007" title="All 2 branches missed.">        for (final Map.Entry&lt;Integer, Set&lt;String&gt;&gt; nodeGroup : nodeGroups().entrySet()) {</span>
+<span class="nc" id="L1008">            final Set&lt;String&gt; nodes = nodeGroup.getValue();</span>
+<span class="nc bnc" id="L1009" title="All 2 branches missed.">            for (final String node : nodes) {</span>
+<span class="nc bnc" id="L1010" title="All 2 branches missed.">                if (isGlobalSource(node)) {</span>
+<span class="nc" id="L1011">                    globalGroups.addAll(nodes);</span>
+                }
+<span class="nc" id="L1013">            }</span>
+<span class="nc" id="L1014">        }</span>
+<span class="nc" id="L1015">        return globalGroups;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private ProcessorTopology build(final Set&lt;String&gt; nodeGroup) {
+<span class="nc" id="L1020">        Objects.requireNonNull(applicationId, &quot;topology has not completed optimization&quot;);</span>
+
+<span class="nc" id="L1022">        final Map&lt;String, ProcessorNode&lt;?, ?, ?, ?&gt;&gt; processorMap = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L1023">        final Map&lt;String, SourceNode&lt;?, ?&gt;&gt; topicSourceMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1024">        final Map&lt;String, SinkNode&lt;?, ?&gt;&gt; topicSinkMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1025">        final Map&lt;String, StateStore&gt; stateStoreMap = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L1026">        final Set&lt;String&gt; repartitionTopics = new HashSet&lt;&gt;();</span>
+
+        // create processor nodes in a topological order (&quot;nodeFactories&quot; is already topologically sorted)
+        // also make sure the state store map values following the insertion ordering
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">        for (final NodeFactory&lt;?, ?, ?, ?&gt; factory : nodeFactories.values()) {</span>
+<span class="nc bnc" id="L1031" title="All 4 branches missed.">            if (nodeGroup == null || nodeGroup.contains(factory.name)) {</span>
+<span class="nc" id="L1032">                final ProcessorNode&lt;?, ?, ?, ?&gt; node = factory.build();</span>
+<span class="nc" id="L1033">                processorMap.put(node.name(), node);</span>
+
+<span class="nc bnc" id="L1035" title="All 2 branches missed.">                if (factory instanceof ProcessorNodeFactory) {</span>
+<span class="nc" id="L1036">                    buildProcessorNode(processorMap,</span>
+                                       stateStoreMap,
+                                       (ProcessorNodeFactory&lt;?, ?, ?, ?&gt;) factory,
+                                       (ProcessorNode&lt;Object, Object, Object, Object&gt;) node);
+
+<span class="nc bnc" id="L1041" title="All 2 branches missed.">                } else if (factory instanceof SourceNodeFactory) {</span>
+<span class="nc" id="L1042">                    buildSourceNode(topicSourceMap,</span>
+                                    repartitionTopics,
+                                    (SourceNodeFactory&lt;?, ?&gt;) factory,
+                                    (SourceNode&lt;?, ?&gt;) node);
+
+<span class="nc bnc" id="L1047" title="All 2 branches missed.">                } else if (factory instanceof SinkNodeFactory) {</span>
+<span class="nc" id="L1048">                    buildSinkNode(processorMap,</span>
+                                  topicSinkMap,
+                                  repartitionTopics,
+                                  (SinkNodeFactory&lt;?, ?&gt;) factory,
+                                  (SinkNode&lt;?, ?&gt;) node);
+                } else {
+<span class="nc" id="L1054">                    throw new TopologyException(&quot;Unknown definition class: &quot; + factory.getClass().getName());</span>
+                }
+            }
+<span class="nc" id="L1057">        }</span>
+
+<span class="nc" id="L1059">        return new ProcessorTopology(new ArrayList&lt;&gt;(processorMap.values()),</span>
+                                     topicSourceMap,
+                                     topicSinkMap,
+<span class="nc" id="L1062">                                     new ArrayList&lt;&gt;(stateStoreMap.values()),</span>
+<span class="nc" id="L1063">                                     new ArrayList&lt;&gt;(globalStateStores.values()),</span>
+                                     storeToChangelogTopic,
+                                     repartitionTopics,
+                                     storeNameToReprocessOnRestore);
+    }
+
+    private void buildSinkNode(final Map&lt;String, ProcessorNode&lt;?, ?, ?, ?&gt;&gt; processorMap,
+                               final Map&lt;String, SinkNode&lt;?, ?&gt;&gt; topicSinkMap,
+                               final Set&lt;String&gt; repartitionTopics,
+                               final SinkNodeFactory&lt;?, ?&gt; sinkNodeFactory,
+                               final SinkNode&lt;?, ?&gt; node) {
+<span class="nc" id="L1074">        @SuppressWarnings(&quot;unchecked&quot;) final ProcessorNode&lt;Object, Object, ?, ?&gt; sinkNode =</span>
+            (ProcessorNode&lt;Object, Object, ?, ?&gt;) node;
+
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">        for (final String predecessorName : sinkNodeFactory.predecessors) {</span>
+<span class="nc" id="L1078">            final ProcessorNode&lt;Object, Object, Object, Object&gt; processor = getProcessor(processorMap, predecessorName);</span>
+<span class="nc" id="L1079">            processor.addChild(sinkNode);</span>
+<span class="nc bnc" id="L1080" title="All 2 branches missed.">            if (sinkNodeFactory.topicExtractor instanceof StaticTopicNameExtractor) {</span>
+<span class="nc" id="L1081">                final String topic = ((StaticTopicNameExtractor&lt;?, ?&gt;) sinkNodeFactory.topicExtractor).topicName;</span>
+
+<span class="nc bnc" id="L1083" title="All 2 branches missed.">                if (internalTopicNamesWithProperties.containsKey(topic)) {</span>
+                    // prefix the internal topic name with the application id
+<span class="nc" id="L1085">                    final String decoratedTopic = decorateTopic(topic);</span>
+<span class="nc" id="L1086">                    topicSinkMap.put(decoratedTopic, node);</span>
+<span class="nc" id="L1087">                    repartitionTopics.add(decoratedTopic);</span>
+<span class="nc" id="L1088">                } else {</span>
+<span class="nc" id="L1089">                    topicSinkMap.put(topic, node);</span>
+                }
+
+            }
+        }
+<span class="nc" id="L1094">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private static &lt;KIn, VIn, KOut, VOut&gt; ProcessorNode&lt;KIn, VIn, KOut, VOut&gt; getProcessor(
+        final Map&lt;String, ProcessorNode&lt;?, ?, ?, ?&gt;&gt; processorMap,
+        final String predecessor) {
+
+<span class="nc" id="L1101">        return (ProcessorNode&lt;KIn, VIn, KOut, VOut&gt;) processorMap.get(predecessor);</span>
+    }
+
+    private void buildSourceNode(final Map&lt;String, SourceNode&lt;?, ?&gt;&gt; topicSourceMap,
+                                 final Set&lt;String&gt; repartitionTopics,
+                                 final SourceNodeFactory&lt;?, ?&gt; sourceNodeFactory,
+                                 final SourceNode&lt;?, ?&gt; node) {
+
+<span class="nc bnc" id="L1109" title="All 2 branches missed.">        final List&lt;String&gt; topics = (sourceNodeFactory.pattern != null) ?</span>
+<span class="nc" id="L1110">            sourceNodeFactory.topics(subscriptionUpdates()) :</span>
+<span class="nc" id="L1111">            sourceNodeFactory.topics;</span>
+
+<span class="nc bnc" id="L1113" title="All 2 branches missed.">        for (final String topic : topics) {</span>
+<span class="nc bnc" id="L1114" title="All 2 branches missed.">            if (internalTopicNamesWithProperties.containsKey(topic)) {</span>
+                // prefix the internal topic name with the application id
+<span class="nc" id="L1116">                final String decoratedTopic = decorateTopic(topic);</span>
+<span class="nc" id="L1117">                topicSourceMap.put(decoratedTopic, node);</span>
+<span class="nc" id="L1118">                repartitionTopics.add(decoratedTopic);</span>
+<span class="nc" id="L1119">            } else {</span>
+<span class="nc" id="L1120">                topicSourceMap.put(topic, node);</span>
+            }
+<span class="nc" id="L1122">        }</span>
+<span class="nc" id="L1123">    }</span>
+
+    @SuppressWarnings(&quot;deprecation&quot;)
+    private void buildProcessorNode(final Map&lt;String, ProcessorNode&lt;?, ?, ?, ?&gt;&gt; processorMap,
+                                    final Map&lt;String, StateStore&gt; stateStoreMap,
+                                    final ProcessorNodeFactory&lt;?, ?, ?, ?&gt; factory,
+                                    final ProcessorNode&lt;Object, Object, Object, Object&gt; node) {
+
+<span class="nc bnc" id="L1131" title="All 2 branches missed.">        for (final String predecessor : factory.predecessors) {</span>
+<span class="nc" id="L1132">            final ProcessorNode&lt;Object, Object, Object, Object&gt; predecessorNode = getProcessor(processorMap, predecessor);</span>
+<span class="nc" id="L1133">            predecessorNode.addChild(node);</span>
+        }
+<span class="nc bnc" id="L1135" title="All 2 branches missed.">        for (final String stateStoreName : factory.stateStoreNames) {</span>
+<span class="nc bnc" id="L1136" title="All 2 branches missed.">            if (!stateStoreMap.containsKey(stateStoreName)) {</span>
+                final StateStore store;
+<span class="nc bnc" id="L1138" title="All 2 branches missed.">                if (stateFactories.containsKey(stateStoreName)) {</span>
+<span class="nc" id="L1139">                    final StoreFactory storeFactory = stateFactories.get(stateStoreName);</span>
+
+                    // remember the changelog topic if this state store is change-logging enabled
+<span class="nc bnc" id="L1142" title="All 4 branches missed.">                    if (storeFactory.loggingEnabled() &amp;&amp; !storeToChangelogTopic.containsKey(stateStoreName)) {</span>
+<span class="nc bnc" id="L1143" title="All 2 branches missed.">                        final String prefix = topologyConfigs == null ?</span>
+<span class="nc" id="L1144">                                applicationId :</span>
+<span class="nc" id="L1145">                                ProcessorContextUtils.topicNamePrefix(topologyConfigs.applicationConfigs.originals(), applicationId);</span>
+<span class="nc" id="L1146">                        final String changelogTopic =</span>
+<span class="nc" id="L1147">                            ProcessorStateManager.storeChangelogTopic(prefix, stateStoreName, topologyName);</span>
+<span class="nc" id="L1148">                        storeToChangelogTopic.put(stateStoreName, changelogTopic);</span>
+<span class="nc" id="L1149">                        changelogTopicToStore.put(changelogTopic, stateStoreName);</span>
+                    }
+<span class="nc bnc" id="L1151" title="All 2 branches missed.">                    if (topologyConfigs != null) {</span>
+<span class="nc" id="L1152">                        storeFactory.configure(topologyConfigs.applicationConfigs);</span>
+                    }
+<span class="nc" id="L1154">                    store = storeFactory.builder().build();</span>
+<span class="nc" id="L1155">                    stateStoreMap.put(stateStoreName, store);</span>
+<span class="nc" id="L1156">                } else {</span>
+<span class="nc" id="L1157">                    store = globalStateStores.get(stateStoreName);</span>
+<span class="nc" id="L1158">                    stateStoreMap.put(stateStoreName, store);</span>
+                }
+
+<span class="nc bnc" id="L1161" title="All 2 branches missed.">                if (store.persistent()) {</span>
+<span class="nc" id="L1162">                    hasPersistentStores = true;</span>
+                }
+            }
+<span class="nc" id="L1165">        }</span>
+<span class="nc" id="L1166">    }</span>
+
+    /**
+     * Get any global {@link StateStore}s that are part of the
+     * topology
+     * @return map containing all global {@link StateStore}s
+     */
+    public Map&lt;String, StateStore&gt; globalStateStores() {
+<span class="nc" id="L1174">        Objects.requireNonNull(applicationId, &quot;topology has not completed optimization&quot;);</span>
+
+<span class="nc" id="L1176">        return Collections.unmodifiableMap(globalStateStores);</span>
+    }
+
+    public Set&lt;String&gt; allStateStoreNames() {
+<span class="nc" id="L1180">        Objects.requireNonNull(applicationId, &quot;topology has not completed optimization&quot;);</span>
+
+<span class="nc" id="L1182">        final Set&lt;String&gt; allNames = new HashSet&lt;&gt;(stateFactories.keySet());</span>
+<span class="nc" id="L1183">        allNames.addAll(globalStateStores.keySet());</span>
+<span class="nc" id="L1184">        return Collections.unmodifiableSet(allNames);</span>
+    }
+
+    public boolean hasStore(final String name) {
+<span class="nc bnc" id="L1188" title="All 4 branches missed.">        return stateFactories.containsKey(name) || globalStateStores.containsKey(name);</span>
+    }
+
+    public boolean hasPersistentStores() {
+<span class="nc" id="L1192">        return hasPersistentStores;</span>
+    }
+
+    /**
+     * Returns the map of topic groups keyed by the group id.
+     * A topic group is a group of topics in the same task.
+     *
+     * @return groups of topic names
+     */
+    public synchronized Map&lt;Subtopology, TopicsInfo&gt; subtopologyToTopicsInfo() {
+<span class="nc" id="L1202">        final Map&lt;Subtopology, TopicsInfo&gt; topicGroups = new LinkedHashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1204" title="All 2 branches missed.">        if (nodeGroups == null) {</span>
+<span class="nc" id="L1205">            nodeGroups = makeNodeGroups();</span>
+        }
+
+<span class="nc bnc" id="L1208" title="All 2 branches missed.">        for (final Map.Entry&lt;Integer, Set&lt;String&gt;&gt; entry : nodeGroups.entrySet()) {</span>
+<span class="nc" id="L1209">            final Set&lt;String&gt; sinkTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1210">            final Set&lt;String&gt; sourceTopics = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1211">            final Map&lt;String, InternalTopicConfig&gt; repartitionTopics = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1212">            final Map&lt;String, InternalTopicConfig&gt; stateChangelogTopics = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1213" title="All 2 branches missed.">            for (final String node : entry.getValue()) {</span>
+                // if the node is a source node, add to the source topics
+<span class="nc" id="L1215">                final List&lt;String&gt; topics = nodeToSourceTopics.get(node);</span>
+<span class="nc bnc" id="L1216" title="All 2 branches missed.">                if (topics != null) {</span>
+                    // if some of the topics are internal, add them to the internal topics
+<span class="nc bnc" id="L1218" title="All 2 branches missed.">                    for (final String topic : topics) {</span>
+                        // skip global topic as they don't need partition assignment
+<span class="nc bnc" id="L1220" title="All 2 branches missed.">                        if (globalTopics.contains(topic)) {</span>
+<span class="nc" id="L1221">                            continue;</span>
+                        }
+<span class="nc bnc" id="L1223" title="All 2 branches missed.">                        if (internalTopicNamesWithProperties.containsKey(topic)) {</span>
+                            // prefix the internal topic name with the application id
+<span class="nc" id="L1225">                            final String internalTopic = decorateTopic(topic);</span>
+
+<span class="nc" id="L1227">                            final RepartitionTopicConfig repartitionTopicConfig = buildRepartitionTopicConfig(</span>
+                                internalTopic,
+<span class="nc" id="L1229">                                internalTopicNamesWithProperties.get(topic).numberOfPartitions()</span>
+                            );
+
+<span class="nc" id="L1232">                            repartitionTopics.put(repartitionTopicConfig.name(), repartitionTopicConfig);</span>
+<span class="nc" id="L1233">                            sourceTopics.add(repartitionTopicConfig.name());</span>
+<span class="nc" id="L1234">                        } else {</span>
+<span class="nc" id="L1235">                            sourceTopics.add(topic);</span>
+                        }
+<span class="nc" id="L1237">                    }</span>
+                }
+
+                // if the node is a sink node, add to the sink topics
+<span class="nc" id="L1241">                final String topic = nodeToSinkTopic.get(node);</span>
+<span class="nc bnc" id="L1242" title="All 2 branches missed.">                if (topic != null) {</span>
+<span class="nc bnc" id="L1243" title="All 2 branches missed.">                    if (internalTopicNamesWithProperties.containsKey(topic)) {</span>
+                        // prefix the change log topic name with the application id
+<span class="nc" id="L1245">                        sinkTopics.add(decorateTopic(topic));</span>
+                    } else {
+<span class="nc" id="L1247">                        sinkTopics.add(topic);</span>
+                    }
+                }
+
+                // if the node is connected to a state store whose changelog topics are not predefined,
+                // add to the changelog topics
+<span class="nc bnc" id="L1253" title="All 2 branches missed.">                for (final StoreFactory stateFactory : stateFactories.values()) {</span>
+<span class="nc bnc" id="L1254" title="All 4 branches missed.">                    if (stateFactory.connectedProcessorNames().contains(node) &amp;&amp; storeToChangelogTopic.containsKey(stateFactory.storeName())) {</span>
+<span class="nc" id="L1255">                        final String topicName = storeToChangelogTopic.get(stateFactory.storeName());</span>
+<span class="nc bnc" id="L1256" title="All 2 branches missed.">                        if (!stateChangelogTopics.containsKey(topicName)) {</span>
+<span class="nc" id="L1257">                            final InternalTopicConfig internalTopicConfig =</span>
+<span class="nc" id="L1258">                                createChangelogTopicConfig(stateFactory, topicName);</span>
+<span class="nc" id="L1259">                            stateChangelogTopics.put(topicName, internalTopicConfig);</span>
+                        }
+                    }
+<span class="nc" id="L1262">                }</span>
+<span class="nc" id="L1263">            }</span>
+<span class="nc bnc" id="L1264" title="All 2 branches missed.">            if (!sourceTopics.isEmpty()) {</span>
+<span class="nc" id="L1265">                topicGroups.put(new Subtopology(entry.getKey(), topologyName), new TopicsInfo(</span>
+<span class="nc" id="L1266">                        Collections.unmodifiableSet(sinkTopics),</span>
+<span class="nc" id="L1267">                        Collections.unmodifiableSet(sourceTopics),</span>
+<span class="nc" id="L1268">                        Collections.unmodifiableMap(repartitionTopics),</span>
+<span class="nc" id="L1269">                        Collections.unmodifiableMap(stateChangelogTopics)));</span>
+            }
+<span class="nc" id="L1271">        }</span>
+
+<span class="nc" id="L1273">        return Collections.unmodifiableMap(topicGroups);</span>
+    }
+
+    public Map&lt;String, List&lt;String&gt;&gt; nodeToSourceTopics() {
+<span class="nc" id="L1277">        return Collections.unmodifiableMap(nodeToSourceTopics);</span>
+    }
+
+    private RepartitionTopicConfig buildRepartitionTopicConfig(final String internalTopic,
+                                                               final Optional&lt;Integer&gt; numberOfPartitions) {
+<span class="nc" id="L1282">        return numberOfPartitions</span>
+<span class="nc" id="L1283">            .map(partitions -&gt; new RepartitionTopicConfig(internalTopic,</span>
+<span class="nc" id="L1284">                                                          Collections.emptyMap(),</span>
+<span class="nc" id="L1285">                                                          partitions,</span>
+                                                          true))
+<span class="nc" id="L1287">            .orElse(new RepartitionTopicConfig(internalTopic, Collections.emptyMap()));</span>
+    }
+
+    private void setRegexMatchedTopicsToSourceNodes() {
+<span class="nc bnc" id="L1291" title="All 2 branches missed.">        if (hasSubscriptionUpdates()) {</span>
+<span class="nc bnc" id="L1292" title="All 2 branches missed.">            for (final String nodeName : nodeToSourcePatterns.keySet()) {</span>
+<span class="nc" id="L1293">                final SourceNodeFactory&lt;?, ?&gt; sourceNode = (SourceNodeFactory&lt;?, ?&gt;) nodeFactories.get(nodeName);</span>
+<span class="nc" id="L1294">                final List&lt;String&gt; sourceTopics = sourceNode.topics(subscriptionUpdates);</span>
+                //need to update nodeToSourceTopics and sourceTopicNames with topics matched from given regex
+<span class="nc" id="L1296">                nodeToSourceTopics.put(nodeName, sourceTopics);</span>
+<span class="nc" id="L1297">                rawSourceTopicNames.addAll(sourceTopics);</span>
+<span class="nc" id="L1298">            }</span>
+<span class="nc" id="L1299">            log.debug(&quot;Updated nodeToSourceTopics: {}&quot;, nodeToSourceTopics);</span>
+        }
+<span class="nc" id="L1301">    }</span>
+
+    private void setRegexMatchedTopicToStateStore() {
+<span class="nc bnc" id="L1304" title="All 2 branches missed.">        if (hasSubscriptionUpdates()) {</span>
+<span class="nc bnc" id="L1305" title="All 2 branches missed.">            for (final Map.Entry&lt;String, Set&lt;Pattern&gt;&gt; storePattern : stateStoreNameToSourceRegex.entrySet()) {</span>
+<span class="nc" id="L1306">                final Set&lt;String&gt; updatedTopicsForStateStore = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L1307" title="All 2 branches missed.">                for (final String subscriptionUpdateTopic : subscriptionUpdates()) {</span>
+<span class="nc bnc" id="L1308" title="All 2 branches missed.">                    for (final Pattern pattern : storePattern.getValue()) {</span>
+<span class="nc bnc" id="L1309" title="All 2 branches missed.">                        if (pattern.matcher(subscriptionUpdateTopic).matches()) {</span>
+<span class="nc" id="L1310">                            updatedTopicsForStateStore.add(subscriptionUpdateTopic);</span>
+                        }
+<span class="nc" id="L1312">                    }</span>
+<span class="nc" id="L1313">                }</span>
+<span class="nc bnc" id="L1314" title="All 2 branches missed.">                if (!updatedTopicsForStateStore.isEmpty()) {</span>
+<span class="nc" id="L1315">                    final Collection&lt;String&gt; storeTopics = stateStoreNameToRawSourceTopicNames.get(storePattern.getKey());</span>
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">                    if (storeTopics != null) {</span>
+<span class="nc" id="L1317">                        updatedTopicsForStateStore.addAll(storeTopics);</span>
+                    }
+<span class="nc" id="L1319">                    stateStoreNameToRawSourceTopicNames.put(</span>
+<span class="nc" id="L1320">                        storePattern.getKey(),</span>
+<span class="nc" id="L1321">                        Collections.unmodifiableSet(updatedTopicsForStateStore));</span>
+                }
+<span class="nc" id="L1323">            }</span>
+        }
+<span class="nc" id="L1325">    }</span>
+
+    private InternalTopicConfig createChangelogTopicConfig(final StoreFactory factory,
+                                                           final String name) {
+<span class="nc bnc" id="L1329" title="All 2 branches missed.">        if (factory.isVersionedStore()) {</span>
+<span class="nc" id="L1330">            return new VersionedChangelogTopicConfig(name, factory.logConfig(), factory.historyRetention());</span>
+<span class="nc bnc" id="L1331" title="All 2 branches missed.">        } else if (factory.isWindowStore()) {</span>
+<span class="nc" id="L1332">            return new WindowedChangelogTopicConfig(name, factory.logConfig(), factory.retentionPeriod());</span>
+        } else {
+<span class="nc" id="L1334">            return new UnwindowedUnversionedChangelogTopicConfig(name, factory.logConfig());</span>
+        }
+    }
+
+    public boolean hasOffsetResetOverrides() {
+<span class="nc" id="L1339">        return noneResetTopics.size() + noneResetPatterns.size()</span>
+<span class="nc" id="L1340">            + earliestResetTopics.size() + earliestResetPatterns.size()</span>
+<span class="nc" id="L1341">            + latestResetTopics.size() + latestResetPatterns.size()</span>
+<span class="nc bnc" id="L1342" title="All 2 branches missed.">            + durationResetTopics.size() + durationResetPatterns.size() &gt; 0;</span>
+    }
+
+    public AutoOffsetResetStrategy offsetResetStrategy(final String topic) {
+        final Optional&lt;Duration&gt; resetDuration;
+
+<span class="nc bnc" id="L1348" title="All 2 branches missed.">        if (maybeDecorateInternalSourceTopics(noneResetTopics).contains(topic) ||</span>
+<span class="nc bnc" id="L1349" title="All 2 branches missed.">            noneResetPatterns.stream().anyMatch(p -&gt; p.matcher(topic).matches())) {</span>
+<span class="nc" id="L1350">            return AutoOffsetResetStrategy.NONE;</span>
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">        } else if (maybeDecorateInternalSourceTopics(earliestResetTopics).contains(topic) ||</span>
+<span class="nc bnc" id="L1352" title="All 2 branches missed.">            earliestResetPatterns.stream().anyMatch(p -&gt; p.matcher(topic).matches())) {</span>
+<span class="nc" id="L1353">            return AutoOffsetResetStrategy.EARLIEST;</span>
+<span class="nc bnc" id="L1354" title="All 2 branches missed.">        } else if (maybeDecorateInternalSourceTopics(latestResetTopics).contains(topic) ||</span>
+<span class="nc bnc" id="L1355" title="All 2 branches missed.">            latestResetPatterns.stream().anyMatch(p -&gt; p.matcher(topic).matches())) {</span>
+<span class="nc" id="L1356">            return AutoOffsetResetStrategy.LATEST;</span>
+<span class="nc bnc" id="L1357" title="All 2 branches missed.">        } else if (maybeDecorateInternalSourceTopics(durationResetTopics.keySet()).contains(topic)) {</span>
+<span class="nc" id="L1358">            return AutoOffsetResetStrategy.fromString(&quot;by_duration:&quot; + durationResetTopics.get(topic).toString());</span>
+<span class="nc bnc" id="L1359" title="All 2 branches missed.">        } else if ((resetDuration = findDuration(topic)).isPresent()) {</span>
+<span class="nc" id="L1360">            return AutoOffsetResetStrategy.fromString(&quot;by_duration:&quot; + resetDuration.get());</span>
+<span class="nc bnc" id="L1361" title="All 2 branches missed.">        } else if (containsTopic(topic)) {</span>
+<span class="nc" id="L1362">            return null;</span>
+        } else {
+<span class="nc" id="L1364">            throw new IllegalStateException(String.format(</span>
+                &quot;Unable to lookup offset reset strategy for the following topic as it does not exist in the topology%s: %s&quot;,
+<span class="nc bnc" id="L1366" title="All 2 branches missed.">                hasNamedTopology() ? topologyName : &quot;&quot;,</span>
+                topic)
+            );
+        }
+    }
+
+    private Optional&lt;Duration&gt; findDuration(final String topic) {
+<span class="nc" id="L1373">        final List&lt;Duration&gt; resetDuration = durationResetPatterns.entrySet().stream()</span>
+<span class="nc" id="L1374">            .filter(e -&gt; e.getKey().matcher(topic).matches())</span>
+<span class="nc" id="L1375">            .map(Map.Entry::getValue)</span>
+<span class="nc" id="L1376">            .collect(Collectors.toList());</span>
+
+<span class="nc bnc" id="L1378" title="All 2 branches missed.">        if (resetDuration.size() &gt; 1) {</span>
+<span class="nc" id="L1379">            throw new IllegalStateException(&quot;Found more than one reset duration for topic: &quot; + topic);</span>
+        }
+
+<span class="nc bnc" id="L1382" title="All 2 branches missed.">        return resetDuration.isEmpty() ? Optional.empty() : resetDuration.stream().findAny();</span>
+    }
+
+    /**
+     * @return  map from state store name to full names (including application id/topology name prefix)
+     *          of all source topics whose processors are connected to it
+     */
+    public Map&lt;String, List&lt;String&gt;&gt; stateStoreNameToFullSourceTopicNames() {
+<span class="nc" id="L1390">        final Map&lt;String, List&lt;String&gt;&gt; results = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1391" title="All 2 branches missed.">        for (final Map.Entry&lt;String, Set&lt;String&gt;&gt; entry : stateStoreNameToRawSourceTopicNames.entrySet()) {</span>
+<span class="nc" id="L1392">            results.put(entry.getKey(), maybeDecorateInternalSourceTopics(entry.getValue()));</span>
+<span class="nc" id="L1393">        }</span>
+<span class="nc" id="L1394">        return results;</span>
+    }
+
+    /**
+     * @return  the full names (including application id/topology name prefix) of all source topics whose
+     *          processors are connected to the given state store
+     */
+    public Collection&lt;String&gt; sourceTopicsForStore(final String storeName) {
+<span class="nc" id="L1402">        return maybeDecorateInternalSourceTopics(stateStoreNameToRawSourceTopicNames.get(storeName));</span>
+    }
+
+    public synchronized Collection&lt;Set&lt;String&gt;&gt; copartitionGroups() {
+        // compute transitive closures of copartitionGroups to relieve registering code to know all members
+        // of a copartitionGroup at the same time
+<span class="nc" id="L1408">        final List&lt;Set&lt;String&gt;&gt; copartitionSourceTopics =</span>
+            copartitionSourceGroups
+<span class="nc" id="L1410">                .stream()</span>
+<span class="nc" id="L1411">                .map(sourceGroup -&gt;</span>
+                         sourceGroup
+<span class="nc" id="L1413">                             .stream()</span>
+<span class="nc" id="L1414">                             .flatMap(node -&gt; maybeDecorateInternalSourceTopics(nodeToSourceTopics.get(node)).stream())</span>
+<span class="nc" id="L1415">                             .collect(Collectors.toSet())</span>
+<span class="nc" id="L1416">                ).collect(Collectors.toList());</span>
+
+<span class="nc" id="L1418">        final Map&lt;String, Set&lt;String&gt;&gt; topicsToCopartitionGroup = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1419" title="All 2 branches missed.">        for (final Set&lt;String&gt; topics : copartitionSourceTopics) {</span>
+<span class="nc bnc" id="L1420" title="All 2 branches missed.">            if (topics != null) {</span>
+<span class="nc" id="L1421">                Set&lt;String&gt; coparititonGroup = null;</span>
+<span class="nc bnc" id="L1422" title="All 2 branches missed.">                for (final String topic : topics) {</span>
+<span class="nc" id="L1423">                    coparititonGroup = topicsToCopartitionGroup.get(topic);</span>
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">                    if (coparititonGroup != null) {</span>
+<span class="nc" id="L1425">                        break;</span>
+                    }
+<span class="nc" id="L1427">                }</span>
+<span class="nc bnc" id="L1428" title="All 2 branches missed.">                if (coparititonGroup == null) {</span>
+<span class="nc" id="L1429">                    coparititonGroup = new HashSet&lt;&gt;();</span>
+                }
+<span class="nc" id="L1431">                coparititonGroup.addAll(maybeDecorateInternalSourceTopics(topics));</span>
+<span class="nc bnc" id="L1432" title="All 2 branches missed.">                for (final String topic : topics) {</span>
+<span class="nc" id="L1433">                    topicsToCopartitionGroup.put(topic, coparititonGroup);</span>
+<span class="nc" id="L1434">                }</span>
+            }
+<span class="nc" id="L1436">        }</span>
+<span class="nc" id="L1437">        final Set&lt;Set&lt;String&gt;&gt; uniqueCopartitionGroups = new HashSet&lt;&gt;(topicsToCopartitionGroup.values());</span>
+<span class="nc" id="L1438">        return List.copyOf(uniqueCopartitionGroups);</span>
+    }
+
+    private List&lt;String&gt; maybeDecorateInternalSourceTopics(final Collection&lt;String&gt; sourceTopics) {
+<span class="nc bnc" id="L1442" title="All 2 branches missed.">        if (sourceTopics == null) {</span>
+<span class="nc" id="L1443">            return Collections.emptyList();</span>
+        }
+<span class="nc" id="L1445">        final List&lt;String&gt; decoratedTopics = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1446" title="All 2 branches missed.">        for (final String topic : sourceTopics) {</span>
+<span class="nc bnc" id="L1447" title="All 2 branches missed.">            if (internalTopicNamesWithProperties.containsKey(topic)) {</span>
+<span class="nc" id="L1448">                decoratedTopics.add(decorateTopic(topic));</span>
+            } else {
+<span class="nc" id="L1450">                decoratedTopics.add(topic);</span>
+            }
+<span class="nc" id="L1452">        }</span>
+<span class="nc" id="L1453">        return decoratedTopics;</span>
+    }
+
+    public String decoratePseudoTopic(final String topic) {
+<span class="nc" id="L1457">        return decorateTopic(topic);</span>
+    }
+
+    @SuppressWarnings(&quot;deprecation&quot;)
+    private String decorateTopic(final String topic) {
+<span class="nc bnc" id="L1462" title="All 2 branches missed.">        if (applicationId == null) {</span>
+<span class="nc" id="L1463">            throw new TopologyException(&quot;there are internal topics and &quot;</span>
+                                            + &quot;applicationId hasn't been set. Call &quot;
+                                            + &quot;setApplicationId first&quot;);
+        }
+
+<span class="nc bnc" id="L1468" title="All 2 branches missed.">        final String prefix = topologyConfigs == null</span>
+<span class="nc" id="L1469">            ? applicationId</span>
+<span class="nc" id="L1470">            : ProcessorContextUtils.topicNamePrefix(topologyConfigs.applicationConfigs.originals(), applicationId);</span>
+
+<span class="nc bnc" id="L1472" title="All 2 branches missed.">        if (hasNamedTopology()) {</span>
+<span class="nc" id="L1473">            return prefix + &quot;-&quot; + topologyName + &quot;-&quot; + topic;</span>
+        } else {
+<span class="nc" id="L1475">            return prefix + &quot;-&quot; + topic;</span>
+        }
+    }
+
+    void initializeSubscription() {
+<span class="nc bnc" id="L1480" title="All 2 branches missed.">        if (usesPatternSubscription()) {</span>
+<span class="nc" id="L1481">            log.debug(&quot;Found pattern subscribed source topics, initializing consumer's subscription pattern.&quot;);</span>
+<span class="nc" id="L1482">            sourceTopicPatternString = buildSourceTopicsPatternString();</span>
+        } else {
+<span class="nc" id="L1484">            log.debug(&quot;No source topics using pattern subscription found, initializing consumer's subscription collection.&quot;);</span>
+<span class="nc" id="L1485">            fullSourceTopicNames = maybeDecorateInternalSourceTopics(rawSourceTopicNames);</span>
+<span class="nc" id="L1486">            Collections.sort(fullSourceTopicNames);</span>
+        }
+<span class="nc" id="L1488">    }</span>
+
+    private String buildSourceTopicsPatternString() {
+<span class="nc" id="L1491">        final List&lt;String&gt; allSourceTopics = maybeDecorateInternalSourceTopics(rawSourceTopicNames);</span>
+<span class="nc" id="L1492">        Collections.sort(allSourceTopics);</span>
+
+<span class="nc" id="L1494">        final StringBuilder builder = new StringBuilder();</span>
+
+<span class="nc bnc" id="L1496" title="All 2 branches missed.">        for (final String topic : allSourceTopics) {</span>
+<span class="nc" id="L1497">            builder.append(topic).append(&quot;|&quot;);</span>
+<span class="nc" id="L1498">        }</span>
+
+<span class="nc bnc" id="L1500" title="All 2 branches missed.">        for (final Pattern sourcePattern : nodeToSourcePatterns.values()) {</span>
+<span class="nc" id="L1501">            builder.append(sourcePattern.pattern()).append(&quot;|&quot;);</span>
+<span class="nc" id="L1502">        }</span>
+
+<span class="nc bnc" id="L1504" title="All 2 branches missed.">        if (builder.length() &gt; 0) {</span>
+<span class="nc" id="L1505">            builder.setLength(builder.length() - 1);</span>
+        }
+
+<span class="nc" id="L1508">        return builder.toString();</span>
+    }
+
+    boolean usesPatternSubscription() {
+<span class="nc bnc" id="L1512" title="All 2 branches missed.">        return !nodeToSourcePatterns.isEmpty();</span>
+    }
+
+    /**
+     * @return names of all source topics, including the application id/named topology prefix for repartition sources
+     */
+    public synchronized List&lt;String&gt; fullSourceTopicNames() {
+<span class="nc bnc" id="L1519" title="All 2 branches missed.">        if (fullSourceTopicNames == null) {</span>
+<span class="nc" id="L1520">            fullSourceTopicNames = maybeDecorateInternalSourceTopics(rawSourceTopicNames);</span>
+<span class="nc" id="L1521">            Collections.sort(fullSourceTopicNames);</span>
+        }
+<span class="nc" id="L1523">        return fullSourceTopicNames;</span>
+    }
+
+    synchronized String sourceTopicPatternString() {
+        // With a NamedTopology, it may be that this topology does not use pattern subscription but another one does
+        // in which case we would need to initialize the pattern string where we would otherwise have not
+<span class="nc bnc" id="L1529" title="All 2 branches missed.">        if (sourceTopicPatternString == null) {</span>
+<span class="nc" id="L1530">            sourceTopicPatternString = buildSourceTopicsPatternString();</span>
+        }
+<span class="nc" id="L1532">        return sourceTopicPatternString;</span>
+    }
+
+    public boolean containsTopic(final String topic) {
+<span class="nc bnc" id="L1536" title="All 2 branches missed.">        return fullSourceTopicNames().contains(topic)</span>
+<span class="nc bnc" id="L1537" title="All 4 branches missed.">            || (usesPatternSubscription() &amp;&amp; Pattern.compile(sourceTopicPatternString()).matcher(topic).matches())</span>
+<span class="nc bnc" id="L1538" title="All 2 branches missed.">            || changelogTopicToStore.containsKey(topic);</span>
+    }
+
+    public boolean hasNoLocalTopology() {
+<span class="nc bnc" id="L1542" title="All 4 branches missed.">        return nodeToSourcePatterns.isEmpty() &amp;&amp; rawSourceTopicNames.isEmpty();</span>
+    }
+
+    public boolean hasGlobalStores() {
+<span class="nc bnc" id="L1546" title="All 2 branches missed.">        return !globalStateStores.isEmpty();</span>
+    }
+
+    private boolean isGlobalSource(final String nodeName) {
+<span class="nc" id="L1550">        final NodeFactory&lt;?, ?, ?, ?&gt; nodeFactory = nodeFactories.get(nodeName);</span>
+
+<span class="nc bnc" id="L1552" title="All 2 branches missed.">        if (nodeFactory instanceof SourceNodeFactory) {</span>
+<span class="nc" id="L1553">            final List&lt;String&gt; topics = ((SourceNodeFactory&lt;?, ?&gt;) nodeFactory).topics;</span>
+<span class="nc bnc" id="L1554" title="All 6 branches missed.">            return topics != null &amp;&amp; topics.size() == 1 &amp;&amp; globalTopics.contains(topics.get(0));</span>
+        }
+<span class="nc" id="L1556">        return false;</span>
+    }
+
+    public Set&lt;String&gt; stateStoreNamesForSubtopology(final int subtopologyId) {
+<span class="nc" id="L1560">        return subtopologyIdToStateStoreNames.get(subtopologyId);</span>
+    }
+
+    private void initializeSubtopologyIdToStateStoreNamesMap() {
+<span class="nc" id="L1564">        final Map&lt;Integer, Set&lt;String&gt;&gt; storeNames = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1566" title="All 2 branches missed.">        for (final Map.Entry&lt;Integer, Set&lt;String&gt;&gt; nodeGroup : makeNodeGroups().entrySet()) {</span>
+<span class="nc" id="L1567">            final Set&lt;String&gt; subtopologyNodes = nodeGroup.getValue();</span>
+<span class="nc" id="L1568">            final boolean isNodeGroupOfGlobalStores = nodeGroupContainsGlobalSourceNode(subtopologyNodes);</span>
+
+<span class="nc bnc" id="L1570" title="All 2 branches missed.">            if (!isNodeGroupOfGlobalStores) {</span>
+<span class="nc" id="L1571">                final int subtopologyId = nodeGroup.getKey();</span>
+<span class="nc" id="L1572">                final Set&lt;String&gt; subtopologyStoreNames = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1574" title="All 2 branches missed.">                for (final String nodeName : subtopologyNodes) {</span>
+<span class="nc" id="L1575">                    final AbstractNode node = nodeFactories.get(nodeName).describe();</span>
+<span class="nc bnc" id="L1576" title="All 2 branches missed.">                    if (node instanceof Processor) {</span>
+<span class="nc" id="L1577">                        subtopologyStoreNames.addAll(((Processor) node).stores());</span>
+                    }
+<span class="nc" id="L1579">                }</span>
+
+<span class="nc" id="L1581">                storeNames.put(subtopologyId, subtopologyStoreNames);</span>
+            }
+<span class="nc" id="L1583">        }</span>
+<span class="nc" id="L1584">        subtopologyIdToStateStoreNames = storeNames;</span>
+<span class="nc" id="L1585">    }</span>
+
+    public TopologyDescription describe() {
+<span class="nc" id="L1588">        final TopologyDescription description = new TopologyDescription(topologyName);</span>
+
+<span class="nc bnc" id="L1590" title="All 2 branches missed.">        for (final Map.Entry&lt;Integer, Set&lt;String&gt;&gt; nodeGroup : makeNodeGroups().entrySet()) {</span>
+
+<span class="nc" id="L1592">            final Set&lt;String&gt; allNodesOfGroups = nodeGroup.getValue();</span>
+<span class="nc" id="L1593">            final boolean isNodeGroupOfGlobalStores = nodeGroupContainsGlobalSourceNode(allNodesOfGroups);</span>
+
+<span class="nc bnc" id="L1595" title="All 2 branches missed.">            if (!isNodeGroupOfGlobalStores) {</span>
+<span class="nc" id="L1596">                describeSubtopology(description, nodeGroup.getKey(), allNodesOfGroups);</span>
+            } else {
+<span class="nc" id="L1598">                describeGlobalStore(description, allNodesOfGroups, nodeGroup.getKey());</span>
+            }
+<span class="nc" id="L1600">        }</span>
+
+<span class="nc" id="L1602">        return description;</span>
+    }
+
+    private void describeGlobalStore(final TopologyDescription description,
+                                     final Set&lt;String&gt; nodes,
+                                     final int id) {
+<span class="nc" id="L1608">        final Iterator&lt;String&gt; it = nodes.iterator();</span>
+<span class="nc bnc" id="L1609" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L1610">            final String node = it.next();</span>
+
+<span class="nc bnc" id="L1612" title="All 2 branches missed.">            if (isGlobalSource(node)) {</span>
+                // we found a GlobalStore node group; those contain exactly two node: {sourceNode,processorNode}
+<span class="nc" id="L1614">                it.remove(); // remove sourceNode from group</span>
+<span class="nc" id="L1615">                final String processorNode = nodes.iterator().next(); // get remaining processorNode</span>
+
+<span class="nc" id="L1617">                description.addGlobalStore(new GlobalStore(</span>
+                    node,
+                    processorNode,
+<span class="nc" id="L1620">                    ((ProcessorNodeFactory&lt;?, ?, ?, ?&gt;) nodeFactories.get(processorNode)).stateStoreNames.iterator().next(),</span>
+<span class="nc" id="L1621">                    nodeToSourceTopics.get(node).get(0),</span>
+                    id
+                ));
+<span class="nc" id="L1624">                break;</span>
+            }
+<span class="nc" id="L1626">        }</span>
+<span class="nc" id="L1627">    }</span>
+
+    private boolean nodeGroupContainsGlobalSourceNode(final Set&lt;String&gt; allNodesOfGroups) {
+<span class="nc bnc" id="L1630" title="All 2 branches missed.">        for (final String node : allNodesOfGroups) {</span>
+<span class="nc bnc" id="L1631" title="All 2 branches missed.">            if (isGlobalSource(node)) {</span>
+<span class="nc" id="L1632">                return true;</span>
+            }
+<span class="nc" id="L1634">        }</span>
+<span class="nc" id="L1635">        return false;</span>
+    }
+
+    private static class NodeComparator implements Comparator&lt;TopologyDescription.Node&gt;, Serializable {
+
+        @Override
+        public int compare(final TopologyDescription.Node node1,
+                           final TopologyDescription.Node node2) {
+<span class="nc bnc" id="L1643" title="All 2 branches missed.">            if (node1.equals(node2)) {</span>
+<span class="nc" id="L1644">                return 0;</span>
+            }
+<span class="nc" id="L1646">            final int size1 = ((AbstractNode) node1).size;</span>
+<span class="nc" id="L1647">            final int size2 = ((AbstractNode) node2).size;</span>
+
+            // it is possible that two nodes have the same sub-tree size (think two nodes connected via state stores)
+            // in this case default to processor name string
+<span class="nc bnc" id="L1651" title="All 2 branches missed.">            if (size1 != size2) {</span>
+<span class="nc" id="L1652">                return size2 - size1;</span>
+            } else {
+<span class="nc" id="L1654">                return node1.name().compareTo(node2.name());</span>
+            }
+        }
+    }
+
+<span class="nc" id="L1659">    private static final NodeComparator NODE_COMPARATOR = new NodeComparator();</span>
+
+    private static void updateSize(final AbstractNode node,
+                                   final int delta) {
+<span class="nc" id="L1663">        node.size += delta;</span>
+
+<span class="nc bnc" id="L1665" title="All 2 branches missed.">        for (final TopologyDescription.Node predecessor : node.predecessors()) {</span>
+<span class="nc" id="L1666">            updateSize((AbstractNode) predecessor, delta);</span>
+<span class="nc" id="L1667">        }</span>
+<span class="nc" id="L1668">    }</span>
+
+    private void describeSubtopology(final TopologyDescription description,
+                                     final Integer subtopologyId,
+                                     final Set&lt;String&gt; nodeNames) {
+
+<span class="nc" id="L1674">        final Map&lt;String, AbstractNode&gt; nodesByName = new HashMap&lt;&gt;();</span>
+
+        // add all nodes
+<span class="nc bnc" id="L1677" title="All 2 branches missed.">        for (final String nodeName : nodeNames) {</span>
+<span class="nc" id="L1678">            nodesByName.put(nodeName, nodeFactories.get(nodeName).describe());</span>
+<span class="nc" id="L1679">        }</span>
+
+        // connect each node to its predecessors and successors
+<span class="nc bnc" id="L1682" title="All 2 branches missed.">        for (final AbstractNode node : nodesByName.values()) {</span>
+<span class="nc bnc" id="L1683" title="All 2 branches missed.">            for (final String predecessorName : nodeFactories.get(node.name()).predecessors) {</span>
+<span class="nc" id="L1684">                final AbstractNode predecessor = nodesByName.get(predecessorName);</span>
+<span class="nc" id="L1685">                node.addPredecessor(predecessor);</span>
+<span class="nc" id="L1686">                predecessor.addSuccessor(node);</span>
+<span class="nc" id="L1687">                updateSize(predecessor, node.size);</span>
+            }
+<span class="nc" id="L1689">        }</span>
+
+<span class="nc" id="L1691">        description.addSubtopology(new SubtopologyDescription(</span>
+<span class="nc" id="L1692">                subtopologyId,</span>
+<span class="nc" id="L1693">                new HashSet&lt;&gt;(nodesByName.values())));</span>
+<span class="nc" id="L1694">    }</span>
+
+    public static final class GlobalStore implements TopologyDescription.GlobalStore {
+        private final Source source;
+        private final Processor processor;
+        private final int id;
+
+        public GlobalStore(final String sourceName,
+                           final String processorName,
+                           final String storeName,
+                           final String topicName,
+<span class="nc" id="L1705">                           final int id) {</span>
+<span class="nc" id="L1706">            source = new Source(sourceName, Collections.singleton(topicName), null);</span>
+<span class="nc" id="L1707">            processor = new Processor(processorName, Collections.singleton(storeName));</span>
+<span class="nc" id="L1708">            source.successors.add(processor);</span>
+<span class="nc" id="L1709">            processor.predecessors.add(source);</span>
+<span class="nc" id="L1710">            this.id = id;</span>
+<span class="nc" id="L1711">        }</span>
+
+        @Override
+        public int id() {
+<span class="nc" id="L1715">            return id;</span>
+        }
+
+        @Override
+        public TopologyDescription.Source source() {
+<span class="nc" id="L1720">            return source;</span>
+        }
+
+        @Override
+        public TopologyDescription.Processor processor() {
+<span class="nc" id="L1725">            return processor;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1730">            return &quot;Sub-topology: &quot; + id + &quot; for global store (will not generate tasks)\n&quot;</span>
+<span class="nc" id="L1731">                    + &quot;    &quot; + source.toString() + &quot;\n&quot;</span>
+<span class="nc" id="L1732">                    + &quot;    &quot; + processor.toString() + &quot;\n&quot;;</span>
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+<span class="nc bnc" id="L1737" title="All 2 branches missed.">            if (this == o) {</span>
+<span class="nc" id="L1738">                return true;</span>
+            }
+<span class="nc bnc" id="L1740" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) {</span>
+<span class="nc" id="L1741">                return false;</span>
+            }
+
+<span class="nc" id="L1744">            final GlobalStore that = (GlobalStore) o;</span>
+<span class="nc bnc" id="L1745" title="All 2 branches missed.">            return source.equals(that.source)</span>
+<span class="nc bnc" id="L1746" title="All 2 branches missed.">                &amp;&amp; processor.equals(that.processor);</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L1751">            return Objects.hash(source, processor);</span>
+        }
+    }
+
+    public abstract static class AbstractNode implements TopologyDescription.Node {
+        final String name;
+<span class="nc" id="L1757">        final Set&lt;TopologyDescription.Node&gt; predecessors = new TreeSet&lt;&gt;(NODE_COMPARATOR);</span>
+<span class="nc" id="L1758">        final Set&lt;TopologyDescription.Node&gt; successors = new TreeSet&lt;&gt;(NODE_COMPARATOR);</span>
+
+        // size of the sub-topology rooted at this node, including the node itself
+        int size;
+
+<span class="nc" id="L1763">        AbstractNode(final String name) {</span>
+<span class="nc" id="L1764">            Objects.requireNonNull(name, &quot;name cannot be null&quot;);</span>
+<span class="nc" id="L1765">            this.name = name;</span>
+<span class="nc" id="L1766">            this.size = 1;</span>
+<span class="nc" id="L1767">        }</span>
+
+        @Override
+        public String name() {
+<span class="nc" id="L1771">            return name;</span>
+        }
+
+        @Override
+        public Set&lt;TopologyDescription.Node&gt; predecessors() {
+<span class="nc" id="L1776">            return Collections.unmodifiableSet(predecessors);</span>
+        }
+
+        @Override
+        public Set&lt;TopologyDescription.Node&gt; successors() {
+<span class="nc" id="L1781">            return Collections.unmodifiableSet(successors);</span>
+        }
+
+        public void addPredecessor(final TopologyDescription.Node predecessor) {
+<span class="nc" id="L1785">            predecessors.add(predecessor);</span>
+<span class="nc" id="L1786">        }</span>
+
+        public void addSuccessor(final TopologyDescription.Node successor) {
+<span class="nc" id="L1789">            successors.add(successor);</span>
+<span class="nc" id="L1790">        }</span>
+    }
+
+    public static final class Source extends AbstractNode implements TopologyDescription.Source {
+        private final Set&lt;String&gt; topics;
+        private final Pattern topicPattern;
+
+        public Source(final String name,
+                      final Set&lt;String&gt; topics,
+                      final Pattern pattern) {
+<span class="nc" id="L1800">            super(name);</span>
+<span class="nc bnc" id="L1801" title="All 4 branches missed.">            if (topics == null &amp;&amp; pattern == null) {</span>
+<span class="nc" id="L1802">                throw new IllegalArgumentException(&quot;Either topics or pattern must be not-null, but both are null.&quot;);</span>
+            }
+<span class="nc bnc" id="L1804" title="All 4 branches missed.">            if (topics != null &amp;&amp; pattern != null) {</span>
+<span class="nc" id="L1805">                throw new IllegalArgumentException(&quot;Either topics or pattern must be null, but both are not null.&quot;);</span>
+            }
+
+<span class="nc" id="L1808">            this.topics = topics;</span>
+<span class="nc" id="L1809">            this.topicPattern = pattern;</span>
+<span class="nc" id="L1810">        }</span>
+
+        @Override
+        public Set&lt;String&gt; topicSet() {
+<span class="nc" id="L1814">            return topics;</span>
+        }
+
+        @Override
+        public Pattern topicPattern() {
+<span class="nc" id="L1819">            return topicPattern;</span>
+        }
+
+        @Override
+        public void addPredecessor(final TopologyDescription.Node predecessor) {
+<span class="nc" id="L1824">            throw new UnsupportedOperationException(&quot;Sources don't have predecessors.&quot;);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc bnc" id="L1829" title="All 2 branches missed.">            final String topicsString = topics == null ? topicPattern.toString() : topics.toString();</span>
+
+<span class="nc" id="L1831">            return &quot;Source: &quot; + name + &quot; (topics: &quot; + topicsString + &quot;)\n      --&gt; &quot; + nodeNames(successors);</span>
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+<span class="nc bnc" id="L1836" title="All 2 branches missed.">            if (this == o) {</span>
+<span class="nc" id="L1837">                return true;</span>
+            }
+<span class="nc bnc" id="L1839" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) {</span>
+<span class="nc" id="L1840">                return false;</span>
+            }
+
+<span class="nc" id="L1843">            final Source source = (Source) o;</span>
+            // omit successor to avoid infinite loops
+<span class="nc bnc" id="L1845" title="All 2 branches missed.">            return name.equals(source.name)</span>
+<span class="nc bnc" id="L1846" title="All 6 branches missed.">                &amp;&amp; Objects.equals(topics, source.topics)</span>
+                &amp;&amp; (topicPattern == null ?
+                        source.topicPattern == null :
+<span class="nc bnc" id="L1849" title="All 2 branches missed.">                        topicPattern.pattern().equals(source.topicPattern.pattern()));</span>
+        }
+
+        @Override
+        public int hashCode() {
+            // omit successor as it might change and alter the hash code
+<span class="nc" id="L1855">            return Objects.hash(name, topics, topicPattern);</span>
+        }
+    }
+
+    public static final class Processor extends AbstractNode implements TopologyDescription.Processor {
+        private final Set&lt;String&gt; stores;
+
+        public Processor(final String name,
+                         final Set&lt;String&gt; stores) {
+<span class="nc" id="L1864">            super(name);</span>
+<span class="nc" id="L1865">            this.stores = stores;</span>
+<span class="nc" id="L1866">        }</span>
+
+        @Override
+        public Set&lt;String&gt; stores() {
+<span class="nc" id="L1870">            return Collections.unmodifiableSet(stores);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1875">            return &quot;Processor: &quot; + name + &quot; (stores: &quot; + stores + &quot;)\n      --&gt; &quot;</span>
+<span class="nc" id="L1876">                + nodeNames(successors) + &quot;\n      &lt;-- &quot; + nodeNames(predecessors);</span>
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+<span class="nc bnc" id="L1881" title="All 2 branches missed.">            if (this == o) {</span>
+<span class="nc" id="L1882">                return true;</span>
+            }
+<span class="nc bnc" id="L1884" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) {</span>
+<span class="nc" id="L1885">                return false;</span>
+            }
+
+<span class="nc" id="L1888">            final Processor processor = (Processor) o;</span>
+            // omit successor to avoid infinite loops
+<span class="nc bnc" id="L1890" title="All 2 branches missed.">            return name.equals(processor.name)</span>
+<span class="nc bnc" id="L1891" title="All 2 branches missed.">                &amp;&amp; stores.equals(processor.stores)</span>
+<span class="nc bnc" id="L1892" title="All 2 branches missed.">                &amp;&amp; predecessors.equals(processor.predecessors);</span>
+        }
+
+        @Override
+        public int hashCode() {
+            // omit successor as it might change and alter the hash code
+<span class="nc" id="L1898">            return Objects.hash(name, stores);</span>
+        }
+    }
+
+    public static final class Sink&lt;K, V&gt; extends AbstractNode implements TopologyDescription.Sink {
+        private final TopicNameExtractor&lt;? super K, ? super V&gt; topicNameExtractor;
+
+        public Sink(final String name,
+                    final TopicNameExtractor&lt;? super K, ? super V&gt; topicNameExtractor) {
+<span class="nc" id="L1907">            super(name);</span>
+<span class="nc" id="L1908">            this.topicNameExtractor = topicNameExtractor;</span>
+<span class="nc" id="L1909">        }</span>
+
+        public Sink(final String name,
+                    final String topic) {
+<span class="nc" id="L1913">            super(name);</span>
+<span class="nc" id="L1914">            this.topicNameExtractor = new StaticTopicNameExtractor&lt;&gt;(topic);</span>
+<span class="nc" id="L1915">        }</span>
+
+        @Override
+        public String topic() {
+<span class="nc bnc" id="L1919" title="All 2 branches missed.">            if (topicNameExtractor instanceof StaticTopicNameExtractor) {</span>
+<span class="nc" id="L1920">                return ((StaticTopicNameExtractor&lt;?, ?&gt;) topicNameExtractor).topicName;</span>
+            } else {
+<span class="nc" id="L1922">                return null;</span>
+            }
+        }
+
+        @Override
+        public TopicNameExtractor&lt;? super K, ? super V&gt; topicNameExtractor() {
+<span class="nc bnc" id="L1928" title="All 2 branches missed.">            if (topicNameExtractor instanceof StaticTopicNameExtractor) {</span>
+<span class="nc" id="L1929">                return null;</span>
+            } else {
+<span class="nc" id="L1931">                return topicNameExtractor;</span>
+            }
+        }
+
+        @Override
+        public void addSuccessor(final TopologyDescription.Node successor) {
+<span class="nc" id="L1937">            throw new UnsupportedOperationException(&quot;Sinks don't have successors.&quot;);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc bnc" id="L1942" title="All 2 branches missed.">            if (topicNameExtractor instanceof StaticTopicNameExtractor) {</span>
+<span class="nc" id="L1943">                return &quot;Sink: &quot; + name + &quot; (topic: &quot; + topic() + &quot;)\n      &lt;-- &quot; + nodeNames(predecessors);</span>
+            }
+<span class="nc" id="L1945">            return &quot;Sink: &quot; + name + &quot; (extractor class: &quot; + topicNameExtractor + &quot;)\n      &lt;-- &quot;</span>
+<span class="nc" id="L1946">                + nodeNames(predecessors);</span>
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+<span class="nc bnc" id="L1951" title="All 2 branches missed.">            if (this == o) {</span>
+<span class="nc" id="L1952">                return true;</span>
+            }
+<span class="nc bnc" id="L1954" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) {</span>
+<span class="nc" id="L1955">                return false;</span>
+            }
+
+<span class="nc" id="L1958">            final Sink&lt;?, ?&gt; sink = (Sink&lt;?, ?&gt;) o;</span>
+<span class="nc bnc" id="L1959" title="All 2 branches missed.">            return name.equals(sink.name)</span>
+<span class="nc bnc" id="L1960" title="All 2 branches missed.">                &amp;&amp; topicNameExtractor.equals(sink.topicNameExtractor)</span>
+<span class="nc bnc" id="L1961" title="All 2 branches missed.">                &amp;&amp; predecessors.equals(sink.predecessors);</span>
+        }
+
+        @Override
+        public int hashCode() {
+            // omit predecessors as it might change and alter the hash code
+<span class="nc" id="L1967">            return Objects.hash(name, topicNameExtractor);</span>
+        }
+    }
+
+    public static final class SubtopologyDescription implements TopologyDescription.Subtopology {
+        private final int id;
+        private final Set&lt;TopologyDescription.Node&gt; nodes;
+
+<span class="nc" id="L1975">        public SubtopologyDescription(final int id, final Set&lt;TopologyDescription.Node&gt; nodes) {</span>
+<span class="nc" id="L1976">            this.id = id;</span>
+<span class="nc" id="L1977">            this.nodes = new TreeSet&lt;&gt;(NODE_COMPARATOR);</span>
+<span class="nc" id="L1978">            this.nodes.addAll(nodes);</span>
+<span class="nc" id="L1979">        }</span>
+
+        @Override
+        public int id() {
+<span class="nc" id="L1983">            return id;</span>
+        }
+
+        @Override
+        public Set&lt;TopologyDescription.Node&gt; nodes() {
+<span class="nc" id="L1988">            return Collections.unmodifiableSet(nodes);</span>
+        }
+
+        // visible for testing
+        Iterator&lt;TopologyDescription.Node&gt; nodesInOrder() {
+<span class="nc" id="L1993">            return nodes.iterator();</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1998">            return &quot;Sub-topology: &quot; + id + &quot;\n&quot; + nodesAsString() + &quot;\n&quot;;</span>
+        }
+
+        private String nodesAsString() {
+<span class="nc" id="L2002">            final StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L2003" title="All 2 branches missed.">            for (final TopologyDescription.Node node : nodes) {</span>
+<span class="nc" id="L2004">                sb.append(&quot;    &quot;);</span>
+<span class="nc" id="L2005">                sb.append(node);</span>
+<span class="nc" id="L2006">                sb.append('\n');</span>
+<span class="nc" id="L2007">            }</span>
+<span class="nc" id="L2008">            return sb.toString();</span>
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+<span class="nc bnc" id="L2013" title="All 2 branches missed.">            if (this == o) {</span>
+<span class="nc" id="L2014">                return true;</span>
+            }
+<span class="nc bnc" id="L2016" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) {</span>
+<span class="nc" id="L2017">                return false;</span>
+            }
+
+<span class="nc" id="L2020">            final SubtopologyDescription that = (SubtopologyDescription) o;</span>
+<span class="nc bnc" id="L2021" title="All 2 branches missed.">            return id == that.id</span>
+<span class="nc bnc" id="L2022" title="All 2 branches missed.">                &amp;&amp; nodes.equals(that.nodes);</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L2027">            return Objects.hash(id, nodes);</span>
+        }
+    }
+
+    public static class TopicsInfo {
+        public final Set&lt;String&gt; sinkTopics;
+        public final Set&lt;String&gt; sourceTopics;
+        public final Map&lt;String, InternalTopicConfig&gt; stateChangelogTopics;
+        public final Map&lt;String, InternalTopicConfig&gt; repartitionSourceTopics;
+
+        TopicsInfo(final Set&lt;String&gt; sinkTopics,
+                   final Set&lt;String&gt; sourceTopics,
+                   final Map&lt;String, InternalTopicConfig&gt; repartitionSourceTopics,
+<span class="nc" id="L2040">                   final Map&lt;String, InternalTopicConfig&gt; stateChangelogTopics) {</span>
+<span class="nc" id="L2041">            this.sinkTopics = sinkTopics;</span>
+<span class="nc" id="L2042">            this.sourceTopics = sourceTopics;</span>
+<span class="nc" id="L2043">            this.stateChangelogTopics = stateChangelogTopics;</span>
+<span class="nc" id="L2044">            this.repartitionSourceTopics = repartitionSourceTopics;</span>
+<span class="nc" id="L2045">        }</span>
+
+        /**
+         * Returns the config for any changelogs that must be prepared for this topic group, ie excluding any source
+         * topics that are reused as a changelog
+         */
+        public Set&lt;InternalTopicConfig&gt; nonSourceChangelogTopics() {
+<span class="nc" id="L2052">            final Set&lt;InternalTopicConfig&gt; topicConfigs = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L2053" title="All 2 branches missed.">            for (final Map.Entry&lt;String, InternalTopicConfig&gt; changelogTopicEntry : stateChangelogTopics.entrySet()) {</span>
+<span class="nc bnc" id="L2054" title="All 2 branches missed.">                if (!sourceTopics.contains(changelogTopicEntry.getKey())) {</span>
+<span class="nc" id="L2055">                    topicConfigs.add(changelogTopicEntry.getValue());</span>
+                }
+<span class="nc" id="L2057">            }</span>
+<span class="nc" id="L2058">            return topicConfigs;</span>
+        }
+
+        /**
+         *
+         * @return the set of changelog topics, which includes both source changelog topics and non
+         * source changelog topics.
+         */
+        public Set&lt;String&gt; changelogTopics() {
+<span class="nc" id="L2067">            return Collections.unmodifiableSet(stateChangelogTopics.keySet());</span>
+        }
+
+        /**
+         * Returns the topic names for any optimized source changelogs
+         */
+        public Set&lt;String&gt; sourceTopicChangelogs() {
+<span class="nc" id="L2074">            return sourceTopics.stream().filter(stateChangelogTopics::containsKey).collect(Collectors.toSet());</span>
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+<span class="nc bnc" id="L2079" title="All 2 branches missed.">            if (o instanceof TopicsInfo) {</span>
+<span class="nc" id="L2080">                final TopicsInfo other = (TopicsInfo) o;</span>
+<span class="nc bnc" id="L2081" title="All 4 branches missed.">                return other.sourceTopics.equals(sourceTopics) &amp;&amp; other.stateChangelogTopics.equals(stateChangelogTopics);</span>
+            } else {
+<span class="nc" id="L2083">                return false;</span>
+            }
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L2089">            final long n = ((long) sourceTopics.hashCode() &lt;&lt; 32) | (long) stateChangelogTopics.hashCode();</span>
+<span class="nc" id="L2090">            return (int) (n % 0xFFFFFFFFL);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L2095">            return &quot;TopicsInfo{&quot; +</span>
+                &quot;sinkTopics=&quot; + sinkTopics +
+                &quot;, sourceTopics=&quot; + sourceTopics +
+                &quot;, repartitionSourceTopics=&quot; + repartitionSourceTopics +
+                &quot;, stateChangelogTopics=&quot; + stateChangelogTopics +
+                '}';
+        }
+    }
+
+    private static class GlobalStoreComparator implements Comparator&lt;TopologyDescription.GlobalStore&gt;, Serializable {
+        @Override
+        public int compare(final TopologyDescription.GlobalStore globalStore1,
+                           final TopologyDescription.GlobalStore globalStore2) {
+<span class="nc bnc" id="L2108" title="All 2 branches missed.">            if (globalStore1.equals(globalStore2)) {</span>
+<span class="nc" id="L2109">                return 0;</span>
+            }
+<span class="nc" id="L2111">            return globalStore1.id() - globalStore2.id();</span>
+        }
+    }
+
+<span class="nc" id="L2115">    private static final GlobalStoreComparator GLOBALSTORE_COMPARATOR = new GlobalStoreComparator();</span>
+
+    private static class SubtopologyComparator implements Comparator&lt;TopologyDescription.Subtopology&gt;, Serializable {
+        @Override
+        public int compare(final TopologyDescription.Subtopology subtopology1,
+                           final TopologyDescription.Subtopology subtopology2) {
+<span class="nc bnc" id="L2121" title="All 2 branches missed.">            if (subtopology1.equals(subtopology2)) {</span>
+<span class="nc" id="L2122">                return 0;</span>
+            }
+<span class="nc" id="L2124">            return subtopology1.id() - subtopology2.id();</span>
+        }
+    }
+
+<span class="nc" id="L2128">    private static final SubtopologyComparator SUBTOPOLOGY_COMPARATOR = new SubtopologyComparator();</span>
+
+    public static final class TopologyDescription implements org.apache.kafka.streams.TopologyDescription {
+<span class="nc" id="L2131">        private final TreeSet&lt;Subtopology&gt; subtopologies = new TreeSet&lt;&gt;(SUBTOPOLOGY_COMPARATOR);</span>
+<span class="nc" id="L2132">        private final TreeSet&lt;GlobalStore&gt; globalStores = new TreeSet&lt;&gt;(GLOBALSTORE_COMPARATOR);</span>
+        private final String namedTopology;
+
+        public TopologyDescription() {
+<span class="nc" id="L2136">            this(null);</span>
+<span class="nc" id="L2137">        }</span>
+
+<span class="nc" id="L2139">        public TopologyDescription(final String namedTopology) {</span>
+<span class="nc" id="L2140">            this.namedTopology = namedTopology;</span>
+<span class="nc" id="L2141">        }</span>
+
+        public void addSubtopology(final Subtopology subtopology) {
+<span class="nc" id="L2144">            subtopologies.add(subtopology);</span>
+<span class="nc" id="L2145">        }</span>
+
+        public void addGlobalStore(final GlobalStore globalStore) {
+<span class="nc" id="L2148">            globalStores.add(globalStore);</span>
+<span class="nc" id="L2149">        }</span>
+
+        @Override
+        public Set&lt;Subtopology&gt; subtopologies() {
+<span class="nc" id="L2153">            return Collections.unmodifiableSet(subtopologies);</span>
+        }
+
+        @Override
+        public Set&lt;GlobalStore&gt; globalStores() {
+<span class="nc" id="L2158">            return Collections.unmodifiableSet(globalStores);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L2163">            final StringBuilder sb = new StringBuilder();</span>
+
+<span class="nc bnc" id="L2165" title="All 2 branches missed.">            if (namedTopology == null) {</span>
+<span class="nc" id="L2166">                sb.append(&quot;Topologies:\n &quot;);</span>
+            } else {
+<span class="nc" id="L2168">                sb.append(&quot;Topology: &quot;).append(namedTopology).append(&quot;:\n &quot;);</span>
+            }
+<span class="nc" id="L2170">            final Subtopology[] sortedSubtopologies =</span>
+<span class="nc" id="L2171">                subtopologies.descendingSet().toArray(new Subtopology[0]);</span>
+<span class="nc" id="L2172">            final GlobalStore[] sortedGlobalStores =</span>
+<span class="nc" id="L2173">                globalStores.descendingSet().toArray(new GlobalStore[0]);</span>
+<span class="nc" id="L2174">            int expectedId = 0;</span>
+<span class="nc" id="L2175">            int subtopologiesIndex = sortedSubtopologies.length - 1;</span>
+<span class="nc" id="L2176">            int globalStoresIndex = sortedGlobalStores.length - 1;</span>
+<span class="nc bnc" id="L2177" title="All 4 branches missed.">            while (subtopologiesIndex != -1 &amp;&amp; globalStoresIndex != -1) {</span>
+<span class="nc" id="L2178">                sb.append(&quot;  &quot;);</span>
+<span class="nc" id="L2179">                final Subtopology subtopology = sortedSubtopologies[subtopologiesIndex];</span>
+<span class="nc" id="L2180">                final GlobalStore globalStore = sortedGlobalStores[globalStoresIndex];</span>
+<span class="nc bnc" id="L2181" title="All 2 branches missed.">                if (subtopology.id() == expectedId) {</span>
+<span class="nc" id="L2182">                    sb.append(subtopology);</span>
+<span class="nc" id="L2183">                    subtopologiesIndex--;</span>
+                } else {
+<span class="nc" id="L2185">                    sb.append(globalStore);</span>
+<span class="nc" id="L2186">                    globalStoresIndex--;</span>
+                }
+<span class="nc" id="L2188">                expectedId++;</span>
+<span class="nc" id="L2189">            }</span>
+<span class="nc bnc" id="L2190" title="All 2 branches missed.">            while (subtopologiesIndex != -1) {</span>
+<span class="nc" id="L2191">                final Subtopology subtopology = sortedSubtopologies[subtopologiesIndex];</span>
+<span class="nc" id="L2192">                sb.append(&quot;  &quot;);</span>
+<span class="nc" id="L2193">                sb.append(subtopology);</span>
+<span class="nc" id="L2194">                subtopologiesIndex--;</span>
+<span class="nc" id="L2195">            }</span>
+<span class="nc bnc" id="L2196" title="All 2 branches missed.">            while (globalStoresIndex != -1) {</span>
+<span class="nc" id="L2197">                final GlobalStore globalStore = sortedGlobalStores[globalStoresIndex];</span>
+<span class="nc" id="L2198">                sb.append(&quot;  &quot;);</span>
+<span class="nc" id="L2199">                sb.append(globalStore);</span>
+<span class="nc" id="L2200">                globalStoresIndex--;</span>
+<span class="nc" id="L2201">            }</span>
+<span class="nc" id="L2202">            return sb.toString();</span>
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+<span class="nc bnc" id="L2207" title="All 2 branches missed.">            if (this == o) {</span>
+<span class="nc" id="L2208">                return true;</span>
+            }
+<span class="nc bnc" id="L2210" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) {</span>
+<span class="nc" id="L2211">                return false;</span>
+            }
+
+<span class="nc" id="L2214">            final TopologyDescription that = (TopologyDescription) o;</span>
+<span class="nc bnc" id="L2215" title="All 2 branches missed.">            return subtopologies.equals(that.subtopologies)</span>
+<span class="nc bnc" id="L2216" title="All 2 branches missed.">                &amp;&amp; globalStores.equals(that.globalStores);</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L2221">            return Objects.hash(subtopologies, globalStores);</span>
+        }
+
+    }
+
+    private static String nodeNames(final Set&lt;TopologyDescription.Node&gt; nodes) {
+<span class="nc" id="L2227">        final StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L2228" title="All 2 branches missed.">        if (!nodes.isEmpty()) {</span>
+<span class="nc bnc" id="L2229" title="All 2 branches missed.">            for (final TopologyDescription.Node n : nodes) {</span>
+<span class="nc" id="L2230">                sb.append(n.name());</span>
+<span class="nc" id="L2231">                sb.append(&quot;, &quot;);</span>
+<span class="nc" id="L2232">            }</span>
+<span class="nc" id="L2233">            sb.deleteCharAt(sb.length() - 1);</span>
+<span class="nc" id="L2234">            sb.deleteCharAt(sb.length() - 1);</span>
+        } else {
+<span class="nc" id="L2236">            return &quot;none&quot;;</span>
+        }
+<span class="nc" id="L2238">        return sb.toString();</span>
+    }
+
+    private Set&lt;String&gt; subscriptionUpdates() {
+<span class="nc" id="L2242">        return Collections.unmodifiableSet(subscriptionUpdates);</span>
+    }
+
+    private boolean hasSubscriptionUpdates() {
+<span class="nc bnc" id="L2246" title="All 2 branches missed.">        return !subscriptionUpdates.isEmpty();</span>
+    }
+
+    synchronized void addSubscribedTopicsFromAssignment(final Set&lt;TopicPartition&gt; partitions, final String logPrefix) {
+<span class="nc bnc" id="L2250" title="All 2 branches missed.">        if (usesPatternSubscription()) {</span>
+<span class="nc" id="L2251">            final Set&lt;String&gt; assignedTopics = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L2252" title="All 2 branches missed.">            for (final TopicPartition topicPartition : partitions) {</span>
+<span class="nc" id="L2253">                assignedTopics.add(topicPartition.topic());</span>
+<span class="nc" id="L2254">            }</span>
+
+<span class="nc" id="L2256">            final Collection&lt;String&gt; existingTopics = subscriptionUpdates();</span>
+
+<span class="nc bnc" id="L2258" title="All 2 branches missed.">            if  (!existingTopics.equals(assignedTopics)) {</span>
+<span class="nc" id="L2259">                assignedTopics.addAll(existingTopics);</span>
+<span class="nc" id="L2260">                updateSubscribedTopics(assignedTopics, logPrefix);</span>
+            }
+        }
+<span class="nc" id="L2263">    }</span>
+
+    synchronized void addSubscribedTopicsFromMetadata(final Set&lt;String&gt; topics, final String logPrefix) {
+<span class="nc bnc" id="L2266" title="All 4 branches missed.">        if (usesPatternSubscription() &amp;&amp; !subscriptionUpdates().equals(topics)) {</span>
+<span class="nc" id="L2267">            updateSubscribedTopics(topics, logPrefix);</span>
+        }
+<span class="nc" id="L2269">    }</span>
+
+    private void updateSubscribedTopics(final Set&lt;String&gt; topics, final String logPrefix) {
+<span class="nc" id="L2272">        subscriptionUpdates.clear();</span>
+<span class="nc" id="L2273">        subscriptionUpdates.addAll(topics);</span>
+
+<span class="nc" id="L2275">        log.debug(&quot;{}found {} topics possibly matching subscription&quot;, logPrefix, topics.size());</span>
+
+<span class="nc" id="L2277">        setRegexMatchedTopicsToSourceNodes();</span>
+<span class="nc" id="L2278">        setRegexMatchedTopicToStateStore();</span>
+<span class="nc" id="L2279">    }</span>
+
+    /**
+     * @return a copy of the string representation of any pattern subscribed source nodes
+     */
+    public synchronized List&lt;String&gt; allSourcePatternStrings() {
+<span class="nc" id="L2285">        return nodeToSourcePatterns.values().stream().map(Pattern::pattern).collect(Collectors.toList());</span>
+    }
+
+    public boolean hasNamedTopology() {
+<span class="nc bnc" id="L2289" title="All 2 branches missed.">        return topologyName != null;</span>
+    }
+
+    public synchronized Map&lt;String, StoreFactory&gt; stateStores() {
+<span class="nc" id="L2293">        return stateFactories;</span>
+    }
+
+    public &lt;KIn, VIn, VOut&gt; WrappedFixedKeyProcessorSupplier&lt;KIn, VIn, VOut&gt; wrapFixedKeyProcessorSupplier(
+        final String name,
+        final FixedKeyProcessorSupplier&lt;KIn, VIn,  VOut&gt; processorSupplier
+    ) {
+<span class="nc" id="L2300">        return ProcessorWrapper.asWrappedFixedKey(</span>
+<span class="nc" id="L2301">            processorWrapper.wrapFixedKeyProcessorSupplier(name, processorSupplier)</span>
+        );
+    }
+
+    public &lt;KIn, VIn, KOut, VOut&gt; WrappedProcessorSupplier&lt;KIn, VIn, KOut, VOut&gt; wrapProcessorSupplier(
+        final String name,
+        final ProcessorSupplier&lt;KIn, VIn, KOut, VOut&gt; processorSupplier
+    ) {
+<span class="nc" id="L2309">        return ProcessorWrapper.asWrapped(</span>
+<span class="nc" id="L2310">            processorWrapper.wrapProcessorSupplier(name, processorSupplier)</span>
+        );
+    }
+
+    public void addImplicitInternalNames(final InternalResourcesNaming internalResourcesNaming) {
+<span class="nc" id="L2315">        implicitInternalNames.add(internalResourcesNaming);</span>
+<span class="nc" id="L2316">    }</span>
+
+    public void checkUnprovidedNames() {
+<span class="nc bnc" id="L2319" title="All 2 branches missed.">        if (!implicitInternalNames.isEmpty()) {</span>
+<span class="nc" id="L2320">            final StringBuilder result = new StringBuilder();</span>
+<span class="nc" id="L2321">            final List&lt;String&gt; changelogTopics = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L2322">            final List&lt;String&gt; stateStores = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L2323">            final List&lt;String&gt; repartitionTopics = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L2324" title="All 2 branches missed.">            for (final InternalResourcesNaming internalResourcesNaming : implicitInternalNames) {</span>
+<span class="nc bnc" id="L2325" title="All 2 branches missed.">                if (!Utils.isBlank(internalResourcesNaming.changelogTopic())) {</span>
+<span class="nc" id="L2326">                    changelogTopics.add(internalResourcesNaming.changelogTopic());</span>
+                }
+<span class="nc bnc" id="L2328" title="All 2 branches missed.">                if (!Utils.isBlank(internalResourcesNaming.stateStore())) {</span>
+<span class="nc" id="L2329">                    stateStores.add(internalResourcesNaming.stateStore());</span>
+                }
+<span class="nc bnc" id="L2331" title="All 2 branches missed.">                if (!Utils.isBlank(internalResourcesNaming.repartitionTopic())) {</span>
+<span class="nc" id="L2332">                    repartitionTopics.add(internalResourcesNaming.repartitionTopic());</span>
+                }
+<span class="nc" id="L2334">            }</span>
+<span class="nc bnc" id="L2335" title="All 2 branches missed.">            if (!changelogTopics.isEmpty()) {</span>
+<span class="nc" id="L2336">                result.append(String.format(&quot;Following changelog topic(s) has not been named: %s%n&quot;, String.join(&quot;, &quot;, changelogTopics)));</span>
+            }
+<span class="nc bnc" id="L2338" title="All 2 branches missed.">            if (!stateStores.isEmpty()) {</span>
+<span class="nc" id="L2339">                result.append(String.format(&quot;Following state store(s) has not been named: %s%n&quot;, String.join(&quot;, &quot;, stateStores)));</span>
+            }
+<span class="nc bnc" id="L2341" title="All 2 branches missed.">            if (!repartitionTopics.isEmpty()) {</span>
+<span class="nc" id="L2342">                result.append(String.format(&quot;Following repartition topic(s) has not been named: %s%n&quot;, String.join(&quot;, &quot;, repartitionTopics)));</span>
+            }
+<span class="nc bnc" id="L2344" title="All 2 branches missed.">            if (ensureExplicitInternalResourceNaming) {</span>
+<span class="nc" id="L2345">                throw new TopologyException(result.toString());</span>
+            } else {
+<span class="nc" id="L2347">                log.warn(&quot;Explicit naming for internal resources is currently disabled. If you want to enforce&quot; +</span>
+                    &quot; user-defined names for all internal resources, set &quot; + ENSURE_EXPLICIT_INTERNAL_RESOURCE_NAMING_CONFIG +
+                    &quot; to true. Note: Changing internal resource names may require a full streams application reset for an&quot; +
+                    &quot; already deployed application. Consult the documentation on naming operators for more details. {}&quot;, result);
+            }
+        }
+<span class="nc" id="L2353">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

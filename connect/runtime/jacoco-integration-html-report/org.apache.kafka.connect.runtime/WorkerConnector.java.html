@@ -1,0 +1,621 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>WorkerConnector.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">WorkerConnector.java</span></div><h1>WorkerConnector.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.common.metrics.PluginMetrics;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.connector.Connector;
+import org.apache.kafka.connect.connector.ConnectorContext;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.runtime.ConnectMetrics.MetricGroup;
+import org.apache.kafka.connect.sink.SinkConnectorContext;
+import org.apache.kafka.connect.source.SourceConnectorContext;
+import org.apache.kafka.connect.storage.CloseableOffsetStorageReader;
+import org.apache.kafka.connect.storage.ConnectorOffsetBackingStore;
+import org.apache.kafka.connect.storage.OffsetStorageReader;
+import org.apache.kafka.connect.util.Callback;
+import org.apache.kafka.connect.util.ConnectUtils;
+import org.apache.kafka.connect.util.LoggingContext;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * Container for connectors which is responsible for managing their lifecycle (e.g. handling startup,
+ * shutdown, pausing, etc.). Internally, we manage the runtime state of the connector and transition according
+ * to target state changes. Note that unlike connector tasks, the connector does not really have a &quot;pause&quot;
+ * state which is distinct from being stopped. We therefore treat pause operations as requests to momentarily
+ * stop the connector, and resume operations as requests to restart it (without reinitialization). Connector
+ * failures, whether in initialization or after startup, are treated as fatal, which means that we will not attempt
+ * to restart this connector instance after failure. What this means from a user perspective is that you must
+ * use the /restart REST API to restart a failed task. This behavior is consistent with task failures.
+ * &lt;p&gt;
+ * Note that this class is NOT thread-safe.
+ */
+public class WorkerConnector implements Runnable {
+<span class="fc" id="L57">    private static final Logger log = LoggerFactory.getLogger(WorkerConnector.class);</span>
+    private static final String THREAD_NAME_PREFIX = &quot;connector-thread-&quot;;
+
+<span class="fc" id="L60">    private enum State {</span>
+<span class="fc" id="L61">        INIT,    // initial state before startup</span>
+<span class="fc" id="L62">        PAUSED,  // The connector has been paused.</span>
+<span class="fc" id="L63">        STOPPED, // the connector has been stopped.</span>
+<span class="fc" id="L64">        STARTED, // the connector has been started/resumed.</span>
+<span class="fc" id="L65">        FAILED,  // the connector has failed (no further transitions are possible after this state)</span>
+    }
+
+    private final String connName;
+    private final Map&lt;String, String&gt; config;
+    private final ConnectorStatus.Listener statusListener;
+    private final ClassLoader loader;
+    private final CloseableConnectorContext ctx;
+    private final Connector connector;
+    private final ConnectorMetricsGroup metrics;
+    private final AtomicReference&lt;TargetState&gt; pendingTargetStateChange;
+    private final AtomicReference&lt;Callback&lt;TargetState&gt;&gt; pendingStateChangeCallback;
+    private final CountDownLatch shutdownLatch;
+    private volatile Throwable externalFailure;
+    private volatile boolean stopping;  // indicates whether the Worker has asked the connector to stop
+    private volatile boolean cancelled; // indicates whether the Worker has cancelled the connector (e.g. because of slow shutdown)
+    private final String version;
+
+    private State state;
+    private final CloseableOffsetStorageReader offsetStorageReader;
+    private final ConnectorOffsetBackingStore offsetStore;
+
+    public WorkerConnector(String connName,
+                           Connector connector,
+                           ConnectorConfig connectorConfig,
+                           CloseableConnectorContext ctx,
+                           ConnectMetrics connectMetrics,
+                           ConnectorStatus.Listener statusListener,
+                           CloseableOffsetStorageReader offsetStorageReader,
+                           ConnectorOffsetBackingStore offsetStore,
+<span class="fc" id="L95">                           ClassLoader loader) {</span>
+<span class="fc" id="L96">        this.connName = connName;</span>
+<span class="fc" id="L97">        this.config = connectorConfig.originalsStrings();</span>
+<span class="fc" id="L98">        this.loader = loader;</span>
+<span class="fc" id="L99">        this.ctx = ctx;</span>
+<span class="fc" id="L100">        this.connector = connector;</span>
+<span class="fc" id="L101">        this.version = connector.version();</span>
+<span class="fc" id="L102">        this.state = State.INIT;</span>
+<span class="fc" id="L103">        this.metrics = new ConnectorMetricsGroup(connectMetrics, AbstractStatus.State.UNASSIGNED, this.version, statusListener);</span>
+<span class="fc" id="L104">        this.statusListener = this.metrics;</span>
+<span class="fc" id="L105">        this.offsetStorageReader = offsetStorageReader;</span>
+<span class="fc" id="L106">        this.offsetStore = offsetStore;</span>
+<span class="fc" id="L107">        this.pendingTargetStateChange = new AtomicReference&lt;&gt;();</span>
+<span class="fc" id="L108">        this.pendingStateChangeCallback = new AtomicReference&lt;&gt;();</span>
+<span class="fc" id="L109">        this.shutdownLatch = new CountDownLatch(1);</span>
+<span class="fc" id="L110">        this.externalFailure = null;</span>
+<span class="fc" id="L111">        this.stopping = false;</span>
+<span class="fc" id="L112">        this.cancelled = false;</span>
+<span class="fc" id="L113">    }</span>
+
+    public ClassLoader loader() {
+<span class="fc" id="L116">        return loader;</span>
+    }
+
+    @Override
+    public void run() {
+        // Clear all MDC parameters, in case this thread is being reused
+<span class="fc" id="L122">        LoggingContext.clear();</span>
+
+<span class="fc" id="L124">        try (LoggingContext loggingContext = LoggingContext.forConnector(connName)) {</span>
+<span class="fc" id="L125">            String savedName = Thread.currentThread().getName();</span>
+            try {
+<span class="fc" id="L127">                Thread.currentThread().setName(THREAD_NAME_PREFIX + connName);</span>
+<span class="fc" id="L128">                doRun();</span>
+            } finally {
+<span class="fc" id="L130">                Thread.currentThread().setName(savedName);</span>
+            }
+        } finally {
+            // In the rare case of an exception being thrown outside the doRun() method, or an
+            // uncaught one being thrown from within it, mark the connector as shut down to avoid
+            // unnecessarily blocking and eventually timing out during awaitShutdown
+<span class="fc" id="L136">            shutdownLatch.countDown();</span>
+        }
+<span class="fc" id="L138">    }</span>
+
+    /**
+     * Fail the connector.
+     * @param cause the cause of the failure; if null, the connector will not be failed
+     */
+    public void fail(Throwable cause) {
+<span class="nc" id="L145">        synchronized (this) {</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">            if (this.externalFailure != null)</span>
+<span class="nc" id="L147">                return;</span>
+<span class="nc" id="L148">            log.error(&quot;{} Connector has failed&quot;, this, cause);</span>
+<span class="nc" id="L149">            this.externalFailure = cause;</span>
+<span class="nc" id="L150">            notify();</span>
+<span class="nc" id="L151">        }</span>
+<span class="nc" id="L152">    }</span>
+
+    void doRun() {
+<span class="fc" id="L155">        initialize();</span>
+<span class="fc bfc" id="L156" title="All 2 branches covered.">        while (!stopping) {</span>
+<span class="fc" id="L157">            Throwable failure = externalFailure;</span>
+<span class="pc bpc" id="L158" title="1 of 2 branches missed.">            if (failure != null)</span>
+<span class="nc" id="L159">                onFailure(failure);</span>
+
+            TargetState newTargetState;
+            Callback&lt;TargetState&gt; stateChangeCallback;
+<span class="fc" id="L163">            synchronized (this) {</span>
+<span class="fc" id="L164">                newTargetState = pendingTargetStateChange.getAndSet(null);</span>
+<span class="fc" id="L165">                stateChangeCallback = pendingStateChangeCallback.getAndSet(null);</span>
+<span class="fc" id="L166">            }</span>
+<span class="pc bpc" id="L167" title="2 of 4 branches missed.">            if (newTargetState != null &amp;&amp; !stopping) {</span>
+<span class="fc" id="L168">                doTransitionTo(newTargetState, stateChangeCallback);</span>
+            }
+<span class="fc" id="L170">            synchronized (this) {</span>
+<span class="pc bpc" id="L171" title="1 of 2 branches missed.">                if (pendingTargetStateChange.get() != null</span>
+<span class="pc bpc" id="L172" title="3 of 6 branches missed.">                        || (!State.FAILED.equals(state) &amp;&amp; externalFailure != null)</span>
+                        || stopping
+                ) {
+                    // An update occurred before we entered the synchronized block; no big deal,
+                    // just start the loop again until we've handled everything
+                } else {
+                    try {
+<span class="fc" id="L179">                        wait();</span>
+<span class="nc" id="L180">                    } catch (InterruptedException e) {</span>
+                        // We'll pick up any potential state changes at the top of the loop
+<span class="fc" id="L182">                    }</span>
+                }
+<span class="fc" id="L184">            }</span>
+<span class="fc" id="L185">        }</span>
+<span class="fc" id="L186">        doShutdown();</span>
+<span class="fc" id="L187">    }</span>
+
+    void initialize() {
+        try {
+<span class="pc bpc" id="L191" title="1 of 4 branches missed.">            if (!isSourceConnector() &amp;&amp; !isSinkConnector()) {</span>
+<span class="nc" id="L192">                throw new ConnectException(&quot;Connector implementations must be a subclass of either SourceConnector or SinkConnector&quot;);</span>
+            }
+<span class="fc" id="L194">            log.debug(&quot;{} Initializing connector {}&quot;, this, connName);</span>
+<span class="fc bfc" id="L195" title="All 2 branches covered.">            if (isSinkConnector()) {</span>
+<span class="fc" id="L196">                SinkConnectorConfig.validate(config);</span>
+<span class="fc" id="L197">                connector.initialize(new WorkerSinkConnectorContext());</span>
+            } else {
+<span class="fc" id="L199">                Objects.requireNonNull(offsetStore, &quot;Offset store cannot be null for source connectors&quot;);</span>
+<span class="fc" id="L200">                Objects.requireNonNull(offsetStorageReader, &quot;Offset reader cannot be null for source connectors&quot;);</span>
+<span class="fc" id="L201">                offsetStore.start();</span>
+<span class="fc" id="L202">                connector.initialize(new WorkerSourceConnectorContext(offsetStorageReader));</span>
+            }
+<span class="nc" id="L204">        } catch (Throwable t) {</span>
+<span class="nc" id="L205">            log.error(&quot;{} Error initializing connector&quot;, this, t);</span>
+<span class="nc" id="L206">            onFailure(t);</span>
+<span class="fc" id="L207">        }</span>
+<span class="fc" id="L208">    }</span>
+
+    private boolean doStart() {
+        try {
+<span class="pc bpc" id="L212" title="2 of 3 branches missed.">            switch (state) {</span>
+                case STARTED:
+<span class="nc" id="L214">                    return false;</span>
+
+                case INIT:
+                case PAUSED:
+                case STOPPED:
+<span class="fc" id="L219">                    connector.start(config);</span>
+<span class="fc" id="L220">                    this.state = State.STARTED;</span>
+<span class="fc" id="L221">                    return true;</span>
+
+                default:
+<span class="nc" id="L224">                    throw new IllegalArgumentException(&quot;Cannot start connector in state &quot; + state);</span>
+            }
+<span class="nc" id="L226">        } catch (Throwable t) {</span>
+<span class="nc" id="L227">            log.error(&quot;{} Error while starting connector&quot;, this, t);</span>
+<span class="nc" id="L228">            onFailure(t);</span>
+<span class="nc" id="L229">            throw t;</span>
+        }
+    }
+
+    private synchronized void onFailure(Throwable t) {
+        // If we've already failed, we don't overwrite the last-reported cause of failure
+<span class="nc bnc" id="L235" title="All 2 branches missed.">        if (this.state == State.FAILED)</span>
+<span class="nc" id="L236">            return;</span>
+
+<span class="nc" id="L238">        statusListener.onFailure(connName, t);</span>
+<span class="nc" id="L239">        this.state = State.FAILED;</span>
+<span class="nc" id="L240">    }</span>
+
+    private void resume() {
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        if (doStart())</span>
+<span class="nc" id="L244">            statusListener.onResume(connName);</span>
+<span class="nc" id="L245">    }</span>
+
+    private void start() {
+<span class="pc bpc" id="L248" title="1 of 2 branches missed.">        if (doStart())</span>
+<span class="fc" id="L249">            statusListener.onStartup(connName);</span>
+<span class="fc" id="L250">    }</span>
+
+    public boolean isRunning() {
+<span class="pc bpc" id="L253" title="1 of 2 branches missed.">        return state == State.STARTED;</span>
+    }
+
+    private void suspend(boolean paused) {
+<span class="nc bnc" id="L257" title="All 2 branches missed.">        State newState = paused ? State.PAUSED : State.STOPPED;</span>
+        try {
+<span class="nc bnc" id="L259" title="All 2 branches missed.">            if (state == newState) {</span>
+                // Already in the desired state
+<span class="nc" id="L261">                return;</span>
+            }
+
+<span class="nc bnc" id="L264" title="All 2 branches missed.">            if (state == State.STARTED) {</span>
+<span class="nc" id="L265">                connector.stop();</span>
+            }
+
+<span class="nc bnc" id="L268" title="All 4 branches missed.">            if (state == State.FAILED &amp;&amp; newState != State.STOPPED) {</span>
+<span class="nc" id="L269">                throw new IllegalArgumentException(&quot;Cannot transition to non-stopped state when connector has already failed&quot;);</span>
+            }
+
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            if (paused) {</span>
+<span class="nc" id="L273">                statusListener.onPause(connName);</span>
+            } else {
+<span class="nc" id="L275">                statusListener.onStop(connName);</span>
+            }
+
+<span class="nc" id="L278">            this.state = newState;</span>
+<span class="nc" id="L279">        } catch (Throwable t) {</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">            log.error(&quot;{} Error while {} connector&quot;, this, paused ? &quot;pausing&quot; : &quot;stopping&quot;, t);</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">            if (paused) {</span>
+<span class="nc" id="L282">                statusListener.onFailure(connName, t);</span>
+<span class="nc" id="L283">                this.state = State.FAILED;</span>
+            } else {
+                // We say the connector is STOPPED even if it fails at this point
+<span class="nc" id="L286">                this.state = State.STOPPED;</span>
+                // One more try to make sure the status is updated correctly
+<span class="nc" id="L288">                statusListener.onStop(connName);</span>
+            }
+<span class="nc" id="L290">        }</span>
+<span class="nc" id="L291">    }</span>
+
+    /**
+     * Stop this connector. This method does not block, it only triggers shutdown. Use
+     * #{@link #awaitShutdown} to block until completion.
+     */
+    public synchronized void shutdown() {
+<span class="fc" id="L298">        log.info(&quot;Scheduled shutdown for {}&quot;, this);</span>
+<span class="fc" id="L299">        stopping = true;</span>
+<span class="fc" id="L300">        notify();</span>
+<span class="fc" id="L301">    }</span>
+
+    void doShutdown() {
+        try {
+<span class="fc" id="L305">            TargetState preEmptedState = pendingTargetStateChange.getAndSet(null);</span>
+<span class="fc" id="L306">            Callback&lt;TargetState&gt; stateChangeCallback = pendingStateChangeCallback.getAndSet(null);</span>
+<span class="pc bpc" id="L307" title="1 of 2 branches missed.">            if (stateChangeCallback != null) {</span>
+<span class="nc" id="L308">                stateChangeCallback.onCompletion(</span>
+                        new ConnectException(
+<span class="nc" id="L310">                                &quot;Could not begin changing connector state to &quot; + preEmptedState.name()</span>
+                                    + &quot; as the connector has been scheduled for shutdown&quot;),
+                        null);
+            }
+<span class="pc bpc" id="L314" title="1 of 2 branches missed.">            if (state == State.STARTED)</span>
+<span class="fc" id="L315">                connector.stop();</span>
+<span class="fc" id="L316">            this.state = State.STOPPED;</span>
+<span class="fc" id="L317">            statusListener.onShutdown(connName);</span>
+<span class="fc" id="L318">            log.info(&quot;Completed shutdown for {}&quot;, this);</span>
+<span class="nc" id="L319">        } catch (Throwable t) {</span>
+<span class="nc" id="L320">            log.error(&quot;{} Error while shutting down connector&quot;, this, t);</span>
+<span class="nc" id="L321">            state = State.FAILED;</span>
+<span class="nc" id="L322">            statusListener.onFailure(connName, t);</span>
+        } finally {
+<span class="fc" id="L324">            Utils.closeQuietly(ctx, &quot;connector context for &quot; + connName);</span>
+<span class="fc" id="L325">            Utils.closeQuietly(metrics, &quot;connector metrics for &quot; + connName);</span>
+<span class="fc" id="L326">            Utils.closeQuietly(offsetStorageReader, &quot;offset reader for &quot; + connName);</span>
+<span class="fc bfc" id="L327" title="All 2 branches covered.">            if (offsetStore != null) {</span>
+<span class="fc" id="L328">                Utils.closeQuietly(offsetStore::stop, &quot;offset backing store for &quot; + connName);</span>
+            }
+        }
+<span class="fc" id="L331">    }</span>
+
+    public synchronized void cancel() {
+        // Proactively update the status of the connector to UNASSIGNED since this connector
+        // instance is being abandoned and we won't update the status on its behalf any more
+        // after this since a new instance may be started soon
+<span class="nc" id="L337">        statusListener.onShutdown(connName);</span>
+<span class="nc" id="L338">        Utils.closeQuietly(ctx, &quot;connector context for &quot; + connName);</span>
+        // Preemptively close the offset reader in case the connector is blocked on an offset read.
+<span class="nc" id="L340">        Utils.closeQuietly(offsetStorageReader, &quot;offset reader for &quot; + connName);</span>
+<span class="nc" id="L341">        cancelled = true;</span>
+<span class="nc" id="L342">    }</span>
+
+    /**
+     * Wait for this connector to finish shutting down.
+     *
+     * @param timeoutMs time in milliseconds to await shutdown
+     * @return true if successful, false if the timeout was reached
+     */
+    public boolean awaitShutdown(long timeoutMs) {
+        try {
+<span class="fc" id="L352">            return shutdownLatch.await(timeoutMs, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L353">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L354">            return false;</span>
+        }
+    }
+
+    public void transitionTo(TargetState targetState, Callback&lt;TargetState&gt; stateChangeCallback) {
+        Callback&lt;TargetState&gt; preEmptedStateChangeCallback;
+        TargetState preEmptedState;
+<span class="fc" id="L361">        synchronized (this) {</span>
+<span class="fc" id="L362">            preEmptedStateChangeCallback = pendingStateChangeCallback.getAndSet(stateChangeCallback);</span>
+<span class="fc" id="L363">            preEmptedState = pendingTargetStateChange.getAndSet(targetState);</span>
+<span class="fc" id="L364">            notify();</span>
+<span class="fc" id="L365">        }</span>
+<span class="pc bpc" id="L366" title="1 of 2 branches missed.">        if (preEmptedStateChangeCallback != null) {</span>
+<span class="nc" id="L367">            preEmptedStateChangeCallback.onCompletion(</span>
+                    new ConnectException(
+<span class="nc" id="L369">                            &quot;Could not begin changing connector state to &quot; + preEmptedState.name()</span>
+                                + &quot; before another request to change state was made;&quot;
+<span class="nc" id="L371">                                + &quot; the new request (which is to change the state to &quot; + targetState.name()</span>
+                                + &quot;) has pre-empted this one&quot;),
+                    null
+            );
+        }
+<span class="fc" id="L376">    }</span>
+
+    void doTransitionTo(TargetState targetState, Callback&lt;TargetState&gt; stateChangeCallback) {
+        // Edge case: we don't do transitions most of the time if we've already failed, but for the STOPPED state, it's fine
+<span class="pc bpc" id="L380" title="3 of 4 branches missed.">        if (state == State.FAILED &amp;&amp; targetState != TargetState.STOPPED) {</span>
+<span class="nc" id="L381">            stateChangeCallback.onCompletion(</span>
+                    new ConnectException(this + &quot; Cannot transition connector to &quot; + targetState + &quot; since it has failed&quot;),
+                    null);
+<span class="nc" id="L384">            return;</span>
+        }
+
+        try {
+<span class="fc" id="L388">            doTransitionTo(targetState);</span>
+<span class="fc" id="L389">            stateChangeCallback.onCompletion(null, targetState);</span>
+<span class="nc" id="L390">        } catch (Throwable t) {</span>
+<span class="nc" id="L391">            stateChangeCallback.onCompletion(</span>
+                    new ConnectException(
+                            &quot;Failed to transition connector &quot; + connName + &quot; to state &quot; + targetState,
+                            t),
+                    null);
+<span class="fc" id="L396">        }</span>
+<span class="fc" id="L397">    }</span>
+
+    private void doTransitionTo(TargetState targetState) {
+<span class="fc" id="L400">        log.debug(&quot;{} Transition connector to {}&quot;, this, targetState);</span>
+<span class="pc bpc" id="L401" title="1 of 2 branches missed.">        if (targetState == TargetState.PAUSED) {</span>
+<span class="nc" id="L402">            suspend(true);</span>
+<span class="pc bpc" id="L403" title="1 of 2 branches missed.">        } else if (targetState == TargetState.STOPPED) {</span>
+<span class="nc" id="L404">            suspend(false);</span>
+<span class="pc bpc" id="L405" title="1 of 2 branches missed.">        } else if (targetState == TargetState.STARTED) {</span>
+<span class="pc bpc" id="L406" title="1 of 2 branches missed.">            if (state == State.INIT)</span>
+<span class="fc" id="L407">                start();</span>
+            else
+<span class="nc" id="L409">                resume();</span>
+        } else {
+<span class="nc" id="L411">            throw new IllegalArgumentException(&quot;Unhandled target state &quot; + targetState);</span>
+        }
+<span class="fc" id="L413">    }</span>
+
+    public final boolean isSinkConnector() {
+<span class="fc" id="L416">        return ConnectUtils.isSinkConnector(connector);</span>
+    }
+
+    public final boolean isSourceConnector() {
+<span class="fc" id="L420">        return ConnectUtils.isSourceConnector(connector);</span>
+    }
+
+    public String connectorVersion() {
+<span class="fc" id="L424">        return version;</span>
+    }
+
+    protected final String connectorType() {
+<span class="fc bfc" id="L428" title="All 2 branches covered.">        if (isSinkConnector())</span>
+<span class="fc" id="L429">            return &quot;sink&quot;;</span>
+<span class="pc bpc" id="L430" title="1 of 2 branches missed.">        if (isSourceConnector())</span>
+<span class="fc" id="L431">            return &quot;source&quot;;</span>
+<span class="nc" id="L432">        return &quot;unknown&quot;;</span>
+    }
+
+    public Connector connector() {
+<span class="fc" id="L436">        return connector;</span>
+    }
+
+    ConnectorMetricsGroup metrics() {
+<span class="nc" id="L440">        return metrics;</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="fc" id="L445">        return &quot;WorkerConnector{&quot; +</span>
+                       &quot;id=&quot; + connName +
+                       '}';
+    }
+
+    class ConnectorMetricsGroup implements ConnectorStatus.Listener, AutoCloseable {
+        /**
+         * Use {@link AbstractStatus.State} since it has all of the states we want,
+         * unlike {@link WorkerConnector.State}.
+         */
+        private volatile AbstractStatus.State state;
+        private final MetricGroup metricGroup;
+        private final ConnectorStatus.Listener delegate;
+
+        public ConnectorMetricsGroup(
+            ConnectMetrics connectMetrics,
+            AbstractStatus.State initialState,
+            String connectorVersion,
+            ConnectorStatus.Listener delegate
+<span class="fc" id="L464">        ) {</span>
+<span class="fc" id="L465">            Objects.requireNonNull(connectMetrics);</span>
+<span class="fc" id="L466">            Objects.requireNonNull(connector);</span>
+<span class="fc" id="L467">            Objects.requireNonNull(initialState);</span>
+<span class="fc" id="L468">            Objects.requireNonNull(delegate);</span>
+<span class="fc" id="L469">            this.delegate = delegate;</span>
+<span class="fc" id="L470">            this.state = initialState;</span>
+<span class="fc" id="L471">            ConnectMetricsRegistry registry = connectMetrics.registry();</span>
+<span class="fc" id="L472">            this.metricGroup = connectMetrics.group(registry.connectorGroupName(),</span>
+<span class="fc" id="L473">                    registry.connectorTagName(), connName);</span>
+            // prevent collisions by removing any previously created metrics in this group.
+<span class="fc" id="L475">            metricGroup.close();</span>
+
+<span class="fc" id="L477">            metricGroup.addImmutableValueMetric(registry.connectorType, connectorType());</span>
+<span class="fc" id="L478">            metricGroup.addImmutableValueMetric(registry.connectorClass, connector.getClass().getName());</span>
+<span class="fc" id="L479">            metricGroup.addImmutableValueMetric(registry.connectorVersion, connectorVersion);</span>
+<span class="pc" id="L480">            metricGroup.addValueMetric(registry.connectorStatus, now -&gt; state.toString().toLowerCase(Locale.getDefault()));</span>
+<span class="fc" id="L481">        }</span>
+
+        public void close() {
+<span class="fc" id="L484">            metricGroup.close();</span>
+<span class="fc" id="L485">        }</span>
+
+        @Override
+        public void onStartup(String connector) {
+<span class="fc" id="L489">            state = AbstractStatus.State.RUNNING;</span>
+<span class="fc" id="L490">            synchronized (this) {</span>
+<span class="pc bpc" id="L491" title="1 of 2 branches missed.">                if (!cancelled) {</span>
+<span class="fc" id="L492">                    delegate.onStartup(connector);</span>
+                }
+<span class="fc" id="L494">            }</span>
+<span class="fc" id="L495">        }</span>
+
+        @Override
+        public void onShutdown(String connector) {
+<span class="fc" id="L499">            state = AbstractStatus.State.UNASSIGNED;</span>
+<span class="fc" id="L500">            synchronized (this) {</span>
+<span class="pc bpc" id="L501" title="1 of 2 branches missed.">                if (!cancelled) {</span>
+<span class="fc" id="L502">                    delegate.onShutdown(connector);</span>
+                }
+<span class="fc" id="L504">            }</span>
+<span class="fc" id="L505">        }</span>
+
+        @Override
+        public void onStop(String connector) {
+<span class="nc" id="L509">            state = AbstractStatus.State.STOPPED;</span>
+<span class="nc" id="L510">            synchronized (this) {</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">                if (!cancelled) {</span>
+<span class="nc" id="L512">                    delegate.onStop(connector);</span>
+                }
+<span class="nc" id="L514">            }</span>
+<span class="nc" id="L515">        }</span>
+
+        @Override
+        public void onPause(String connector) {
+<span class="nc" id="L519">            state = AbstractStatus.State.PAUSED;</span>
+<span class="nc" id="L520">            synchronized (this) {</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">                if (!cancelled) {</span>
+<span class="nc" id="L522">                    delegate.onPause(connector);</span>
+                }
+<span class="nc" id="L524">            }</span>
+<span class="nc" id="L525">        }</span>
+
+        @Override
+        public void onResume(String connector) {
+<span class="nc" id="L529">            state = AbstractStatus.State.RUNNING;</span>
+<span class="nc" id="L530">            synchronized (this) {</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">                if (!cancelled) {</span>
+<span class="nc" id="L532">                    delegate.onResume(connector);</span>
+                }
+<span class="nc" id="L534">            }</span>
+<span class="nc" id="L535">        }</span>
+
+        @Override
+        public void onFailure(String connector, Throwable cause) {
+<span class="nc" id="L539">            state = AbstractStatus.State.FAILED;</span>
+<span class="nc" id="L540">            synchronized (this) {</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">                if (!cancelled) {</span>
+<span class="nc" id="L542">                    delegate.onFailure(connector, cause);</span>
+                }
+<span class="nc" id="L544">            }</span>
+<span class="nc" id="L545">        }</span>
+
+        @Override
+        public void onDeletion(String connector) {
+<span class="nc" id="L549">            state = AbstractStatus.State.DESTROYED;</span>
+<span class="nc" id="L550">            delegate.onDeletion(connector);</span>
+<span class="nc" id="L551">        }</span>
+
+        @Override
+        public void onRestart(String connector) {
+<span class="nc" id="L555">            state = AbstractStatus.State.RESTARTING;</span>
+<span class="nc" id="L556">            delegate.onRestart(connector);</span>
+<span class="nc" id="L557">        }</span>
+
+        boolean isUnassigned() {
+<span class="nc bnc" id="L560" title="All 2 branches missed.">            return state == AbstractStatus.State.UNASSIGNED;</span>
+        }
+
+        boolean isRunning() {
+<span class="nc bnc" id="L564" title="All 2 branches missed.">            return state == AbstractStatus.State.RUNNING;</span>
+        }
+
+        boolean isPaused() {
+<span class="nc bnc" id="L568" title="All 2 branches missed.">            return state == AbstractStatus.State.PAUSED;</span>
+        }
+
+        boolean isStopped() {
+<span class="nc bnc" id="L572" title="All 2 branches missed.">            return state == AbstractStatus.State.STOPPED;</span>
+        }
+
+        boolean isFailed() {
+<span class="nc bnc" id="L576" title="All 2 branches missed.">            return state == AbstractStatus.State.FAILED;</span>
+        }
+
+        protected MetricGroup metricGroup() {
+<span class="nc" id="L580">            return metricGroup;</span>
+        }
+    }
+
+<span class="fc" id="L584">    private abstract class WorkerConnectorContext implements ConnectorContext {</span>
+
+        @Override
+        public void requestTaskReconfiguration() {
+<span class="nc" id="L588">            WorkerConnector.this.ctx.requestTaskReconfiguration();</span>
+<span class="nc" id="L589">        }</span>
+
+        @Override
+        public void raiseError(Exception e) {
+<span class="nc" id="L593">            log.error(&quot;{} Connector raised an error&quot;, WorkerConnector.this, e);</span>
+<span class="nc" id="L594">            onFailure(e);</span>
+<span class="nc" id="L595">            WorkerConnector.this.ctx.raiseError(e);</span>
+<span class="nc" id="L596">        }</span>
+
+        @Override
+        public PluginMetrics pluginMetrics() {
+<span class="nc" id="L600">            return WorkerConnector.this.ctx.pluginMetrics();</span>
+        }
+    }
+
+<span class="fc" id="L604">    private class WorkerSinkConnectorContext extends WorkerConnectorContext implements SinkConnectorContext {</span>
+    }
+
+    private class WorkerSourceConnectorContext extends WorkerConnectorContext implements SourceConnectorContext {
+
+        private final OffsetStorageReader offsetStorageReader;
+
+<span class="fc" id="L611">        WorkerSourceConnectorContext(OffsetStorageReader offsetStorageReader) {</span>
+<span class="fc" id="L612">            this.offsetStorageReader = offsetStorageReader;</span>
+<span class="fc" id="L613">        }</span>
+
+        @Override
+        public OffsetStorageReader offsetStorageReader() {
+<span class="nc" id="L617">            return offsetStorageReader;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

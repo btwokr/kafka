@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HealthCheckThread.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.standalone</a> &gt; <span class="el_source">HealthCheckThread.java</span></div><h1>HealthCheckThread.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime.standalone;
+
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.util.Callback;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.LinkedList;
+import java.util.Queue;
+
+/**
+ * Thread that can be used to check for the readiness and liveness of a standalone herder.
+ * @see &lt;a href=&quot;https://cwiki.apache.org/confluence/display/KAFKA/KIP-1017%3A+Health+check+endpoint+for+Kafka+Connect&quot;&gt;KIP-1017&lt;/a&gt;
+ */
+class HealthCheckThread extends Thread {
+
+<span class="nc" id="L34">    private static final Logger log = LoggerFactory.getLogger(HealthCheckThread.class);</span>
+
+    private final StandaloneHerder herder;
+    private final Queue&lt;Callback&lt;Void&gt;&gt; callbacks;
+    private volatile boolean running;
+
+<span class="nc" id="L40">    public HealthCheckThread(StandaloneHerder herder) {</span>
+<span class="nc" id="L41">        this.herder = herder;</span>
+<span class="nc" id="L42">        this.callbacks = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L43">        this.running = true;</span>
+<span class="nc" id="L44">    }</span>
+
+    @Override
+    public void run() {
+        while (true) {
+            try {
+                Callback&lt;Void&gt; callback;
+<span class="nc" id="L51">                synchronized (this) {</span>
+<span class="nc bnc" id="L52" title="All 4 branches missed.">                    while (running &amp;&amp; this.callbacks.isEmpty())</span>
+<span class="nc" id="L53">                        wait();</span>
+
+<span class="nc bnc" id="L55" title="All 2 branches missed.">                    if (!running)</span>
+<span class="nc" id="L56">                        break;</span>
+
+<span class="nc" id="L58">                    callback = callbacks.remove();</span>
+<span class="nc" id="L59">                }</span>
+
+                // For now, our only criteria for liveness (as opposed to readiness)
+                // in standalone mode is that the worker isn't deadlocked
+<span class="nc" id="L63">                synchronized (herder) {</span>
+                    try {
+<span class="nc" id="L65">                        callback.onCompletion(null, null);</span>
+<span class="nc" id="L66">                    } catch (Throwable t) {</span>
+<span class="nc" id="L67">                        log.warn(&quot;Failed to complete health check callback&quot;, t);</span>
+<span class="nc" id="L68">                    }</span>
+<span class="nc" id="L69">                }</span>
+<span class="nc" id="L70">            } catch (Throwable t) {</span>
+<span class="nc" id="L71">                log.warn(&quot;Health check thread encountered unexpected error&quot;, t);</span>
+<span class="nc" id="L72">            }</span>
+        }
+
+<span class="nc" id="L75">        Throwable shuttingDown = new ConnectException(&quot;The herder is shutting down&quot;);</span>
+
+        // Don't leave callbacks dangling, even if shutdown has already started
+<span class="nc bnc" id="L78" title="All 2 branches missed.">        while (!this.callbacks.isEmpty()) {</span>
+            try {
+<span class="nc" id="L80">                callbacks.remove().onCompletion(shuttingDown, null);</span>
+<span class="nc" id="L81">            } catch (Throwable t) {</span>
+<span class="nc" id="L82">                log.warn(&quot;Failed to complete health check callback during shutdown&quot;, t);</span>
+<span class="nc" id="L83">            }</span>
+        }
+<span class="nc" id="L85">    }</span>
+
+    /**
+     * Check the health of the herder. This method may be called at any time after
+     * the thread has been constructed, but callbacks will only be invoked after this
+     * thread has been {@link #start() started}.
+     *
+     * @param callback callback to invoke after herder health has been verified or if
+     *                 an error occurs that indicates herder is unhealthy; may not be null
+     * @throws  IllegalStateException if invoked after {@link #shutDown()}
+     */
+    public void check(Callback&lt;Void&gt; callback) {
+<span class="nc bnc" id="L97" title="All 2 branches missed.">        if (callback == null) {</span>
+<span class="nc" id="L98">            log.warn(&quot;Ignoring null callback&quot;);</span>
+<span class="nc" id="L99">            return;</span>
+        }
+
+<span class="nc" id="L102">        synchronized (this) {</span>
+<span class="nc bnc" id="L103" title="All 2 branches missed.">            if (!running) {</span>
+<span class="nc" id="L104">                throw new IllegalStateException(&quot;Cannot check herder health after thread has been shut down&quot;);</span>
+            }
+
+<span class="nc" id="L107">            this.callbacks.add(callback);</span>
+<span class="nc" id="L108">            notifyAll();</span>
+<span class="nc" id="L109">        }</span>
+<span class="nc" id="L110">    }</span>
+
+    /**
+     * Trigger shutdown of the thread, stop accepting new callbacks via {@link #check(Callback)},
+     * and await the termination of the thread.
+     */
+    public void shutDown() {
+<span class="nc" id="L117">        synchronized (this) {</span>
+<span class="nc" id="L118">            this.running = false;</span>
+<span class="nc" id="L119">            notifyAll();</span>
+<span class="nc" id="L120">        }</span>
+
+        try {
+<span class="nc" id="L123">            join();</span>
+<span class="nc" id="L124">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L125">            log.warn(</span>
+                    &quot;Interrupted during graceful shutdown; will interrupt health check thread &quot;
+                            + &quot;and then return immediately without waiting for thread to terminate&quot;,
+                    e
+            );
+<span class="nc" id="L130">            this.interrupt();</span>
+            // Preserve the interrupt status in case later operations block too
+<span class="nc" id="L132">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L133">        }</span>
+<span class="nc" id="L134">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,547 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CurrentAssignmentBuilder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.coordinator.group.streams</a> &gt; <span class="el_source">CurrentAssignmentBuilder.java</span></div><h1>CurrentAssignmentBuilder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.coordinator.group.streams;
+
+import org.apache.kafka.common.errors.FencedMemberEpochException;
+
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.BiFunction;
+import java.util.function.BiPredicate;
+
+/**
+ * The CurrentAssignmentBuilder class encapsulates the reconciliation engine of the streams group protocol. Given the current state of a
+ * member and a desired or target assignment state, the state machine takes the necessary steps to converge them.
+ */
+public class CurrentAssignmentBuilder {
+
+    /**
+     * The streams group member which is reconciled.
+     */
+    private final StreamsGroupMember member;
+
+    /**
+     * The target assignment epoch.
+     */
+    private int targetAssignmentEpoch;
+
+    /**
+     * The target assignment.
+     */
+    private TasksTuple targetAssignment;
+
+    /**
+     * A function which returns the current process ID of an active task or null if the active task
+     * is not assigned. The current process ID is the process ID of the current owner.
+     */
+    private BiFunction&lt;String, Integer, String&gt; currentActiveTaskProcessId;
+
+    /**
+     * A function which returns the current process IDs of a standby task or null if the standby
+     * task is not assigned. The current process IDs are the process IDs of all current owners.
+     */
+    private BiFunction&lt;String, Integer, Set&lt;String&gt;&gt; currentStandbyTaskProcessIds;
+
+    /**
+     * A function which returns the current process IDs of a warmup task or null if the warmup task
+     * is not assigned. The current process IDs are the process IDs of all current owners.
+     */
+    private BiFunction&lt;String, Integer, Set&lt;String&gt;&gt; currentWarmupTaskProcessIds;
+
+    /**
+     * The tasks owned by the member. This may be provided by the member in the StreamsGroupHeartbeat request.
+     */
+<span class="nc" id="L72">    private Optional&lt;TasksTuple&gt; ownedTasks = Optional.empty();</span>
+
+    /**
+     * Constructs the CurrentAssignmentBuilder based on the current state of the provided streams group member.
+     *
+     * @param member The streams group member that must be reconciled.
+     */
+<span class="nc" id="L79">    public CurrentAssignmentBuilder(StreamsGroupMember member) {</span>
+<span class="nc" id="L80">        this.member = Objects.requireNonNull(member);</span>
+<span class="nc" id="L81">    }</span>
+
+    /**
+     * Sets the target assignment epoch and the target assignment that the streams group member must be reconciled to.
+     *
+     * @param targetAssignmentEpoch The target assignment epoch.
+     * @param targetAssignment      The target assignment.
+     * @return This object.
+     */
+    public CurrentAssignmentBuilder withTargetAssignment(int targetAssignmentEpoch,
+                                                         TasksTuple targetAssignment) {
+<span class="nc" id="L92">        this.targetAssignmentEpoch = targetAssignmentEpoch;</span>
+<span class="nc" id="L93">        this.targetAssignment = Objects.requireNonNull(targetAssignment);</span>
+<span class="nc" id="L94">        return this;</span>
+    }
+
+    /**
+     * Sets a BiFunction which allows to retrieve the current process ID of an active task. This is
+     * used by the state machine to determine if an active task is free or still used by another
+     * member, and if there is still a task on a specific process that is not yet revoked.
+     *
+     * @param currentActiveTaskProcessId A BiFunction which gets the process ID of a subtopology ID /
+     *                                   partition ID pair.
+     * @return This object.
+     */
+    public CurrentAssignmentBuilder withCurrentActiveTaskProcessId(BiFunction&lt;String, Integer, String&gt; currentActiveTaskProcessId) {
+<span class="nc" id="L107">        this.currentActiveTaskProcessId = Objects.requireNonNull(currentActiveTaskProcessId);</span>
+<span class="nc" id="L108">        return this;</span>
+    }
+
+    /**
+     * Sets a BiFunction which allows to retrieve the current process IDs of a standby task. This is
+     * used by the state machine to determine if there is still a task on a specific process that is
+     * not yet revoked.
+     *
+     * @param currentStandbyTaskProcessIds A BiFunction which gets the process IDs of a subtopology
+     *                                     ID / partition ID pair.
+     * @return This object.
+     */
+    public CurrentAssignmentBuilder withCurrentStandbyTaskProcessIds(
+        BiFunction&lt;String, Integer, Set&lt;String&gt;&gt; currentStandbyTaskProcessIds
+    ) {
+<span class="nc" id="L123">        this.currentStandbyTaskProcessIds = Objects.requireNonNull(currentStandbyTaskProcessIds);</span>
+<span class="nc" id="L124">        return this;</span>
+    }
+
+    /**
+     * Sets a BiFunction which allows to retrieve the current process IDs of a warmup task. This is
+     * used by the state machine to determine if there is still a task on a specific process that is
+     * not yet revoked.
+     *
+     * @param currentWarmupTaskProcessIds A BiFunction which gets the process IDs of a subtopology ID
+     *                                    / partition ID pair.
+     * @return This object.
+     */
+    public CurrentAssignmentBuilder withCurrentWarmupTaskProcessIds(BiFunction&lt;String, Integer, Set&lt;String&gt;&gt; currentWarmupTaskProcessIds) {
+<span class="nc" id="L137">        this.currentWarmupTaskProcessIds = Objects.requireNonNull(currentWarmupTaskProcessIds);</span>
+<span class="nc" id="L138">        return this;</span>
+    }
+
+    /**
+     * Sets the tasks currently owned by the member. This comes directly from the last StreamsGroupHeartbeat request. This is used to
+     * determine if the member has revoked the necessary tasks. Passing null into this function means that the member did not provide
+     * its owned tasks in this heartbeat.
+     *
+     * @param ownedAssignment A collection of active, standby and warm-up tasks
+     * @return This object.
+     */
+    public CurrentAssignmentBuilder withOwnedAssignment(TasksTuple ownedAssignment) {
+<span class="nc" id="L150">        this.ownedTasks = Optional.ofNullable(ownedAssignment);</span>
+<span class="nc" id="L151">        return this;</span>
+    }
+
+    /**
+     * Builds the next state for the member or keep the current one if it is not possible to move forward with the current state.
+     *
+     * @return A new StreamsGroupMember or the current one.
+     */
+    public StreamsGroupMember build() {
+<span class="nc bnc" id="L160" title="All 5 branches missed.">        switch (member.state()) {</span>
+            case STABLE:
+                // When the member is in the STABLE state, we verify if a newer
+                // epoch (or target assignment) is available. If it is, we can
+                // reconcile the member towards it. Otherwise, we return.
+<span class="nc bnc" id="L165" title="All 2 branches missed.">                if (member.memberEpoch() != targetAssignmentEpoch) {</span>
+<span class="nc" id="L166">                    return computeNextAssignment(</span>
+<span class="nc" id="L167">                        member.memberEpoch(),</span>
+<span class="nc" id="L168">                        member.assignedTasks()</span>
+                    );
+                } else {
+<span class="nc" id="L171">                    return member;</span>
+                }
+
+            case UNREVOKED_TASKS:
+                // When the member is in the UNREVOKED_TASKS state, we wait
+                // until the member has revoked the necessary tasks. They are
+                // considered revoked when they are not anymore reported in the
+                // owned tasks set in the StreamsGroupHeartbeat API.
+
+                // If the member provides its owned tasks, we verify if it still
+                // owns any of the revoked tasks. If it did not provide it's
+                // owned tasks, or we still own some of the revoked tasks, we
+                // cannot progress.
+<span class="nc" id="L184">                if (</span>
+<span class="nc bnc" id="L185" title="All 4 branches missed.">                    ownedTasks.isEmpty() || ownedTasks.get().containsAny(member.tasksPendingRevocation())</span>
+                ) {
+<span class="nc" id="L187">                    return member;</span>
+                }
+
+                // When the member has revoked all the pending tasks, it can
+                // transition to the next epoch (current + 1) and we can reconcile
+                // its state towards the latest target assignment.
+<span class="nc" id="L193">                return computeNextAssignment(</span>
+<span class="nc" id="L194">                    member.memberEpoch() + 1,</span>
+<span class="nc" id="L195">                    member.assignedTasks()</span>
+                );
+
+            case UNRELEASED_TASKS:
+                // When the member is in the UNRELEASED_TASKS, we reconcile the
+                // member towards the latest target assignment. This will assign any
+                // of the unreleased tasks when they become available.
+<span class="nc" id="L202">                return computeNextAssignment(</span>
+<span class="nc" id="L203">                    member.memberEpoch(),</span>
+<span class="nc" id="L204">                    member.assignedTasks()</span>
+                );
+
+            case UNKNOWN:
+                // We could only end up in this state if a new state is added in the
+                // future and the group coordinator is downgraded. In this case, the
+                // best option is to fence the member to force it to rejoin the group
+                // without any tasks and to reconcile it again from scratch.
+<span class="nc bnc" id="L212" title="All 4 branches missed.">                if ((ownedTasks.isEmpty() || !ownedTasks.get().isEmpty())) {</span>
+<span class="nc" id="L213">                    throw new FencedMemberEpochException(</span>
+                        &quot;The streams group member is in a unknown state. &quot;
+                            + &quot;The member must abandon all its tasks and rejoin.&quot;);
+                }
+
+<span class="nc" id="L218">                return computeNextAssignment(</span>
+                    targetAssignmentEpoch,
+<span class="nc" id="L220">                    member.assignedTasks()</span>
+                );
+        }
+
+<span class="nc" id="L224">        return member;</span>
+    }
+
+    /**
+     * Takes the current currentAssignment and the targetAssignment, and generates three
+     * collections:
+     *
+     * - the resultAssignedTasks: the tasks that are assigned in both the current and target
+     * assignments.
+     * - the resultTasksPendingRevocation: the tasks that are assigned in the current
+     * assignment but not in the target assignment.
+     * - the resultTasksPendingAssignment: the tasks that are assigned in the target assignment but
+     * not in the current assignment, and can be assigned currently (i.e., they are not owned by
+     * another member, as defined by the `isUnreleasedTask` predicate).
+     */
+    private boolean computeAssignmentDifference(Map&lt;String, Set&lt;Integer&gt;&gt; currentAssignment,
+                                                Map&lt;String, Set&lt;Integer&gt;&gt; targetAssignment,
+                                                Map&lt;String, Set&lt;Integer&gt;&gt; resultAssignedTasks,
+                                                Map&lt;String, Set&lt;Integer&gt;&gt; resultTasksPendingRevocation,
+                                                Map&lt;String, Set&lt;Integer&gt;&gt; resultTasksPendingAssignment,
+                                                BiPredicate&lt;String, Integer&gt; isUnreleasedTask) {
+<span class="nc" id="L245">        boolean hasUnreleasedTasks = false;</span>
+
+<span class="nc" id="L247">        Set&lt;String&gt; allSubtopologyIds = new HashSet&lt;&gt;(targetAssignment.keySet());</span>
+<span class="nc" id="L248">        allSubtopologyIds.addAll(currentAssignment.keySet());</span>
+
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        for (String subtopologyId : allSubtopologyIds) {</span>
+<span class="nc" id="L251">            hasUnreleasedTasks |= computeAssignmentDifferenceForOneSubtopology(</span>
+                subtopologyId,
+<span class="nc" id="L253">                currentAssignment.getOrDefault(subtopologyId, Set.of()),</span>
+<span class="nc" id="L254">                targetAssignment.getOrDefault(subtopologyId, Set.of()),</span>
+                resultAssignedTasks,
+                resultTasksPendingRevocation,
+                resultTasksPendingAssignment,
+                isUnreleasedTask
+            );
+<span class="nc" id="L260">        }</span>
+<span class="nc" id="L261">        return hasUnreleasedTasks;</span>
+    }
+
+    private static boolean computeAssignmentDifferenceForOneSubtopology(final String subtopologyId,
+                                                                        final Set&lt;Integer&gt; currentTasksForThisSubtopology,
+                                                                        final Set&lt;Integer&gt; targetTasksForThisSubtopology,
+                                                                        final Map&lt;String, Set&lt;Integer&gt;&gt; resultAssignedTasks,
+                                                                        final Map&lt;String, Set&lt;Integer&gt;&gt; resultTasksPendingRevocation,
+                                                                        final Map&lt;String, Set&lt;Integer&gt;&gt; resultTasksPendingAssignment,
+                                                                        final BiPredicate&lt;String, Integer&gt; isUnreleasedTask) {
+        // Result Assigned Tasks = Current Tasks ∩ Target Tasks
+        // i.e. we remove all tasks from the current assignment that are not in the target
+        //         assignment
+<span class="nc" id="L274">        Set&lt;Integer&gt; resultAssignedTasksForThisSubtopology = new HashSet&lt;&gt;(currentTasksForThisSubtopology);</span>
+<span class="nc" id="L275">        resultAssignedTasksForThisSubtopology.retainAll(targetTasksForThisSubtopology);</span>
+
+        // Result Tasks Pending Revocation = Current Tasks - Result Assigned Tasks
+        // i.e. we will ask the member to revoke all tasks in its current assignment that
+        //      are not in the target assignment
+<span class="nc" id="L280">        Set&lt;Integer&gt; resultTasksPendingRevocationForThisSubtopology = new HashSet&lt;&gt;(currentTasksForThisSubtopology);</span>
+<span class="nc" id="L281">        resultTasksPendingRevocationForThisSubtopology.removeAll(resultAssignedTasksForThisSubtopology);</span>
+
+        // Result Tasks Pending Assignment = Target Tasks - Result Assigned Tasks - Unreleased Tasks
+        // i.e. we will ask the member to assign all tasks in its target assignment,
+        //      except those that are already assigned, and those that are unreleased
+<span class="nc" id="L286">        Set&lt;Integer&gt; resultTasksPendingAssignmentForThisSubtopology = new HashSet&lt;&gt;(targetTasksForThisSubtopology);</span>
+<span class="nc" id="L287">        resultTasksPendingAssignmentForThisSubtopology.removeAll(resultAssignedTasksForThisSubtopology);</span>
+<span class="nc" id="L288">        boolean hasUnreleasedTasks = resultTasksPendingAssignmentForThisSubtopology.removeIf(taskId -&gt;</span>
+<span class="nc" id="L289">            isUnreleasedTask.test(subtopologyId, taskId)</span>
+        );
+
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        if (!resultAssignedTasksForThisSubtopology.isEmpty()) {</span>
+<span class="nc" id="L293">            resultAssignedTasks.put(subtopologyId, resultAssignedTasksForThisSubtopology);</span>
+        }
+
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        if (!resultTasksPendingRevocationForThisSubtopology.isEmpty()) {</span>
+<span class="nc" id="L297">            resultTasksPendingRevocation.put(subtopologyId, resultTasksPendingRevocationForThisSubtopology);</span>
+        }
+
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        if (!resultTasksPendingAssignmentForThisSubtopology.isEmpty()) {</span>
+<span class="nc" id="L301">            resultTasksPendingAssignment.put(subtopologyId, resultTasksPendingAssignmentForThisSubtopology);</span>
+        }
+
+<span class="nc" id="L304">        return hasUnreleasedTasks;</span>
+    }
+
+    /**
+     * Takes the current currentAssignment and the targetAssignment, and generates three
+     * collections:
+     *
+     * - the resultAssignedTasks: the tasks that are assigned in both the current and target
+     * assignments.
+     * - the resultTasksPendingRevocation: the tasks that are assigned in the current
+     * assignment but not in the target assignment.
+     * - the resultTasksPendingAssignment: the tasks that are assigned in the target assignment but
+     * not in the current assignment, and can be assigned currently (i.e., they are not owned by
+     * another member, as defined by the `isUnreleasedTask` predicate).
+     *
+     * Epoch Handling:
+     * - For tasks in resultAssignedTasks and resultTasksPendingRevocation, the epoch from currentAssignment is preserved.
+     * - For tasks in resultTasksPendingAssignment, the targetAssignmentEpoch is used.
+     */
+    private boolean computeAssignmentDifferenceWithEpoch(Map&lt;String, Map&lt;Integer, Integer&gt;&gt; currentAssignment,
+                                                         Map&lt;String, Set&lt;Integer&gt;&gt; targetAssignment,
+                                                         int targetAssignmentEpoch,
+                                                         Map&lt;String, Map&lt;Integer, Integer&gt;&gt; resultAssignedTasks,
+                                                         Map&lt;String, Map&lt;Integer, Integer&gt;&gt; resultTasksPendingRevocation,
+                                                         Map&lt;String, Map&lt;Integer, Integer&gt;&gt; resultTasksPendingAssignment,
+                                                         BiPredicate&lt;String, Integer&gt; isUnreleasedTask) {
+<span class="nc" id="L330">        boolean hasUnreleasedTasks = false;</span>
+
+<span class="nc" id="L332">        Set&lt;String&gt; allSubtopologyIds = new HashSet&lt;&gt;(targetAssignment.keySet());</span>
+<span class="nc" id="L333">        allSubtopologyIds.addAll(currentAssignment.keySet());</span>
+
+<span class="nc bnc" id="L335" title="All 2 branches missed.">        for (String subtopologyId : allSubtopologyIds) {</span>
+<span class="nc" id="L336">            hasUnreleasedTasks |= computeAssignmentDifferenceForOneSubtopologyWithEpoch(</span>
+                subtopologyId,
+<span class="nc" id="L338">                currentAssignment.getOrDefault(subtopologyId, Map.of()),</span>
+<span class="nc" id="L339">                targetAssignment.getOrDefault(subtopologyId, Set.of()),</span>
+                targetAssignmentEpoch,
+                resultAssignedTasks,
+                resultTasksPendingRevocation,
+                resultTasksPendingAssignment,
+                isUnreleasedTask
+            );
+<span class="nc" id="L346">        }</span>
+<span class="nc" id="L347">        return hasUnreleasedTasks;</span>
+    }
+
+    private static boolean computeAssignmentDifferenceForOneSubtopologyWithEpoch(final String subtopologyId,
+                                                                                 final Map&lt;Integer, Integer&gt; currentTasksForThisSubtopology,
+                                                                                 final Set&lt;Integer&gt; targetTasksForThisSubtopology,
+                                                                                 final int targetAssignmentEpoch,
+                                                                                 final Map&lt;String, Map&lt;Integer, Integer&gt;&gt; resultAssignedTasks,
+                                                                                 final Map&lt;String, Map&lt;Integer, Integer&gt;&gt; resultTasksPendingRevocation,
+                                                                                 final Map&lt;String, Map&lt;Integer, Integer&gt;&gt; resultTasksPendingAssignment,
+                                                                                 final BiPredicate&lt;String, Integer&gt; isUnreleasedTask) {
+        // Result Assigned Tasks = Current Tasks ∩ Target Tasks
+        // i.e. we remove all tasks from the current assignment that are not in the target
+        //         assignment
+<span class="nc" id="L361">        Map&lt;Integer, Integer&gt; resultAssignedTasksForThisSubtopology = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">        for (Map.Entry&lt;Integer, Integer&gt; entry : currentTasksForThisSubtopology.entrySet()) {</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">            if (targetTasksForThisSubtopology.contains(entry.getKey())) {</span>
+<span class="nc" id="L364">                resultAssignedTasksForThisSubtopology.put(entry.getKey(), entry.getValue());</span>
+            }
+<span class="nc" id="L366">        }</span>
+
+        // Result Tasks Pending Revocation = Current Tasks - Result Assigned Tasks
+        // i.e. we will ask the member to revoke all tasks in its current assignment that
+        //      are not in the target assignment
+<span class="nc" id="L371">        Map&lt;Integer, Integer&gt; resultTasksPendingRevocationForThisSubtopology = new HashMap&lt;&gt;(currentTasksForThisSubtopology);</span>
+<span class="nc" id="L372">        resultTasksPendingRevocationForThisSubtopology.keySet().removeAll(resultAssignedTasksForThisSubtopology.keySet());</span>
+
+        // Result Tasks Pending Assignment = Target Tasks - Result Assigned Tasks - Unreleased Tasks
+        // i.e. we will ask the member to assign all tasks in its target assignment,
+        //      except those that are already assigned, and those that are unreleased
+<span class="nc" id="L377">        Map&lt;Integer, Integer&gt; resultTasksPendingAssignmentForThisSubtopology = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">        for (Integer taskId : targetTasksForThisSubtopology) {</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">            if (!resultAssignedTasksForThisSubtopology.containsKey(taskId)) {</span>
+<span class="nc" id="L380">                resultTasksPendingAssignmentForThisSubtopology.put(taskId, targetAssignmentEpoch);</span>
+            }
+<span class="nc" id="L382">        }</span>
+<span class="nc" id="L383">        boolean hasUnreleasedTasks = resultTasksPendingAssignmentForThisSubtopology.keySet().removeIf(taskId -&gt;</span>
+<span class="nc" id="L384">            isUnreleasedTask.test(subtopologyId, taskId)</span>
+        );
+
+<span class="nc bnc" id="L387" title="All 2 branches missed.">        if (!resultAssignedTasksForThisSubtopology.isEmpty()) {</span>
+<span class="nc" id="L388">            resultAssignedTasks.put(subtopologyId, resultAssignedTasksForThisSubtopology);</span>
+        }
+
+<span class="nc bnc" id="L391" title="All 2 branches missed.">        if (!resultTasksPendingRevocationForThisSubtopology.isEmpty()) {</span>
+<span class="nc" id="L392">            resultTasksPendingRevocation.put(subtopologyId, resultTasksPendingRevocationForThisSubtopology);</span>
+        }
+
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        if (!resultTasksPendingAssignmentForThisSubtopology.isEmpty()) {</span>
+<span class="nc" id="L396">            resultTasksPendingAssignment.put(subtopologyId, resultTasksPendingAssignmentForThisSubtopology);</span>
+        }
+
+<span class="nc" id="L399">        return hasUnreleasedTasks;</span>
+    }
+
+    /**
+     * Computes the next assignment.
+     *
+     * @param memberEpoch         The epoch of the member to use. This may be different from
+     *                            the epoch in {@link CurrentAssignmentBuilder#member}.
+     * @param memberAssignedTasks The assigned tasks of the member to use.
+     * @return A new StreamsGroupMember.
+     */
+    private StreamsGroupMember computeNextAssignment(int memberEpoch,
+                                                     TasksTupleWithEpochs memberAssignedTasks) {
+<span class="nc" id="L412">        Map&lt;String, Map&lt;Integer, Integer&gt;&gt; newActiveAssignedTasks = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L413">        Map&lt;String, Map&lt;Integer, Integer&gt;&gt; newActiveTasksPendingRevocation = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L414">        Map&lt;String, Map&lt;Integer, Integer&gt;&gt; newActiveTasksPendingAssignment = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L415">        Map&lt;String, Set&lt;Integer&gt;&gt; newStandbyAssignedTasks = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L416">        Map&lt;String, Set&lt;Integer&gt;&gt; newStandbyTasksPendingRevocation = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L417">        Map&lt;String, Set&lt;Integer&gt;&gt; newStandbyTasksPendingAssignment = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L418">        Map&lt;String, Set&lt;Integer&gt;&gt; newWarmupAssignedTasks = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L419">        Map&lt;String, Set&lt;Integer&gt;&gt; newWarmupTasksPendingRevocation = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L420">        Map&lt;String, Set&lt;Integer&gt;&gt; newWarmupTasksPendingAssignment = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L422">        boolean hasUnreleasedActiveTasks = computeAssignmentDifferenceWithEpoch(</span>
+<span class="nc" id="L423">            memberAssignedTasks.activeTasksWithEpochs(),</span>
+<span class="nc" id="L424">            targetAssignment.activeTasks(),</span>
+            targetAssignmentEpoch,
+            newActiveAssignedTasks,
+            newActiveTasksPendingRevocation,
+            newActiveTasksPendingAssignment,
+            (subtopologyId, partitionId) -&gt;
+<span class="nc bnc" id="L430" title="All 2 branches missed.">                currentActiveTaskProcessId.apply(subtopologyId, partitionId) != null ||</span>
+<span class="nc" id="L431">                    currentStandbyTaskProcessIds.apply(subtopologyId, partitionId)</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">                        .contains(member.processId()) ||</span>
+<span class="nc" id="L433">                    currentWarmupTaskProcessIds.apply(subtopologyId, partitionId)</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">                        .contains(member.processId())</span>
+        );
+
+<span class="nc" id="L437">        boolean hasUnreleasedStandbyTasks = computeAssignmentDifference(</span>
+<span class="nc" id="L438">            memberAssignedTasks.standbyTasks(),</span>
+<span class="nc" id="L439">            targetAssignment.standbyTasks(),</span>
+            newStandbyAssignedTasks,
+            newStandbyTasksPendingRevocation,
+            newStandbyTasksPendingAssignment,
+            (subtopologyId, partitionId) -&gt;
+<span class="nc bnc" id="L444" title="All 2 branches missed.">                Objects.equals(currentActiveTaskProcessId.apply(subtopologyId, partitionId),</span>
+<span class="nc" id="L445">                    member.processId()) ||</span>
+<span class="nc" id="L446">                    currentStandbyTaskProcessIds.apply(subtopologyId, partitionId)</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">                        .contains(member.processId()) ||</span>
+<span class="nc" id="L448">                    currentWarmupTaskProcessIds.apply(subtopologyId, partitionId)</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">                        .contains(member.processId())</span>
+        );
+
+<span class="nc" id="L452">        boolean hasUnreleasedWarmupTasks = computeAssignmentDifference(</span>
+<span class="nc" id="L453">            memberAssignedTasks.warmupTasks(),</span>
+<span class="nc" id="L454">            targetAssignment.warmupTasks(),</span>
+            newWarmupAssignedTasks,
+            newWarmupTasksPendingRevocation,
+            newWarmupTasksPendingAssignment,
+            (subtopologyId, partitionId) -&gt;
+<span class="nc bnc" id="L459" title="All 2 branches missed.">                Objects.equals(currentActiveTaskProcessId.apply(subtopologyId, partitionId),</span>
+<span class="nc" id="L460">                    member.processId()) ||</span>
+<span class="nc" id="L461">                    currentStandbyTaskProcessIds.apply(subtopologyId, partitionId)</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">                        .contains(member.processId()) ||</span>
+<span class="nc" id="L463">                    currentWarmupTaskProcessIds.apply(subtopologyId, partitionId)</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">                        .contains(member.processId())</span>
+        );
+
+<span class="nc bnc" id="L467" title="All 6 branches missed.">        return buildNewMember(</span>
+            memberEpoch,
+            new TasksTupleWithEpochs(
+                newActiveTasksPendingRevocation,
+                newStandbyTasksPendingRevocation,
+                newWarmupTasksPendingRevocation
+            ),
+            new TasksTupleWithEpochs(
+                newActiveAssignedTasks,
+                newStandbyAssignedTasks,
+                newWarmupAssignedTasks
+            ),
+            new TasksTupleWithEpochs(
+                newActiveTasksPendingAssignment,
+                newStandbyTasksPendingAssignment,
+                newWarmupTasksPendingAssignment
+            ),
+            hasUnreleasedActiveTasks || hasUnreleasedStandbyTasks || hasUnreleasedWarmupTasks
+        );
+    }
+
+    private StreamsGroupMember buildNewMember(final int memberEpoch,
+                                              final TasksTupleWithEpochs newTasksPendingRevocation,
+                                              final TasksTupleWithEpochs newAssignedTasks,
+                                              final TasksTupleWithEpochs newTasksPendingAssignment,
+                                              final boolean hasUnreleasedTasks) {
+
+<span class="nc" id="L494">        final boolean hasTasksToBeRevoked =</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">            (!newTasksPendingRevocation.isEmpty())</span>
+<span class="nc bnc" id="L496" title="All 4 branches missed.">                &amp;&amp; (ownedTasks.isEmpty() || ownedTasks.get().containsAny(newTasksPendingRevocation));</span>
+
+<span class="nc bnc" id="L498" title="All 2 branches missed.">        if (hasTasksToBeRevoked) {</span>
+            // If there are tasks to be revoked, the member remains in its current
+            // epoch and requests the revocation of those tasks. It transitions to
+            // the UNREVOKED_TASKS state to wait until the client acknowledges the
+            // revocation of the tasks.
+<span class="nc" id="L503">            return new StreamsGroupMember.Builder(member)</span>
+<span class="nc" id="L504">                .setState(MemberState.UNREVOKED_TASKS)</span>
+<span class="nc" id="L505">                .updateMemberEpoch(memberEpoch)</span>
+<span class="nc" id="L506">                .setAssignedTasks(newAssignedTasks)</span>
+<span class="nc" id="L507">                .setTasksPendingRevocation(newTasksPendingRevocation)</span>
+<span class="nc" id="L508">                .build();</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">        } else if (!newTasksPendingAssignment.isEmpty()) {</span>
+            // If there are tasks to be assigned, the member transitions to the
+            // target epoch and requests the assignment of those tasks. Note that
+            // the tasks are directly added to the assigned tasks set. The
+            // member transitions to the STABLE state or to the UNRELEASED_TASKS
+            // state depending on whether there are unreleased tasks or not.
+            MemberState newState =
+<span class="nc bnc" id="L516" title="All 2 branches missed.">                hasUnreleasedTasks</span>
+<span class="nc" id="L517">                    ? MemberState.UNRELEASED_TASKS</span>
+<span class="nc" id="L518">                    : MemberState.STABLE;</span>
+<span class="nc" id="L519">            return new StreamsGroupMember.Builder(member)</span>
+<span class="nc" id="L520">                .setState(newState)</span>
+<span class="nc" id="L521">                .updateMemberEpoch(targetAssignmentEpoch)</span>
+<span class="nc" id="L522">                .setAssignedTasks(newAssignedTasks.merge(newTasksPendingAssignment))</span>
+<span class="nc" id="L523">                .setTasksPendingRevocation(TasksTupleWithEpochs.EMPTY)</span>
+<span class="nc" id="L524">                .build();</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">        } else if (hasUnreleasedTasks) {</span>
+            // If there are no tasks to be revoked nor to be assigned but some
+            // tasks are not available yet, the member transitions to the target
+            // epoch, to the UNRELEASED_TASKS state and waits.
+<span class="nc" id="L529">            return new StreamsGroupMember.Builder(member)</span>
+<span class="nc" id="L530">                .setState(MemberState.UNRELEASED_TASKS)</span>
+<span class="nc" id="L531">                .updateMemberEpoch(targetAssignmentEpoch)</span>
+<span class="nc" id="L532">                .setAssignedTasks(newAssignedTasks)</span>
+<span class="nc" id="L533">                .setTasksPendingRevocation(TasksTupleWithEpochs.EMPTY)</span>
+<span class="nc" id="L534">                .build();</span>
+        } else {
+            // Otherwise, the member transitions to the target epoch and to the
+            // STABLE state.
+<span class="nc" id="L538">            return new StreamsGroupMember.Builder(member)</span>
+<span class="nc" id="L539">                .setState(MemberState.STABLE)</span>
+<span class="nc" id="L540">                .updateMemberEpoch(targetAssignmentEpoch)</span>
+<span class="nc" id="L541">                .setAssignedTasks(newAssignedTasks)</span>
+<span class="nc" id="L542">                .setTasksPendingRevocation(TasksTupleWithEpochs.EMPTY)</span>
+<span class="nc" id="L543">                .build();</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

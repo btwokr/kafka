@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RocksDBTimestampedStoreWithHeaders.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">RocksDBTimestampedStoreWithHeaders.java</span></div><h1>RocksDBTimestampedStoreWithHeaders.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.Query;
+import org.apache.kafka.streams.query.QueryConfig;
+import org.apache.kafka.streams.query.QueryResult;
+import org.apache.kafka.streams.state.HeadersBytesStore;
+import org.apache.kafka.streams.state.internals.metrics.RocksDBMetricsRecorder;
+
+import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.DBOptions;
+import org.rocksdb.Options;
+import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.RocksIterator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * A persistent key-(value-timestamp-headers) store based on RocksDB.
+ */
+public class RocksDBTimestampedStoreWithHeaders extends RocksDBStore implements HeadersBytesStore {
+
+<span class="nc" id="L48">    private static final Logger log = LoggerFactory.getLogger(RocksDBTimestampedStoreWithHeaders.class);</span>
+
+    /**
+     * Legacy column family name - must match {@code RocksDBTimestampedStore#TIMESTAMPED_VALUES_COLUMN_FAMILY_NAME}
+     */
+<span class="nc" id="L53">    private static final byte[] LEGACY_TIMESTAMPED_CF_NAME =</span>
+        RocksDBTimestampedStore.TIMESTAMPED_VALUES_COLUMN_FAMILY_NAME;
+
+<span class="nc" id="L56">    static final byte[] TIMESTAMPED_VALUES_WITH_HEADERS_CF_NAME =</span>
+<span class="nc" id="L57">        &quot;keyValueWithTimestampAndHeaders&quot;.getBytes(StandardCharsets.UTF_8);</span>
+
+
+    public RocksDBTimestampedStoreWithHeaders(final String name,
+                                              final String metricsScope) {
+<span class="nc" id="L62">        super(name, metricsScope);</span>
+<span class="nc" id="L63">    }</span>
+
+    RocksDBTimestampedStoreWithHeaders(final String name,
+                                       final String parentDir,
+                                       final RocksDBMetricsRecorder metricsRecorder) {
+<span class="nc" id="L68">        super(name, parentDir, metricsRecorder);</span>
+<span class="nc" id="L69">    }</span>
+
+    @Override
+    void openRocksDB(final DBOptions dbOptions,
+                     final ColumnFamilyOptions columnFamilyOptions) {
+        // Check if we're upgrading from RocksDBTimestampedStore or from plain RocksDBStore
+        final List&lt;byte[]&gt; existingCFs;
+<span class="nc" id="L76">        try (final Options options = new Options(dbOptions, new ColumnFamilyOptions())) {</span>
+<span class="nc" id="L77">            existingCFs = RocksDB.listColumnFamilies(options, dbDir.getAbsolutePath());</span>
+<span class="nc" id="L78">        } catch (final RocksDBException e) {</span>
+<span class="nc" id="L79">            throw new ProcessorStateException(&quot;Error listing column families for store &quot; + name, e);</span>
+<span class="nc" id="L80">        }</span>
+
+<span class="nc" id="L82">        final boolean hasTimestampedCF = existingCFs.stream()</span>
+<span class="nc" id="L83">            .anyMatch(cf -&gt; Arrays.equals(cf, LEGACY_TIMESTAMPED_CF_NAME));</span>
+
+<span class="nc bnc" id="L85" title="All 2 branches missed.">        if (hasTimestampedCF) {</span>
+            // Upgrading from timestamped store - use 2 CFs: LEGACY_TIMESTAMPED + HEADERS
+<span class="nc" id="L87">            openFromTimestampedStore(dbOptions, columnFamilyOptions); // needs to check that default-CF has no data</span>
+        } else {
+<span class="nc" id="L89">            openFromDefaultStore(dbOptions, columnFamilyOptions);</span>
+        }
+
+<span class="nc" id="L92">    }</span>
+
+    private void openFromDefaultStore(final DBOptions dbOptions,
+                                      final ColumnFamilyOptions columnFamilyOptions) {
+
+<span class="nc" id="L97">        final List&lt;ColumnFamilyHandle&gt; columnFamilies = openRocksDB(</span>
+            dbOptions,
+            new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY, columnFamilyOptions),
+            new ColumnFamilyDescriptor(TIMESTAMPED_VALUES_WITH_HEADERS_CF_NAME, columnFamilyOptions),
+<span class="nc" id="L101">            new ColumnFamilyDescriptor(OFFSETS_COLUMN_FAMILY_NAME, createOffsetsCFOptions())</span>
+        );
+
+<span class="nc" id="L104">        final ColumnFamilyHandle defaultCf = columnFamilies.get(0);</span>
+<span class="nc" id="L105">        final ColumnFamilyHandle headersCf = columnFamilies.get(1);</span>
+<span class="nc" id="L106">        final ColumnFamilyHandle offsetsCf = columnFamilies.get(2);</span>
+
+        // Check if default CF has data (plain store upgrade)
+<span class="nc" id="L109">        try (final RocksIterator defaultIter = db.newIterator(defaultCf)) {</span>
+<span class="nc" id="L110">            defaultIter.seekToFirst();</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">            if (defaultIter.isValid()) {</span>
+<span class="nc" id="L112">                log.info(&quot;Opening store {} in upgrade mode from plain key value store&quot;, name);</span>
+<span class="nc" id="L113">                cfAccessor = new DualColumnFamilyAccessor(</span>
+                    offsetsCf,
+                    defaultCf,
+                    headersCf,
+                    HeadersBytesStore::convertFromPlainToHeaderFormat,
+                    this,
+                    open
+                );
+            } else {
+<span class="nc" id="L122">                log.info(&quot;Opening store {} in regular headers-aware mode&quot;, name);</span>
+<span class="nc" id="L123">                cfAccessor = new SingleColumnFamilyAccessor(offsetsCf, headersCf);</span>
+<span class="nc" id="L124">                defaultCf.close();</span>
+            }
+<span class="nc" id="L126">        } catch (final RuntimeException e) {</span>
+<span class="nc bnc" id="L127" title="All 2 branches missed.">            for (final ColumnFamilyHandle handle : columnFamilies) {</span>
+<span class="nc" id="L128">                handle.close();</span>
+<span class="nc" id="L129">            }</span>
+<span class="nc" id="L130">            throw e;</span>
+<span class="nc" id="L131">        }</span>
+<span class="nc" id="L132">    }</span>
+
+    private void openFromTimestampedStore(final DBOptions dbOptions,
+                                          final ColumnFamilyOptions columnFamilyOptions) {
+<span class="nc" id="L136">        final List&lt;ColumnFamilyHandle&gt; columnFamilies = openRocksDB(</span>
+            dbOptions,
+            // we have to open the default CF to be able to open the legacy CF, but we won't use it
+            new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY, columnFamilyOptions),
+            new ColumnFamilyDescriptor(LEGACY_TIMESTAMPED_CF_NAME, columnFamilyOptions),
+            new ColumnFamilyDescriptor(TIMESTAMPED_VALUES_WITH_HEADERS_CF_NAME, columnFamilyOptions),
+<span class="nc" id="L142">            new ColumnFamilyDescriptor(OFFSETS_COLUMN_FAMILY_NAME, createOffsetsCFOptions())</span>
+        );
+
+        try {
+            // verify and close empty Default ColumnFamily
+<span class="nc" id="L147">            try (final RocksIterator defaultIter = db.newIterator(columnFamilies.get(0))) {</span>
+<span class="nc" id="L148">                defaultIter.seekToFirst();</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">                if (defaultIter.isValid()) {</span>
+<span class="nc" id="L150">                    throw new ProcessorStateException(</span>
+                        &quot;Inconsistent store state for &quot; + name + &quot;. &quot; +
+                            &quot;Cannot have both plain (DEFAULT) and timestamped data simultaneously. &quot; +
+                            &quot;Headers store can upgrade from either plain or timestamped format, but not both.&quot;
+                    );
+                }
+            }
+            // close default column family handle
+<span class="nc" id="L158">            columnFamilies.get(0).close();</span>
+
+<span class="nc" id="L160">            final ColumnFamilyHandle legacyTimestampedCf = columnFamilies.get(1);</span>
+<span class="nc" id="L161">            final ColumnFamilyHandle headersCf = columnFamilies.get(2);</span>
+<span class="nc" id="L162">            final ColumnFamilyHandle offsetsCf = columnFamilies.get(3);</span>
+
+            // Check if legacy timestamped CF has data
+<span class="nc" id="L165">            try (final RocksIterator legacyIter = db.newIterator(legacyTimestampedCf)) {</span>
+<span class="nc" id="L166">                legacyIter.seekToFirst();</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">                if (legacyIter.isValid()) {</span>
+<span class="nc" id="L168">                    log.info(&quot;Opening store {} in upgrade mode from timestamped store&quot;, name);</span>
+<span class="nc" id="L169">                    cfAccessor = new DualColumnFamilyAccessor(</span>
+                        offsetsCf,
+                        legacyTimestampedCf,
+                        headersCf,
+                        HeadersBytesStore::convertToHeaderFormat,
+                        this,
+                            open
+                    );
+                } else {
+<span class="nc" id="L178">                    log.info(&quot;Opening store {} in regular headers-aware mode&quot;, name);</span>
+<span class="nc" id="L179">                    cfAccessor = new SingleColumnFamilyAccessor(offsetsCf, headersCf);</span>
+                    try {
+<span class="nc" id="L181">                        db.dropColumnFamily(legacyTimestampedCf);</span>
+<span class="nc" id="L182">                    } catch (final RocksDBException e) {</span>
+<span class="nc" id="L183">                        throw new RuntimeException(e);</span>
+                    } finally {
+<span class="nc" id="L185">                        legacyTimestampedCf.close();</span>
+                    }
+                }
+            }
+<span class="nc" id="L189">        } catch (final RuntimeException e) {</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">            for (final ColumnFamilyHandle handle : columnFamilies) {</span>
+<span class="nc" id="L191">                handle.close();</span>
+<span class="nc" id="L192">            }</span>
+<span class="nc" id="L193">            throw e;</span>
+<span class="nc" id="L194">        }</span>
+<span class="nc" id="L195">    }</span>
+
+    @SuppressWarnings(&quot;SynchronizeOnNonFinalField&quot;)
+    @Override
+    public &lt;R&gt; QueryResult&lt;R&gt; query(final Query&lt;R&gt; query,
+                                    final PositionBound positionBound,
+                                    final QueryConfig config) {
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        final long start = config.isCollectExecutionInfo() ? System.nanoTime() : -1L;</span>
+        final QueryResult&lt;R&gt; result;
+
+<span class="nc" id="L205">        synchronized (position) {</span>
+<span class="nc" id="L206">            result = QueryResult.forUnknownQueryType(query, this);</span>
+
+<span class="nc bnc" id="L208" title="All 2 branches missed.">            if (config.isCollectExecutionInfo()) {</span>
+<span class="nc" id="L209">                result.addExecutionInfo(</span>
+<span class="nc" id="L210">                    &quot;Handled in &quot; + this.getClass() + &quot; in &quot; + (System.nanoTime() - start) + &quot;ns&quot;</span>
+                );
+            }
+<span class="nc" id="L213">            result.setPosition(position.copy());</span>
+<span class="nc" id="L214">        }</span>
+<span class="nc" id="L215">        return result;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

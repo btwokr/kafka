@@ -1,0 +1,613 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ProducerBatch.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.producer.internals</a> &gt; <span class="el_source">ProducerBatch.java</span></div><h1>ProducerBatch.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.producer.internals;
+
+import org.apache.kafka.clients.producer.Callback;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.RecordBatchTooLargeException;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.common.record.internal.AbstractRecords;
+import org.apache.kafka.common.record.internal.CompressionRatioEstimator;
+import org.apache.kafka.common.record.internal.CompressionType;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.record.internal.MemoryRecordsBuilder;
+import org.apache.kafka.common.record.internal.MutableRecordBatch;
+import org.apache.kafka.common.record.internal.Record;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.requests.ProduceResponse;
+import org.apache.kafka.common.utils.ProducerIdAndEpoch;
+import org.apache.kafka.common.utils.Time;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Objects;
+import java.util.OptionalInt;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
+
+import static org.apache.kafka.common.record.internal.RecordBatch.MAGIC_VALUE_V2;
+import static org.apache.kafka.common.record.internal.RecordBatch.NO_TIMESTAMP;
+
+/**
+ * A batch of records that is or will be sent.
+ *
+ * This class is not thread safe and external synchronization must be used when modifying it
+ */
+public final class ProducerBatch {
+
+<span class="fc" id="L62">    private static final Logger log = LoggerFactory.getLogger(ProducerBatch.class);</span>
+
+<span class="fc" id="L64">    private enum FinalState { ABORTED, FAILED, SUCCEEDED }</span>
+
+    final long createdMs;
+    final TopicPartition topicPartition;
+    final ProduceRequestResult produceFuture;
+
+<span class="fc" id="L70">    private final List&lt;Thunk&gt; thunks = new ArrayList&lt;&gt;();</span>
+    private final MemoryRecordsBuilder recordsBuilder;
+<span class="fc" id="L72">    private final AtomicInteger attempts = new AtomicInteger(0);</span>
+    private final boolean isSplitBatch;
+<span class="fc" id="L74">    private final AtomicReference&lt;FinalState&gt; finalState = new AtomicReference&lt;&gt;(null);</span>
+<span class="fc" id="L75">    private boolean bufferDeallocated = false;</span>
+    // Tracks if the batch has been sent to the NetworkClient
+<span class="fc" id="L77">    private boolean inflight = false;</span>
+
+    int recordCount;
+    int maxRecordSize;
+    private long lastAttemptMs;
+    private long lastAppendTime;
+    private long drainedMs;
+    private boolean retry;
+    private boolean reopened;
+
+    // Tracks the current-leader's epoch to which this batch would be sent, in the current to produce the batch.
+    private OptionalInt currentLeaderEpoch;
+    // Tracks the attempt in which leader was changed to currentLeaderEpoch for the 1st time.
+    private int attemptsWhenLeaderLastChanged;
+
+    public ProducerBatch(TopicPartition tp, MemoryRecordsBuilder recordsBuilder, long createdMs) {
+<span class="fc" id="L93">        this(tp, recordsBuilder, createdMs, false);</span>
+<span class="fc" id="L94">    }</span>
+
+<span class="fc" id="L96">    public ProducerBatch(TopicPartition tp, MemoryRecordsBuilder recordsBuilder, long createdMs, boolean isSplitBatch) {</span>
+<span class="fc" id="L97">        this.createdMs = createdMs;</span>
+<span class="fc" id="L98">        this.lastAttemptMs = createdMs;</span>
+<span class="fc" id="L99">        this.recordsBuilder = recordsBuilder;</span>
+<span class="fc" id="L100">        this.topicPartition = tp;</span>
+<span class="fc" id="L101">        this.lastAppendTime = createdMs;</span>
+<span class="fc" id="L102">        this.produceFuture = new ProduceRequestResult(topicPartition);</span>
+<span class="fc" id="L103">        this.retry = false;</span>
+<span class="fc" id="L104">        this.isSplitBatch = isSplitBatch;</span>
+<span class="fc" id="L105">        float compressionRatioEstimation = CompressionRatioEstimator.estimation(topicPartition.topic(),</span>
+<span class="fc" id="L106">                                                                                recordsBuilder.compression().type());</span>
+<span class="fc" id="L107">        this.currentLeaderEpoch = OptionalInt.empty();</span>
+<span class="fc" id="L108">        this.attemptsWhenLeaderLastChanged = 0;</span>
+<span class="fc" id="L109">        recordsBuilder.setEstimatedCompressionRatio(compressionRatioEstimation);</span>
+<span class="fc" id="L110">    }</span>
+
+    /**
+     * It will update the leader to which this batch will be produced for the ongoing attempt, if a newer leader is known.
+     * @param latestLeaderEpoch latest leader's epoch.
+     */
+    void maybeUpdateLeaderEpoch(OptionalInt latestLeaderEpoch) {
+<span class="pc bpc" id="L117" title="1 of 2 branches missed.">        if (latestLeaderEpoch.isPresent()</span>
+<span class="pc bpc" id="L118" title="1 of 4 branches missed.">            &amp;&amp; (currentLeaderEpoch.isEmpty() || currentLeaderEpoch.getAsInt() &lt; latestLeaderEpoch.getAsInt())) {</span>
+<span class="fc" id="L119">            log.trace(&quot;For {}, leader will be updated, currentLeaderEpoch: {}, attemptsWhenLeaderLastChanged:{}, latestLeaderEpoch: {}, current attempt: {}&quot;,</span>
+<span class="fc" id="L120">                this, currentLeaderEpoch, attemptsWhenLeaderLastChanged, latestLeaderEpoch, attempts);</span>
+<span class="fc" id="L121">            attemptsWhenLeaderLastChanged = attempts();</span>
+<span class="fc" id="L122">            currentLeaderEpoch = latestLeaderEpoch;</span>
+        } else {
+<span class="fc" id="L124">            log.trace(&quot;For {}, leader wasn't updated, currentLeaderEpoch: {}, attemptsWhenLeaderLastChanged:{}, latestLeaderEpoch: {}, current attempt: {}&quot;,</span>
+<span class="fc" id="L125">                this, currentLeaderEpoch, attemptsWhenLeaderLastChanged, latestLeaderEpoch, attempts);</span>
+        }
+<span class="fc" id="L127">    }</span>
+
+    /**
+     * It will return true, for a when batch is being retried, it will be retried to a newer leader.
+     */
+
+    boolean hasLeaderChangedForTheOngoingRetry() {
+<span class="fc" id="L134">        int attempts = attempts();</span>
+<span class="pc bpc" id="L135" title="1 of 2 branches missed.">        boolean isRetry = attempts &gt;= 1;</span>
+<span class="pc bpc" id="L136" title="1 of 2 branches missed.">        if (!isRetry)</span>
+<span class="fc" id="L137">            return false;</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        return attempts == attemptsWhenLeaderLastChanged;</span>
+    }
+
+
+    /**
+     * Append the record to the current record set and return the relative offset within that record set
+     *
+     * @return The RecordSend corresponding to this record or null if there isn't sufficient room.
+     */
+    public FutureRecordMetadata tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers, Callback callback, long now) {
+<span class="pc bpc" id="L148" title="1 of 2 branches missed.">        if (!recordsBuilder.hasRoomFor(timestamp, key, value, headers)) {</span>
+<span class="nc" id="L149">            return null;</span>
+        } else {
+<span class="fc" id="L151">            this.recordsBuilder.append(timestamp, key, value, headers);</span>
+<span class="fc" id="L152">            this.maxRecordSize = Math.max(this.maxRecordSize, AbstractRecords.estimateSizeInBytesUpperBound(magic(),</span>
+<span class="fc" id="L153">                    recordsBuilder.compression().type(), key, value, headers));</span>
+<span class="fc" id="L154">            this.lastAppendTime = now;</span>
+<span class="fc" id="L155">            FutureRecordMetadata future = new FutureRecordMetadata(this.produceFuture, this.recordCount,</span>
+                                                                   timestamp,
+<span class="pc bpc" id="L157" title="1 of 2 branches missed.">                                                                   key == null ? -1 : key.length,</span>
+<span class="fc bfc" id="L158" title="All 2 branches covered.">                                                                   value == null ? -1 : value.length,</span>
+                                                                   Time.SYSTEM);
+            // we have to keep every future returned to the users in case the batch needs to be
+            // split to several new batches and resent.
+<span class="fc" id="L162">            thunks.add(new Thunk(callback, future));</span>
+<span class="fc" id="L163">            this.recordCount++;</span>
+<span class="fc" id="L164">            return future;</span>
+        }
+    }
+
+    /**
+     * This method is only used by {@link #split(int)} when splitting a large batch to smaller ones.
+     * @return true if the record has been successfully appended, false otherwise.
+     */
+    private boolean tryAppendForSplit(long timestamp, ByteBuffer key, ByteBuffer value, Header[] headers, Thunk thunk) {
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (!recordsBuilder.hasRoomFor(timestamp, key, value, headers)) {</span>
+<span class="nc" id="L174">            return false;</span>
+        } else {
+            // No need to get the CRC.
+<span class="nc" id="L177">            this.recordsBuilder.append(timestamp, key, value, headers);</span>
+<span class="nc" id="L178">            this.maxRecordSize = Math.max(this.maxRecordSize, AbstractRecords.estimateSizeInBytesUpperBound(magic(),</span>
+<span class="nc" id="L179">                    recordsBuilder.compression().type(), key, value, headers));</span>
+<span class="nc" id="L180">            FutureRecordMetadata future = new FutureRecordMetadata(this.produceFuture, this.recordCount,</span>
+                                                                   timestamp,
+<span class="nc bnc" id="L182" title="All 2 branches missed.">                                                                   key == null ? -1 : key.remaining(),</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">                                                                   value == null ? -1 : value.remaining(),</span>
+                                                                   Time.SYSTEM);
+            // Chain the future to the original thunk.
+<span class="nc" id="L186">            thunk.future.chain(future);</span>
+<span class="nc" id="L187">            this.thunks.add(thunk);</span>
+<span class="nc" id="L188">            this.recordCount++;</span>
+<span class="nc" id="L189">            return true;</span>
+        }
+    }
+
+    /**
+     * Abort the batch and complete the future and callbacks.
+     *
+     * @param exception The exception to use to complete the future and awaiting callbacks.
+     */
+    public void abort(RuntimeException exception) {
+<span class="nc bnc" id="L199" title="All 2 branches missed.">        if (!finalState.compareAndSet(null, FinalState.ABORTED))</span>
+<span class="nc" id="L200">            throw new IllegalStateException(&quot;Batch has already been completed in final state &quot; + finalState.get());</span>
+
+<span class="nc" id="L202">        log.trace(&quot;Aborting batch for partition {}&quot;, topicPartition, exception);</span>
+<span class="nc" id="L203">        completeFutureAndFireCallbacks(ProduceResponse.INVALID_OFFSET, RecordBatch.NO_TIMESTAMP, index -&gt; exception);</span>
+<span class="nc" id="L204">    }</span>
+
+    /**
+     * Check if the batch has been completed (either successfully or exceptionally).
+     * @return `true` if the batch has been completed, `false` otherwise.
+     */
+    public boolean isDone() {
+<span class="nc bnc" id="L211" title="All 2 branches missed.">        return finalState() != null;</span>
+    }
+
+    /**
+     * Complete the batch successfully.
+     * @param baseOffset The base offset of the messages assigned by the server
+     * @param logAppendTime The log append time or -1 if CreateTime is being used
+     * @return true if the batch was completed as a result of this call, and false
+     *   if it had been completed previously
+     */
+    public boolean complete(long baseOffset, long logAppendTime) {
+<span class="fc" id="L222">        return done(baseOffset, logAppendTime, null, null);</span>
+    }
+
+    /**
+     * Complete the batch exceptionally. The provided top-level exception will be used
+     * for each record future contained in the batch.
+     *
+     * @param topLevelException top-level partition error
+     * @param recordExceptions Record exception function mapping batchIndex to the respective record exception
+     * @return true if the batch was completed as a result of this call, and false
+     *   if it had been completed previously
+     */
+    public boolean completeExceptionally(
+        RuntimeException topLevelException,
+        Function&lt;Integer, RuntimeException&gt; recordExceptions
+    ) {
+<span class="nc" id="L238">        Objects.requireNonNull(topLevelException);</span>
+<span class="nc" id="L239">        Objects.requireNonNull(recordExceptions);</span>
+<span class="nc" id="L240">        return done(ProduceResponse.INVALID_OFFSET, RecordBatch.NO_TIMESTAMP, topLevelException, recordExceptions);</span>
+    }
+
+    /**
+     * Finalize the state of a batch. Final state, once set, is immutable. This function may be called
+     * once or twice on a batch. It may be called twice if
+     * 1. An inflight batch expires before a response from the broker is received. The batch's final
+     * state is set to FAILED. But it could succeed on the broker and second time around batch.done() may
+     * try to set SUCCEEDED final state.
+     * 2. If a transaction abortion happens or if the producer is closed forcefully, the final state is
+     * ABORTED but again it could succeed if broker responds with a success.
+     *
+     * Attempted transitions from [FAILED | ABORTED] --&gt; SUCCEEDED are logged.
+     * Attempted transitions from one failure state to the same or a different failed state are ignored.
+     * Attempted transitions from SUCCEEDED to the same or a failed state throw an exception.
+     *
+     * @param baseOffset The base offset of the messages assigned by the server
+     * @param logAppendTime The log append time or -1 if CreateTime is being used
+     * @param topLevelException The exception that occurred (or null if the request was successful)
+     * @param recordExceptions Record exception function mapping batchIndex to the respective record exception
+     * @return true if the batch was completed successfully and false if the batch was previously aborted
+     */
+    private boolean done(
+        long baseOffset,
+        long logAppendTime,
+        RuntimeException topLevelException,
+        Function&lt;Integer, RuntimeException&gt; recordExceptions
+    ) {
+<span class="pc bpc" id="L268" title="1 of 2 branches missed.">        final FinalState tryFinalState = (topLevelException == null) ? FinalState.SUCCEEDED : FinalState.FAILED;</span>
+<span class="pc bpc" id="L269" title="1 of 2 branches missed.">        if (tryFinalState == FinalState.SUCCEEDED) {</span>
+<span class="fc" id="L270">            log.trace(&quot;Successfully produced messages to {} with base offset {}.&quot;, topicPartition, baseOffset);</span>
+        } else {
+<span class="nc" id="L272">            log.trace(&quot;Failed to produce messages to {} with base offset {}.&quot;, topicPartition, baseOffset, topLevelException);</span>
+        }
+
+<span class="pc bpc" id="L275" title="1 of 2 branches missed.">        if (this.finalState.compareAndSet(null, tryFinalState)) {</span>
+<span class="fc" id="L276">            completeFutureAndFireCallbacks(baseOffset, logAppendTime, recordExceptions);</span>
+<span class="fc" id="L277">            return true;</span>
+        }
+
+<span class="nc bnc" id="L280" title="All 2 branches missed.">        if (this.finalState.get() != FinalState.SUCCEEDED) {</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">            if (tryFinalState == FinalState.SUCCEEDED) {</span>
+                // Log if a previously unsuccessful batch succeeded later on.
+<span class="nc" id="L283">                log.debug(&quot;ProduceResponse returned {} for {} after batch with base offset {} had already been {}.&quot;,</span>
+<span class="nc" id="L284">                    tryFinalState, topicPartition, baseOffset, this.finalState.get());</span>
+            } else {
+                // FAILED --&gt; FAILED and ABORTED --&gt; FAILED transitions are ignored.
+<span class="nc" id="L287">                log.debug(&quot;Ignored state transition {} -&gt; {} for {} batch with base offset {}&quot;,</span>
+<span class="nc" id="L288">                    this.finalState.get(), tryFinalState, topicPartition, baseOffset);</span>
+            }
+        } else {
+            // A SUCCESSFUL batch must not attempt another state change.
+<span class="nc" id="L292">            throw new IllegalStateException(&quot;A &quot; + this.finalState.get() + &quot; batch must not attempt another state change to &quot; + tryFinalState);</span>
+        }
+<span class="nc" id="L294">        return false;</span>
+    }
+
+    private void completeFutureAndFireCallbacks(
+        long baseOffset,
+        long logAppendTime,
+        Function&lt;Integer, RuntimeException&gt; recordExceptions
+    ) {
+        // Set the future before invoking the callbacks as we rely on its state for the `onCompletion` call
+<span class="fc" id="L303">        produceFuture.set(baseOffset, logAppendTime, recordExceptions);</span>
+
+        // execute callbacks
+<span class="fc bfc" id="L306" title="All 2 branches covered.">        for (int i = 0; i &lt; thunks.size(); i++) {</span>
+            try {
+<span class="fc" id="L308">                Thunk thunk = thunks.get(i);</span>
+<span class="pc bpc" id="L309" title="1 of 2 branches missed.">                if (thunk.callback != null) {</span>
+<span class="pc bpc" id="L310" title="1 of 2 branches missed.">                    if (recordExceptions == null) {</span>
+<span class="fc" id="L311">                        RecordMetadata metadata = thunk.future.value();</span>
+<span class="fc" id="L312">                        thunk.callback.onCompletion(metadata, null);</span>
+<span class="fc" id="L313">                    } else {</span>
+<span class="nc" id="L314">                        RuntimeException exception = recordExceptions.apply(i);</span>
+<span class="nc" id="L315">                        thunk.callback.onCompletion(null, exception);</span>
+                    }
+                }
+<span class="nc" id="L318">            } catch (Exception e) {</span>
+<span class="nc" id="L319">                log.error(&quot;Error executing user-provided callback on message for topic-partition '{}'&quot;, topicPartition, e);</span>
+<span class="fc" id="L320">            }</span>
+        }
+
+<span class="fc" id="L323">        produceFuture.done();</span>
+<span class="fc" id="L324">    }</span>
+
+    public Deque&lt;ProducerBatch&gt; split(int splitBatchSize) {
+<span class="nc" id="L327">        RecordBatch recordBatch = validateAndGetRecordBatch();</span>
+<span class="nc" id="L328">        Deque&lt;ProducerBatch&gt; batches = splitRecordsIntoBatches(recordBatch, splitBatchSize);</span>
+<span class="nc" id="L329">        finalizeSplitBatches(batches);</span>
+<span class="nc" id="L330">        return batches;</span>
+    }
+
+    private RecordBatch validateAndGetRecordBatch() {
+<span class="nc" id="L334">        MemoryRecords memoryRecords = recordsBuilder.build();</span>
+<span class="nc" id="L335">        Iterator&lt;MutableRecordBatch&gt; recordBatchIter = memoryRecords.batches().iterator();</span>
+
+<span class="nc bnc" id="L337" title="All 2 branches missed.">        if (!recordBatchIter.hasNext())</span>
+<span class="nc" id="L338">            throw new IllegalStateException(&quot;Cannot split an empty producer batch.&quot;);</span>
+
+<span class="nc" id="L340">        RecordBatch recordBatch = recordBatchIter.next();</span>
+<span class="nc bnc" id="L341" title="All 4 branches missed.">        if (recordBatch.magic() &lt; MAGIC_VALUE_V2 &amp;&amp; !recordBatch.isCompressed())</span>
+<span class="nc" id="L342">            throw new IllegalArgumentException(&quot;Batch splitting cannot be used with non-compressed messages &quot; +</span>
+                    &quot;with version v0 and v1&quot;);
+
+<span class="nc bnc" id="L345" title="All 2 branches missed.">        if (recordBatchIter.hasNext())</span>
+<span class="nc" id="L346">            throw new IllegalArgumentException(&quot;A producer batch should only have one record batch.&quot;);</span>
+
+<span class="nc" id="L348">        return recordBatch;</span>
+    }
+
+    private Deque&lt;ProducerBatch&gt; splitRecordsIntoBatches(RecordBatch recordBatch, int splitBatchSize) {
+<span class="nc" id="L352">        Deque&lt;ProducerBatch&gt; batches = new ArrayDeque&lt;&gt;();</span>
+<span class="nc" id="L353">        Iterator&lt;Thunk&gt; thunkIter = thunks.iterator();</span>
+        // We always allocate batch size because we are already splitting a big batch.
+        // And we also Retain the create time of the original batch.
+<span class="nc" id="L356">        ProducerBatch batch = null;</span>
+
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        for (Record record : recordBatch) {</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">            assert thunkIter.hasNext();</span>
+<span class="nc" id="L360">            Thunk thunk = thunkIter.next();</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">            if (batch == null)</span>
+<span class="nc" id="L362">                batch = createBatchOffAccumulatorForRecord(record, splitBatchSize);</span>
+
+            // A newly created batch can always host the first message.
+<span class="nc bnc" id="L365" title="All 2 branches missed.">            if (!batch.tryAppendForSplit(record.timestamp(), record.key(), record.value(), record.headers(), thunk)) {</span>
+<span class="nc" id="L366">                batches.add(batch);</span>
+<span class="nc" id="L367">                batch.closeForRecordAppends();</span>
+<span class="nc" id="L368">                batch = createBatchOffAccumulatorForRecord(record, splitBatchSize);</span>
+<span class="nc" id="L369">                batch.tryAppendForSplit(record.timestamp(), record.key(), record.value(), record.headers(), thunk);</span>
+            }
+<span class="nc" id="L371">        }</span>
+
+        // Close the last batch and add it to the batch list after split.
+<span class="nc bnc" id="L374" title="All 2 branches missed.">        if (batch != null) {</span>
+<span class="nc" id="L375">            batches.add(batch);</span>
+<span class="nc" id="L376">            batch.closeForRecordAppends();</span>
+        }
+
+<span class="nc" id="L379">        return batches;</span>
+    }
+
+    private void finalizeSplitBatches(Deque&lt;ProducerBatch&gt; batches) {
+        // Chain all split batch ProduceRequestResults to the original batch's produceFuture
+        // Ensures the original batch's future doesn't complete until all split batches complete
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        for (ProducerBatch splitBatch : batches) {</span>
+<span class="nc" id="L386">            produceFuture.addDependent(splitBatch.produceFuture);</span>
+<span class="nc" id="L387">        }</span>
+
+<span class="nc" id="L389">        produceFuture.set(ProduceResponse.INVALID_OFFSET, NO_TIMESTAMP, index -&gt; new RecordBatchTooLargeException());</span>
+<span class="nc" id="L390">        produceFuture.done();</span>
+
+<span class="nc" id="L392">        assignProducerStateToBatches(batches);</span>
+<span class="nc" id="L393">    }</span>
+
+    private void assignProducerStateToBatches(Deque&lt;ProducerBatch&gt; batches) {
+<span class="nc bnc" id="L396" title="All 2 branches missed.">        if (hasSequence()) {</span>
+<span class="nc" id="L397">            int sequence = baseSequence();</span>
+<span class="nc" id="L398">            ProducerIdAndEpoch producerIdAndEpoch = new ProducerIdAndEpoch(producerId(), producerEpoch());</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">            for (ProducerBatch newBatch : batches) {</span>
+<span class="nc" id="L400">                newBatch.setProducerState(producerIdAndEpoch, sequence, isTransactional());</span>
+<span class="nc" id="L401">                sequence += newBatch.recordCount;</span>
+<span class="nc" id="L402">            }</span>
+        }
+<span class="nc" id="L404">    }</span>
+
+    private ProducerBatch createBatchOffAccumulatorForRecord(Record record, int batchSize) {
+<span class="nc" id="L407">        int initialSize = Math.max(AbstractRecords.estimateSizeInBytesUpperBound(magic(),</span>
+<span class="nc" id="L408">                recordsBuilder.compression().type(), record.key(), record.value(), record.headers()), batchSize);</span>
+<span class="nc" id="L409">        ByteBuffer buffer = ByteBuffer.allocate(initialSize);</span>
+
+        // Note that we intentionally do not set producer state (producerId, epoch, sequence, and isTransactional)
+        // for the newly created batch. This will be set when the batch is dequeued for sending (which is consistent
+        // with how normal batches are handled).
+<span class="nc" id="L414">        MemoryRecordsBuilder builder = MemoryRecords.builder(buffer, magic(), recordsBuilder.compression(),</span>
+                TimestampType.CREATE_TIME, 0L);
+<span class="nc" id="L416">        return new ProducerBatch(topicPartition, builder, this.createdMs, true);</span>
+    }
+
+    public boolean isCompressed() {
+<span class="nc bnc" id="L420" title="All 2 branches missed.">        return recordsBuilder.compression().type() != CompressionType.NONE;</span>
+    }
+
+    /**
+     * A callback and the associated FutureRecordMetadata argument to pass to it.
+     */
+    private static final class Thunk {
+        final Callback callback;
+        final FutureRecordMetadata future;
+
+<span class="fc" id="L430">        Thunk(Callback callback, FutureRecordMetadata future) {</span>
+<span class="fc" id="L431">            this.callback = callback;</span>
+<span class="fc" id="L432">            this.future = future;</span>
+<span class="fc" id="L433">        }</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L438">        return &quot;ProducerBatch(topicPartition=&quot; + topicPartition + &quot;, recordCount=&quot; + recordCount + &quot;)&quot;;</span>
+    }
+
+    boolean hasReachedDeliveryTimeout(long deliveryTimeoutMs, long now) {
+<span class="pc bpc" id="L442" title="1 of 2 branches missed.">        return deliveryTimeoutMs &lt;= now - this.createdMs;</span>
+    }
+
+    public FinalState finalState() {
+<span class="nc" id="L446">        return this.finalState.get();</span>
+    }
+
+    int attempts() {
+<span class="fc" id="L450">        return attempts.get();</span>
+    }
+
+    void reenqueued(long now) {
+<span class="nc" id="L454">        attempts.getAndIncrement();</span>
+<span class="nc" id="L455">        lastAttemptMs = Math.max(lastAppendTime, now);</span>
+<span class="nc" id="L456">        lastAppendTime = Math.max(lastAppendTime, now);</span>
+<span class="nc" id="L457">        retry = true;</span>
+<span class="nc" id="L458">    }</span>
+
+    long queueTimeMs() {
+<span class="fc" id="L461">        return drainedMs - createdMs;</span>
+    }
+
+    long waitedTimeMs(long nowMs) {
+<span class="fc" id="L465">        return Math.max(0, nowMs - lastAttemptMs);</span>
+    }
+
+    void drained(long nowMs) {
+<span class="fc" id="L469">        this.drainedMs = Math.max(drainedMs, nowMs);</span>
+<span class="fc" id="L470">    }</span>
+
+    boolean isSplitBatch() {
+<span class="fc" id="L473">        return isSplitBatch;</span>
+    }
+
+    /**
+     * Returns if the batch is been retried for sending to kafka
+     */
+    public boolean inRetry() {
+<span class="nc" id="L480">        return this.retry;</span>
+    }
+
+    public MemoryRecords records() {
+<span class="fc" id="L484">        return recordsBuilder.build();</span>
+    }
+
+    public int estimatedSizeInBytes() {
+<span class="fc" id="L488">        return recordsBuilder.estimatedSizeInBytes();</span>
+    }
+
+    public double compressionRatio() {
+<span class="fc" id="L492">        return recordsBuilder.compressionRatio();</span>
+    }
+
+    public boolean isFull() {
+<span class="fc" id="L496">        return recordsBuilder.isFull();</span>
+    }
+
+    public void setProducerState(ProducerIdAndEpoch producerIdAndEpoch, int baseSequence, boolean isTransactional) {
+<span class="fc" id="L500">        recordsBuilder.setProducerState(producerIdAndEpoch.producerId, producerIdAndEpoch.epoch, baseSequence, isTransactional);</span>
+<span class="fc" id="L501">    }</span>
+
+    public void resetProducerState(ProducerIdAndEpoch producerIdAndEpoch, int baseSequence) {
+<span class="nc" id="L504">        log.info(&quot;Resetting sequence number of batch with current sequence {} for partition {} to {}&quot;,</span>
+<span class="nc" id="L505">                this.baseSequence(), this.topicPartition, baseSequence);</span>
+<span class="nc" id="L506">        reopened = true;</span>
+<span class="nc" id="L507">        recordsBuilder.reopenAndRewriteProducerState(producerIdAndEpoch.producerId, producerIdAndEpoch.epoch, baseSequence, isTransactional());</span>
+<span class="nc" id="L508">    }</span>
+
+    /**
+     * Release resources required for record appends (e.g. compression buffers). Once this method is called, it's only
+     * possible to update the RecordBatch header.
+     */
+    public void closeForRecordAppends() {
+<span class="nc" id="L515">        recordsBuilder.closeForRecordAppends();</span>
+<span class="nc" id="L516">    }</span>
+
+    public void close() {
+<span class="fc" id="L519">        recordsBuilder.close();</span>
+<span class="pc bpc" id="L520" title="1 of 2 branches missed.">        if (!recordsBuilder.isControlBatch()) {</span>
+<span class="fc" id="L521">            CompressionRatioEstimator.updateEstimation(topicPartition.topic(),</span>
+<span class="fc" id="L522">                                                       recordsBuilder.compression().type(),</span>
+<span class="fc" id="L523">                                                       (float) recordsBuilder.compressionRatio());</span>
+        }
+<span class="fc" id="L525">        reopened = false;</span>
+<span class="fc" id="L526">    }</span>
+
+    /**
+     * Abort the record builder and reset the state of the underlying buffer. This is used prior to aborting
+     * the batch with {@link #abort(RuntimeException)} and ensures that no record previously appended can be
+     * read. This is used in scenarios where we want to ensure a batch ultimately gets aborted, but in which
+     * it is not safe to invoke the completion callbacks (e.g. because we are holding a lock, such as
+     * when aborting batches in {@link RecordAccumulator}).
+     */
+    public void abortRecordAppends() {
+<span class="nc" id="L536">        recordsBuilder.abort();</span>
+<span class="nc" id="L537">    }</span>
+
+    public boolean isClosed() {
+<span class="nc" id="L540">        return recordsBuilder.isClosed();</span>
+    }
+
+    public ByteBuffer buffer() {
+<span class="fc" id="L544">        return recordsBuilder.buffer();</span>
+    }
+
+    public int initialCapacity() {
+<span class="fc" id="L548">        return recordsBuilder.initialCapacity();</span>
+    }
+
+    public boolean isWritable() {
+<span class="nc bnc" id="L552" title="All 2 branches missed.">        return !recordsBuilder.isClosed();</span>
+    }
+
+    public byte magic() {
+<span class="fc" id="L556">        return recordsBuilder.magic();</span>
+    }
+
+    public long producerId() {
+<span class="fc" id="L560">        return recordsBuilder.producerId();</span>
+    }
+
+    public short producerEpoch() {
+<span class="fc" id="L564">        return recordsBuilder.producerEpoch();</span>
+    }
+
+    public int baseSequence() {
+<span class="fc" id="L568">        return recordsBuilder.baseSequence();</span>
+    }
+
+    public int lastSequence() {
+<span class="fc" id="L572">        return recordsBuilder.baseSequence() + recordsBuilder.numRecords() - 1;</span>
+    }
+
+    public boolean hasSequence() {
+<span class="fc bfc" id="L576" title="All 2 branches covered.">        return baseSequence() != RecordBatch.NO_SEQUENCE;</span>
+    }
+
+    public boolean isTransactional() {
+<span class="nc" id="L580">        return recordsBuilder.isTransactional();</span>
+    }
+
+    public boolean sequenceHasBeenReset() {
+<span class="nc" id="L584">        return reopened;</span>
+    }
+
+    public boolean isBufferDeallocated() {
+<span class="fc" id="L588">        return bufferDeallocated;</span>
+    }
+
+    public void markBufferDeallocated() {
+<span class="fc" id="L592">        bufferDeallocated = true;</span>
+<span class="fc" id="L593">    }</span>
+
+    public boolean isInflight() {
+<span class="fc" id="L596">        return inflight;</span>
+    }
+
+    public void setInflight(boolean inflight) {
+<span class="fc" id="L600">        this.inflight = inflight;</span>
+<span class="fc" id="L601">    }</span>
+
+    // VisibleForTesting
+    OptionalInt currentLeaderEpoch() {
+<span class="nc" id="L605">        return currentLeaderEpoch;</span>
+    }
+
+    // VisibleForTesting
+    int attemptsWhenLeaderLastChanged() {
+<span class="nc" id="L610">        return attemptsWhenLeaderLastChanged;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

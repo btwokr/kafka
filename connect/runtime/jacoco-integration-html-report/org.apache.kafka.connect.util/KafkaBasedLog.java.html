@@ -1,0 +1,604 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaBasedLog.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.util</a> &gt; <span class="el_source">KafkaBasedLog.java</span></div><h1>KafkaBasedLog.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.util;
+
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.PartitionInfo;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.errors.WakeupException;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.errors.ConnectException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+
+
+/**
+ * &lt;p&gt;
+ *     KafkaBasedLog provides a generic implementation of a shared, compacted log of records stored in Kafka that all
+ *     clients need to consume and, at times, agree on their offset / that they have read to the end of the log.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ *     This functionality is useful for storing different types of data that all clients may need to agree on --
+ *     offsets or config for example. This class runs a consumer in a background thread to continuously tail the target
+ *     topic, accepts write requests which it writes to the topic using an internal producer, and provides some helpful
+ *     utilities like checking the current log end offset and waiting until the current end of the log is reached.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ *     To support different use cases, this class works with either single- or multi-partition topics.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ *     Since this class is generic, it delegates the details of data storage via a callback that is invoked for each
+ *     record that is consumed from the topic. The invocation of callbacks is guaranteed to be serialized -- if the
+ *     calling class keeps track of state based on the log and only writes to it when consume callbacks are invoked
+ *     and only reads it in {@link #readToEnd(Callback)} callbacks then no additional synchronization will be required.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ *     This is a useful utility that has been used outside of Connect. This isn't in Connect's public API,
+ *     but we've tried to maintain the method signatures and backward compatibility since early Kafka versions.
+ * &lt;/p&gt;
+ */
+public class KafkaBasedLog&lt;K, V&gt; {
+<span class="fc" id="L86">    private static final Logger log = LoggerFactory.getLogger(KafkaBasedLog.class);</span>
+<span class="fc" id="L87">    private static final long CREATE_TOPIC_TIMEOUT_NS = TimeUnit.SECONDS.toNanos(30);</span>
+<span class="fc" id="L88">    private static final long MAX_SLEEP_MS = TimeUnit.SECONDS.toMillis(1);</span>
+    // 15min of admin retry duration to ensure successful metadata propagation.  10 seconds of backoff
+    // in between retries
+<span class="fc" id="L91">    private static final Duration ADMIN_CLIENT_RETRY_DURATION = Duration.ofMinutes(15);</span>
+<span class="fc" id="L92">    private static final long ADMIN_CLIENT_RETRY_BACKOFF_MS = TimeUnit.SECONDS.toMillis(10);</span>
+
+    private final Time time;
+    private final String topic;
+    private int partitionCount;
+    private final Map&lt;String, Object&gt; producerConfigs;
+    private final Map&lt;String, Object&gt; consumerConfigs;
+    private final Callback&lt;ConsumerRecord&lt;K, V&gt;&gt; consumedCallback;
+    private final Supplier&lt;TopicAdmin&gt; topicAdminSupplier;
+    private final boolean requireAdminForOffsets;
+    private Consumer&lt;K, V&gt; consumer;
+    private Optional&lt;Producer&lt;K, V&gt;&gt; producer;
+    private TopicAdmin admin;
+    // Visible for testing
+    Thread thread;
+    private boolean stopRequested;
+    private final Queue&lt;Callback&lt;Void&gt;&gt; readLogEndOffsetCallbacks;
+    private final java.util.function.Consumer&lt;TopicAdmin&gt; initializer;
+    // initialized as false for backward compatibility
+<span class="fc" id="L111">    private volatile boolean reportErrorsToCallback = false;</span>
+
+    /**
+     * Create a new KafkaBasedLog object. This does not start reading the log and writing is not permitted until
+     * {@link #start()} is invoked.
+     *
+     * @param topic              the topic to treat as a log
+     * @param producerConfigs    configuration options to use when creating the internal producer. At a minimum this must
+     *                           contain compatible serializer settings for the generic types used on this class. Some
+     *                           setting, such as the number of acks, will be overridden to ensure correct behavior of this
+     *                           class.
+     * @param consumerConfigs    configuration options to use when creating the internal consumer. At a minimum this must
+     *                           contain compatible serializer settings for the generic types used on this class. Some
+     *                           setting, such as the auto offset reset policy, will be overridden to ensure correct
+     *                           behavior of this class.
+     * @param topicAdminSupplier supplier function for an admin client, the lifecycle of which is expected to be controlled
+     *                           by the calling component; may not be null
+     * @param consumedCallback   callback to invoke for each {@link ConsumerRecord} consumed when tailing the log
+     * @param time               Time interface
+     * @param initializer        the function that should be run when this log is {@link #start() started}; may be null
+     */
+    public KafkaBasedLog(String topic,
+                         Map&lt;String, Object&gt; producerConfigs,
+                         Map&lt;String, Object&gt; consumerConfigs,
+                         Supplier&lt;TopicAdmin&gt; topicAdminSupplier,
+                         Callback&lt;ConsumerRecord&lt;K, V&gt;&gt; consumedCallback,
+                         Time time,
+<span class="fc" id="L138">                         java.util.function.Consumer&lt;TopicAdmin&gt; initializer) {</span>
+<span class="fc" id="L139">        this.topic = topic;</span>
+<span class="fc" id="L140">        this.producerConfigs = producerConfigs;</span>
+<span class="fc" id="L141">        this.consumerConfigs = consumerConfigs;</span>
+<span class="fc" id="L142">        this.topicAdminSupplier = Objects.requireNonNull(topicAdminSupplier);</span>
+<span class="fc" id="L143">        this.consumedCallback = consumedCallback;</span>
+<span class="fc" id="L144">        this.stopRequested = false;</span>
+<span class="fc" id="L145">        this.readLogEndOffsetCallbacks = new ArrayDeque&lt;&gt;();</span>
+<span class="fc" id="L146">        this.time = time;</span>
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">        this.initializer = initializer != null ? initializer : admin -&gt; { };</span>
+        // Initialize the producer Optional here to prevent NPEs later on
+<span class="fc" id="L149">        this.producer = Optional.empty();</span>
+
+        // If the consumer is configured with isolation.level = read_committed, then its end offsets method cannot be relied on
+        // as it will not take records from currently-open transactions into account. We want to err on the side of caution in that
+        // case: when users request a read to the end of the log, we will read up to the point where the latest offsets visible to the
+        // consumer are at least as high as the (possibly-part-of-a-transaction) end offsets of the topic.
+<span class="fc" id="L155">        this.requireAdminForOffsets = IsolationLevel.READ_COMMITTED.toString()</span>
+<span class="fc" id="L156">                .equals(consumerConfigs.get(ConsumerConfig.ISOLATION_LEVEL_CONFIG));</span>
+<span class="fc" id="L157">    }</span>
+
+    /**
+     * Create a new KafkaBasedLog object using pre-existing Kafka clients. This does not start reading the log and writing
+     * is not permitted until {@link #start()} is invoked. Note that the consumer and (if not null) producer given to this log
+     * will be closed when this log is {@link #stop() stopped}.
+     *
+     * @param topic the topic to treat as a log
+     * @param consumer the consumer to use for reading from the log; may not be null
+     * @param producer the producer to use for writing to the log; may be null, which will create a read-only log
+     * @param topicAdmin an admin client, the lifecycle of which is expected to be controlled by the calling component;
+     *                   may not be null
+     * @param consumedCallback   callback to invoke for each {@link ConsumerRecord} consumed when tailing the log
+     * @param time               Time interface
+     * @param initializer        the function that should be run when this log is {@link #start() started}; may be null
+     * @param readTopicPartition A predicate which returns true for each {@link TopicPartition} that should be read
+     * @return a {@link KafkaBasedLog} using the given clients
+     */
+    public static &lt;K, V&gt; KafkaBasedLog&lt;K, V&gt; withExistingClients(String topic,
+                                                                 Consumer&lt;K, V&gt; consumer,
+                                                                 Producer&lt;K, V&gt; producer,
+                                                                 TopicAdmin topicAdmin,
+                                                                 Callback&lt;ConsumerRecord&lt;K, V&gt;&gt; consumedCallback,
+                                                                 Time time,
+                                                                 java.util.function.Consumer&lt;TopicAdmin&gt; initializer,
+                                                                 Predicate&lt;TopicPartition&gt; readTopicPartition
+    ) {
+<span class="nc" id="L184">        Objects.requireNonNull(topicAdmin);</span>
+<span class="nc" id="L185">        Objects.requireNonNull(readTopicPartition);</span>
+<span class="nc" id="L186">        return new KafkaBasedLog&lt;&gt;(topic,</span>
+<span class="nc" id="L187">                Map.of(),</span>
+<span class="nc" id="L188">                Map.of(),</span>
+<span class="nc" id="L189">                () -&gt; topicAdmin,</span>
+                consumedCallback,
+                time,
+<span class="nc" id="L192">                initializer) {</span>
+
+            @Override
+            protected Producer&lt;K, V&gt; createProducer() {
+<span class="nc" id="L196">                return producer;</span>
+            }
+
+            @Override
+            protected Consumer&lt;K, V&gt; createConsumer() {
+<span class="nc" id="L201">                return consumer;</span>
+            }
+
+            @Override
+            protected boolean readPartition(TopicPartition topicPartition) {
+<span class="nc" id="L206">                return readTopicPartition.test(topicPartition);</span>
+            }
+
+            @Override
+            public void stop() {
+<span class="nc" id="L211">                super.stop();</span>
+                // Close the clients here, if the thread that was responsible for closing them was never started.
+<span class="nc" id="L213">                Utils.closeQuietly(producer, &quot;producer&quot;);</span>
+<span class="nc" id="L214">                Utils.closeQuietly(consumer, &quot;consumer&quot;);</span>
+<span class="nc" id="L215">            }</span>
+        };
+    }
+
+    public void start() {
+<span class="fc" id="L220">        start(false);</span>
+<span class="fc" id="L221">    }</span>
+
+    public void start(boolean reportErrorsToCallback) {
+<span class="fc" id="L224">        this.reportErrorsToCallback = reportErrorsToCallback;</span>
+<span class="fc" id="L225">        log.info(&quot;Starting KafkaBasedLog with topic {} reportErrorsToCallback={}&quot;, topic, reportErrorsToCallback);</span>
+
+        // Create the topic admin client and initialize the topic ...
+<span class="fc" id="L228">        admin = topicAdminSupplier.get();   // may be null</span>
+<span class="pc bpc" id="L229" title="3 of 4 branches missed.">        if (admin == null &amp;&amp; requireAdminForOffsets) {</span>
+<span class="nc" id="L230">            throw new ConnectException(</span>
+                    &quot;Must provide a TopicAdmin to KafkaBasedLog when consumer is configured with &quot;
+                            + ConsumerConfig.ISOLATION_LEVEL_CONFIG + &quot; set to &quot;
+                            + IsolationLevel.READ_COMMITTED
+            );
+        }
+<span class="fc" id="L236">        initializer.accept(admin);</span>
+
+        // Then create the producer and consumer
+<span class="fc" id="L239">        producer = Optional.ofNullable(createProducer());</span>
+<span class="pc bpc" id="L240" title="1 of 2 branches missed.">        if (producer.isEmpty())</span>
+<span class="nc" id="L241">            log.trace(&quot;Creating read-only KafkaBasedLog for topic {}&quot;, topic);</span>
+<span class="fc" id="L242">        consumer = createConsumer();</span>
+
+<span class="fc" id="L244">        List&lt;TopicPartition&gt; partitions = new ArrayList&lt;&gt;();</span>
+
+        // We expect that the topics will have been created either manually by the user or automatically by the herder
+<span class="fc" id="L247">        List&lt;PartitionInfo&gt; partitionInfos = consumer.partitionsFor(topic);</span>
+<span class="fc" id="L248">        long started = time.nanoseconds();</span>
+<span class="fc" id="L249">        long sleepMs = 100;</span>
+<span class="pc bpc" id="L250" title="3 of 4 branches missed.">        while (partitionInfos.isEmpty() &amp;&amp; time.nanoseconds() - started &lt; CREATE_TOPIC_TIMEOUT_NS) {</span>
+<span class="nc" id="L251">            time.sleep(sleepMs);</span>
+<span class="nc" id="L252">            sleepMs = Math.min(2 * sleepMs, MAX_SLEEP_MS);</span>
+<span class="nc" id="L253">            partitionInfos = consumer.partitionsFor(topic);</span>
+        }
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">        if (partitionInfos.isEmpty())</span>
+<span class="nc" id="L256">            throw new ConnectException(&quot;Could not look up partition metadata for topic '&quot; + topic + &quot;' in the&quot; +</span>
+                    &quot; allotted period. This could indicate a connectivity issue, unavailable topic partitions, or if&quot; +
+                    &quot; this is your first use of the topic it may have taken too long to create.&quot;);
+
+<span class="fc bfc" id="L260" title="All 2 branches covered.">        for (PartitionInfo partition : partitionInfos) {</span>
+<span class="fc" id="L261">            TopicPartition topicPartition = new TopicPartition(partition.topic(), partition.partition());</span>
+<span class="pc bpc" id="L262" title="1 of 2 branches missed.">            if (readPartition(topicPartition)) {</span>
+<span class="fc" id="L263">                partitions.add(topicPartition);</span>
+            }
+<span class="fc" id="L265">        }</span>
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">        if (partitions.isEmpty()) {</span>
+<span class="nc" id="L267">            throw new ConnectException(&quot;Some partitions for &quot; + topic + &quot; exist, but no partitions matched the &quot; +</span>
+                    &quot;required filter.&quot;);
+        }
+<span class="fc" id="L270">        partitionCount = partitions.size();</span>
+<span class="fc" id="L271">        consumer.assign(partitions);</span>
+
+        // Always consume from the beginning of all partitions. Necessary to ensure that we don't use committed offsets
+        // when a 'group.id' is specified (if offsets happen to have been committed unexpectedly).
+<span class="fc" id="L275">        consumer.seekToBeginning(partitions);</span>
+
+<span class="fc" id="L277">        readToLogEnd(true);</span>
+
+<span class="fc" id="L279">        thread = new WorkThread();</span>
+<span class="fc" id="L280">        thread.start();</span>
+
+<span class="fc" id="L282">        log.info(&quot;Finished reading KafkaBasedLog for topic {}&quot;, topic);</span>
+
+<span class="fc" id="L284">        log.info(&quot;Started KafkaBasedLog for topic {}&quot;, topic);</span>
+<span class="fc" id="L285">    }</span>
+
+    public void stop() {
+<span class="fc" id="L288">        log.info(&quot;Stopping KafkaBasedLog for topic {}&quot;, topic);</span>
+
+<span class="fc" id="L290">        synchronized (this) {</span>
+<span class="fc" id="L291">            stopRequested = true;</span>
+<span class="fc" id="L292">        }</span>
+<span class="pc bpc" id="L293" title="1 of 2 branches missed.">        if (consumer != null) {</span>
+<span class="fc" id="L294">            consumer.wakeup();</span>
+        }
+
+<span class="pc bpc" id="L297" title="1 of 2 branches missed.">        if (thread != null) {</span>
+            try {
+<span class="fc" id="L299">                thread.join();</span>
+<span class="nc" id="L300">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L301">                throw new ConnectException(&quot;Failed to stop KafkaBasedLog. Exiting without cleanly shutting &quot; +</span>
+                        &quot;down it's producer and consumer.&quot;, e);
+<span class="fc" id="L303">            }</span>
+        }
+
+<span class="fc" id="L306">        producer.ifPresent(p -&gt; Utils.closeQuietly(p, &quot;KafkaBasedLog producer for topic &quot; + topic));</span>
+<span class="fc" id="L307">        Utils.closeQuietly(consumer, &quot;KafkaBasedLog consumer for topic &quot; + topic);</span>
+
+        // do not close the admin client, since we don't own it
+<span class="fc" id="L310">        admin = null;</span>
+
+<span class="fc" id="L312">        log.info(&quot;Stopped KafkaBasedLog for topic {}&quot;, topic);</span>
+<span class="fc" id="L313">    }</span>
+
+    /**
+     * Flushes any outstanding writes and then reads to the current end of the log and invokes the specified callback.
+     * Note that this checks the current offsets, reads to them, and invokes the callback regardless of whether
+     * additional records have been written to the log. If the caller needs to ensure they have truly reached the end
+     * of the log, they must ensure there are no other writers during this period.
+     * &lt;p&gt;
+     * This waits until the end of all partitions has been reached.
+     * &lt;p&gt;
+     * This method is asynchronous. If you need a synchronous version, pass an instance of
+     * {@link org.apache.kafka.connect.util.FutureCallback} as the {@code callback} parameter and wait on it to block.
+     *
+     * @param callback the callback to invoke once the end of the log has been reached.
+     */
+    public void readToEnd(Callback&lt;Void&gt; callback) {
+<span class="fc" id="L329">        log.trace(&quot;Starting read to end log for topic {}&quot;, topic);</span>
+<span class="fc" id="L330">        flush();</span>
+<span class="fc" id="L331">        synchronized (this) {</span>
+<span class="fc" id="L332">            readLogEndOffsetCallbacks.add(callback);</span>
+<span class="fc" id="L333">        }</span>
+<span class="fc" id="L334">        consumer.wakeup();</span>
+<span class="fc" id="L335">    }</span>
+
+    /**
+     * Flush the underlying producer to ensure that all pending writes have been sent.
+     */
+    public void flush() {
+<span class="fc" id="L341">        producer.ifPresent(Producer::flush);</span>
+<span class="fc" id="L342">    }</span>
+
+    /**
+     * Same as {@link #readToEnd(Callback)} but provides a {@link Future} instead of using a callback.
+     * @return the future associated with the operation
+     */
+    public Future&lt;Void&gt; readToEnd() {
+<span class="fc" id="L349">        FutureCallback&lt;Void&gt; future = new FutureCallback&lt;&gt;(null);</span>
+<span class="fc" id="L350">        readToEnd(future);</span>
+<span class="fc" id="L351">        return future;</span>
+    }
+
+    /**
+     * Send a record asynchronously to the configured {@link #topic} without using a producer callback.
+     * &lt;p&gt;
+     * This method exists for backward compatibility reasons and delegates to the newer
+     * {@link #sendWithReceipt(Object, Object)} method that returns a future.
+     * @param key the key for the {@link ProducerRecord}
+     * @param value the value for the {@link ProducerRecord}
+     */
+    public void send(K key, V value) {
+<span class="nc" id="L363">        sendWithReceipt(key, value);</span>
+<span class="nc" id="L364">    }</span>
+
+    /**
+     * Send a record asynchronously to the configured {@link #topic}.
+     * &lt;p&gt;
+     * This method exists for backward compatibility reasons and delegates to the newer
+     * {@link #sendWithReceipt(Object, Object, org.apache.kafka.clients.producer.Callback)} method that returns a future.
+     * @param key the key for the {@link ProducerRecord}
+     * @param value the value for the {@link ProducerRecord}
+     * @param callback the callback to invoke after completion; can be null if no callback is desired
+     */
+    public void send(K key, V value, org.apache.kafka.clients.producer.Callback callback) {
+<span class="fc" id="L376">        sendWithReceipt(key, value, callback);</span>
+<span class="fc" id="L377">    }</span>
+
+    /**
+     * Send a record asynchronously to the configured {@link #topic} without using a producer callback.
+     * @param key the key for the {@link ProducerRecord}
+     * @param value the value for the {@link ProducerRecord}
+     *
+     * @return the future from the call to {@link Producer#send}. {@link Future#get} can be called on this returned
+     *         future if synchronous behavior is desired.
+     */
+    public Future&lt;RecordMetadata&gt; sendWithReceipt(K key, V value) {
+<span class="fc" id="L388">        return sendWithReceipt(key, value, null);</span>
+    }
+
+    /**
+     * Send a record asynchronously to the configured {@link #topic}.
+     * @param key the key for the {@link ProducerRecord}
+     * @param value the value for the {@link ProducerRecord}
+     * @param callback the callback to invoke after completion; can be null if no callback is desired
+     *
+     * @return the future from the call to {@link Producer#send}. {@link Future#get} can be called on this returned
+     *         future if synchronous behavior is desired.
+     */
+    public Future&lt;RecordMetadata&gt; sendWithReceipt(K key, V value, org.apache.kafka.clients.producer.Callback callback) {
+<span class="fc" id="L401">        return producer.orElseThrow(() -&gt;</span>
+<span class="nc" id="L402">                new IllegalStateException(&quot;This KafkaBasedLog was created in read-only mode and does not support write operations&quot;)</span>
+<span class="fc" id="L403">        ).send(new ProducerRecord&lt;&gt;(topic, key, value), callback);</span>
+    }
+
+    public int partitionCount() {
+<span class="fc" id="L407">        return partitionCount;</span>
+    }
+
+    protected Producer&lt;K, V&gt; createProducer() {
+        // Always require producer acks to all to ensure durable writes
+<span class="fc" id="L412">        producerConfigs.put(ProducerConfig.ACKS_CONFIG, &quot;all&quot;);</span>
+
+        // Don't allow more than one in-flight request to prevent reordering on retry (if enabled)
+<span class="fc" id="L415">        producerConfigs.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 1);</span>
+<span class="fc" id="L416">        return new KafkaProducer&lt;&gt;(producerConfigs);</span>
+    }
+
+    protected Consumer&lt;K, V&gt; createConsumer() {
+        // Always force reset to the beginning of the log since this class wants to consume all available log data
+<span class="fc" id="L421">        consumerConfigs.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, &quot;earliest&quot;);</span>
+
+        // Turn off autocommit since we always want to consume the full log
+<span class="fc" id="L424">        consumerConfigs.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);</span>
+<span class="fc" id="L425">        return new KafkaConsumer&lt;&gt;(consumerConfigs);</span>
+    }
+
+    /**
+     * Signals whether a topic partition should be read by this log. Invoked on {@link #start() startup} once
+     * for every partition found in the log's backing topic.
+     * &lt;p&gt;This method can be overridden by subclasses when only a subset of the assigned partitions
+     * should be read into memory. By default, all partitions are read.
+     * @param topicPartition A topic partition which could be read by this log.
+     * @return true if the partition should be read by this log, false if its contents should be ignored.
+     */
+    protected boolean readPartition(TopicPartition topicPartition) {
+<span class="fc" id="L437">        return true;</span>
+    }
+
+    private void poll() {
+        try {
+<span class="fc" id="L442">            ConsumerRecords&lt;K, V&gt; records = consumer.poll(Duration.ofMillis(Integer.MAX_VALUE));</span>
+<span class="fc bfc" id="L443" title="All 2 branches covered.">            for (ConsumerRecord&lt;K, V&gt; record : records)</span>
+<span class="fc" id="L444">                consumedCallback.onCompletion(null, record);</span>
+<span class="fc" id="L445">        } catch (WakeupException e) {</span>
+            // Expected on get() or stop(). The calling code should handle this
+<span class="fc" id="L447">            throw e;</span>
+<span class="nc" id="L448">        } catch (KafkaException e) {</span>
+<span class="nc" id="L449">            log.error(&quot;Error polling: &quot;, e);</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">            if (reportErrorsToCallback) {</span>
+<span class="nc" id="L451">                consumedCallback.onCompletion(e, null);</span>
+            }
+<span class="fc" id="L453">        }</span>
+<span class="fc" id="L454">    }</span>
+
+    /**
+     * This method finds the end offsets of the Kafka log's topic partitions, optionally retrying
+     * if the {@code listOffsets()} method of the admin client throws a {@link RetriableException}.
+     *
+     * @param shouldRetry Boolean flag to enable retry for the admin client {@code listOffsets()} call.
+     * @see TopicAdmin#retryEndOffsets
+     */
+    private void readToLogEnd(boolean shouldRetry) {
+<span class="fc" id="L464">        Set&lt;TopicPartition&gt; assignment = consumer.assignment();</span>
+<span class="fc" id="L465">        Map&lt;TopicPartition, Long&gt; endOffsets = readEndOffsets(assignment, shouldRetry);</span>
+<span class="fc" id="L466">        log.trace(&quot;Reading to end of log offsets {}&quot;, endOffsets);</span>
+
+<span class="fc bfc" id="L468" title="All 2 branches covered.">        while (!endOffsets.isEmpty()) {</span>
+<span class="fc" id="L469">            Iterator&lt;Map.Entry&lt;TopicPartition, Long&gt;&gt; it = endOffsets.entrySet().iterator();</span>
+<span class="fc bfc" id="L470" title="All 2 branches covered.">            while (it.hasNext()) {</span>
+<span class="fc" id="L471">                Map.Entry&lt;TopicPartition, Long&gt; entry = it.next();</span>
+<span class="fc" id="L472">                TopicPartition topicPartition = entry.getKey();</span>
+<span class="fc" id="L473">                long endOffset = entry.getValue();</span>
+<span class="fc" id="L474">                long lastConsumedOffset = consumer.position(topicPartition);</span>
+<span class="fc bfc" id="L475" title="All 2 branches covered.">                if (lastConsumedOffset &gt;= endOffset) {</span>
+<span class="fc" id="L476">                    log.trace(&quot;Read to end offset {} for {}&quot;, endOffset, topicPartition);</span>
+<span class="fc" id="L477">                    it.remove();</span>
+                } else {
+<span class="fc" id="L479">                    log.trace(&quot;Behind end offset {} for {}; last-read offset is {}&quot;,</span>
+<span class="fc" id="L480">                            endOffset, topicPartition, lastConsumedOffset);</span>
+<span class="fc" id="L481">                    poll();</span>
+<span class="fc" id="L482">                    break;</span>
+                }
+<span class="fc" id="L484">            }</span>
+<span class="fc" id="L485">        }</span>
+<span class="fc" id="L486">    }</span>
+
+    // Visible for testing
+    /**
+     * Read to the end of the given list of topic partitions
+     * @param assignment the topic partitions to read to the end of
+     * @param shouldRetry boolean flag to enable retry for the admin client {@code listOffsets()} call.
+     * @throws UnsupportedVersionException if the log's consumer is using the &quot;read_committed&quot; isolation level (and
+     * therefore a separate admin client is required to read end offsets for the topic), but the broker does not support
+     * reading end offsets using an admin client
+     */
+    Map&lt;TopicPartition, Long&gt; readEndOffsets(Set&lt;TopicPartition&gt; assignment, boolean shouldRetry) throws UnsupportedVersionException {
+<span class="fc" id="L498">        log.trace(&quot;Reading to end of offset log&quot;);</span>
+
+        // Note that we'd prefer to not use the consumer to find the end offsets for the assigned topic partitions.
+        // That is because it's possible that the consumer is already blocked waiting for new records to appear, when
+        // the consumer is already at the end. In such cases, using 'consumer.endOffsets(...)' will block until at least
+        // one more record becomes available, meaning we can't even check whether we're at the end offset.
+        // Since all we're trying to do here is get the end offset, we should use the supplied admin client
+        // (if available) to obtain the end offsets for the given topic partitions.
+
+        // Deprecated constructors do not provide an admin supplier, so the admin is potentially null.
+<span class="pc bpc" id="L508" title="1 of 2 branches missed.">        if (admin != null) {</span>
+            // Use the admin client to immediately find the end offsets for the assigned topic partitions.
+            // Unlike using the consumer
+            try {
+<span class="fc bfc" id="L512" title="All 2 branches covered.">                if (shouldRetry) {</span>
+<span class="fc" id="L513">                    return admin.retryEndOffsets(assignment,</span>
+                            ADMIN_CLIENT_RETRY_DURATION,
+                            ADMIN_CLIENT_RETRY_BACKOFF_MS);
+                }
+
+<span class="fc" id="L518">                return admin.endOffsets(assignment);</span>
+<span class="nc" id="L519">            } catch (UnsupportedVersionException e) {</span>
+                // This may happen with really old brokers that don't support the auto topic creation
+                // field in metadata requests
+<span class="nc bnc" id="L522" title="All 2 branches missed.">                if (requireAdminForOffsets) {</span>
+                    // Should be handled by the caller during log startup
+<span class="nc" id="L524">                    throw e;</span>
+                }
+<span class="nc" id="L526">                log.debug(&quot;Reading to end of log offsets with consumer since admin client is unsupported: {}&quot;, e.getMessage());</span>
+                // Forget the reference to the admin so that we won't even try to use the admin the next time this method is called
+<span class="nc" id="L528">                admin = null;</span>
+                // continue and let the consumer handle the read
+            }
+            // Other errors, like timeouts and retriable exceptions are intentionally propagated
+        }
+        // The admin may be null if older deprecated constructor is used or if the admin client is using a broker that doesn't
+        // support getting the end offsets (e.g., 0.10.x). In such cases, we should use the consumer, which is not ideal (see above).
+<span class="nc" id="L535">        return consumer.endOffsets(assignment);</span>
+    }
+
+    private class WorkThread extends Thread {
+<span class="fc" id="L539">        public WorkThread() {</span>
+<span class="fc" id="L540">            super(&quot;KafkaBasedLog Work Thread - &quot; + topic);</span>
+<span class="fc" id="L541">        }</span>
+        @Override
+        public void run() {
+<span class="fc" id="L544">            log.trace(&quot;{} started execution&quot;, this);</span>
+            while (true) {
+<span class="fc" id="L546">                int numCallbacks = 0;</span>
+                try {
+<span class="fc" id="L548">                    synchronized (KafkaBasedLog.this) {</span>
+<span class="fc bfc" id="L549" title="All 2 branches covered.">                        if (stopRequested)</span>
+<span class="fc" id="L550">                            break;</span>
+<span class="fc" id="L551">                        numCallbacks = readLogEndOffsetCallbacks.size();</span>
+<span class="fc" id="L552">                    }</span>
+
+<span class="fc bfc" id="L554" title="All 2 branches covered.">                    if (numCallbacks &gt; 0) {</span>
+                        try {
+<span class="fc" id="L556">                            readToLogEnd(false);</span>
+<span class="fc" id="L557">                            log.trace(&quot;Finished read to end log for topic {}&quot;, topic);</span>
+<span class="nc" id="L558">                        } catch (TimeoutException e) {</span>
+<span class="nc" id="L559">                            log.warn(&quot;Timeout while reading log to end for topic '{}'. Retrying automatically. &quot; +</span>
+<span class="nc" id="L560">                                &quot;This may occur when brokers are unavailable or unreachable. Reason: {}&quot;, topic, e.getMessage());</span>
+<span class="nc" id="L561">                            continue;</span>
+<span class="nc" id="L562">                        } catch (RetriableException | org.apache.kafka.connect.errors.RetriableException e) {</span>
+<span class="nc" id="L563">                            log.warn(&quot;Retriable error while reading log to end for topic '{}'. Retrying automatically. &quot; +</span>
+<span class="nc" id="L564">                                &quot;Reason: {}&quot;, topic, e.getMessage());</span>
+<span class="nc" id="L565">                            continue;</span>
+<span class="nc" id="L566">                        } catch (WakeupException e) {</span>
+                            // Either received another get() call and need to retry reading to end of log or stop() was
+                            // called. Both are handled by restarting this loop.
+<span class="nc" id="L569">                            continue;</span>
+<span class="fc" id="L570">                        }</span>
+                    }
+
+<span class="fc" id="L573">                    synchronized (KafkaBasedLog.this) {</span>
+                        // Only invoke exactly the number of callbacks we found before triggering the read to log end
+                        // since it is possible for another write + readToEnd to sneak in the meantime
+<span class="fc bfc" id="L576" title="All 2 branches covered.">                        for (int i = 0; i &lt; numCallbacks; i++) {</span>
+<span class="fc" id="L577">                            Callback&lt;Void&gt; cb = readLogEndOffsetCallbacks.poll();</span>
+<span class="fc" id="L578">                            cb.onCompletion(null, null);</span>
+                        }
+<span class="fc" id="L580">                    }</span>
+
+                    try {
+<span class="fc" id="L583">                        poll();</span>
+<span class="fc" id="L584">                    } catch (WakeupException e) {</span>
+                        // See previous comment, both possible causes of this wakeup are handled by starting this loop again
+<span class="fc" id="L586">                        continue;</span>
+<span class="fc" id="L587">                    }</span>
+<span class="nc" id="L588">                } catch (Throwable t) {</span>
+<span class="nc" id="L589">                    log.error(&quot;Unexpected exception in {}&quot;, this, t);</span>
+<span class="nc" id="L590">                    synchronized (KafkaBasedLog.this) {</span>
+                        // Only fail exactly the number of callbacks we found before triggering the read to log end
+                        // since it is possible for another write + readToEnd to sneak in the meantime which we don't
+                        // want to fail.
+<span class="nc bnc" id="L594" title="All 2 branches missed.">                        for (int i = 0; i &lt; numCallbacks; i++) {</span>
+<span class="nc" id="L595">                            Callback&lt;Void&gt; cb = readLogEndOffsetCallbacks.poll();</span>
+<span class="nc" id="L596">                            cb.onCompletion(t, null);</span>
+                        }
+<span class="nc" id="L598">                    }</span>
+<span class="fc" id="L599">                }</span>
+<span class="fc" id="L600">            }</span>
+<span class="fc" id="L601">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

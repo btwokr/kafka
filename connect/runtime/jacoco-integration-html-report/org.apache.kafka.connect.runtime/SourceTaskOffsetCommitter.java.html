@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SourceTaskOffsetCommitter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">SourceTaskOffsetCommitter.java</span></div><h1>SourceTaskOffsetCommitter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.common.utils.internals.ThreadUtils;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.source.SourceTask;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+import org.apache.kafka.connect.util.LoggingContext;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * &lt;p&gt;
+ * Manages offset commit scheduling and execution for {@link SourceTask}s.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Unlike sink tasks which directly manage their offset commits in the main poll() thread since
+ * they drive the event loop and control (for all intents and purposes) the timeouts, source
+ * tasks are at the whim of the connector and cannot be guaranteed to wake up on the necessary
+ * schedule. Instead, this class tracks all the active tasks, their schedule for commits, and
+ * ensures they are invoked in a timely fashion.
+ * &lt;/p&gt;
+ */
+class SourceTaskOffsetCommitter {
+<span class="fc" id="L50">    private static final Logger log = LoggerFactory.getLogger(SourceTaskOffsetCommitter.class);</span>
+
+    private final WorkerConfig config;
+    private final ScheduledExecutorService commitExecutorService;
+    private final ConcurrentMap&lt;ConnectorTaskId, ScheduledFuture&lt;?&gt;&gt; committers;
+
+    // visible for testing
+    SourceTaskOffsetCommitter(WorkerConfig config,
+                              ScheduledExecutorService commitExecutorService,
+<span class="fc" id="L59">                              ConcurrentMap&lt;ConnectorTaskId, ScheduledFuture&lt;?&gt;&gt; committers) {</span>
+<span class="fc" id="L60">        this.config = config;</span>
+<span class="fc" id="L61">        this.commitExecutorService = commitExecutorService;</span>
+<span class="fc" id="L62">        this.committers = committers;</span>
+<span class="fc" id="L63">    }</span>
+
+    public SourceTaskOffsetCommitter(WorkerConfig config) {
+<span class="fc" id="L66">        this(config, Executors.newSingleThreadScheduledExecutor(ThreadUtils.createThreadFactory(</span>
+<span class="fc" id="L67">                SourceTaskOffsetCommitter.class.getSimpleName() + &quot;-%d&quot;, false)),</span>
+                new ConcurrentHashMap&lt;&gt;());
+<span class="fc" id="L69">    }</span>
+
+    public void close(long timeoutMs) {
+<span class="fc" id="L72">        ThreadUtils.shutdownExecutorServiceQuietly(commitExecutorService, timeoutMs, TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L73">    }</span>
+
+    public void schedule(final ConnectorTaskId id, final WorkerSourceTask workerTask) {
+<span class="fc" id="L76">        long commitIntervalMs = config.getLong(WorkerConfig.OFFSET_COMMIT_INTERVAL_MS_CONFIG);</span>
+<span class="fc" id="L77">        ScheduledFuture&lt;?&gt; commitFuture = commitExecutorService.scheduleWithFixedDelay(() -&gt; {</span>
+<span class="nc" id="L78">            try (LoggingContext loggingContext = LoggingContext.forOffsets(id)) {</span>
+<span class="nc" id="L79">                commit(workerTask);</span>
+            }
+<span class="nc" id="L81">        }, commitIntervalMs, commitIntervalMs, TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L82">        committers.put(id, commitFuture);</span>
+<span class="fc" id="L83">    }</span>
+
+    public void remove(ConnectorTaskId id) {
+<span class="fc" id="L86">        final ScheduledFuture&lt;?&gt; task = committers.remove(id);</span>
+<span class="pc bpc" id="L87" title="1 of 2 branches missed.">        if (task == null)</span>
+<span class="nc" id="L88">            return;</span>
+
+<span class="fc" id="L90">        try (LoggingContext loggingContext = LoggingContext.forTask(id)) {</span>
+<span class="fc" id="L91">            task.cancel(false);</span>
+<span class="pc bpc" id="L92" title="1 of 2 branches missed.">            if (!task.isDone())</span>
+<span class="nc" id="L93">                task.get();</span>
+<span class="nc" id="L94">        } catch (CancellationException e) {</span>
+            // ignore
+<span class="nc" id="L96">            log.trace(&quot;Offset commit thread was cancelled by another thread while removing connector task with id: {}&quot;, id);</span>
+<span class="nc" id="L97">        } catch (ExecutionException | InterruptedException e) {</span>
+<span class="nc" id="L98">            throw new ConnectException(&quot;Unexpected interruption in SourceTaskOffsetCommitter while removing task with id: &quot; + id, e);</span>
+<span class="pc" id="L99">        }</span>
+<span class="fc" id="L100">    }</span>
+
+    // Visible for testing
+    static void commit(WorkerSourceTask workerTask) {
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        if (!workerTask.shouldCommitOffsets()) {</span>
+<span class="nc" id="L105">            log.trace(&quot;{} Skipping offset commit as there are no offsets that should be committed&quot;, workerTask);</span>
+<span class="nc" id="L106">            return;</span>
+        }
+
+<span class="nc" id="L109">        log.debug(&quot;{} Committing offsets&quot;, workerTask);</span>
+        try {
+<span class="nc bnc" id="L111" title="All 2 branches missed.">            if (workerTask.commitOffsets()) {</span>
+<span class="nc" id="L112">                return;</span>
+            }
+<span class="nc" id="L114">            log.error(&quot;{} Failed to commit offsets&quot;, workerTask);</span>
+<span class="nc" id="L115">        } catch (Throwable t) {</span>
+            // We're very careful about exceptions here since any uncaught exceptions in the commit
+            // thread would cause the fixed interval schedule on the ExecutorService to stop running
+            // for that task
+<span class="nc" id="L119">            log.error(&quot;{} Unhandled exception when committing: &quot;, workerTask, t);</span>
+<span class="nc" id="L120">        }</span>
+<span class="nc" id="L121">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

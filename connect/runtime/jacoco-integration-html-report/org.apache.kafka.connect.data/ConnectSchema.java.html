@@ -1,0 +1,368 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConnectSchema.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.data</a> &gt; <span class="el_source">ConnectSchema.java</span></div><h1>ConnectSchema.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.data;
+
+import org.apache.kafka.connect.errors.DataException;
+
+import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.EnumMap;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+public class ConnectSchema implements Schema {
+    /**
+     * Maps {@link Schema.Type}s to a list of Java classes that can be used to represent them.
+     */
+<span class="fc" id="L35">    private static final Map&lt;Type, List&lt;Class&lt;?&gt;&gt;&gt; SCHEMA_TYPE_CLASSES = Collections.unmodifiableMap(new EnumMap&lt;&gt;(Map.ofEntries(</span>
+<span class="fc" id="L36">        Map.entry(Type.INT8, List.of(Byte.class)),</span>
+<span class="fc" id="L37">        Map.entry(Type.INT16, List.of(Short.class)),</span>
+<span class="fc" id="L38">        Map.entry(Type.INT32, List.of(Integer.class)),</span>
+<span class="fc" id="L39">        Map.entry(Type.INT64, List.of(Long.class)),</span>
+<span class="fc" id="L40">        Map.entry(Type.FLOAT32, List.of(Float.class)),</span>
+<span class="fc" id="L41">        Map.entry(Type.FLOAT64, List.of(Double.class)),</span>
+<span class="fc" id="L42">        Map.entry(Type.BOOLEAN, List.of(Boolean.class)),</span>
+<span class="fc" id="L43">        Map.entry(Type.STRING, List.of(String.class)),</span>
+        // Bytes are special and have 2 representations. byte[] causes problems because it doesn't handle equals() and
+        // hashCode() like we want objects to, so we support both byte[] and ByteBuffer. Using plain byte[] can cause
+        // those methods to fail, so ByteBuffers are recommended
+<span class="fc" id="L47">        Map.entry(Type.BYTES, List.of(byte[].class, ByteBuffer.class)),</span>
+<span class="fc" id="L48">        Map.entry(Type.ARRAY, List.of(List.class)),</span>
+<span class="fc" id="L49">        Map.entry(Type.MAP, List.of(Map.class)),</span>
+<span class="fc" id="L50">        Map.entry(Type.STRUCT, List.of(Struct.class))</span>
+    )));
+    /**
+     * Maps known logical types to a list of Java classes that can be used to represent them.
+     */
+    // We don't need to put these into JAVA_CLASS_SCHEMA_TYPES since that's only used to determine schemas for
+    // schemaless data and logical types will have ambiguous schemas (e.g. many of them use the same Java class) so
+    // they should not be used without schemas.
+<span class="fc" id="L58">    private static final Map&lt;String, List&lt;Class&lt;?&gt;&gt;&gt; LOGICAL_TYPE_CLASSES = Map.of(</span>
+<span class="fc" id="L59">        Decimal.LOGICAL_NAME, List.of(BigDecimal.class),</span>
+<span class="fc" id="L60">        Date.LOGICAL_NAME, List.of(java.util.Date.class),</span>
+<span class="fc" id="L61">        Time.LOGICAL_NAME, List.of(java.util.Date.class),</span>
+<span class="fc" id="L62">        Timestamp.LOGICAL_NAME, List.of(java.util.Date.class)</span>
+    );
+
+    /**
+     * Maps the Java classes to the corresponding {@link Schema.Type}.
+     */
+<span class="fc" id="L68">    private static final Map&lt;Class&lt;?&gt;, Type&gt; JAVA_CLASS_SCHEMA_TYPES = SCHEMA_TYPE_CLASSES.entrySet()</span>
+<span class="fc" id="L69">        .stream()</span>
+<span class="fc" id="L70">        .flatMap(entry -&gt; entry.getValue().stream().map(klass -&gt; Map.entry(klass, entry.getKey())))</span>
+<span class="fc" id="L71">        .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+
+    // The type of the field
+    private final Type type;
+    private final boolean optional;
+    private final Object defaultValue;
+
+    private final List&lt;Field&gt; fields;
+    private final Map&lt;String, Field&gt; fieldsByName;
+
+    private final Schema keySchema;
+    private final Schema valueSchema;
+
+    // Optional name and version provide a built-in way to indicate what type of data is included. Most
+    // useful for structs to indicate the semantics of the struct and map it to some existing underlying
+    // serializer-specific schema. However, can also be useful in specifying other logical types (e.g. a set is an array
+    // with additional constraints).
+    private final String name;
+    private final Integer version;
+    // Optional human readable documentation describing this schema.
+    private final String doc;
+    private final Map&lt;String, String&gt; parameters;
+    // precomputed hash code. There is no need to re-compute every time hashCode() is called.
+<span class="fc" id="L94">    private Integer hash = null;</span>
+
+    /**
+     * Construct a Schema. Most users should not construct schemas manually, preferring {@link SchemaBuilder} instead.
+     */
+<span class="fc" id="L99">    public ConnectSchema(Type type, boolean optional, Object defaultValue, String name, Integer version, String doc, Map&lt;String, String&gt; parameters, List&lt;Field&gt; fields, Schema keySchema, Schema valueSchema) {</span>
+<span class="fc" id="L100">        this.type = type;</span>
+<span class="fc" id="L101">        this.optional = optional;</span>
+<span class="fc" id="L102">        this.defaultValue = defaultValue;</span>
+<span class="fc" id="L103">        this.name = name;</span>
+<span class="fc" id="L104">        this.version = version;</span>
+<span class="fc" id="L105">        this.doc = doc;</span>
+<span class="fc" id="L106">        this.parameters = parameters;</span>
+
+<span class="fc bfc" id="L108" title="All 2 branches covered.">        if (this.type == Type.STRUCT) {</span>
+<span class="pc bpc" id="L109" title="1 of 2 branches missed.">            this.fields = fields == null ? List.of() : fields;</span>
+<span class="fc" id="L110">            this.fieldsByName = new HashMap&lt;&gt;(this.fields.size());</span>
+<span class="fc bfc" id="L111" title="All 2 branches covered.">            for (Field field : this.fields)</span>
+<span class="fc" id="L112">                fieldsByName.put(field.name(), field);</span>
+        } else {
+<span class="fc" id="L114">            this.fields = null;</span>
+<span class="fc" id="L115">            this.fieldsByName = null;</span>
+        }
+
+<span class="fc" id="L118">        this.keySchema = keySchema;</span>
+<span class="fc" id="L119">        this.valueSchema = valueSchema;</span>
+<span class="fc" id="L120">    }</span>
+
+    /**
+     * Construct a Schema for a primitive type, setting schema parameters, struct fields, and key and value schemas to null.
+     */
+    public ConnectSchema(Type type, boolean optional, Object defaultValue, String name, Integer version, String doc) {
+<span class="nc" id="L126">        this(type, optional, defaultValue, name, version, doc, null, null, null, null);</span>
+<span class="nc" id="L127">    }</span>
+
+    /**
+     * Construct a default schema for a primitive type. The schema is required, has no default value, name, version,
+     * or documentation.
+     */
+    public ConnectSchema(Type type) {
+<span class="nc" id="L134">        this(type, false, null, null, null, null);</span>
+<span class="nc" id="L135">    }</span>
+
+    @Override
+    public Type type() {
+<span class="fc" id="L139">        return type;</span>
+    }
+
+    @Override
+    public boolean isOptional() {
+<span class="fc" id="L144">        return optional;</span>
+    }
+
+    @Override
+    public Object defaultValue() {
+<span class="fc" id="L149">        return defaultValue;</span>
+    }
+
+    @Override
+    public String name() {
+<span class="fc" id="L154">        return name;</span>
+    }
+
+    @Override
+    public Integer version() {
+<span class="nc" id="L159">        return version;</span>
+    }
+
+    @Override
+    public String doc() {
+<span class="nc" id="L164">        return doc;</span>
+    }
+
+    @Override
+    public Map&lt;String, String&gt; parameters() {
+<span class="nc" id="L169">        return parameters;</span>
+    }
+
+    @Override
+    public List&lt;Field&gt; fields() {
+<span class="pc bpc" id="L174" title="1 of 2 branches missed.">        if (type != Type.STRUCT)</span>
+<span class="nc" id="L175">            throw new DataException(&quot;Cannot list fields on non-struct type&quot;);</span>
+<span class="fc" id="L176">        return fields;</span>
+    }
+
+    @Override
+    public Field field(String fieldName) {
+<span class="pc bpc" id="L181" title="1 of 2 branches missed.">        if (type != Type.STRUCT)</span>
+<span class="nc" id="L182">            throw new DataException(&quot;Cannot look up fields on non-struct type&quot;);</span>
+<span class="fc" id="L183">        return fieldsByName.get(fieldName);</span>
+    }
+
+    @Override
+    public Schema keySchema() {
+<span class="pc bpc" id="L188" title="1 of 2 branches missed.">        if (type != Type.MAP)</span>
+<span class="nc" id="L189">            throw new DataException(&quot;Cannot look up key schema on non-map type&quot;);</span>
+<span class="fc" id="L190">        return keySchema;</span>
+    }
+
+    @Override
+    public Schema valueSchema() {
+<span class="pc bpc" id="L195" title="3 of 4 branches missed.">        if (type != Type.MAP &amp;&amp; type != Type.ARRAY)</span>
+<span class="nc" id="L196">            throw new DataException(&quot;Cannot look up value schema on non-array and non-map type&quot;);</span>
+<span class="fc" id="L197">        return valueSchema;</span>
+    }
+
+
+
+    /**
+     * Validate that the value can be used with the schema, i.e. that its type matches the schema type and nullability
+     * requirements. Throws a {@link DataException} if the value is invalid.
+     * @param schema Schema to test
+     * @param value value to test
+     */
+    public static void validateValue(Schema schema, Object value) {
+<span class="nc" id="L209">        validateValue(null, schema, value);</span>
+<span class="nc" id="L210">    }</span>
+
+    public static void validateValue(String field, Schema schema, Object value) {
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">        validateValue(schema, value, field == null ? &quot;value&quot; : &quot;field: \&quot;&quot; + field + &quot;\&quot;&quot;);</span>
+<span class="fc" id="L214">    }</span>
+
+    private static void validateValue(Schema schema, Object value, String location) {
+<span class="fc bfc" id="L217" title="All 2 branches covered.">        if (value == null) {</span>
+<span class="pc bpc" id="L218" title="1 of 2 branches missed.">            if (!schema.isOptional())</span>
+<span class="nc" id="L219">                throw new DataException(&quot;Invalid value: null used for required &quot; + location</span>
+<span class="nc" id="L220">                        + &quot;, schema type: &quot; + schema.type());</span>
+<span class="fc" id="L221">            return;</span>
+        }
+
+<span class="fc" id="L224">        List&lt;Class&lt;?&gt;&gt; expectedClasses = expectedClassesFor(schema);</span>
+<span class="fc" id="L225">        boolean foundMatch = false;</span>
+<span class="pc bpc" id="L226" title="1 of 2 branches missed.">        for (Class&lt;?&gt; expectedClass : expectedClasses) {</span>
+<span class="pc bpc" id="L227" title="1 of 2 branches missed.">            if (expectedClass.isInstance(value)) {</span>
+<span class="fc" id="L228">                foundMatch = true;</span>
+<span class="fc" id="L229">                break;</span>
+            }
+<span class="nc" id="L231">        }</span>
+
+<span class="pc bpc" id="L233" title="1 of 2 branches missed.">        if (!foundMatch) {</span>
+<span class="nc" id="L234">            StringBuilder exceptionMessage = new StringBuilder(&quot;Invalid Java object for schema&quot;);</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">            if (schema.name() != null) {</span>
+<span class="nc" id="L236">                exceptionMessage.append(&quot; \&quot;&quot;).append(schema.name()).append(&quot;\&quot;&quot;);</span>
+            }
+<span class="nc" id="L238">            exceptionMessage.append(&quot; with type &quot;).append(schema.type()).append(&quot;: &quot;).append(value.getClass());</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">            if (location != null) {</span>
+<span class="nc" id="L240">                exceptionMessage.append(&quot; for &quot;).append(location);</span>
+            }
+<span class="nc" id="L242">            throw new DataException(exceptionMessage.toString());</span>
+        }
+
+<span class="pc bpc" id="L245" title="2 of 4 branches missed.">        switch (schema.type()) {</span>
+            case STRUCT:
+<span class="nc" id="L247">                Struct struct = (Struct) value;</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                if (!struct.schema().equals(schema))</span>
+<span class="nc" id="L249">                    throw new DataException(&quot;Struct schemas do not match.&quot;);</span>
+<span class="nc" id="L250">                struct.validate();</span>
+<span class="nc" id="L251">                break;</span>
+            case ARRAY:
+<span class="nc" id="L253">                List&lt;?&gt; array = (List&lt;?&gt;) value;</span>
+<span class="nc" id="L254">                String entryLocation = &quot;element of array &quot; + location;</span>
+<span class="nc" id="L255">                Schema arrayValueSchema = assertSchemaNotNull(schema.valueSchema(), entryLocation);</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">                for (Object entry : array) {</span>
+<span class="nc" id="L257">                    validateValue(arrayValueSchema, entry, entryLocation);</span>
+<span class="nc" id="L258">                }</span>
+<span class="nc" id="L259">                break;</span>
+            case MAP:
+<span class="fc" id="L261">                Map&lt;?, ?&gt; map = (Map&lt;?, ?&gt;) value;</span>
+<span class="fc" id="L262">                String keyLocation = &quot;key of map &quot; + location;</span>
+<span class="fc" id="L263">                String valueLocation = &quot;value of map &quot; + location;</span>
+<span class="fc" id="L264">                Schema mapKeySchema = assertSchemaNotNull(schema.keySchema(), keyLocation);</span>
+<span class="fc" id="L265">                Schema mapValueSchema = assertSchemaNotNull(schema.valueSchema(), valueLocation);</span>
+<span class="fc bfc" id="L266" title="All 2 branches covered.">                for (Map.Entry&lt;?, ?&gt; entry : map.entrySet()) {</span>
+<span class="fc" id="L267">                    validateValue(mapKeySchema, entry.getKey(), keyLocation);</span>
+<span class="fc" id="L268">                    validateValue(mapValueSchema, entry.getValue(), valueLocation);</span>
+<span class="fc" id="L269">                }</span>
+                break;
+        }
+<span class="fc" id="L272">    }</span>
+
+    private static Schema assertSchemaNotNull(Schema schema, String location) {
+<span class="pc bpc" id="L275" title="1 of 2 branches missed.">        if (schema == null) {</span>
+<span class="nc" id="L276">            throw new DataException(&quot;No schema defined for &quot; + location);</span>
+        }
+<span class="fc" id="L278">        return schema;</span>
+    }
+
+    private static List&lt;Class&lt;?&gt;&gt; expectedClassesFor(Schema schema) {
+<span class="fc" id="L282">        List&lt;Class&lt;?&gt;&gt; expectedClasses = null;</span>
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">        if (schema.name() != null) {</span>
+<span class="nc" id="L284">            expectedClasses = LOGICAL_TYPE_CLASSES.get(schema.name());</span>
+        }
+<span class="pc bpc" id="L286" title="1 of 2 branches missed.">        if (expectedClasses == null)</span>
+<span class="fc" id="L287">            expectedClasses = SCHEMA_TYPE_CLASSES.getOrDefault(schema.type(), List.of());</span>
+<span class="fc" id="L288">        return expectedClasses;</span>
+    }
+
+    /**
+     * Validate that the value can be used for this schema, i.e. that its type matches the schema type and optional
+     * requirements. Throws a {@link DataException} if the value is invalid.
+     * @param value the value to validate
+     */
+    public void validateValue(Object value) {
+<span class="nc" id="L297">        validateValue(this, value);</span>
+<span class="nc" id="L298">    }</span>
+
+    @Override
+    public ConnectSchema schema() {
+<span class="nc" id="L302">        return this;</span>
+    }
+
+
+    @Override
+    public boolean equals(Object o) {
+<span class="pc bpc" id="L308" title="1 of 2 branches missed.">        if (this == o) return true;</span>
+<span class="nc bnc" id="L309" title="All 4 branches missed.">        if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="nc" id="L310">        ConnectSchema schema = (ConnectSchema) o;</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">        return Objects.equals(optional, schema.optional) &amp;&amp;</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">                Objects.equals(version, schema.version) &amp;&amp;</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                Objects.equals(name, schema.name) &amp;&amp;</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                Objects.equals(doc, schema.doc) &amp;&amp;</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">                Objects.equals(type, schema.type) &amp;&amp;</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">                Objects.deepEquals(defaultValue, schema.defaultValue) &amp;&amp;</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">                Objects.equals(fields, schema.fields) &amp;&amp;</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">                Objects.equals(keySchema, schema.keySchema) &amp;&amp;</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">                Objects.equals(valueSchema, schema.valueSchema) &amp;&amp;</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">                Objects.equals(parameters, schema.parameters);</span>
+    }
+
+    @Override
+    public int hashCode() {
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (this.hash == null) {</span>
+<span class="nc" id="L326">            this.hash = Objects.hash(type, optional, defaultValue, fields, keySchema, valueSchema, name, version, doc,</span>
+                parameters);
+        }
+<span class="nc" id="L329">        return this.hash;</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        if (name != null)</span>
+<span class="nc" id="L335">            return &quot;Schema{&quot; + name + &quot;:&quot; + type + &quot;}&quot;;</span>
+        else
+<span class="nc" id="L337">            return &quot;Schema{&quot; + type + &quot;}&quot;;</span>
+    }
+
+
+    /**
+     * Get the {@link Schema.Type} associated with the given class.
+     *
+     * @param klass the Class whose associated schema type is to be returned
+     * @return the corresponding type, or null if there is no matching type
+     */
+    public static Type schemaType(Class&lt;?&gt; klass) {
+<span class="fc" id="L348">        synchronized (JAVA_CLASS_SCHEMA_TYPES) {</span>
+<span class="fc" id="L349">            Type schemaType = JAVA_CLASS_SCHEMA_TYPES.get(klass);</span>
+<span class="fc bfc" id="L350" title="All 2 branches covered.">            if (schemaType != null)</span>
+<span class="fc" id="L351">                return schemaType;</span>
+
+            // Since the lookup only checks the class, we need to also try
+<span class="pc bpc" id="L354" title="1 of 2 branches missed.">            for (Map.Entry&lt;Class&lt;?&gt;, Type&gt; entry : JAVA_CLASS_SCHEMA_TYPES.entrySet()) {</span>
+                try {
+<span class="fc" id="L356">                    klass.asSubclass(entry.getKey());</span>
+                    // Cache this for subsequent lookups
+<span class="fc" id="L358">                    JAVA_CLASS_SCHEMA_TYPES.put(klass, entry.getValue());</span>
+<span class="fc" id="L359">                    return entry.getValue();</span>
+<span class="fc" id="L360">                } catch (ClassCastException e) {</span>
+                    // Expected, ignore
+                }
+<span class="fc" id="L363">            }</span>
+<span class="nc" id="L364">        }</span>
+<span class="nc" id="L365">        return null;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

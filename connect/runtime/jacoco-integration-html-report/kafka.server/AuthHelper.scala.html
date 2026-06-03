@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AuthHelper.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">kafka.server</a> &gt; <span class="el_source">AuthHelper.scala</span></div><h1>AuthHelper.scala</h1><pre class="source lang-java linenums">/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package kafka.server
+
+import java.lang.{Byte =&gt; JByte}
+import java.util.Collections
+import kafka.network.RequestChannel
+import org.apache.kafka.clients.admin.EndpointType
+import org.apache.kafka.common.acl.AclOperation
+import org.apache.kafka.common.acl.AclOperation.DESCRIBE
+import org.apache.kafka.common.errors.ClusterAuthorizationException
+import org.apache.kafka.common.internals.Plugin
+import org.apache.kafka.common.message.DescribeClusterResponseData
+import org.apache.kafka.common.message.DescribeClusterResponseData.DescribeClusterBrokerCollection
+import org.apache.kafka.common.protocol.Errors
+import org.apache.kafka.common.requests.{DescribeClusterRequest, RequestContext}
+import org.apache.kafka.common.resource.Resource.CLUSTER_NAME
+import org.apache.kafka.common.resource.ResourceType.CLUSTER
+import org.apache.kafka.common.resource.{PatternType, Resource, ResourcePattern, ResourceType}
+import org.apache.kafka.common.utils.Utils
+import org.apache.kafka.security.authorizer.AclEntry
+import org.apache.kafka.server.authorizer.{Action, AuthorizationResult, Authorizer}
+
+import scala.collection.Seq
+import scala.jdk.CollectionConverters._
+
+<span class="fc" id="L42">class AuthHelper(authorizer: Option[Plugin[Authorizer]]) {</span>
+  def authorize(requestContext: RequestContext,
+                operation: AclOperation,
+                resourceType: ResourceType,
+                resourceName: String,
+<span class="fc" id="L47">                logIfAllowed: Boolean = true,</span>
+<span class="fc" id="L48">                logIfDenied: Boolean = true,</span>
+<span class="fc" id="L49">                refCount: Int = 1): Boolean = {</span>
+<span class="pc" id="L50">    authorizer.forall { authZ =&gt;</span>
+<span class="nc" id="L51">      val resource = new ResourcePattern(resourceType, resourceName, PatternType.LITERAL)</span>
+<span class="nc" id="L52">      val actions = Collections.singletonList(new Action(operation, resource, refCount, logIfAllowed, logIfDenied))</span>
+<span class="nc bnc" id="L53" title="All 6 branches missed.">      authZ.get.authorize(requestContext, actions).get(0) == AuthorizationResult.ALLOWED</span>
+    }
+  }
+
+  def authorizeClusterOperation(request: RequestChannel.Request, operation: AclOperation): Unit = {
+<span class="pc bpc" id="L58" title="1 of 2 branches missed.">    if (!authorize(request.context, operation, CLUSTER, CLUSTER_NAME))</span>
+<span class="pc" id="L59">      throw new ClusterAuthorizationException(s&quot;Request $request needs $operation permission.&quot;)</span>
+  }
+
+  def authorizedOperations(request: RequestChannel.Request, resource: Resource): Int = {
+<span class="fc" id="L63">    val supportedOps = AclEntry.supportedOperations(resource.resourceType).asScala.toList</span>
+<span class="pc" id="L64">    val authorizedOps = authorizer match {</span>
+<span class="pc bpc" id="L65" title="1 of 2 branches missed.">      case Some(authZ) =&gt;</span>
+<span class="nc" id="L66">        val resourcePattern = new ResourcePattern(resource.resourceType, resource.name, PatternType.LITERAL)</span>
+<span class="nc" id="L67">        val actions = supportedOps.map { op =&gt; new Action(op, resourcePattern, 1, false, false) }</span>
+<span class="nc" id="L68">        authZ.get.authorize(request.context, actions.asJava).asScala</span>
+<span class="nc" id="L69">          .zip(supportedOps)</span>
+<span class="nc bnc" id="L70" title="All 6 branches missed.">          .filter(_._1 == AuthorizationResult.ALLOWED)</span>
+<span class="nc" id="L71">          .map(_._2).toSet</span>
+<span class="pc bpc" id="L72" title="1 of 2 branches missed.">      case None =&gt;</span>
+<span class="fc" id="L73">        supportedOps.toSet</span>
+    }
+<span class="fc" id="L75">    Utils.to32BitField(authorizedOps.map(operation =&gt; operation.code.asInstanceOf[JByte]).asJava)</span>
+  }
+
+  def authorizeByResourceType(requestContext: RequestContext, operation: AclOperation,
+                              resourceType: ResourceType): Boolean = {
+<span class="nc" id="L80">    authorizer.forall { authZ =&gt;</span>
+<span class="nc bnc" id="L81" title="All 6 branches missed.">      authZ.get.authorizeByResourceType(requestContext, operation, resourceType) == AuthorizationResult.ALLOWED</span>
+    }
+  }
+
+  def partitionSeqByAuthorized[T](requestContext: RequestContext,
+                                  operation: AclOperation,
+                                  resourceType: ResourceType,
+                                  resources: Seq[T],
+<span class="fc" id="L89">                                  logIfAllowed: Boolean = true,</span>
+<span class="fc" id="L90">                                  logIfDenied: Boolean = true)(resourceName: T =&gt; String): (Seq[T], Seq[T]) = {</span>
+<span class="pc" id="L91">    authorizer match {</span>
+<span class="pc bpc" id="L92" title="1 of 2 branches missed.">      case Some(_) =&gt;</span>
+<span class="nc" id="L93">        val authorizedResourceNames = filterByAuthorized(requestContext, operation, resourceType,</span>
+<span class="nc" id="L94">          resources, logIfAllowed, logIfDenied)(resourceName)</span>
+<span class="nc" id="L95">        resources.partition(resource =&gt; authorizedResourceNames.contains(resourceName(resource)))</span>
+<span class="pc bpc" id="L96" title="1 of 2 branches missed.">      case None =&gt; (resources, Seq.empty)</span>
+    }
+  }
+
+  def filterByAuthorized[T](requestContext: RequestContext,
+                            operation: AclOperation,
+                            resourceType: ResourceType,
+                            resources: Iterable[T],
+<span class="fc" id="L104">                            logIfAllowed: Boolean = true,</span>
+<span class="fc" id="L105">                            logIfDenied: Boolean = true)(resourceName: T =&gt; String): Set[String] = {</span>
+<span class="pc" id="L106">    authorizer match {</span>
+<span class="pc bpc" id="L107" title="1 of 2 branches missed.">      case Some(authZ) =&gt;</span>
+<span class="nc" id="L108">        val resourceNameToCount = resources.groupMapReduce(resourceName)(_ =&gt; 1)(_ + _)</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">        val actions = resourceNameToCount.iterator.map { case (resourceName, count) =&gt;</span>
+<span class="nc" id="L110">          val resource = new ResourcePattern(resourceType, resourceName, PatternType.LITERAL)</span>
+<span class="nc" id="L111">          new Action(operation, resource, count, logIfAllowed, logIfDenied)</span>
+        }.toBuffer
+<span class="nc" id="L113">        authZ.get.authorize(requestContext, actions.asJava).asScala</span>
+<span class="nc" id="L114">          .zip(resourceNameToCount.keySet)</span>
+<span class="nc bnc" id="L115" title="All 16 branches missed.">          .collect { case (authzResult, resourceName) if authzResult == AuthorizationResult.ALLOWED =&gt;</span>
+<span class="nc" id="L116">            resourceName</span>
+          }.toSet
+<span class="pc bpc" id="L118" title="1 of 2 branches missed.">      case None =&gt; resources.iterator.map(resourceName).toSet</span>
+    }
+  }
+
+  def computeDescribeClusterResponse(
+    request: RequestChannel.Request,
+    expectedEndpointType: EndpointType,
+    clusterId: String,
+    getNodes: () =&gt; DescribeClusterBrokerCollection,
+    getControllerId: () =&gt; Int
+  ): DescribeClusterResponseData = {
+<span class="fc" id="L129">    val describeClusterRequest = request.body[DescribeClusterRequest]</span>
+<span class="fc" id="L130">    val requestEndpointType = EndpointType.fromId(describeClusterRequest.data().endpointType())</span>
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">    if (requestEndpointType.equals(EndpointType.UNKNOWN)) {</span>
+<span class="nc" id="L132">      return new DescribeClusterResponseData().</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        setErrorCode(if (request.header.data().requestApiVersion() == 0) {</span>
+<span class="nc" id="L134">          Errors.INVALID_REQUEST.code()</span>
+        } else {
+<span class="nc" id="L136">          Errors.UNSUPPORTED_ENDPOINT_TYPE.code()</span>
+        }).
+<span class="nc" id="L138">        setErrorMessage(&quot;Unsupported endpoint type &quot; + describeClusterRequest.data().endpointType().toInt)</span>
+<span class="pc bpc" id="L139" title="1 of 2 branches missed.">    } else if (!expectedEndpointType.equals(requestEndpointType)) {</span>
+<span class="nc" id="L140">      return new DescribeClusterResponseData().</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        setErrorCode(if (request.header.data().requestApiVersion() == 0) {</span>
+<span class="nc" id="L142">          Errors.INVALID_REQUEST.code()</span>
+        } else {
+<span class="nc" id="L144">          Errors.MISMATCHED_ENDPOINT_TYPE.code()</span>
+        }).
+<span class="nc" id="L146">        setErrorMessage(&quot;The request was sent to an endpoint of type &quot; + expectedEndpointType +</span>
+<span class="nc" id="L147">          &quot;, but we wanted an endpoint of type &quot; + requestEndpointType)</span>
+    }
+<span class="fc" id="L149">    var clusterAuthorizedOperations = Int.MinValue // Default value in the schema</span>
+    // get cluster authorized operations
+<span class="pc bpc" id="L151" title="1 of 2 branches missed.">    if (describeClusterRequest.data.includeClusterAuthorizedOperations) {</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">      if (authorize(request.context, DESCRIBE, CLUSTER, CLUSTER_NAME))</span>
+<span class="nc" id="L153">        clusterAuthorizedOperations = authorizedOperations(request, Resource.CLUSTER)</span>
+      else
+<span class="nc" id="L155">        clusterAuthorizedOperations = 0</span>
+    }
+    // Get the node list and the controller ID.
+<span class="fc" id="L158">    val nodes = getNodes()</span>
+<span class="fc" id="L159">    val controllerId = getControllerId()</span>
+    // If the provided controller ID is not in the node list, return -1 instead
+    // to avoid confusing the client. This could happen in a case where we know
+    // the controller ID, but we don't yet have KIP-919 information about that
+    // controller.
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">    val effectiveControllerId = if (nodes.find(controllerId) == null) {</span>
+<span class="nc" id="L165">      -1</span>
+    } else {
+<span class="fc" id="L167">      controllerId</span>
+    }
+<span class="fc" id="L169">    new DescribeClusterResponseData().</span>
+<span class="fc" id="L170">      setClusterId(clusterId).</span>
+<span class="fc" id="L171">      setControllerId(effectiveControllerId).</span>
+<span class="fc" id="L172">      setClusterAuthorizedOperations(clusterAuthorizedOperations).</span>
+<span class="fc" id="L173">      setBrokers(nodes).</span>
+<span class="fc" id="L174">      setEndpointType(expectedEndpointType.id())</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

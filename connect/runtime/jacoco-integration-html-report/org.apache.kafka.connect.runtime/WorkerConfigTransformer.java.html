@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>WorkerConfigTransformer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">WorkerConfigTransformer.java</span></div><h1>WorkerConfigTransformer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigTransformer;
+import org.apache.kafka.common.config.ConfigTransformerResult;
+import org.apache.kafka.common.config.provider.ConfigProvider;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.runtime.Herder.ConfigReloadAction;
+import org.apache.kafka.connect.util.Callback;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+
+/**
+ * A wrapper class to perform configuration transformations and schedule reloads for any
+ * retrieved TTL values.
+ */
+public class WorkerConfigTransformer implements AutoCloseable {
+<span class="fc" id="L40">    private static final Logger log = LoggerFactory.getLogger(WorkerConfigTransformer.class);</span>
+
+    private final Worker worker;
+    private final ConfigTransformer configTransformer;
+<span class="fc" id="L44">    private final ConcurrentMap&lt;String, Map&lt;String, HerderRequest&gt;&gt; requests = new ConcurrentHashMap&lt;&gt;();</span>
+    private final Map&lt;String, ConfigProvider&gt; configProviders;
+
+<span class="fc" id="L47">    public WorkerConfigTransformer(Worker worker, Map&lt;String, ConfigProvider&gt; configProviders) {</span>
+<span class="fc" id="L48">        this.worker = worker;</span>
+<span class="fc" id="L49">        this.configProviders = configProviders;</span>
+<span class="fc" id="L50">        this.configTransformer = new ConfigTransformer(configProviders);</span>
+<span class="fc" id="L51">    }</span>
+
+    public Map&lt;String, String&gt; transform(Map&lt;String, String&gt; configs) {
+<span class="fc" id="L54">        return transform(null, configs);</span>
+    }
+
+    public Map&lt;String, String&gt; transform(String connectorName, Map&lt;String, String&gt; configs) {
+<span class="pc bpc" id="L58" title="1 of 2 branches missed.">        if (configs == null) return null;</span>
+<span class="fc" id="L59">        ConfigTransformerResult result = configTransformer.transform(configs);</span>
+<span class="fc bfc" id="L60" title="All 2 branches covered.">        if (connectorName != null) {</span>
+<span class="fc" id="L61">            String key = ConnectorConfig.CONFIG_RELOAD_ACTION_CONFIG;</span>
+<span class="fc" id="L62">            String action = (String) ConfigDef.parseType(key, configs.get(key), ConfigDef.Type.STRING);</span>
+<span class="pc bpc" id="L63" title="1 of 2 branches missed.">            if (action == null) {</span>
+                // The default action is &quot;restart&quot;.
+<span class="fc" id="L65">                action = ConnectorConfig.CONFIG_RELOAD_ACTION_RESTART;</span>
+            }
+<span class="fc" id="L67">            ConfigReloadAction reloadAction = ConfigReloadAction.valueOf(action.toUpperCase(Locale.ROOT));</span>
+<span class="pc bpc" id="L68" title="1 of 2 branches missed.">            if (reloadAction == ConfigReloadAction.RESTART) {</span>
+<span class="fc" id="L69">                scheduleReload(connectorName, result.ttls());</span>
+            }
+        }
+<span class="fc" id="L72">        return result.data();</span>
+    }
+
+    private void scheduleReload(String connectorName, Map&lt;String, Long&gt; ttls) {
+<span class="pc bpc" id="L76" title="1 of 2 branches missed.">        for (Map.Entry&lt;String, Long&gt; entry : ttls.entrySet()) {</span>
+<span class="nc" id="L77">            scheduleReload(connectorName, entry.getKey(), entry.getValue());</span>
+<span class="nc" id="L78">        }</span>
+<span class="fc" id="L79">    }</span>
+
+    private void scheduleReload(String connectorName, String path, long ttl) {
+<span class="nc" id="L82">        Map&lt;String, HerderRequest&gt; connectorRequests = requests.computeIfAbsent(connectorName, s -&gt; new ConcurrentHashMap&lt;&gt;());</span>
+<span class="nc" id="L83">        connectorRequests.compute(path, (s, previousRequest) -&gt; {</span>
+<span class="nc bnc" id="L84" title="All 2 branches missed.">            if (previousRequest != null) {</span>
+                // Delete previous request for ttl which is now stale
+<span class="nc" id="L86">                previousRequest.cancel();</span>
+            }
+<span class="nc" id="L88">            log.info(&quot;Scheduling a restart of connector {} in {} ms&quot;, connectorName, ttl);</span>
+<span class="nc" id="L89">            Callback&lt;Void&gt; cb = (error, result) -&gt; {</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">                if (error != null) {</span>
+<span class="nc" id="L91">                    log.error(&quot;Unexpected error during connector restart: &quot;, error);</span>
+                }
+<span class="nc" id="L93">            };</span>
+<span class="nc" id="L94">            return worker.herder().restartConnector(ttl, connectorName, cb);</span>
+        });
+<span class="nc" id="L96">    }</span>
+
+    @Override
+    public void close() {
+<span class="pc" id="L100">        configProviders.values().forEach(x -&gt; Utils.closeQuietly(x, &quot;config provider&quot;));</span>
+<span class="fc" id="L101">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

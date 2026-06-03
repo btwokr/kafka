@@ -1,0 +1,1689 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MessageDataGenerator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.message</a> &gt; <span class="el_source">MessageDataGenerator.java</span></div><h1>MessageDataGenerator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.message;
+
+import java.io.BufferedWriter;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.stream.Collectors;
+
+/**
+ * Generates Kafka MessageData classes.
+ */
+public final class MessageDataGenerator implements MessageClassGenerator {
+    private final StructRegistry structRegistry;
+    private final HeaderGenerator headerGenerator;
+    private final SchemaGenerator schemaGenerator;
+    private final CodeBuffer buffer;
+    private Versions messageFlexibleVersions;
+
+<span class="nc" id="L39">    MessageDataGenerator(String packageName) {</span>
+<span class="nc" id="L40">        this.structRegistry = new StructRegistry();</span>
+<span class="nc" id="L41">        this.headerGenerator = new HeaderGenerator(packageName);</span>
+<span class="nc" id="L42">        this.schemaGenerator = new SchemaGenerator(headerGenerator, structRegistry);</span>
+<span class="nc" id="L43">        this.buffer = new CodeBuffer();</span>
+<span class="nc" id="L44">    }</span>
+
+    @Override
+    public String outputName(MessageSpec spec) {
+<span class="nc" id="L48">        return spec.dataClassName();</span>
+    }
+
+    @Override
+    public void generateAndWrite(MessageSpec message, BufferedWriter writer) throws Exception {
+<span class="nc" id="L53">        generate(message);</span>
+<span class="nc" id="L54">        write(writer);</span>
+<span class="nc" id="L55">    }</span>
+
+    void generate(MessageSpec message) throws Exception {
+<span class="nc bnc" id="L58" title="All 2 branches missed.">        if (message.struct().versions().contains(Short.MAX_VALUE)) {</span>
+<span class="nc" id="L59">            throw new RuntimeException(&quot;Message &quot; + message.name() + &quot; does &quot; +</span>
+                &quot;not specify a maximum version.&quot;);
+        }
+<span class="nc" id="L62">        structRegistry.register(message);</span>
+<span class="nc" id="L63">        schemaGenerator.generateSchemas(message);</span>
+<span class="nc" id="L64">        messageFlexibleVersions = message.flexibleVersions();</span>
+<span class="nc" id="L65">        generateClass(Optional.of(message),</span>
+<span class="nc" id="L66">            message.dataClassName(),</span>
+<span class="nc" id="L67">            message.struct(),</span>
+<span class="nc" id="L68">            message.struct().versions());</span>
+<span class="nc" id="L69">        headerGenerator.generate();</span>
+<span class="nc" id="L70">    }</span>
+
+    void write(BufferedWriter writer) throws Exception {
+<span class="nc" id="L73">        headerGenerator.buffer().write(writer);</span>
+<span class="nc" id="L74">        buffer.write(writer);</span>
+<span class="nc" id="L75">    }</span>
+
+    private void generateClass(Optional&lt;MessageSpec&gt; topLevelMessageSpec,
+                               String className,
+                               StructSpec struct,
+                               Versions parentVersions) throws Exception {
+<span class="nc" id="L81">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L82">        boolean isTopLevel = topLevelMessageSpec.isPresent();</span>
+<span class="nc" id="L83">        boolean isSetElement = struct.hasKeys(); // Check if the class is inside a set.</span>
+<span class="nc bnc" id="L84" title="All 4 branches missed.">        if (isTopLevel &amp;&amp; isSetElement) {</span>
+<span class="nc" id="L85">            throw new RuntimeException(&quot;Cannot set mapKey on top level fields.&quot;);</span>
+        }
+<span class="nc" id="L87">        generateClassHeader(className, isTopLevel, isSetElement);</span>
+<span class="nc" id="L88">        buffer.incrementIndent();</span>
+<span class="nc" id="L89">        generateFieldDeclarations(struct, isSetElement);</span>
+<span class="nc" id="L90">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L91">        schemaGenerator.writeSchema(className, buffer);</span>
+<span class="nc" id="L92">        generateClassConstructors(className, struct, isSetElement);</span>
+<span class="nc" id="L93">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">        if (isTopLevel) {</span>
+<span class="nc" id="L95">            generateShortAccessor(&quot;apiKey&quot;, topLevelMessageSpec.get().apiKey().orElse((short) -1));</span>
+        }
+<span class="nc" id="L97">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L98">        generateShortAccessor(&quot;lowestSupportedVersion&quot;, parentVersions.lowest());</span>
+<span class="nc" id="L99">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L100">        generateShortAccessor(&quot;highestSupportedVersion&quot;, parentVersions.highest());</span>
+<span class="nc" id="L101">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L102">        generateClassReader(className, struct, parentVersions);</span>
+<span class="nc" id="L103">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L104">        generateClassWriter(className, struct, parentVersions);</span>
+<span class="nc" id="L105">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L106">        generateClassMessageSize(className, struct, parentVersions);</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">        if (isSetElement) {</span>
+<span class="nc" id="L108">            buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L109">            generateClassEquals(className, struct, true);</span>
+        }
+<span class="nc" id="L111">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L112">        generateClassEquals(className, struct, false);</span>
+<span class="nc" id="L113">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L114">        generateClassHashCode(struct, isSetElement);</span>
+<span class="nc" id="L115">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L116">        generateClassDuplicate(className, struct);</span>
+<span class="nc" id="L117">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L118">        generateClassToString(className, struct);</span>
+<span class="nc" id="L119">        generateFieldAccessors(struct, isSetElement);</span>
+<span class="nc" id="L120">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L121">        generateUnknownTaggedFieldsAccessor();</span>
+<span class="nc" id="L122">        generateFieldMutators(struct, className, isSetElement);</span>
+
+<span class="nc bnc" id="L124" title="All 2 branches missed.">        if (!isTopLevel) {</span>
+<span class="nc" id="L125">            buffer.decrementIndent();</span>
+<span class="nc" id="L126">            buffer.printf(&quot;}%n&quot;);</span>
+        }
+<span class="nc" id="L128">        generateSubclasses(className, struct, parentVersions, isSetElement);</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        if (isTopLevel) {</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">            for (Iterator&lt;StructSpec&gt; iter = structRegistry.commonStructs(); iter.hasNext(); ) {</span>
+<span class="nc" id="L131">                StructSpec commonStruct = iter.next();</span>
+<span class="nc" id="L132">                generateClass(Optional.empty(),</span>
+<span class="nc" id="L133">                        commonStruct.name(),</span>
+                        commonStruct,
+<span class="nc" id="L135">                        commonStruct.versions());</span>
+<span class="nc" id="L136">            }</span>
+<span class="nc" id="L137">            buffer.decrementIndent();</span>
+<span class="nc" id="L138">            buffer.printf(&quot;}%n&quot;);</span>
+        }
+<span class="nc" id="L140">    }</span>
+
+    private void generateClassHeader(String className, boolean isTopLevel,
+                                     boolean isSetElement) {
+<span class="nc" id="L144">        Set&lt;String&gt; implementedInterfaces = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        if (isTopLevel) {</span>
+<span class="nc" id="L146">            implementedInterfaces.add(&quot;ApiMessage&quot;);</span>
+<span class="nc" id="L147">            headerGenerator.addImport(MessageGenerator.API_MESSAGE_CLASS);</span>
+        } else {
+<span class="nc" id="L149">            implementedInterfaces.add(&quot;Message&quot;);</span>
+<span class="nc" id="L150">            headerGenerator.addImport(MessageGenerator.MESSAGE_CLASS);</span>
+        }
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        if (isSetElement) {</span>
+<span class="nc" id="L153">            headerGenerator.addImport(MessageGenerator.IMPLICIT_LINKED_HASH_MULTI_COLLECTION_CLASS);</span>
+<span class="nc" id="L154">            implementedInterfaces.add(&quot;ImplicitLinkedHashMultiCollection.Element&quot;);</span>
+        }
+<span class="nc" id="L156">        Set&lt;String&gt; classModifiers = new LinkedHashSet&lt;&gt;();</span>
+<span class="nc" id="L157">        classModifiers.add(&quot;public&quot;);</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        if (!isTopLevel) {</span>
+<span class="nc" id="L159">            classModifiers.add(&quot;static&quot;);</span>
+        }
+<span class="nc" id="L161">        buffer.printf(&quot;%s class %s implements %s {%n&quot;,</span>
+<span class="nc" id="L162">            String.join(&quot; &quot;, classModifiers),</span>
+            className,
+<span class="nc" id="L164">            String.join(&quot;, &quot;, implementedInterfaces));</span>
+<span class="nc" id="L165">    }</span>
+
+    private void generateSubclasses(String className, StructSpec struct,
+            Versions parentVersions, boolean isSetElement) throws Exception {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        for (FieldSpec field : struct.fields()) {</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">            if (field.type().isStructArray()) {</span>
+<span class="nc" id="L171">                FieldType.ArrayType arrayType = (FieldType.ArrayType) field.type();</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">                if (!structRegistry.commonStructNames().contains(arrayType.elementName())) {</span>
+<span class="nc" id="L173">                    generateClass(Optional.empty(),</span>
+<span class="nc" id="L174">                            arrayType.elementType().toString(),</span>
+<span class="nc" id="L175">                            structRegistry.findStruct(field),</span>
+<span class="nc" id="L176">                            parentVersions.intersect(struct.versions()));</span>
+                }
+<span class="nc bnc" id="L178" title="All 2 branches missed.">            } else if (field.type().isStruct()) {</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">                if (!structRegistry.commonStructNames().contains(field.typeString())) {</span>
+<span class="nc" id="L180">                    generateClass(Optional.empty(),</span>
+<span class="nc" id="L181">                            field.typeString(),</span>
+<span class="nc" id="L182">                            structRegistry.findStruct(field),</span>
+<span class="nc" id="L183">                            parentVersions.intersect(struct.versions()));</span>
+                }
+            }
+<span class="nc" id="L186">        }</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        if (isSetElement) {</span>
+<span class="nc" id="L188">            generateHashSet(className, struct);</span>
+        }
+<span class="nc" id="L190">    }</span>
+
+    private void generateHashSet(String className, StructSpec struct) {
+<span class="nc" id="L193">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L194">        headerGenerator.addImport(MessageGenerator.IMPLICIT_LINKED_HASH_MULTI_COLLECTION_CLASS);</span>
+<span class="nc" id="L195">        buffer.printf(&quot;public static class %s extends ImplicitLinkedHashMultiCollection&lt;%s&gt; {%n&quot;,</span>
+<span class="nc" id="L196">            FieldSpec.collectionType(className), className);</span>
+<span class="nc" id="L197">        buffer.incrementIndent();</span>
+<span class="nc" id="L198">        generateHashSetZeroArgConstructor(className);</span>
+<span class="nc" id="L199">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L200">        generateHashSetSizeArgConstructor(className);</span>
+<span class="nc" id="L201">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L202">        generateHashSetIteratorConstructor(className);</span>
+<span class="nc" id="L203">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L204">        generateHashSetIterableConstructor(className);</span>
+<span class="nc" id="L205">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L206">        generateHashSetFindMethod(className, struct);</span>
+<span class="nc" id="L207">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L208">        generateHashSetFindAllMethod(className, struct);</span>
+<span class="nc" id="L209">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L210">        generateCollectionDuplicateMethod(className);</span>
+<span class="nc" id="L211">        buffer.decrementIndent();</span>
+<span class="nc" id="L212">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L213">    }</span>
+
+    private void generateHashSetZeroArgConstructor(String className) {
+<span class="nc" id="L216">        buffer.printf(&quot;public %s() {%n&quot;, FieldSpec.collectionType(className));</span>
+<span class="nc" id="L217">        buffer.incrementIndent();</span>
+<span class="nc" id="L218">        buffer.printf(&quot;super();%n&quot;);</span>
+<span class="nc" id="L219">        buffer.decrementIndent();</span>
+<span class="nc" id="L220">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L221">    }</span>
+
+    private void generateHashSetSizeArgConstructor(String className) {
+<span class="nc" id="L224">        buffer.printf(&quot;public %s(int expectedNumElements) {%n&quot;,</span>
+<span class="nc" id="L225">            FieldSpec.collectionType(className));</span>
+<span class="nc" id="L226">        buffer.incrementIndent();</span>
+<span class="nc" id="L227">        buffer.printf(&quot;super(expectedNumElements);%n&quot;);</span>
+<span class="nc" id="L228">        buffer.decrementIndent();</span>
+<span class="nc" id="L229">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L230">    }</span>
+
+    private void generateHashSetIteratorConstructor(String className) {
+<span class="nc" id="L233">        headerGenerator.addImport(MessageGenerator.ITERATOR_CLASS);</span>
+<span class="nc" id="L234">        buffer.printf(&quot;public %s(Iterator&lt;%s&gt; iterator) {%n&quot;,</span>
+<span class="nc" id="L235">            FieldSpec.collectionType(className), className);</span>
+<span class="nc" id="L236">        buffer.incrementIndent();</span>
+<span class="nc" id="L237">        buffer.printf(&quot;super(iterator);%n&quot;);</span>
+<span class="nc" id="L238">        buffer.decrementIndent();</span>
+<span class="nc" id="L239">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L240">    }</span>
+
+    private void generateHashSetIterableConstructor(String className) {
+<span class="nc" id="L243">        buffer.printf(&quot;public %s(Iterable&lt;%s&gt; iterable) {%n&quot;,</span>
+<span class="nc" id="L244">            FieldSpec.collectionType(className), className);</span>
+<span class="nc" id="L245">        buffer.incrementIndent();</span>
+<span class="nc" id="L246">        buffer.printf(&quot;super(iterable.iterator());%n&quot;);</span>
+<span class="nc" id="L247">        buffer.decrementIndent();</span>
+<span class="nc" id="L248">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L249">    }</span>
+
+    private void generateHashSetFindMethod(String className, StructSpec struct) {
+<span class="nc" id="L252">        headerGenerator.addImport(MessageGenerator.LIST_CLASS);</span>
+<span class="nc" id="L253">        buffer.printf(&quot;public %s find(%s) {%n&quot;, className,</span>
+<span class="nc" id="L254">            commaSeparatedHashSetFieldAndTypes(struct));</span>
+<span class="nc" id="L255">        buffer.incrementIndent();</span>
+<span class="nc" id="L256">        generateKeyElement(className, struct);</span>
+<span class="nc" id="L257">        headerGenerator.addImport(MessageGenerator.IMPLICIT_LINKED_HASH_MULTI_COLLECTION_CLASS);</span>
+<span class="nc" id="L258">        buffer.printf(&quot;return find(_key);%n&quot;);</span>
+<span class="nc" id="L259">        buffer.decrementIndent();</span>
+<span class="nc" id="L260">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L261">    }</span>
+
+    private void generateHashSetFindAllMethod(String className, StructSpec struct) {
+<span class="nc" id="L264">        headerGenerator.addImport(MessageGenerator.LIST_CLASS);</span>
+<span class="nc" id="L265">        buffer.printf(&quot;public List&lt;%s&gt; findAll(%s) {%n&quot;, className,</span>
+<span class="nc" id="L266">            commaSeparatedHashSetFieldAndTypes(struct));</span>
+<span class="nc" id="L267">        buffer.incrementIndent();</span>
+<span class="nc" id="L268">        generateKeyElement(className, struct);</span>
+<span class="nc" id="L269">        headerGenerator.addImport(MessageGenerator.IMPLICIT_LINKED_HASH_MULTI_COLLECTION_CLASS);</span>
+<span class="nc" id="L270">        buffer.printf(&quot;return findAll(_key);%n&quot;);</span>
+<span class="nc" id="L271">        buffer.decrementIndent();</span>
+<span class="nc" id="L272">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L273">    }</span>
+
+    private void generateKeyElement(String className, StructSpec struct) {
+<span class="nc" id="L276">        buffer.printf(&quot;%s _key = new %s();%n&quot;, className, className);</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">        for (FieldSpec field : struct.fields()) {</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">            if (field.mapKey()) {</span>
+<span class="nc" id="L279">                buffer.printf(&quot;_key.set%s(%s);%n&quot;,</span>
+<span class="nc" id="L280">                    field.capitalizedCamelCaseName(),</span>
+<span class="nc" id="L281">                    field.camelCaseName());</span>
+            }
+<span class="nc" id="L283">        }</span>
+<span class="nc" id="L284">    }</span>
+
+    private String commaSeparatedHashSetFieldAndTypes(StructSpec struct) {
+<span class="nc" id="L287">        return struct.fields().stream().</span>
+<span class="nc" id="L288">            filter(FieldSpec::mapKey).</span>
+<span class="nc" id="L289">            map(f -&gt; String.format(&quot;%s %s&quot;,</span>
+<span class="nc" id="L290">                f.concreteJavaType(headerGenerator, structRegistry), f.camelCaseName())).</span>
+<span class="nc" id="L291">            collect(Collectors.joining(&quot;, &quot;));</span>
+    }
+
+    private void generateCollectionDuplicateMethod(String className) {
+<span class="nc" id="L295">        headerGenerator.addImport(MessageGenerator.LIST_CLASS);</span>
+<span class="nc" id="L296">        buffer.printf(&quot;public %s duplicate() {%n&quot;, FieldSpec.collectionType(className));</span>
+<span class="nc" id="L297">        buffer.incrementIndent();</span>
+<span class="nc" id="L298">        buffer.printf(&quot;%s _duplicate = new %s(size());%n&quot;,</span>
+<span class="nc" id="L299">            FieldSpec.collectionType(className), FieldSpec.collectionType(className));</span>
+<span class="nc" id="L300">        buffer.printf(&quot;for (%s _element : this) {%n&quot;, className);</span>
+<span class="nc" id="L301">        buffer.incrementIndent();</span>
+<span class="nc" id="L302">        buffer.printf(&quot;_duplicate.add(_element.duplicate());%n&quot;);</span>
+<span class="nc" id="L303">        buffer.decrementIndent();</span>
+<span class="nc" id="L304">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L305">        buffer.printf(&quot;return _duplicate;%n&quot;);</span>
+<span class="nc" id="L306">        buffer.decrementIndent();</span>
+<span class="nc" id="L307">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L308">    }</span>
+
+    private void generateFieldDeclarations(StructSpec struct, boolean isSetElement) {
+<span class="nc bnc" id="L311" title="All 2 branches missed.">        for (FieldSpec field : struct.fields()) {</span>
+<span class="nc" id="L312">            generateFieldDeclaration(field);</span>
+<span class="nc" id="L313">        }</span>
+<span class="nc" id="L314">        headerGenerator.addImport(MessageGenerator.LIST_CLASS);</span>
+<span class="nc" id="L315">        headerGenerator.addImport(MessageGenerator.RAW_TAGGED_FIELD_CLASS);</span>
+<span class="nc" id="L316">        buffer.printf(&quot;private List&lt;RawTaggedField&gt; _unknownTaggedFields;%n&quot;);</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        if (isSetElement) {</span>
+<span class="nc" id="L318">            buffer.printf(&quot;private int next;%n&quot;);</span>
+<span class="nc" id="L319">            buffer.printf(&quot;private int prev;%n&quot;);</span>
+        }
+<span class="nc" id="L321">    }</span>
+
+    private void generateFieldDeclaration(FieldSpec field) {
+<span class="nc" id="L324">        buffer.printf(&quot;%s %s;%n&quot;,</span>
+<span class="nc" id="L325">            field.fieldAbstractJavaType(headerGenerator, structRegistry),</span>
+<span class="nc" id="L326">            field.camelCaseName());</span>
+<span class="nc" id="L327">    }</span>
+
+    private void generateFieldAccessors(StructSpec struct, boolean isSetElement) {
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        for (FieldSpec field : struct.fields()) {</span>
+<span class="nc" id="L331">            generateFieldAccessor(field);</span>
+<span class="nc" id="L332">        }</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        if (isSetElement) {</span>
+<span class="nc" id="L334">            buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L335">            buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L336">            generateAccessor(&quot;int&quot;, &quot;next&quot;, &quot;next&quot;);</span>
+
+<span class="nc" id="L338">            buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L339">            buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L340">            generateAccessor(&quot;int&quot;, &quot;prev&quot;, &quot;prev&quot;);</span>
+        }
+<span class="nc" id="L342">    }</span>
+
+    private void generateUnknownTaggedFieldsAccessor() {
+<span class="nc" id="L345">        buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L346">        headerGenerator.addImport(MessageGenerator.LIST_CLASS);</span>
+<span class="nc" id="L347">        headerGenerator.addImport(MessageGenerator.RAW_TAGGED_FIELD_CLASS);</span>
+<span class="nc" id="L348">        buffer.printf(&quot;public List&lt;RawTaggedField&gt; unknownTaggedFields() {%n&quot;);</span>
+<span class="nc" id="L349">        buffer.incrementIndent();</span>
+        // Optimize _unknownTaggedFields by not creating a new list object
+        // unless we need it.
+<span class="nc" id="L352">        buffer.printf(&quot;if (_unknownTaggedFields == null) {%n&quot;);</span>
+<span class="nc" id="L353">        buffer.incrementIndent();</span>
+<span class="nc" id="L354">        headerGenerator.addImport(MessageGenerator.ARRAYLIST_CLASS);</span>
+<span class="nc" id="L355">        buffer.printf(&quot;_unknownTaggedFields = new ArrayList&lt;&gt;(0);%n&quot;);</span>
+<span class="nc" id="L356">        buffer.decrementIndent();</span>
+<span class="nc" id="L357">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L358">        buffer.printf(&quot;return _unknownTaggedFields;%n&quot;);</span>
+<span class="nc" id="L359">        buffer.decrementIndent();</span>
+<span class="nc" id="L360">        buffer.printf(&quot;}%n&quot;);</span>
+
+<span class="nc" id="L362">    }</span>
+
+    private void generateFieldMutators(StructSpec struct, String className,
+                                       boolean isSetElement) {
+<span class="nc bnc" id="L366" title="All 2 branches missed.">        for (FieldSpec field : struct.fields()) {</span>
+<span class="nc" id="L367">            generateFieldMutator(className, field);</span>
+<span class="nc" id="L368">        }</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">        if (isSetElement) {</span>
+<span class="nc" id="L370">            buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L371">            buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L372">            generateSetter(&quot;int&quot;, &quot;setNext&quot;, &quot;next&quot;);</span>
+
+<span class="nc" id="L374">            buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L375">            buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L376">            generateSetter(&quot;int&quot;, &quot;setPrev&quot;, &quot;prev&quot;);</span>
+        }
+<span class="nc" id="L378">    }</span>
+
+    private void generateClassConstructors(String className, StructSpec struct, boolean isSetElement) {
+<span class="nc" id="L381">        headerGenerator.addImport(MessageGenerator.READABLE_CLASS);</span>
+<span class="nc" id="L382">        buffer.printf(&quot;public %s(Readable _readable, short _version) {%n&quot;, className);</span>
+<span class="nc" id="L383">        buffer.incrementIndent();</span>
+<span class="nc" id="L384">        buffer.printf(&quot;read(_readable, _version);%n&quot;);</span>
+<span class="nc" id="L385">        generateConstructorEpilogue(isSetElement);</span>
+<span class="nc" id="L386">        buffer.decrementIndent();</span>
+<span class="nc" id="L387">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L388">        buffer.printf(&quot;%n&quot;);</span>
+
+<span class="nc" id="L390">        buffer.printf(&quot;public %s() {%n&quot;, className);</span>
+<span class="nc" id="L391">        buffer.incrementIndent();</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">        for (FieldSpec field : struct.fields()) {</span>
+<span class="nc" id="L393">            buffer.printf(&quot;this.%s = %s;%n&quot;,</span>
+<span class="nc" id="L394">                field.camelCaseName(),</span>
+<span class="nc" id="L395">                field.fieldDefault(headerGenerator, structRegistry));</span>
+<span class="nc" id="L396">        }</span>
+<span class="nc" id="L397">        generateConstructorEpilogue(isSetElement);</span>
+<span class="nc" id="L398">        buffer.decrementIndent();</span>
+<span class="nc" id="L399">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L400">    }</span>
+
+    private void generateConstructorEpilogue(boolean isSetElement) {
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        if (isSetElement) {</span>
+<span class="nc" id="L404">            headerGenerator.addImport(MessageGenerator.IMPLICIT_LINKED_HASH_COLLECTION_CLASS);</span>
+<span class="nc" id="L405">            buffer.printf(&quot;this.prev = ImplicitLinkedHashCollection.INVALID_INDEX;%n&quot;);</span>
+<span class="nc" id="L406">            buffer.printf(&quot;this.next = ImplicitLinkedHashCollection.INVALID_INDEX;%n&quot;);</span>
+        }
+<span class="nc" id="L408">    }</span>
+
+    private void generateShortAccessor(String name, short val) {
+<span class="nc" id="L411">        buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L412">        buffer.printf(&quot;public short %s() {%n&quot;, name);</span>
+<span class="nc" id="L413">        buffer.incrementIndent();</span>
+<span class="nc" id="L414">        buffer.printf(&quot;return %d;%n&quot;, val);</span>
+<span class="nc" id="L415">        buffer.decrementIndent();</span>
+<span class="nc" id="L416">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L417">    }</span>
+
+    private void generateClassReader(String className, StructSpec struct,
+                                     Versions parentVersions) {
+<span class="nc" id="L421">        headerGenerator.addImport(MessageGenerator.READABLE_CLASS);</span>
+<span class="nc" id="L422">        buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L423">        buffer.printf(&quot;public final void read(Readable _readable, short _version) {%n&quot;);</span>
+<span class="nc" id="L424">        buffer.incrementIndent();</span>
+<span class="nc" id="L425">        VersionConditional.forVersions(parentVersions, struct.versions()).</span>
+<span class="nc" id="L426">            allowMembershipCheckAlwaysFalse(false).</span>
+<span class="nc" id="L427">            ifNotMember(__ -&gt; {</span>
+<span class="nc" id="L428">                headerGenerator.addImport(MessageGenerator.UNSUPPORTED_VERSION_EXCEPTION_CLASS);</span>
+<span class="nc" id="L429">                buffer.printf(&quot;throw new UnsupportedVersionException(\&quot;Can't read &quot; +</span>
+                    &quot;version \&quot; + _version + \&quot; of %s\&quot;);%n&quot;, className);
+<span class="nc" id="L431">            }).</span>
+<span class="nc" id="L432">            generate(buffer);</span>
+<span class="nc" id="L433">        Versions curVersions = parentVersions.intersect(struct.versions());</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">        for (FieldSpec field : struct.fields()) {</span>
+<span class="nc" id="L435">            Versions fieldFlexibleVersions = fieldFlexibleVersions(field);</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            if (!field.taggedVersions().intersect(fieldFlexibleVersions).equals(field.taggedVersions())) {</span>
+<span class="nc" id="L437">                throw new RuntimeException(&quot;Field &quot; + field.name() + &quot; specifies tagged &quot; +</span>
+<span class="nc" id="L438">                    &quot;versions &quot; + field.taggedVersions() + &quot; that are not a subset of the &quot; +</span>
+                    &quot;flexible versions &quot; + fieldFlexibleVersions);
+            }
+<span class="nc" id="L441">            Versions mandatoryVersions = field.versions().subtract(field.taggedVersions());</span>
+<span class="nc" id="L442">            VersionConditional.forVersions(mandatoryVersions, curVersions).</span>
+<span class="nc" id="L443">                alwaysEmitBlockScope(field.type().isVariableLength()).</span>
+<span class="nc" id="L444">                ifNotMember(__ -&gt; {</span>
+                    // If the field is not present, or is tagged, set it to its default here.
+<span class="nc" id="L446">                    buffer.printf(&quot;this.%s = %s;%n&quot;, field.camelCaseName(),</span>
+<span class="nc" id="L447">                        field.fieldDefault(headerGenerator, structRegistry));</span>
+<span class="nc" id="L448">                }).</span>
+<span class="nc" id="L449">                ifMember(presentAndUntaggedVersions -&gt; {</span>
+<span class="nc bnc" id="L450" title="All 4 branches missed.">                    if (field.type().isVariableLength() &amp;&amp; !field.type().isStruct()) {</span>
+<span class="nc" id="L451">                        ClauseGenerator callGenerateVariableLengthReader = versions -&gt;</span>
+<span class="nc" id="L452">                            generateVariableLengthReader(fieldFlexibleVersions(field),</span>
+<span class="nc" id="L453">                                field.camelCaseName(),</span>
+<span class="nc" id="L454">                                field.type(),</span>
+                                versions,
+<span class="nc" id="L456">                                field.nullableVersions(),</span>
+<span class="nc" id="L457">                                String.format(&quot;this.%s = &quot;, field.camelCaseName()),</span>
+<span class="nc" id="L458">                                String.format(&quot;;%n&quot;),</span>
+<span class="nc" id="L459">                                structRegistry.isStructArrayWithKeys(field),</span>
+<span class="nc" id="L460">                                field.zeroCopy()</span>
+                            );
+                        // For arrays where the field type needs to be serialized differently in flexible
+                        // versions, lift the flexible version check outside of the array.
+                        // This may mean generating two separate 'for' loops-- one for flexible
+                        // versions, and one for regular versions.
+<span class="nc bnc" id="L466" title="All 2 branches missed.">                        if (field.type().isArray() &amp;&amp;</span>
+<span class="nc" id="L467">                            ((FieldType.ArrayType) field.type()).elementType().</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">                                serializationIsDifferentInFlexibleVersions()) {</span>
+<span class="nc" id="L469">                            VersionConditional.forVersions(fieldFlexibleVersions(field),</span>
+                                    presentAndUntaggedVersions).
+<span class="nc" id="L471">                                ifMember(callGenerateVariableLengthReader).</span>
+<span class="nc" id="L472">                                ifNotMember(callGenerateVariableLengthReader).</span>
+<span class="nc" id="L473">                                generate(buffer);</span>
+                        } else {
+<span class="nc" id="L475">                            callGenerateVariableLengthReader.generate(presentAndUntaggedVersions);</span>
+                        }
+<span class="nc bnc" id="L477" title="All 2 branches missed.">                    } else if (field.type().isStruct()) {</span>
+<span class="nc" id="L478">                        generateStructReader(field, presentAndUntaggedVersions, false);</span>
+                    } else {
+<span class="nc" id="L480">                        buffer.printf(&quot;this.%s = %s;%n&quot;, field.camelCaseName(),</span>
+<span class="nc" id="L481">                            primitiveReadExpression(field.type()));</span>
+                    }
+<span class="nc" id="L483">                }).</span>
+<span class="nc" id="L484">                generate(buffer);</span>
+<span class="nc" id="L485">        }</span>
+<span class="nc" id="L486">        buffer.printf(&quot;this._unknownTaggedFields = null;%n&quot;);</span>
+<span class="nc" id="L487">        VersionConditional.forVersions(messageFlexibleVersions, curVersions).</span>
+<span class="nc" id="L488">            ifMember(curFlexibleVersions -&gt; {</span>
+<span class="nc" id="L489">                buffer.printf(&quot;int _numTaggedFields = _readable.readUnsignedVarint();%n&quot;);</span>
+<span class="nc" id="L490">                buffer.printf(&quot;for (int _i = 0; _i &lt; _numTaggedFields; _i++) {%n&quot;);</span>
+<span class="nc" id="L491">                buffer.incrementIndent();</span>
+<span class="nc" id="L492">                buffer.printf(&quot;int _tag = _readable.readUnsignedVarint();%n&quot;);</span>
+<span class="nc" id="L493">                buffer.printf(&quot;int _size = _readable.readUnsignedVarint();%n&quot;);</span>
+<span class="nc" id="L494">                buffer.printf(&quot;switch (_tag) {%n&quot;);</span>
+<span class="nc" id="L495">                buffer.incrementIndent();</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">                for (FieldSpec field : struct.fields()) {</span>
+<span class="nc" id="L497">                    Versions validTaggedVersions = field.versions().intersect(field.taggedVersions());</span>
+<span class="nc bnc" id="L498" title="All 2 branches missed.">                    if (!validTaggedVersions.empty()) {</span>
+<span class="nc bnc" id="L499" title="All 2 branches missed.">                        if (field.tag().isEmpty()) {</span>
+<span class="nc" id="L500">                            throw new RuntimeException(&quot;Field &quot; + field.name() + &quot; has tagged versions, but no tag.&quot;);</span>
+                        }
+<span class="nc" id="L502">                        buffer.printf(&quot;case %d: {%n&quot;, field.tag().get());</span>
+<span class="nc" id="L503">                        buffer.incrementIndent();</span>
+<span class="nc" id="L504">                        VersionConditional.forVersions(validTaggedVersions, curFlexibleVersions).</span>
+<span class="nc" id="L505">                            ifMember(presentAndTaggedVersions -&gt; {</span>
+<span class="nc bnc" id="L506" title="All 4 branches missed.">                                if (field.type().isVariableLength() &amp;&amp; !field.type().isStruct()) {</span>
+                                    // All tagged fields are serialized using the new-style
+                                    // flexible versions serialization.
+<span class="nc" id="L509">                                    generateVariableLengthReader(fieldFlexibleVersions(field),</span>
+<span class="nc" id="L510">                                        field.camelCaseName(),</span>
+<span class="nc" id="L511">                                        field.type(),</span>
+                                        presentAndTaggedVersions,
+<span class="nc" id="L513">                                        field.nullableVersions(),</span>
+<span class="nc" id="L514">                                        String.format(&quot;this.%s = &quot;, field.camelCaseName()),</span>
+<span class="nc" id="L515">                                        String.format(&quot;;%n&quot;),</span>
+<span class="nc" id="L516">                                        structRegistry.isStructArrayWithKeys(field),</span>
+<span class="nc" id="L517">                                        field.zeroCopy());</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">                                } else if (field.type().isStruct()) {</span>
+<span class="nc" id="L519">                                    generateStructReader(field, presentAndTaggedVersions, true);</span>
+                                } else {
+<span class="nc" id="L521">                                    buffer.printf(&quot;this.%s = %s;%n&quot;, field.camelCaseName(),</span>
+<span class="nc" id="L522">                                        primitiveReadExpression(field.type()));</span>
+                                }
+<span class="nc" id="L524">                                buffer.printf(&quot;break;%n&quot;);</span>
+<span class="nc" id="L525">                            }).</span>
+<span class="nc" id="L526">                            ifNotMember(__ -&gt; buffer.printf(&quot;throw new RuntimeException(\&quot;Tag %d is not &quot; +</span>
+<span class="nc" id="L527">                                &quot;valid for version \&quot; + _version);%n&quot;, field.tag().get())).</span>
+<span class="nc" id="L528">                            generate(buffer);</span>
+<span class="nc" id="L529">                        buffer.decrementIndent();</span>
+<span class="nc" id="L530">                        buffer.printf(&quot;}%n&quot;);</span>
+                    }
+<span class="nc" id="L532">                }</span>
+<span class="nc" id="L533">                buffer.printf(&quot;default:%n&quot;);</span>
+<span class="nc" id="L534">                buffer.incrementIndent();</span>
+<span class="nc" id="L535">                buffer.printf(&quot;this._unknownTaggedFields = _readable.readUnknownTaggedField(this._unknownTaggedFields, _tag, _size);%n&quot;);</span>
+<span class="nc" id="L536">                buffer.printf(&quot;break;%n&quot;);</span>
+<span class="nc" id="L537">                buffer.decrementIndent();</span>
+<span class="nc" id="L538">                buffer.decrementIndent();</span>
+<span class="nc" id="L539">                buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L540">                buffer.decrementIndent();</span>
+<span class="nc" id="L541">                buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L542">            }).</span>
+<span class="nc" id="L543">            generate(buffer);</span>
+<span class="nc" id="L544">        buffer.decrementIndent();</span>
+<span class="nc" id="L545">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L546">    }</span>
+
+    private void generateStructReader(
+        FieldSpec field,
+        Versions supportedVersions,
+        boolean tagged
+    ) {
+<span class="nc" id="L553">        VersionConditional.forVersions(field.nullableVersions(), supportedVersions).</span>
+<span class="nc" id="L554">            ifMember(__ -&gt; {</span>
+<span class="nc bnc" id="L555" title="All 2 branches missed.">                if (tagged) {</span>
+<span class="nc" id="L556">                    buffer.printf(&quot;if (_readable.readUnsignedVarint() &lt;= 0) {%n&quot;);</span>
+                } else {
+<span class="nc" id="L558">                    buffer.printf(&quot;if (_readable.readByte() &lt; 0) {%n&quot;);</span>
+                }
+<span class="nc" id="L560">                buffer.incrementIndent();</span>
+<span class="nc" id="L561">                buffer.printf(&quot;this.%s = null;%n&quot;, field.camelCaseName());</span>
+<span class="nc" id="L562">                buffer.decrementIndent();</span>
+<span class="nc" id="L563">                buffer.printf(&quot;} else {%n&quot;);</span>
+<span class="nc" id="L564">                buffer.incrementIndent();</span>
+<span class="nc" id="L565">                buffer.printf(&quot;this.%s = %s;%n&quot;, field.camelCaseName(),</span>
+<span class="nc" id="L566">                    primitiveReadExpression(field.type()));</span>
+<span class="nc" id="L567">                buffer.decrementIndent();</span>
+<span class="nc" id="L568">                buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L569">            }).</span>
+<span class="nc" id="L570">            ifNotMember(__ -&gt; buffer.printf(&quot;this.%s = %s;%n&quot;, field.camelCaseName(),</span>
+<span class="nc" id="L571">                primitiveReadExpression(field.type()))).</span>
+<span class="nc" id="L572">            generate(buffer);</span>
+<span class="nc" id="L573">    }</span>
+
+    private String primitiveReadExpression(FieldType type) {
+<span class="nc bnc" id="L576" title="All 2 branches missed.">        if (type instanceof FieldType.BoolFieldType) {</span>
+<span class="nc" id="L577">            return &quot;_readable.readByte() != 0&quot;;</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">        } else if (type instanceof FieldType.Int8FieldType) {</span>
+<span class="nc" id="L579">            return &quot;_readable.readByte()&quot;;</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">        } else if (type instanceof FieldType.Int16FieldType) {</span>
+<span class="nc" id="L581">            return &quot;_readable.readShort()&quot;;</span>
+<span class="nc bnc" id="L582" title="All 2 branches missed.">        } else if (type instanceof FieldType.Uint16FieldType) {</span>
+<span class="nc" id="L583">            return &quot;_readable.readUnsignedShort()&quot;;</span>
+<span class="nc bnc" id="L584" title="All 2 branches missed.">        } else if (type instanceof FieldType.Uint32FieldType) {</span>
+<span class="nc" id="L585">            return &quot;_readable.readUnsignedInt()&quot;;</span>
+<span class="nc bnc" id="L586" title="All 2 branches missed.">        } else if (type instanceof FieldType.Int32FieldType) {</span>
+<span class="nc" id="L587">            return &quot;_readable.readInt()&quot;;</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">        } else if (type instanceof FieldType.Int64FieldType) {</span>
+<span class="nc" id="L589">            return &quot;_readable.readLong()&quot;;</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">        } else if (type instanceof FieldType.UUIDFieldType) {</span>
+<span class="nc" id="L591">            return &quot;_readable.readUuid()&quot;;</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">        } else if (type instanceof FieldType.Float64FieldType) {</span>
+<span class="nc" id="L593">            return &quot;_readable.readDouble()&quot;;</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">        } else if (type.isStruct()) {</span>
+<span class="nc" id="L595">            return String.format(&quot;new %s(_readable, _version)&quot;, type);</span>
+        } else {
+<span class="nc" id="L597">            throw new RuntimeException(&quot;Unsupported field type &quot; + type);</span>
+        }
+    }
+
+    private void generateVariableLengthReader(Versions fieldFlexibleVersions,
+                                              String name,
+                                              FieldType type,
+                                              Versions possibleVersions,
+                                              Versions nullableVersions,
+                                              String assignmentPrefix,
+                                              String assignmentSuffix,
+                                              boolean isStructArrayWithKeys,
+                                              boolean zeroCopy) {
+<span class="nc bnc" id="L610" title="All 2 branches missed.">        String lengthVar = type.isArray() ? &quot;arrayLength&quot; : &quot;length&quot;;</span>
+<span class="nc" id="L611">        buffer.printf(&quot;int %s;%n&quot;, lengthVar);</span>
+<span class="nc" id="L612">        VersionConditional.forVersions(fieldFlexibleVersions, possibleVersions).</span>
+<span class="nc" id="L613">            ifMember(__ -&gt; buffer.printf(&quot;%s = _readable.readUnsignedVarint() - 1;%n&quot;, lengthVar)).</span>
+<span class="nc" id="L614">            ifNotMember(__ -&gt; {</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">                if (type.isString()) {</span>
+<span class="nc" id="L616">                    buffer.printf(&quot;%s = _readable.readShort();%n&quot;, lengthVar);</span>
+<span class="nc bnc" id="L617" title="All 6 branches missed.">                } else if (type.isBytes() || type.isArray() || type.isRecords()) {</span>
+<span class="nc" id="L618">                    buffer.printf(&quot;%s = _readable.readInt();%n&quot;, lengthVar);</span>
+                } else {
+<span class="nc" id="L620">                    throw new RuntimeException(&quot;Can't handle variable length type &quot; + type);</span>
+                }
+<span class="nc" id="L622">            }).</span>
+<span class="nc" id="L623">            generate(buffer);</span>
+<span class="nc" id="L624">        buffer.printf(&quot;if (%s &lt; 0) {%n&quot;, lengthVar);</span>
+<span class="nc" id="L625">        buffer.incrementIndent();</span>
+<span class="nc" id="L626">        VersionConditional.forVersions(nullableVersions, possibleVersions).</span>
+<span class="nc" id="L627">            ifNotMember(__ -&gt; buffer.printf(&quot;throw new RuntimeException(\&quot;non-nullable field %s &quot; +</span>
+                &quot;was serialized as null\&quot;);%n&quot;, name)).
+<span class="nc" id="L629">            ifMember(__ -&gt; buffer.printf(&quot;%snull%s&quot;, assignmentPrefix, assignmentSuffix)).</span>
+<span class="nc" id="L630">            generate(buffer);</span>
+<span class="nc" id="L631">        buffer.decrementIndent();</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">        if (type.isString()) {</span>
+<span class="nc" id="L633">            buffer.printf(&quot;} else if (%s &gt; 0x7fff) {%n&quot;, lengthVar);</span>
+<span class="nc" id="L634">            buffer.incrementIndent();</span>
+<span class="nc" id="L635">            buffer.printf(&quot;throw new RuntimeException(\&quot;string field %s &quot; +</span>
+                &quot;had invalid length \&quot; + %s);%n&quot;, name, lengthVar);
+<span class="nc" id="L637">            buffer.decrementIndent();</span>
+        }
+<span class="nc" id="L639">        buffer.printf(&quot;} else {%n&quot;);</span>
+<span class="nc" id="L640">        buffer.incrementIndent();</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">        if (type.isString()) {</span>
+<span class="nc" id="L642">            buffer.printf(&quot;%s_readable.readString(%s)%s&quot;,</span>
+                assignmentPrefix, lengthVar, assignmentSuffix);
+<span class="nc bnc" id="L644" title="All 2 branches missed.">        } else if (type.isBytes()) {</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">            if (zeroCopy) {</span>
+<span class="nc" id="L646">                buffer.printf(&quot;%s_readable.readByteBuffer(%s)%s&quot;,</span>
+                    assignmentPrefix, lengthVar, assignmentSuffix);
+            } else {
+<span class="nc" id="L649">                buffer.printf(&quot;byte[] newBytes = _readable.readArray(%s);%n&quot;, lengthVar);</span>
+<span class="nc" id="L650">                buffer.printf(&quot;%snewBytes%s&quot;, assignmentPrefix, assignmentSuffix);</span>
+            }
+<span class="nc bnc" id="L652" title="All 2 branches missed.">        } else if (type.isRecords()) {</span>
+<span class="nc" id="L653">            buffer.printf(&quot;%s_readable.readRecords(%s)%s&quot;,</span>
+                assignmentPrefix, lengthVar, assignmentSuffix);
+<span class="nc bnc" id="L655" title="All 2 branches missed.">        } else if (type.isArray()) {</span>
+<span class="nc" id="L656">            FieldType.ArrayType arrayType = (FieldType.ArrayType) type;</span>
+<span class="nc" id="L657">            buffer.printf(&quot;if (%s &gt; _readable.remaining()) {%n&quot;, lengthVar);</span>
+<span class="nc" id="L658">            buffer.incrementIndent();</span>
+<span class="nc" id="L659">            buffer.printf(&quot;throw new RuntimeException(\&quot;Tried to allocate a collection of size \&quot; + %s + \&quot;, but &quot; +</span>
+                    &quot;there are only \&quot; + _readable.remaining() + \&quot; bytes remaining.\&quot;);%n&quot;, lengthVar);
+<span class="nc" id="L661">            buffer.decrementIndent();</span>
+<span class="nc" id="L662">            buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc bnc" id="L663" title="All 2 branches missed.">            if (isStructArrayWithKeys) {</span>
+<span class="nc" id="L664">                headerGenerator.addImport(MessageGenerator.IMPLICIT_LINKED_HASH_MULTI_COLLECTION_CLASS);</span>
+<span class="nc" id="L665">                buffer.printf(&quot;%s newCollection = new %s(%s);%n&quot;,</span>
+<span class="nc" id="L666">                    FieldSpec.collectionType(arrayType.elementType().toString()),</span>
+<span class="nc" id="L667">                        FieldSpec.collectionType(arrayType.elementType().toString()), lengthVar);</span>
+            } else {
+<span class="nc" id="L669">                headerGenerator.addImport(MessageGenerator.ARRAYLIST_CLASS);</span>
+<span class="nc" id="L670">                String boxedArrayType =</span>
+<span class="nc" id="L671">                    arrayType.elementType().getBoxedJavaType(headerGenerator);</span>
+<span class="nc" id="L672">                buffer.printf(&quot;ArrayList&lt;%s&gt; newCollection = new ArrayList&lt;&gt;(%s);%n&quot;, boxedArrayType, lengthVar);</span>
+            }
+<span class="nc" id="L674">            buffer.printf(&quot;for (int i = 0; i &lt; %s; i++) {%n&quot;, lengthVar);</span>
+<span class="nc" id="L675">            buffer.incrementIndent();</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">            if (arrayType.elementType().isArray()) {</span>
+<span class="nc" id="L677">                throw new RuntimeException(&quot;Nested arrays are not supported.  &quot; +</span>
+                    &quot;Use an array of structures containing another array.&quot;);
+<span class="nc bnc" id="L679" title="All 4 branches missed.">            } else if (arrayType.elementType().isBytes() || arrayType.elementType().isString()) {</span>
+<span class="nc" id="L680">                generateVariableLengthReader(fieldFlexibleVersions,</span>
+                    name + &quot; element&quot;,
+<span class="nc" id="L682">                    arrayType.elementType(),</span>
+                    possibleVersions,
+                    Versions.NONE,
+                    &quot;newCollection.add(&quot;,
+<span class="nc" id="L686">                    String.format(&quot;);%n&quot;),</span>
+                    false,
+                    false);
+            } else {
+<span class="nc" id="L690">                buffer.printf(&quot;newCollection.add(%s);%n&quot;,</span>
+<span class="nc" id="L691">                    primitiveReadExpression(arrayType.elementType()));</span>
+            }
+<span class="nc" id="L693">            buffer.decrementIndent();</span>
+<span class="nc" id="L694">            buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L695">            buffer.printf(&quot;%snewCollection%s&quot;, assignmentPrefix, assignmentSuffix);</span>
+<span class="nc" id="L696">        } else {</span>
+<span class="nc" id="L697">            throw new RuntimeException(&quot;Can't handle variable length type &quot; + type);</span>
+        }
+<span class="nc" id="L699">        buffer.decrementIndent();</span>
+<span class="nc" id="L700">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L701">    }</span>
+
+    private void generateClassWriter(String className, StructSpec struct,
+            Versions parentVersions) {
+<span class="nc" id="L705">        headerGenerator.addImport(MessageGenerator.WRITABLE_CLASS);</span>
+<span class="nc" id="L706">        headerGenerator.addImport(MessageGenerator.OBJECT_SERIALIZATION_CACHE_CLASS);</span>
+<span class="nc" id="L707">        buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L708">        buffer.printf(&quot;public void write(Writable _writable, ObjectSerializationCache _cache, short _version) {%n&quot;);</span>
+<span class="nc" id="L709">        buffer.incrementIndent();</span>
+<span class="nc" id="L710">        VersionConditional.forVersions(struct.versions(), parentVersions).</span>
+<span class="nc" id="L711">            allowMembershipCheckAlwaysFalse(false).</span>
+<span class="nc" id="L712">            ifNotMember(__ -&gt; {</span>
+<span class="nc" id="L713">                headerGenerator.addImport(MessageGenerator.UNSUPPORTED_VERSION_EXCEPTION_CLASS);</span>
+<span class="nc" id="L714">                buffer.printf(&quot;throw new UnsupportedVersionException(\&quot;Can't write &quot; +</span>
+                    &quot;version \&quot; + _version + \&quot; of %s\&quot;);%n&quot;, className);
+<span class="nc" id="L716">            }).</span>
+<span class="nc" id="L717">            generate(buffer);</span>
+<span class="nc" id="L718">        buffer.printf(&quot;int _numTaggedFields = 0;%n&quot;);</span>
+<span class="nc" id="L719">        Versions curVersions = parentVersions.intersect(struct.versions());</span>
+<span class="nc" id="L720">        TreeMap&lt;Integer, FieldSpec&gt; taggedFields = new TreeMap&lt;&gt;();</span>
+<span class="nc bnc" id="L721" title="All 2 branches missed.">        for (FieldSpec field : struct.fields()) {</span>
+<span class="nc" id="L722">            VersionConditional cond = VersionConditional.forVersions(field.versions(), curVersions).</span>
+<span class="nc" id="L723">                ifMember(presentVersions -&gt;</span>
+<span class="nc" id="L724">                    VersionConditional.forVersions(field.taggedVersions(), presentVersions).</span>
+<span class="nc" id="L725">                        ifNotMember(presentAndUntaggedVersions -&gt; {</span>
+<span class="nc bnc" id="L726" title="All 4 branches missed.">                            if (field.type().isVariableLength() &amp;&amp; !field.type().isStruct()) {</span>
+<span class="nc" id="L727">                                ClauseGenerator callGenerateVariableLengthWriter = versions -&gt;</span>
+<span class="nc" id="L728">                                    generateVariableLengthWriter(fieldFlexibleVersions(field),</span>
+<span class="nc" id="L729">                                        field.camelCaseName(),</span>
+<span class="nc" id="L730">                                        field.type(),</span>
+                                        versions,
+<span class="nc" id="L732">                                        field.nullableVersions(),</span>
+<span class="nc" id="L733">                                        field.zeroCopy()</span>
+                                    );
+                                // For arrays where the field type needs to be serialized differently in flexible
+                                // versions, lift the flexible version check outside of the array.
+                                // This may mean generating two separate 'for' loops-- one for flexible
+                                // versions, and one for regular versions.
+<span class="nc bnc" id="L739" title="All 2 branches missed.">                                if (field.type().isArray() &amp;&amp;</span>
+<span class="nc" id="L740">                                    ((FieldType.ArrayType) field.type()).elementType().</span>
+<span class="nc bnc" id="L741" title="All 2 branches missed.">                                        serializationIsDifferentInFlexibleVersions()) {</span>
+<span class="nc" id="L742">                                    VersionConditional.forVersions(fieldFlexibleVersions(field),</span>
+                                            presentAndUntaggedVersions).
+<span class="nc" id="L744">                                        ifMember(callGenerateVariableLengthWriter).</span>
+<span class="nc" id="L745">                                        ifNotMember(callGenerateVariableLengthWriter).</span>
+<span class="nc" id="L746">                                        generate(buffer);</span>
+                                } else {
+<span class="nc" id="L748">                                    callGenerateVariableLengthWriter.generate(presentAndUntaggedVersions);</span>
+                                }
+<span class="nc bnc" id="L750" title="All 2 branches missed.">                            } else if (field.type().isStruct()) {</span>
+<span class="nc" id="L751">                                IsNullConditional.forName(field.camelCaseName()).</span>
+<span class="nc" id="L752">                                    possibleVersions(presentAndUntaggedVersions).</span>
+<span class="nc" id="L753">                                    nullableVersions(field.nullableVersions()).</span>
+<span class="nc" id="L754">                                    ifNull(() -&gt;</span>
+<span class="nc" id="L755">                                        VersionConditional.forVersions(field.nullableVersions(), presentAndUntaggedVersions).</span>
+<span class="nc" id="L756">                                            ifMember(__ -&gt; buffer.printf(&quot;_writable.writeByte((byte) -1);%n&quot;)).</span>
+<span class="nc" id="L757">                                            ifNotMember(__ -&gt; buffer.printf(&quot;throw new NullPointerException();%n&quot;)).</span>
+<span class="nc" id="L758">                                            generate(buffer)</span>
+                                    ).
+<span class="nc" id="L760">                                    ifShouldNotBeNull(() -&gt; {</span>
+<span class="nc" id="L761">                                        VersionConditional.forVersions(field.nullableVersions(), presentAndUntaggedVersions).</span>
+<span class="nc" id="L762">                                            ifMember(__ -&gt; buffer.printf(&quot;_writable.writeByte((byte) 1);%n&quot;)).</span>
+<span class="nc" id="L763">                                            generate(buffer);</span>
+<span class="nc" id="L764">                                        buffer.printf(&quot;%s;%n&quot;,</span>
+<span class="nc" id="L765">                                            primitiveWriteExpression(field.type(), field.camelCaseName()));</span>
+<span class="nc" id="L766">                                    }).</span>
+<span class="nc" id="L767">                                    generate(buffer);</span>
+                            } else {
+<span class="nc" id="L769">                                buffer.printf(&quot;%s;%n&quot;,</span>
+<span class="nc" id="L770">                                    primitiveWriteExpression(field.type(), field.camelCaseName()));</span>
+                            }
+<span class="nc" id="L772">                        }).</span>
+<span class="nc" id="L773">                        ifMember(__ -&gt; {</span>
+<span class="nc" id="L774">                            field.generateNonDefaultValueCheck(headerGenerator,</span>
+<span class="nc" id="L775">                                structRegistry, buffer, &quot;this.&quot;, field.nullableVersions());</span>
+<span class="nc" id="L776">                            buffer.incrementIndent();</span>
+<span class="nc" id="L777">                            buffer.printf(&quot;_numTaggedFields++;%n&quot;);</span>
+<span class="nc" id="L778">                            buffer.decrementIndent();</span>
+<span class="nc" id="L779">                            buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc bnc" id="L780" title="All 2 branches missed.">                            if (taggedFields.put(field.tag().get(), field) != null) {</span>
+<span class="nc" id="L781">                                throw new RuntimeException(&quot;Field &quot; + field.name() + &quot; has tag &quot; +</span>
+<span class="nc" id="L782">                                    field.tag() + &quot;, but another field already used that tag.&quot;);</span>
+                            }
+<span class="nc" id="L784">                        }).</span>
+<span class="nc" id="L785">                        generate(buffer)</span>
+                );
+<span class="nc bnc" id="L787" title="All 2 branches missed.">            if (!field.ignorable()) {</span>
+<span class="nc" id="L788">                cond.ifNotMember(__ -&gt; field.generateNonIgnorableFieldCheck(headerGenerator,</span>
+                    structRegistry, &quot;this.&quot;, buffer));
+            }
+<span class="nc" id="L791">            cond.generate(buffer);</span>
+<span class="nc" id="L792">        }</span>
+<span class="nc" id="L793">        headerGenerator.addImport(MessageGenerator.RAW_TAGGED_FIELD_WRITER_CLASS);</span>
+<span class="nc" id="L794">        buffer.printf(&quot;RawTaggedFieldWriter _rawWriter = RawTaggedFieldWriter.forFields(_unknownTaggedFields);%n&quot;);</span>
+<span class="nc" id="L795">        buffer.printf(&quot;_numTaggedFields += _rawWriter.numFields();%n&quot;);</span>
+<span class="nc" id="L796">        VersionConditional.forVersions(messageFlexibleVersions, curVersions).</span>
+<span class="nc" id="L797">            ifNotMember(__ -&gt; generateCheckForUnsupportedNumTaggedFields(&quot;_numTaggedFields &gt; 0&quot;)).</span>
+<span class="nc" id="L798">            ifMember(flexibleVersions -&gt; {</span>
+<span class="nc" id="L799">                buffer.printf(&quot;_writable.writeUnsignedVarint(_numTaggedFields);%n&quot;);</span>
+<span class="nc" id="L800">                int prevTag = -1;</span>
+<span class="nc bnc" id="L801" title="All 2 branches missed.">                for (FieldSpec field : taggedFields.values()) {</span>
+<span class="nc bnc" id="L802" title="All 2 branches missed.">                    if (prevTag + 1 != field.tag().get()) {</span>
+<span class="nc" id="L803">                        buffer.printf(&quot;_rawWriter.writeRawTags(_writable, %d);%n&quot;, field.tag().get());</span>
+                    }
+<span class="nc" id="L805">                    VersionConditional.</span>
+<span class="nc" id="L806">                        forVersions(field.taggedVersions().intersect(field.versions()), flexibleVersions).</span>
+<span class="nc" id="L807">                        allowMembershipCheckAlwaysFalse(false).</span>
+<span class="nc" id="L808">                        ifMember(presentAndTaggedVersions -&gt; {</span>
+<span class="nc" id="L809">                            IsNullConditional cond = IsNullConditional.forName(field.camelCaseName()).</span>
+<span class="nc" id="L810">                                nullableVersions(field.nullableVersions()).</span>
+<span class="nc" id="L811">                                possibleVersions(presentAndTaggedVersions).</span>
+<span class="nc" id="L812">                                alwaysEmitBlockScope(true).</span>
+<span class="nc" id="L813">                                ifShouldNotBeNull(() -&gt; {</span>
+<span class="nc bnc" id="L814" title="All 2 branches missed.">                                    if (!field.defaultString().equals(&quot;null&quot;)) {</span>
+<span class="nc" id="L815">                                        field.generateNonDefaultValueCheck(headerGenerator,</span>
+                                            structRegistry, buffer, &quot;this.&quot;, Versions.NONE);
+<span class="nc" id="L817">                                        buffer.incrementIndent();</span>
+                                    }
+<span class="nc" id="L819">                                    buffer.printf(&quot;_writable.writeUnsignedVarint(%d);%n&quot;, field.tag().get());</span>
+<span class="nc bnc" id="L820" title="All 2 branches missed.">                                    if (field.type().isString()) {</span>
+<span class="nc" id="L821">                                        buffer.printf(&quot;byte[] _stringBytes = _cache.getSerializedValue(this.%s);%n&quot;,</span>
+<span class="nc" id="L822">                                            field.camelCaseName());</span>
+<span class="nc" id="L823">                                        headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc" id="L824">                                        buffer.printf(&quot;_writable.writeUnsignedVarint(_stringBytes.length + &quot; +</span>
+                                            &quot;ByteUtils.sizeOfUnsignedVarint(_stringBytes.length + 1));%n&quot;);
+<span class="nc" id="L826">                                        buffer.printf(&quot;_writable.writeUnsignedVarint(_stringBytes.length + 1);%n&quot;);</span>
+<span class="nc" id="L827">                                        buffer.printf(&quot;_writable.writeByteArray(_stringBytes);%n&quot;);</span>
+<span class="nc bnc" id="L828" title="All 2 branches missed.">                                    } else if (field.type().isBytes()) {</span>
+<span class="nc" id="L829">                                        headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc" id="L830">                                        buffer.printf(&quot;_writable.writeUnsignedVarint(this.%s.length + &quot; +</span>
+                                                &quot;ByteUtils.sizeOfUnsignedVarint(this.%s.length + 1));%n&quot;,
+<span class="nc" id="L832">                                            field.camelCaseName(), field.camelCaseName());</span>
+<span class="nc" id="L833">                                        buffer.printf(&quot;_writable.writeUnsignedVarint(this.%s.length + 1);%n&quot;,</span>
+<span class="nc" id="L834">                                            field.camelCaseName());</span>
+<span class="nc" id="L835">                                        buffer.printf(&quot;_writable.writeByteArray(this.%s);%n&quot;,</span>
+<span class="nc" id="L836">                                            field.camelCaseName());</span>
+<span class="nc bnc" id="L837" title="All 2 branches missed.">                                    } else if (field.type().isArray()) {</span>
+<span class="nc" id="L838">                                        headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc" id="L839">                                        buffer.printf(&quot;_writable.writeUnsignedVarint(_cache.getArraySizeInBytes(this.%s));%n&quot;,</span>
+<span class="nc" id="L840">                                            field.camelCaseName());</span>
+<span class="nc" id="L841">                                        generateVariableLengthWriter(fieldFlexibleVersions(field),</span>
+<span class="nc" id="L842">                                            field.camelCaseName(),</span>
+<span class="nc" id="L843">                                            field.type(),</span>
+                                            presentAndTaggedVersions,
+                                            Versions.NONE,
+<span class="nc" id="L846">                                            field.zeroCopy());</span>
+<span class="nc bnc" id="L847" title="All 2 branches missed.">                                    } else if (field.type().isStruct()) {</span>
+<span class="nc" id="L848">                                        VersionConditional.forVersions(field.nullableVersions(), presentAndTaggedVersions).</span>
+<span class="nc" id="L849">                                            ifMember(___ -&gt; {</span>
+<span class="nc" id="L850">                                                buffer.printf(&quot;_writable.writeUnsignedVarint(this.%s.size(_cache, _version) + 1);%n&quot;,</span>
+<span class="nc" id="L851">                                                    field.camelCaseName());</span>
+<span class="nc" id="L852">                                                buffer.printf(&quot;_writable.writeUnsignedVarint(1);%n&quot;);</span>
+<span class="nc" id="L853">                                            }).</span>
+<span class="nc" id="L854">                                            ifNotMember(___ -&gt;</span>
+<span class="nc" id="L855">                                                buffer.printf(&quot;_writable.writeUnsignedVarint(this.%s.size(_cache, _version));%n&quot;,</span>
+<span class="nc" id="L856">                                                    field.camelCaseName())</span>
+                                            ).
+<span class="nc" id="L858">                                            generate(buffer);</span>
+<span class="nc" id="L859">                                        buffer.printf(&quot;%s;%n&quot;,</span>
+<span class="nc" id="L860">                                            primitiveWriteExpression(field.type(), field.camelCaseName()));</span>
+<span class="nc bnc" id="L861" title="All 2 branches missed.">                                    } else if (field.type().isRecords()) {</span>
+<span class="nc" id="L862">                                        throw new RuntimeException(&quot;Unsupported attempt to declare field `&quot; +</span>
+<span class="nc" id="L863">                                            field.name() + &quot;` with `records` type as a tagged field.&quot;);</span>
+                                    } else {
+<span class="nc" id="L865">                                        buffer.printf(&quot;_writable.writeUnsignedVarint(%d);%n&quot;,</span>
+<span class="nc" id="L866">                                            field.type().fixedLength().get());</span>
+<span class="nc" id="L867">                                        buffer.printf(&quot;%s;%n&quot;,</span>
+<span class="nc" id="L868">                                            primitiveWriteExpression(field.type(), field.camelCaseName()));</span>
+                                    }
+<span class="nc bnc" id="L870" title="All 2 branches missed.">                                    if (!field.defaultString().equals(&quot;null&quot;)) {</span>
+<span class="nc" id="L871">                                        buffer.decrementIndent();</span>
+<span class="nc" id="L872">                                        buffer.printf(&quot;}%n&quot;);</span>
+                                    }
+<span class="nc" id="L874">                                });</span>
+<span class="nc bnc" id="L875" title="All 2 branches missed.">                            if (!field.defaultString().equals(&quot;null&quot;)) {</span>
+<span class="nc" id="L876">                                cond.ifNull(() -&gt; {</span>
+<span class="nc" id="L877">                                    buffer.printf(&quot;_writable.writeUnsignedVarint(%d);%n&quot;, field.tag().get());</span>
+<span class="nc" id="L878">                                    buffer.printf(&quot;_writable.writeUnsignedVarint(1);%n&quot;);</span>
+<span class="nc" id="L879">                                    buffer.printf(&quot;_writable.writeUnsignedVarint(0);%n&quot;);</span>
+<span class="nc" id="L880">                                });</span>
+                            }
+<span class="nc" id="L882">                            cond.generate(buffer);</span>
+<span class="nc" id="L883">                        }).</span>
+<span class="nc" id="L884">                        generate(buffer);</span>
+<span class="nc" id="L885">                    prevTag = field.tag().get();</span>
+<span class="nc" id="L886">                }</span>
+<span class="nc bnc" id="L887" title="All 2 branches missed.">                if (prevTag &lt; Integer.MAX_VALUE) {</span>
+<span class="nc" id="L888">                    buffer.printf(&quot;_rawWriter.writeRawTags(_writable, Integer.MAX_VALUE);%n&quot;);</span>
+                }
+<span class="nc" id="L890">            }).</span>
+<span class="nc" id="L891">            generate(buffer);</span>
+<span class="nc" id="L892">        buffer.decrementIndent();</span>
+<span class="nc" id="L893">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L894">    }</span>
+
+    private void generateCheckForUnsupportedNumTaggedFields(String conditional) {
+<span class="nc" id="L897">        buffer.printf(&quot;if (%s) {%n&quot;, conditional);</span>
+<span class="nc" id="L898">        buffer.incrementIndent();</span>
+<span class="nc" id="L899">        headerGenerator.addImport(MessageGenerator.UNSUPPORTED_VERSION_EXCEPTION_CLASS);</span>
+<span class="nc" id="L900">        buffer.printf(&quot;throw new UnsupportedVersionException(\&quot;Tagged fields were set, &quot; +</span>
+            &quot;but version \&quot; + _version + \&quot; of this message does not support them.\&quot;);%n&quot;);
+<span class="nc" id="L902">        buffer.decrementIndent();</span>
+<span class="nc" id="L903">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L904">    }</span>
+
+    private String primitiveWriteExpression(FieldType type, String name) {
+<span class="nc bnc" id="L907" title="All 2 branches missed.">        if (type instanceof FieldType.BoolFieldType) {</span>
+<span class="nc" id="L908">            return String.format(&quot;_writable.writeByte(%s ? (byte) 1 : (byte) 0)&quot;, name);</span>
+<span class="nc bnc" id="L909" title="All 2 branches missed.">        } else if (type instanceof FieldType.Int8FieldType) {</span>
+<span class="nc" id="L910">            return String.format(&quot;_writable.writeByte(%s)&quot;, name);</span>
+<span class="nc bnc" id="L911" title="All 2 branches missed.">        } else if (type instanceof FieldType.Int16FieldType) {</span>
+<span class="nc" id="L912">            return String.format(&quot;_writable.writeShort(%s)&quot;, name);</span>
+<span class="nc bnc" id="L913" title="All 2 branches missed.">        } else if (type instanceof FieldType.Uint16FieldType) {</span>
+<span class="nc" id="L914">            return String.format(&quot;_writable.writeUnsignedShort(%s)&quot;, name);</span>
+<span class="nc bnc" id="L915" title="All 2 branches missed.">        } else if (type instanceof FieldType.Uint32FieldType) {</span>
+<span class="nc" id="L916">            return String.format(&quot;_writable.writeUnsignedInt(%s)&quot;, name);</span>
+<span class="nc bnc" id="L917" title="All 2 branches missed.">        } else if (type instanceof FieldType.Int32FieldType) {</span>
+<span class="nc" id="L918">            return String.format(&quot;_writable.writeInt(%s)&quot;, name);</span>
+<span class="nc bnc" id="L919" title="All 2 branches missed.">        } else if (type instanceof FieldType.Int64FieldType) {</span>
+<span class="nc" id="L920">            return String.format(&quot;_writable.writeLong(%s)&quot;, name);</span>
+<span class="nc bnc" id="L921" title="All 2 branches missed.">        } else if (type instanceof FieldType.UUIDFieldType) {</span>
+<span class="nc" id="L922">            return String.format(&quot;_writable.writeUuid(%s)&quot;, name);</span>
+<span class="nc bnc" id="L923" title="All 2 branches missed.">        } else if (type instanceof FieldType.Float64FieldType) {</span>
+<span class="nc" id="L924">            return String.format(&quot;_writable.writeDouble(%s)&quot;, name);</span>
+<span class="nc bnc" id="L925" title="All 2 branches missed.">        } else if (type instanceof FieldType.StructType) {</span>
+<span class="nc" id="L926">            return String.format(&quot;%s.write(_writable, _cache, _version)&quot;, name);</span>
+        } else {
+<span class="nc" id="L928">            throw new RuntimeException(&quot;Unsupported field type &quot; + type);</span>
+        }
+    }
+
+    private void generateVariableLengthWriter(Versions fieldFlexibleVersions,
+                                              String name,
+                                              FieldType type,
+                                              Versions possibleVersions,
+                                              Versions nullableVersions,
+                                              boolean zeroCopy) {
+<span class="nc" id="L938">        IsNullConditional.forName(name).</span>
+<span class="nc" id="L939">            possibleVersions(possibleVersions).</span>
+<span class="nc" id="L940">            nullableVersions(nullableVersions).</span>
+<span class="nc" id="L941">            alwaysEmitBlockScope(type.isString()).</span>
+<span class="nc" id="L942">            ifNull(() -&gt;</span>
+<span class="nc" id="L943">                VersionConditional.forVersions(nullableVersions, possibleVersions).</span>
+<span class="nc" id="L944">                    ifMember(presentVersions -&gt;</span>
+<span class="nc" id="L945">                        VersionConditional.forVersions(fieldFlexibleVersions, presentVersions).</span>
+<span class="nc" id="L946">                            ifMember(___ -&gt; buffer.printf(&quot;_writable.writeUnsignedVarint(0);%n&quot;)).</span>
+<span class="nc" id="L947">                            ifNotMember(___ -&gt; {</span>
+<span class="nc bnc" id="L948" title="All 2 branches missed.">                                if (type.isString()) {</span>
+<span class="nc" id="L949">                                    buffer.printf(&quot;_writable.writeShort((short) -1);%n&quot;);</span>
+                                } else {
+<span class="nc" id="L951">                                    buffer.printf(&quot;_writable.writeInt(-1);%n&quot;);</span>
+                                }
+<span class="nc" id="L953">                            }).</span>
+<span class="nc" id="L954">                            generate(buffer)</span>
+                    ).
+<span class="nc" id="L956">                    ifNotMember(__ -&gt; buffer.printf(&quot;throw new NullPointerException();%n&quot;)).</span>
+<span class="nc" id="L957">                    generate(buffer)</span>
+            ).
+<span class="nc" id="L959">            ifShouldNotBeNull(() -&gt; {</span>
+                final String lengthExpression;
+<span class="nc bnc" id="L961" title="All 2 branches missed.">                if (type.isString()) {</span>
+<span class="nc" id="L962">                    buffer.printf(&quot;byte[] _stringBytes = _cache.getSerializedValue(%s);%n&quot;,</span>
+                        name);
+<span class="nc" id="L964">                    lengthExpression = &quot;_stringBytes.length&quot;;</span>
+<span class="nc bnc" id="L965" title="All 2 branches missed.">                } else if (type.isBytes()) {</span>
+<span class="nc bnc" id="L966" title="All 2 branches missed.">                    if (zeroCopy) {</span>
+<span class="nc" id="L967">                        lengthExpression = String.format(&quot;%s.remaining()&quot;, name);</span>
+                    } else {
+<span class="nc" id="L969">                        lengthExpression = String.format(&quot;%s.length&quot;, name);</span>
+                    }
+<span class="nc bnc" id="L971" title="All 2 branches missed.">                } else if (type.isRecords()) {</span>
+<span class="nc" id="L972">                    lengthExpression = String.format(&quot;%s.sizeInBytes()&quot;, name);</span>
+<span class="nc bnc" id="L973" title="All 2 branches missed.">                } else if (type.isArray()) {</span>
+<span class="nc" id="L974">                    lengthExpression = String.format(&quot;%s.size()&quot;, name);</span>
+                } else {
+<span class="nc" id="L976">                    throw new RuntimeException(&quot;Unhandled type &quot; + type);</span>
+                }
+                // Check whether we're dealing with a flexible version or not.  In a flexible
+                // version, the length is serialized differently.
+                //
+                // Note: for arrays, each branch of the if contains the loop for writing out
+                // the elements.  This allows us to lift the version check out of the loop.
+                // This is helpful for things like arrays of strings, where each element
+                // will be serialized differently based on whether the version is flexible.
+<span class="nc" id="L985">                VersionConditional.forVersions(fieldFlexibleVersions, possibleVersions).</span>
+<span class="nc" id="L986">                    ifMember(ifMemberVersions -&gt; buffer.printf(&quot;_writable.writeUnsignedVarint(%s + 1);%n&quot;, lengthExpression)).</span>
+<span class="nc" id="L987">                    ifNotMember(ifNotMemberVersions -&gt; {</span>
+<span class="nc bnc" id="L988" title="All 2 branches missed.">                        if (type.isString()) {</span>
+<span class="nc" id="L989">                            buffer.printf(&quot;_writable.writeShort((short) %s);%n&quot;, lengthExpression);</span>
+                        } else {
+<span class="nc" id="L991">                            buffer.printf(&quot;_writable.writeInt(%s);%n&quot;, lengthExpression);</span>
+                        }
+<span class="nc" id="L993">                    }).</span>
+<span class="nc" id="L994">                    generate(buffer);</span>
+<span class="nc bnc" id="L995" title="All 2 branches missed.">                if (type.isString()) {</span>
+<span class="nc" id="L996">                    buffer.printf(&quot;_writable.writeByteArray(_stringBytes);%n&quot;);</span>
+<span class="nc bnc" id="L997" title="All 2 branches missed.">                } else if (type.isBytes()) {</span>
+<span class="nc bnc" id="L998" title="All 2 branches missed.">                    if (zeroCopy) {</span>
+<span class="nc" id="L999">                        buffer.printf(&quot;_writable.writeByteBuffer(%s);%n&quot;, name);</span>
+                    } else {
+<span class="nc" id="L1001">                        buffer.printf(&quot;_writable.writeByteArray(%s);%n&quot;, name);</span>
+                    }
+<span class="nc bnc" id="L1003" title="All 2 branches missed.">                } else if (type.isRecords()) {</span>
+<span class="nc" id="L1004">                    buffer.printf(&quot;_writable.writeRecords(%s);%n&quot;, name);</span>
+<span class="nc bnc" id="L1005" title="All 2 branches missed.">                } else if (type.isArray()) {</span>
+<span class="nc" id="L1006">                    FieldType.ArrayType arrayType = (FieldType.ArrayType) type;</span>
+<span class="nc" id="L1007">                    FieldType elementType = arrayType.elementType();</span>
+<span class="nc" id="L1008">                    String elementName = String.format(&quot;%sElement&quot;, name);</span>
+<span class="nc" id="L1009">                    buffer.printf(&quot;for (%s %s : %s) {%n&quot;,</span>
+<span class="nc" id="L1010">                        elementType.getBoxedJavaType(headerGenerator),</span>
+                        elementName,
+                        name);
+<span class="nc" id="L1013">                    buffer.incrementIndent();</span>
+<span class="nc bnc" id="L1014" title="All 2 branches missed.">                    if (elementType.isArray()) {</span>
+<span class="nc" id="L1015">                        throw new RuntimeException(&quot;Nested arrays are not supported.  &quot; +</span>
+                            &quot;Use an array of structures containing another array.&quot;);
+<span class="nc bnc" id="L1017" title="All 4 branches missed.">                    } else if (elementType.isBytes() || elementType.isString()) {</span>
+<span class="nc" id="L1018">                        generateVariableLengthWriter(fieldFlexibleVersions,</span>
+                            elementName,
+                            elementType,
+                            possibleVersions,
+                            Versions.NONE,
+                            false);
+                    } else {
+<span class="nc" id="L1025">                        buffer.printf(&quot;%s;%n&quot;, primitiveWriteExpression(elementType, elementName));</span>
+                    }
+<span class="nc" id="L1027">                    buffer.decrementIndent();</span>
+<span class="nc" id="L1028">                    buffer.printf(&quot;}%n&quot;);</span>
+                }
+<span class="nc" id="L1030">            }).</span>
+<span class="nc" id="L1031">            generate(buffer);</span>
+<span class="nc" id="L1032">    }</span>
+
+    private void generateClassMessageSize(
+        String className,
+        StructSpec struct,
+        Versions parentVersions
+    ) {
+<span class="nc" id="L1039">        headerGenerator.addImport(MessageGenerator.OBJECT_SERIALIZATION_CACHE_CLASS);</span>
+<span class="nc" id="L1040">        headerGenerator.addImport(MessageGenerator.MESSAGE_SIZE_ACCUMULATOR_CLASS);</span>
+<span class="nc" id="L1041">        buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L1042">        buffer.printf(&quot;public void addSize(MessageSizeAccumulator _size, ObjectSerializationCache _cache, short _version) {%n&quot;);</span>
+<span class="nc" id="L1043">        buffer.incrementIndent();</span>
+<span class="nc" id="L1044">        buffer.printf(&quot;int _numTaggedFields = 0;%n&quot;);</span>
+<span class="nc" id="L1045">        VersionConditional.forVersions(parentVersions, struct.versions()).</span>
+<span class="nc" id="L1046">            allowMembershipCheckAlwaysFalse(false).</span>
+<span class="nc" id="L1047">            ifNotMember(__ -&gt; {</span>
+<span class="nc" id="L1048">                headerGenerator.addImport(MessageGenerator.UNSUPPORTED_VERSION_EXCEPTION_CLASS);</span>
+<span class="nc" id="L1049">                buffer.printf(&quot;throw new UnsupportedVersionException(\&quot;Can't size &quot; +</span>
+                    &quot;version \&quot; + _version + \&quot; of %s\&quot;);%n&quot;, className);
+<span class="nc" id="L1051">            }).</span>
+<span class="nc" id="L1052">            generate(buffer);</span>
+<span class="nc" id="L1053">        Versions curVersions = parentVersions.intersect(struct.versions());</span>
+<span class="nc bnc" id="L1054" title="All 2 branches missed.">        for (FieldSpec field : struct.fields()) {</span>
+<span class="nc" id="L1055">            VersionConditional.forVersions(field.versions(), curVersions).</span>
+<span class="nc" id="L1056">                ifMember(presentVersions -&gt;</span>
+<span class="nc" id="L1057">                    VersionConditional.forVersions(field.taggedVersions(), presentVersions).</span>
+<span class="nc" id="L1058">                        ifMember(presentAndTaggedVersions -&gt; generateFieldSize(field, presentAndTaggedVersions, true)).</span>
+<span class="nc" id="L1059">                        ifNotMember(presentAndUntaggedVersions -&gt; generateFieldSize(field, presentAndUntaggedVersions, false)).</span>
+<span class="nc" id="L1060">                        generate(buffer)</span>
+<span class="nc" id="L1061">                ).generate(buffer);</span>
+<span class="nc" id="L1062">        }</span>
+<span class="nc" id="L1063">        buffer.printf(&quot;if (_unknownTaggedFields != null) {%n&quot;);</span>
+<span class="nc" id="L1064">        buffer.incrementIndent();</span>
+<span class="nc" id="L1065">        buffer.printf(&quot;_numTaggedFields += _unknownTaggedFields.size();%n&quot;);</span>
+<span class="nc" id="L1066">        buffer.printf(&quot;for (RawTaggedField _field : _unknownTaggedFields) {%n&quot;);</span>
+<span class="nc" id="L1067">        buffer.incrementIndent();</span>
+<span class="nc" id="L1068">        headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc" id="L1069">        buffer.printf(&quot;_size.addBytes(ByteUtils.sizeOfUnsignedVarint(_field.tag()));%n&quot;);</span>
+<span class="nc" id="L1070">        buffer.printf(&quot;_size.addBytes(ByteUtils.sizeOfUnsignedVarint(_field.size()));%n&quot;);</span>
+<span class="nc" id="L1071">        buffer.printf(&quot;_size.addBytes(_field.size());%n&quot;);</span>
+<span class="nc" id="L1072">        buffer.decrementIndent();</span>
+<span class="nc" id="L1073">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L1074">        buffer.decrementIndent();</span>
+<span class="nc" id="L1075">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L1076">        VersionConditional.forVersions(messageFlexibleVersions, curVersions).</span>
+<span class="nc" id="L1077">            ifNotMember(__ -&gt; generateCheckForUnsupportedNumTaggedFields(&quot;_numTaggedFields &gt; 0&quot;)).</span>
+<span class="nc" id="L1078">            ifMember(__ -&gt; {</span>
+<span class="nc" id="L1079">                headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc" id="L1080">                buffer.printf(&quot;_size.addBytes(ByteUtils.sizeOfUnsignedVarint(_numTaggedFields));%n&quot;);</span>
+<span class="nc" id="L1081">            }).</span>
+<span class="nc" id="L1082">            generate(buffer);</span>
+<span class="nc" id="L1083">        buffer.decrementIndent();</span>
+<span class="nc" id="L1084">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L1085">    }</span>
+
+    /**
+     * Generate the size calculator for a variable-length array element.
+     * Array elements cannot be null.
+     */
+    private void generateVariableLengthArrayElementSize(Versions flexibleVersions,
+                                                        String fieldName,
+                                                        FieldType type,
+                                                        Versions versions) {
+<span class="nc bnc" id="L1095" title="All 2 branches missed.">        if (type instanceof FieldType.StringFieldType) {</span>
+<span class="nc" id="L1096">            generateStringToBytes(fieldName);</span>
+<span class="nc" id="L1097">            VersionConditional.forVersions(flexibleVersions, versions).</span>
+<span class="nc" id="L1098">                ifNotMember(__ -&gt; buffer.printf(&quot;_size.addBytes(_stringBytes.length + 2);%n&quot;)).</span>
+<span class="nc" id="L1099">                ifMember(__ -&gt; {</span>
+<span class="nc" id="L1100">                    headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc" id="L1101">                    buffer.printf(&quot;_size.addBytes(_stringBytes.length + &quot; +</span>
+                        &quot;ByteUtils.sizeOfUnsignedVarint(_stringBytes.length + 1));%n&quot;);
+<span class="nc" id="L1103">                }).</span>
+<span class="nc" id="L1104">                generate(buffer);</span>
+<span class="nc bnc" id="L1105" title="All 2 branches missed.">        } else if (type instanceof FieldType.BytesFieldType) {</span>
+<span class="nc" id="L1106">            buffer.printf(&quot;_size.addBytes(%s.length);%n&quot;, fieldName);</span>
+<span class="nc" id="L1107">            VersionConditional.forVersions(flexibleVersions, versions).</span>
+<span class="nc" id="L1108">                ifNotMember(__ -&gt; buffer.printf(&quot;_size.addBytes(4);%n&quot;)).</span>
+<span class="nc" id="L1109">                ifMember(__ -&gt; {</span>
+<span class="nc" id="L1110">                    headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc" id="L1111">                    buffer.printf(&quot;_size.addBytes(&quot; +</span>
+                            &quot;ByteUtils.sizeOfUnsignedVarint(%s.length + 1));%n&quot;,
+                        fieldName);
+<span class="nc" id="L1114">                }).</span>
+<span class="nc" id="L1115">                generate(buffer);</span>
+<span class="nc bnc" id="L1116" title="All 2 branches missed.">        } else if (type instanceof FieldType.StructType) {</span>
+<span class="nc" id="L1117">            buffer.printf(&quot;%s.addSize(_size, _cache, _version);%n&quot;, fieldName);</span>
+        } else {
+<span class="nc" id="L1119">            throw new RuntimeException(&quot;Unsupported type &quot; + type);</span>
+        }
+<span class="nc" id="L1121">    }</span>
+
+    private void generateFieldSize(FieldSpec field,
+                                   Versions possibleVersions,
+                                   boolean tagged) {
+<span class="nc bnc" id="L1126" title="All 2 branches missed.">        if (field.type().fixedLength().isPresent()) {</span>
+<span class="nc" id="L1127">            generateFixedLengthFieldSize(field, tagged);</span>
+        } else {
+<span class="nc" id="L1129">            generateVariableLengthFieldSize(field, possibleVersions, tagged);</span>
+        }
+<span class="nc" id="L1131">    }</span>
+
+    private void generateFixedLengthFieldSize(FieldSpec field,
+                                              boolean tagged) {
+<span class="nc bnc" id="L1135" title="All 2 branches missed.">        if (tagged) {</span>
+            // Check to see that the field is not set to the default value.
+            // If it is, then we don't need to serialize it.
+<span class="nc" id="L1138">            field.generateNonDefaultValueCheck(headerGenerator, structRegistry, buffer,</span>
+<span class="nc" id="L1139">                &quot;this.&quot;, field.nullableVersions());</span>
+<span class="nc" id="L1140">            buffer.incrementIndent();</span>
+<span class="nc" id="L1141">            buffer.printf(&quot;_numTaggedFields++;%n&quot;);</span>
+<span class="nc" id="L1142">            buffer.printf(&quot;_size.addBytes(%d);%n&quot;,</span>
+<span class="nc" id="L1143">                MessageGenerator.sizeOfUnsignedVarint(field.tag().get()));</span>
+            // Account for the tagged field prefix length.
+<span class="nc" id="L1145">            buffer.printf(&quot;_size.addBytes(%d);%n&quot;,</span>
+<span class="nc" id="L1146">                MessageGenerator.sizeOfUnsignedVarint(field.type().fixedLength().get()));</span>
+<span class="nc" id="L1147">            buffer.printf(&quot;_size.addBytes(%d);%n&quot;, field.type().fixedLength().get());</span>
+<span class="nc" id="L1148">            buffer.decrementIndent();</span>
+<span class="nc" id="L1149">            buffer.printf(&quot;}%n&quot;);</span>
+        } else {
+<span class="nc" id="L1151">            buffer.printf(&quot;_size.addBytes(%d);%n&quot;, field.type().fixedLength().get());</span>
+        }
+<span class="nc" id="L1153">    }</span>
+
+    private void generateVariableLengthFieldSize(FieldSpec field,
+                                                 Versions possibleVersions,
+                                                 boolean tagged) {
+<span class="nc" id="L1158">        IsNullConditional.forField(field).</span>
+<span class="nc" id="L1159">            alwaysEmitBlockScope(true).</span>
+<span class="nc" id="L1160">            possibleVersions(possibleVersions).</span>
+<span class="nc" id="L1161">            nullableVersions(field.nullableVersions()).</span>
+<span class="nc" id="L1162">            ifNull(() -&gt; {</span>
+<span class="nc bnc" id="L1163" title="All 4 branches missed.">                if (!tagged || !field.defaultString().equals(&quot;null&quot;)) {</span>
+<span class="nc" id="L1164">                    VersionConditional.forVersions(fieldFlexibleVersions(field), possibleVersions).</span>
+<span class="nc" id="L1165">                        ifMember(__ -&gt; {</span>
+<span class="nc bnc" id="L1166" title="All 2 branches missed.">                            if (tagged) {</span>
+<span class="nc" id="L1167">                                buffer.printf(&quot;_numTaggedFields++;%n&quot;);</span>
+<span class="nc" id="L1168">                                buffer.printf(&quot;_size.addBytes(%d);%n&quot;,</span>
+<span class="nc" id="L1169">                                    MessageGenerator.sizeOfUnsignedVarint(field.tag().get()));</span>
+<span class="nc" id="L1170">                                buffer.printf(&quot;_size.addBytes(%d);%n&quot;, MessageGenerator.sizeOfUnsignedVarint(</span>
+<span class="nc" id="L1171">                                    MessageGenerator.sizeOfUnsignedVarint(0)));</span>
+                            }
+<span class="nc" id="L1173">                            buffer.printf(&quot;_size.addBytes(%d);%n&quot;, MessageGenerator.sizeOfUnsignedVarint(0));</span>
+<span class="nc" id="L1174">                        }).</span>
+<span class="nc" id="L1175">                        ifNotMember(__ -&gt; {</span>
+<span class="nc bnc" id="L1176" title="All 2 branches missed.">                            if (tagged) {</span>
+<span class="nc" id="L1177">                                throw new RuntimeException(&quot;Tagged field &quot; + field.name() +</span>
+                                    &quot; should not be present in non-flexible versions.&quot;);
+                            }
+<span class="nc bnc" id="L1180" title="All 2 branches missed.">                            if (field.type().isString()) {</span>
+<span class="nc" id="L1181">                                buffer.printf(&quot;_size.addBytes(2);%n&quot;);</span>
+<span class="nc bnc" id="L1182" title="All 2 branches missed.">                            } else if (field.type().isStruct()) {</span>
+<span class="nc" id="L1183">                                buffer.printf(&quot;_size.addBytes(1);%n&quot;);</span>
+                            } else {
+<span class="nc" id="L1185">                                buffer.printf(&quot;_size.addBytes(4);%n&quot;);</span>
+                            }
+<span class="nc" id="L1187">                        }).</span>
+<span class="nc" id="L1188">                        generate(buffer);</span>
+                }
+<span class="nc" id="L1190">            }).</span>
+<span class="nc" id="L1191">            ifShouldNotBeNull(() -&gt; {</span>
+<span class="nc bnc" id="L1192" title="All 2 branches missed.">                if (tagged) {</span>
+<span class="nc bnc" id="L1193" title="All 2 branches missed.">                    if (!field.defaultString().equals(&quot;null&quot;)) {</span>
+<span class="nc" id="L1194">                        field.generateNonDefaultValueCheck(headerGenerator,</span>
+                            structRegistry, buffer, &quot;this.&quot;, Versions.NONE);
+<span class="nc" id="L1196">                        buffer.incrementIndent();</span>
+                    }
+<span class="nc" id="L1198">                    buffer.printf(&quot;_numTaggedFields++;%n&quot;);</span>
+<span class="nc" id="L1199">                    buffer.printf(&quot;_size.addBytes(%d);%n&quot;,</span>
+<span class="nc" id="L1200">                        MessageGenerator.sizeOfUnsignedVarint(field.tag().get()));</span>
+                }
+<span class="nc bnc" id="L1202" title="All 2 branches missed.">                if (field.type().isString()) {</span>
+<span class="nc" id="L1203">                    generateStringToBytes(field.camelCaseName());</span>
+<span class="nc" id="L1204">                    VersionConditional.forVersions(fieldFlexibleVersions(field), possibleVersions).</span>
+<span class="nc" id="L1205">                        ifMember(__ -&gt; {</span>
+<span class="nc" id="L1206">                            headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc bnc" id="L1207" title="All 2 branches missed.">                            if (tagged) {</span>
+<span class="nc" id="L1208">                                buffer.printf(&quot;int _stringPrefixSize = &quot; +</span>
+                                    &quot;ByteUtils.sizeOfUnsignedVarint(_stringBytes.length + 1);%n&quot;);
+<span class="nc" id="L1210">                                buffer.printf(&quot;_size.addBytes(_stringBytes.length + _stringPrefixSize + &quot; +</span>
+                                    &quot;ByteUtils.sizeOfUnsignedVarint(_stringPrefixSize + _stringBytes.length));%n&quot;);
+
+                            } else {
+<span class="nc" id="L1214">                                buffer.printf(&quot;_size.addBytes(_stringBytes.length + &quot; +</span>
+                                    &quot;ByteUtils.sizeOfUnsignedVarint(_stringBytes.length + 1));%n&quot;);
+                            }
+<span class="nc" id="L1217">                        }).</span>
+<span class="nc" id="L1218">                        ifNotMember(__ -&gt; {</span>
+<span class="nc bnc" id="L1219" title="All 2 branches missed.">                            if (tagged) {</span>
+<span class="nc" id="L1220">                                throw new RuntimeException(&quot;Tagged field &quot; + field.name() +</span>
+                                    &quot; should not be present in non-flexible versions.&quot;);
+                            }
+<span class="nc" id="L1223">                            buffer.printf(&quot;_size.addBytes(_stringBytes.length + 2);%n&quot;);</span>
+<span class="nc" id="L1224">                        }).</span>
+<span class="nc" id="L1225">                        generate(buffer);</span>
+<span class="nc bnc" id="L1226" title="All 2 branches missed.">                } else if (field.type().isArray()) {</span>
+<span class="nc bnc" id="L1227" title="All 2 branches missed.">                    if (tagged) {</span>
+<span class="nc" id="L1228">                        buffer.printf(&quot;int _sizeBeforeArray = _size.totalSize();%n&quot;);</span>
+                    }
+<span class="nc" id="L1230">                    VersionConditional.forVersions(fieldFlexibleVersions(field), possibleVersions).</span>
+<span class="nc" id="L1231">                        ifMember(__ -&gt; {</span>
+<span class="nc" id="L1232">                            headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc" id="L1233">                            buffer.printf(&quot;_size.addBytes(ByteUtils.sizeOfUnsignedVarint(%s.size() + 1));%n&quot;,</span>
+<span class="nc" id="L1234">                                field.camelCaseName());</span>
+<span class="nc" id="L1235">                        }).</span>
+<span class="nc" id="L1236">                        ifNotMember(__ -&gt; buffer.printf(&quot;_size.addBytes(4);%n&quot;)).</span>
+<span class="nc" id="L1237">                        generate(buffer);</span>
+<span class="nc" id="L1238">                    FieldType.ArrayType arrayType = (FieldType.ArrayType) field.type();</span>
+<span class="nc" id="L1239">                    FieldType elementType = arrayType.elementType();</span>
+<span class="nc bnc" id="L1240" title="All 2 branches missed.">                    if (elementType.fixedLength().isPresent()) {</span>
+<span class="nc" id="L1241">                        buffer.printf(&quot;_size.addBytes(%s.size() * %d);%n&quot;,</span>
+<span class="nc" id="L1242">                            field.camelCaseName(),</span>
+<span class="nc" id="L1243">                            elementType.fixedLength().get());</span>
+<span class="nc bnc" id="L1244" title="All 2 branches missed.">                    } else if (elementType instanceof FieldType.ArrayType) {</span>
+<span class="nc" id="L1245">                        throw new RuntimeException(&quot;Arrays of arrays are not supported &quot; +</span>
+                            &quot;(use a struct).&quot;);
+                    } else {
+<span class="nc" id="L1248">                        buffer.printf(&quot;for (%s %sElement : %s) {%n&quot;,</span>
+<span class="nc" id="L1249">                            elementType.getBoxedJavaType(headerGenerator),</span>
+<span class="nc" id="L1250">                            field.camelCaseName(), field.camelCaseName());</span>
+<span class="nc" id="L1251">                        buffer.incrementIndent();</span>
+<span class="nc" id="L1252">                        generateVariableLengthArrayElementSize(fieldFlexibleVersions(field),</span>
+<span class="nc" id="L1253">                            String.format(&quot;%sElement&quot;, field.camelCaseName()),</span>
+                            elementType,
+                            possibleVersions);
+<span class="nc" id="L1256">                        buffer.decrementIndent();</span>
+<span class="nc" id="L1257">                        buffer.printf(&quot;}%n&quot;);</span>
+                    }
+<span class="nc bnc" id="L1259" title="All 2 branches missed.">                    if (tagged) {</span>
+<span class="nc" id="L1260">                        headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc" id="L1261">                        buffer.printf(&quot;int _arraySize = _size.totalSize() - _sizeBeforeArray;%n&quot;);</span>
+<span class="nc" id="L1262">                        buffer.printf(&quot;_cache.setArraySizeInBytes(%s, _arraySize);%n&quot;,</span>
+<span class="nc" id="L1263">                            field.camelCaseName());</span>
+<span class="nc" id="L1264">                        buffer.printf(&quot;_size.addBytes(ByteUtils.sizeOfUnsignedVarint(_arraySize));%n&quot;);</span>
+                    }
+<span class="nc bnc" id="L1266" title="All 2 branches missed.">                } else if (field.type().isBytes()) {</span>
+<span class="nc bnc" id="L1267" title="All 2 branches missed.">                    if (tagged) {</span>
+<span class="nc" id="L1268">                        buffer.printf(&quot;int _sizeBeforeBytes = _size.totalSize();%n&quot;);</span>
+                    }
+<span class="nc bnc" id="L1270" title="All 2 branches missed.">                    if (field.zeroCopy()) {</span>
+<span class="nc" id="L1271">                        buffer.printf(&quot;_size.addZeroCopyBytes(%s.remaining());%n&quot;, field.camelCaseName());</span>
+                    } else {
+<span class="nc" id="L1273">                        buffer.printf(&quot;_size.addBytes(%s.length);%n&quot;, field.camelCaseName());</span>
+                    }
+<span class="nc" id="L1275">                    VersionConditional.forVersions(fieldFlexibleVersions(field), possibleVersions).</span>
+<span class="nc" id="L1276">                        ifMember(__ -&gt; {</span>
+<span class="nc" id="L1277">                            headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc bnc" id="L1278" title="All 2 branches missed.">                            if (field.zeroCopy()) {</span>
+<span class="nc" id="L1279">                                buffer.printf(&quot;_size.addBytes(&quot; +</span>
+<span class="nc" id="L1280">                                        &quot;ByteUtils.sizeOfUnsignedVarint(%s.remaining() + 1));%n&quot;, field.camelCaseName());</span>
+                            } else {
+<span class="nc" id="L1282">                                buffer.printf(&quot;_size.addBytes(ByteUtils.sizeOfUnsignedVarint(%s.length + 1));%n&quot;,</span>
+<span class="nc" id="L1283">                                    field.camelCaseName());</span>
+                            }
+<span class="nc" id="L1285">                        }).</span>
+<span class="nc" id="L1286">                        ifNotMember(__ -&gt; buffer.printf(&quot;_size.addBytes(4);%n&quot;)).</span>
+<span class="nc" id="L1287">                        generate(buffer);</span>
+<span class="nc bnc" id="L1288" title="All 2 branches missed.">                    if (tagged) {</span>
+<span class="nc" id="L1289">                        headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc" id="L1290">                        buffer.printf(&quot;int _bytesSize = _size.totalSize() - _sizeBeforeBytes;%n&quot;);</span>
+<span class="nc" id="L1291">                        buffer.printf(&quot;_size.addBytes(ByteUtils.sizeOfUnsignedVarint(_bytesSize));%n&quot;);</span>
+                    }
+<span class="nc bnc" id="L1293" title="All 2 branches missed.">                } else if (field.type().isRecords()) {</span>
+<span class="nc" id="L1294">                    buffer.printf(&quot;_size.addZeroCopyBytes(%s.sizeInBytes());%n&quot;, field.camelCaseName());</span>
+<span class="nc" id="L1295">                    VersionConditional.forVersions(fieldFlexibleVersions(field), possibleVersions).</span>
+<span class="nc" id="L1296">                        ifMember(__ -&gt; {</span>
+<span class="nc" id="L1297">                            headerGenerator.addImport(MessageGenerator.BYTE_UTILS_CLASS);</span>
+<span class="nc" id="L1298">                            buffer.printf(&quot;_size.addBytes(&quot; +</span>
+<span class="nc" id="L1299">                                &quot;ByteUtils.sizeOfUnsignedVarint(%s.sizeInBytes() + 1));%n&quot;, field.camelCaseName());</span>
+<span class="nc" id="L1300">                        }).</span>
+<span class="nc" id="L1301">                        ifNotMember(__ -&gt; buffer.printf(&quot;_size.addBytes(4);%n&quot;)).</span>
+<span class="nc" id="L1302">                        generate(buffer);</span>
+<span class="nc bnc" id="L1303" title="All 2 branches missed.">                } else if (field.type().isStruct()) {</span>
+<span class="nc bnc" id="L1304" title="All 2 branches missed.">                    if (tagged) {</span>
+<span class="nc" id="L1305">                        buffer.printf(&quot;int _sizeBeforeStruct = _size.totalSize();%n&quot;, field.camelCaseName());</span>
+                        // Add a byte if the field is nullable.
+<span class="nc" id="L1307">                        VersionConditional.forVersions(field.nullableVersions(), possibleVersions).</span>
+<span class="nc" id="L1308">                            ifMember(__ -&gt; buffer.printf(&quot;_size.addBytes(1);%n&quot;)).</span>
+<span class="nc" id="L1309">                            generate(buffer);</span>
+<span class="nc" id="L1310">                        buffer.printf(&quot;this.%s.addSize(_size, _cache, _version);%n&quot;, field.camelCaseName());</span>
+<span class="nc" id="L1311">                        buffer.printf(&quot;int _structSize = _size.totalSize() - _sizeBeforeStruct;%n&quot;, field.camelCaseName());</span>
+<span class="nc" id="L1312">                        buffer.printf(&quot;_size.addBytes(ByteUtils.sizeOfUnsignedVarint(_structSize));%n&quot;);</span>
+                    } else {
+                        // Add a byte if the field is nullable.
+<span class="nc" id="L1315">                        VersionConditional.forVersions(field.nullableVersions(), possibleVersions).</span>
+<span class="nc" id="L1316">                            ifMember(__ -&gt; buffer.printf(&quot;_size.addBytes(1);%n&quot;)).</span>
+<span class="nc" id="L1317">                            generate(buffer);</span>
+<span class="nc" id="L1318">                        buffer.printf(&quot;this.%s.addSize(_size, _cache, _version);%n&quot;, field.camelCaseName());</span>
+                    }
+                } else {
+<span class="nc" id="L1321">                    throw new RuntimeException(&quot;unhandled type &quot; + field.type());</span>
+                }
+<span class="nc bnc" id="L1323" title="All 4 branches missed.">                if (tagged &amp;&amp; !field.defaultString().equals(&quot;null&quot;)) {</span>
+<span class="nc" id="L1324">                    buffer.decrementIndent();</span>
+<span class="nc" id="L1325">                    buffer.printf(&quot;}%n&quot;);</span>
+                }
+<span class="nc" id="L1327">            }).</span>
+<span class="nc" id="L1328">            generate(buffer);</span>
+<span class="nc" id="L1329">    }</span>
+
+    private void generateStringToBytes(String name) {
+<span class="nc" id="L1332">        headerGenerator.addImport(MessageGenerator.STANDARD_CHARSETS);</span>
+<span class="nc" id="L1333">        buffer.printf(&quot;byte[] _stringBytes = %s.getBytes(StandardCharsets.UTF_8);%n&quot;, name);</span>
+<span class="nc" id="L1334">        buffer.printf(&quot;if (_stringBytes.length &gt; 0x7fff) {%n&quot;);</span>
+<span class="nc" id="L1335">        buffer.incrementIndent();</span>
+<span class="nc" id="L1336">        buffer.printf(&quot;throw new RuntimeException(\&quot;'%s' field is too long to &quot; +</span>
+            &quot;be serialized\&quot;);%n&quot;, name);
+<span class="nc" id="L1338">        buffer.decrementIndent();</span>
+<span class="nc" id="L1339">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L1340">        buffer.printf(&quot;_cache.cacheSerializedValue(%s, _stringBytes);%n&quot;, name);</span>
+<span class="nc" id="L1341">    }</span>
+
+    private void generateClassEquals(String className, StructSpec struct,
+                                     boolean elementKeysAreEqual) {
+<span class="nc" id="L1345">        buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L1346">        buffer.printf(&quot;public boolean %s(Object obj) {%n&quot;,</span>
+<span class="nc bnc" id="L1347" title="All 2 branches missed.">            elementKeysAreEqual ? &quot;elementKeysAreEqual&quot; : &quot;equals&quot;);</span>
+<span class="nc" id="L1348">        buffer.incrementIndent();</span>
+<span class="nc" id="L1349">        buffer.printf(&quot;if (!(obj instanceof %s)) return false;%n&quot;, className);</span>
+<span class="nc" id="L1350">        buffer.printf(&quot;%s other = (%s) obj;%n&quot;, className, className);</span>
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">        if (!struct.fields().isEmpty()) {</span>
+<span class="nc bnc" id="L1352" title="All 2 branches missed.">            for (FieldSpec field : struct.fields()) {</span>
+<span class="nc bnc" id="L1353" title="All 4 branches missed.">                if (!elementKeysAreEqual || field.mapKey()) {</span>
+<span class="nc" id="L1354">                    generateFieldEquals(field);</span>
+                }
+<span class="nc" id="L1356">            }</span>
+        }
+<span class="nc bnc" id="L1358" title="All 2 branches missed.">        if (elementKeysAreEqual) {</span>
+<span class="nc" id="L1359">            buffer.printf(&quot;return true;%n&quot;);</span>
+        } else {
+<span class="nc" id="L1361">            headerGenerator.addImport(MessageGenerator.MESSAGE_UTIL_CLASS);</span>
+<span class="nc" id="L1362">            buffer.printf(&quot;return MessageUtil.compareRawTaggedFields(_unknownTaggedFields, &quot; +</span>
+                &quot;other._unknownTaggedFields);%n&quot;);
+        }
+<span class="nc" id="L1365">        buffer.decrementIndent();</span>
+<span class="nc" id="L1366">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L1367">    }</span>
+
+    private void generateFieldEquals(FieldSpec field) {
+<span class="nc bnc" id="L1370" title="All 2 branches missed.">        if (field.type() instanceof FieldType.UUIDFieldType) {</span>
+<span class="nc" id="L1371">            buffer.printf(&quot;if (!this.%s.equals(other.%s)) return false;%n&quot;,</span>
+<span class="nc" id="L1372">                field.camelCaseName(), field.camelCaseName());</span>
+<span class="nc bnc" id="L1373" title="All 6 branches missed.">        } else if (field.type().isString() || field.type().isArray() || field.type().isStruct()) {</span>
+<span class="nc" id="L1374">            buffer.printf(&quot;if (this.%s == null) {%n&quot;, field.camelCaseName());</span>
+<span class="nc" id="L1375">            buffer.incrementIndent();</span>
+<span class="nc" id="L1376">            buffer.printf(&quot;if (other.%s != null) return false;%n&quot;, field.camelCaseName());</span>
+<span class="nc" id="L1377">            buffer.decrementIndent();</span>
+<span class="nc" id="L1378">            buffer.printf(&quot;} else {%n&quot;);</span>
+<span class="nc" id="L1379">            buffer.incrementIndent();</span>
+<span class="nc" id="L1380">            buffer.printf(&quot;if (!this.%s.equals(other.%s)) return false;%n&quot;,</span>
+<span class="nc" id="L1381">                field.camelCaseName(), field.camelCaseName());</span>
+<span class="nc" id="L1382">            buffer.decrementIndent();</span>
+<span class="nc" id="L1383">            buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc bnc" id="L1384" title="All 2 branches missed.">        } else if (field.type().isBytes()) {</span>
+<span class="nc bnc" id="L1385" title="All 2 branches missed.">            if (field.zeroCopy()) {</span>
+<span class="nc" id="L1386">                headerGenerator.addImport(MessageGenerator.OBJECTS_CLASS);</span>
+<span class="nc" id="L1387">                buffer.printf(&quot;if (!Objects.equals(this.%s, other.%s)) return false;%n&quot;,</span>
+<span class="nc" id="L1388">                    field.camelCaseName(), field.camelCaseName());</span>
+            } else {
+                // Arrays#equals handles nulls.
+<span class="nc" id="L1391">                headerGenerator.addImport(MessageGenerator.ARRAYS_CLASS);</span>
+<span class="nc" id="L1392">                buffer.printf(&quot;if (!Arrays.equals(this.%s, other.%s)) return false;%n&quot;,</span>
+<span class="nc" id="L1393">                    field.camelCaseName(), field.camelCaseName());</span>
+            }
+<span class="nc bnc" id="L1395" title="All 2 branches missed.">        } else if (field.type().isRecords()) {</span>
+<span class="nc" id="L1396">            headerGenerator.addImport(MessageGenerator.OBJECTS_CLASS);</span>
+<span class="nc" id="L1397">            buffer.printf(&quot;if (!Objects.equals(this.%s, other.%s)) return false;%n&quot;,</span>
+<span class="nc" id="L1398">                    field.camelCaseName(), field.camelCaseName());</span>
+        } else {
+<span class="nc" id="L1400">            buffer.printf(&quot;if (%s != other.%s) return false;%n&quot;,</span>
+<span class="nc" id="L1401">                field.camelCaseName(), field.camelCaseName());</span>
+        }
+<span class="nc" id="L1403">    }</span>
+
+    private void generateClassHashCode(StructSpec struct, boolean onlyMapKeys) {
+<span class="nc" id="L1406">        buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L1407">        buffer.printf(&quot;public int hashCode() {%n&quot;);</span>
+<span class="nc" id="L1408">        buffer.incrementIndent();</span>
+<span class="nc" id="L1409">        buffer.printf(&quot;int hashCode = 0;%n&quot;);</span>
+<span class="nc bnc" id="L1410" title="All 2 branches missed.">        for (FieldSpec field : struct.fields()) {</span>
+<span class="nc bnc" id="L1411" title="All 4 branches missed.">            if ((!onlyMapKeys) || field.mapKey()) {</span>
+<span class="nc" id="L1412">                generateFieldHashCode(field);</span>
+            }
+<span class="nc" id="L1414">        }</span>
+<span class="nc" id="L1415">        buffer.printf(&quot;return hashCode;%n&quot;);</span>
+<span class="nc" id="L1416">        buffer.decrementIndent();</span>
+<span class="nc" id="L1417">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L1418">    }</span>
+
+    private void generateFieldHashCode(FieldSpec field) {
+<span class="nc bnc" id="L1421" title="All 2 branches missed.">        if (field.type() instanceof FieldType.BoolFieldType) {</span>
+<span class="nc" id="L1422">            buffer.printf(&quot;hashCode = 31 * hashCode + (%s ? 1231 : 1237);%n&quot;,</span>
+<span class="nc" id="L1423">                field.camelCaseName());</span>
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">        } else if ((field.type() instanceof FieldType.Int8FieldType) ||</span>
+<span class="nc bnc" id="L1425" title="All 2 branches missed.">                    (field.type() instanceof FieldType.Int16FieldType) ||</span>
+<span class="nc bnc" id="L1426" title="All 2 branches missed.">                    (field.type() instanceof FieldType.Uint16FieldType) ||</span>
+<span class="nc bnc" id="L1427" title="All 2 branches missed.">                    (field.type() instanceof FieldType.Int32FieldType)) {</span>
+<span class="nc" id="L1428">            buffer.printf(&quot;hashCode = 31 * hashCode + %s;%n&quot;,</span>
+<span class="nc" id="L1429">                field.camelCaseName());</span>
+<span class="nc bnc" id="L1430" title="All 2 branches missed.">        } else if (field.type() instanceof FieldType.Int64FieldType ||</span>
+<span class="nc bnc" id="L1431" title="All 2 branches missed.">                    (field.type() instanceof FieldType.Uint32FieldType)) {</span>
+<span class="nc" id="L1432">            buffer.printf(&quot;hashCode = 31 * hashCode + ((int) (%s &gt;&gt; 32) ^ (int) %s);%n&quot;,</span>
+<span class="nc" id="L1433">                field.camelCaseName(), field.camelCaseName());</span>
+<span class="nc bnc" id="L1434" title="All 2 branches missed.">        } else if (field.type() instanceof FieldType.UUIDFieldType) {</span>
+<span class="nc" id="L1435">            buffer.printf(&quot;hashCode = 31 * hashCode + %s.hashCode();%n&quot;,</span>
+<span class="nc" id="L1436">                field.camelCaseName());</span>
+<span class="nc bnc" id="L1437" title="All 2 branches missed.">        } else if (field.type() instanceof FieldType.Float64FieldType) {</span>
+<span class="nc" id="L1438">            buffer.printf(&quot;hashCode = 31 * hashCode + Double.hashCode(%s);%n&quot;,</span>
+<span class="nc" id="L1439">                field.camelCaseName(), field.camelCaseName());</span>
+<span class="nc bnc" id="L1440" title="All 2 branches missed.">        } else if (field.type().isBytes()) {</span>
+<span class="nc bnc" id="L1441" title="All 2 branches missed.">            if (field.zeroCopy()) {</span>
+<span class="nc" id="L1442">                headerGenerator.addImport(MessageGenerator.OBJECTS_CLASS);</span>
+<span class="nc" id="L1443">                buffer.printf(&quot;hashCode = 31 * hashCode + Objects.hashCode(%s);%n&quot;,</span>
+<span class="nc" id="L1444">                        field.camelCaseName());</span>
+            } else {
+<span class="nc" id="L1446">                headerGenerator.addImport(MessageGenerator.ARRAYS_CLASS);</span>
+<span class="nc" id="L1447">                buffer.printf(&quot;hashCode = 31 * hashCode + Arrays.hashCode(%s);%n&quot;,</span>
+<span class="nc" id="L1448">                    field.camelCaseName());</span>
+            }
+<span class="nc bnc" id="L1450" title="All 2 branches missed.">        } else if (field.type().isRecords()) {</span>
+<span class="nc" id="L1451">            headerGenerator.addImport(MessageGenerator.OBJECTS_CLASS);</span>
+<span class="nc" id="L1452">            buffer.printf(&quot;hashCode = 31 * hashCode + Objects.hashCode(%s);%n&quot;,</span>
+<span class="nc" id="L1453">                    field.camelCaseName());</span>
+<span class="nc bnc" id="L1454" title="All 2 branches missed.">        } else if (field.type().isStruct()</span>
+<span class="nc bnc" id="L1455" title="All 2 branches missed.">                   || field.type().isArray()</span>
+<span class="nc bnc" id="L1456" title="All 2 branches missed.">                   || field.type().isString()) {</span>
+<span class="nc" id="L1457">            buffer.printf(&quot;hashCode = 31 * hashCode + (%s == null ? 0 : %s.hashCode());%n&quot;,</span>
+<span class="nc" id="L1458">                          field.camelCaseName(), field.camelCaseName());</span>
+        } else {
+<span class="nc" id="L1460">            throw new RuntimeException(&quot;Unsupported field type &quot; + field.type());</span>
+        }
+<span class="nc" id="L1462">    }</span>
+
+    private void generateClassDuplicate(String className, StructSpec struct) {
+<span class="nc" id="L1465">        buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L1466">        buffer.printf(&quot;public %s duplicate() {%n&quot;, className);</span>
+<span class="nc" id="L1467">        buffer.incrementIndent();</span>
+<span class="nc" id="L1468">        buffer.printf(&quot;%s _duplicate = new %s();%n&quot;, className, className);</span>
+<span class="nc bnc" id="L1469" title="All 2 branches missed.">        for (FieldSpec field : struct.fields()) {</span>
+<span class="nc" id="L1470">            generateFieldDuplicate(new Target(field,</span>
+<span class="nc" id="L1471">                field.camelCaseName(),</span>
+<span class="nc" id="L1472">                field.camelCaseName(),</span>
+<span class="nc" id="L1473">                input -&gt; String.format(&quot;_duplicate.%s = %s&quot;, field.camelCaseName(), input)));</span>
+<span class="nc" id="L1474">        }</span>
+<span class="nc" id="L1475">        buffer.printf(&quot;return _duplicate;%n&quot;);</span>
+<span class="nc" id="L1476">        buffer.decrementIndent();</span>
+<span class="nc" id="L1477">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L1478">    }</span>
+
+    private void generateFieldDuplicate(Target target) {
+<span class="nc" id="L1481">        FieldSpec field = target.field();</span>
+<span class="nc bnc" id="L1482" title="All 2 branches missed.">        if ((field.type() instanceof FieldType.BoolFieldType) ||</span>
+<span class="nc bnc" id="L1483" title="All 2 branches missed.">                (field.type() instanceof FieldType.Int8FieldType) ||</span>
+<span class="nc bnc" id="L1484" title="All 2 branches missed.">                (field.type() instanceof FieldType.Int16FieldType) ||</span>
+<span class="nc bnc" id="L1485" title="All 2 branches missed.">                (field.type() instanceof FieldType.Uint16FieldType) ||</span>
+<span class="nc bnc" id="L1486" title="All 2 branches missed.">                (field.type() instanceof FieldType.Uint32FieldType) ||</span>
+<span class="nc bnc" id="L1487" title="All 2 branches missed.">                (field.type() instanceof FieldType.Int32FieldType) ||</span>
+<span class="nc bnc" id="L1488" title="All 2 branches missed.">                (field.type() instanceof FieldType.Int64FieldType) ||</span>
+<span class="nc bnc" id="L1489" title="All 2 branches missed.">                (field.type() instanceof FieldType.Float64FieldType) ||</span>
+<span class="nc bnc" id="L1490" title="All 2 branches missed.">                (field.type() instanceof FieldType.UUIDFieldType)) {</span>
+<span class="nc" id="L1491">            buffer.printf(&quot;%s;%n&quot;, target.assignmentStatement(target.sourceVariable()));</span>
+        } else {
+<span class="nc" id="L1493">            IsNullConditional cond = IsNullConditional.forName(target.sourceVariable()).</span>
+<span class="nc" id="L1494">                nullableVersions(target.field().nullableVersions()).</span>
+<span class="nc" id="L1495">                ifNull(() -&gt; buffer.printf(&quot;%s;%n&quot;, target.assignmentStatement(&quot;null&quot;)));</span>
+<span class="nc bnc" id="L1496" title="All 2 branches missed.">            if (field.type().isBytes()) {</span>
+<span class="nc bnc" id="L1497" title="All 2 branches missed.">                if (field.zeroCopy()) {</span>
+<span class="nc" id="L1498">                    cond.ifShouldNotBeNull(() -&gt;</span>
+<span class="nc" id="L1499">                        buffer.printf(&quot;%s;%n&quot;, target.assignmentStatement(</span>
+<span class="nc" id="L1500">                            String.format(&quot;%s.duplicate()&quot;, target.sourceVariable()))));</span>
+                } else {
+<span class="nc" id="L1502">                    cond.ifShouldNotBeNull(() -&gt; {</span>
+<span class="nc" id="L1503">                        headerGenerator.addImport(MessageGenerator.MESSAGE_UTIL_CLASS);</span>
+<span class="nc" id="L1504">                        buffer.printf(&quot;%s;%n&quot;, target.assignmentStatement(</span>
+<span class="nc" id="L1505">                            String.format(&quot;MessageUtil.duplicate(%s)&quot;,</span>
+<span class="nc" id="L1506">                                target.sourceVariable())));</span>
+<span class="nc" id="L1507">                    });</span>
+                }
+<span class="nc bnc" id="L1509" title="All 2 branches missed.">            } else if (field.type().isRecords()) {</span>
+<span class="nc" id="L1510">                cond.ifShouldNotBeNull(() -&gt; {</span>
+<span class="nc" id="L1511">                    headerGenerator.addImport(MessageGenerator.MEMORY_RECORDS_CLASS);</span>
+<span class="nc" id="L1512">                    buffer.printf(&quot;%s;%n&quot;, target.assignmentStatement(</span>
+<span class="nc" id="L1513">                        String.format(&quot;MemoryRecords.readableRecords(((MemoryRecords) %s).buffer().duplicate())&quot;,</span>
+<span class="nc" id="L1514">                            target.sourceVariable())));</span>
+<span class="nc" id="L1515">                });</span>
+<span class="nc bnc" id="L1516" title="All 2 branches missed.">            } else if (field.type().isStruct()) {</span>
+<span class="nc" id="L1517">                cond.ifShouldNotBeNull(() -&gt;</span>
+<span class="nc" id="L1518">                    buffer.printf(&quot;%s;%n&quot;, target.assignmentStatement(</span>
+<span class="nc" id="L1519">                        String.format(&quot;%s.duplicate()&quot;, target.sourceVariable()))));</span>
+<span class="nc bnc" id="L1520" title="All 2 branches missed.">            } else if (field.type().isString()) {</span>
+                // Strings are immutable, so we don't need to duplicate them.
+<span class="nc" id="L1522">                cond.ifShouldNotBeNull(() -&gt;</span>
+<span class="nc" id="L1523">                    buffer.printf(&quot;%s;%n&quot;, target.assignmentStatement(</span>
+<span class="nc" id="L1524">                        target.sourceVariable())));</span>
+<span class="nc bnc" id="L1525" title="All 2 branches missed.">            } else if (field.type().isArray()) {</span>
+<span class="nc" id="L1526">                cond.ifShouldNotBeNull(() -&gt; {</span>
+<span class="nc" id="L1527">                    String newArrayName =</span>
+<span class="nc" id="L1528">                        String.format(&quot;new%s&quot;, field.capitalizedCamelCaseName());</span>
+<span class="nc" id="L1529">                    String type = field.concreteJavaType(headerGenerator, structRegistry);</span>
+<span class="nc" id="L1530">                    buffer.printf(&quot;%s %s = new %s(%s.size());%n&quot;,</span>
+<span class="nc" id="L1531">                        type, newArrayName, type, target.sourceVariable());</span>
+<span class="nc" id="L1532">                    FieldType.ArrayType arrayType = (FieldType.ArrayType) field.type();</span>
+<span class="nc" id="L1533">                    buffer.printf(&quot;for (%s _element : %s) {%n&quot;,</span>
+<span class="nc" id="L1534">                        arrayType.elementType().getBoxedJavaType(headerGenerator),</span>
+<span class="nc" id="L1535">                        target.sourceVariable());</span>
+<span class="nc" id="L1536">                    buffer.incrementIndent();</span>
+<span class="nc" id="L1537">                    generateFieldDuplicate(target.arrayElementTarget(input -&gt;</span>
+<span class="nc" id="L1538">                        String.format(&quot;%s.add(%s)&quot;, newArrayName, input)));</span>
+<span class="nc" id="L1539">                    buffer.decrementIndent();</span>
+<span class="nc" id="L1540">                    buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L1541">                    buffer.printf(&quot;%s;%n&quot;, target.assignmentStatement(</span>
+<span class="nc" id="L1542">                        String.format(&quot;new%s&quot;, field.capitalizedCamelCaseName())));</span>
+<span class="nc" id="L1543">                });</span>
+            } else {
+<span class="nc" id="L1545">                throw new RuntimeException(&quot;Unhandled field type &quot; + field.type());</span>
+            }
+<span class="nc" id="L1547">            cond.generate(buffer);</span>
+        }
+<span class="nc" id="L1549">    }</span>
+
+    private void generateClassToString(String className, StructSpec struct) {
+<span class="nc" id="L1552">        buffer.printf(&quot;@Override%n&quot;);</span>
+<span class="nc" id="L1553">        buffer.printf(&quot;public String toString() {%n&quot;);</span>
+<span class="nc" id="L1554">        buffer.incrementIndent();</span>
+<span class="nc" id="L1555">        buffer.printf(&quot;return \&quot;%s(\&quot;%n&quot;, className);</span>
+<span class="nc" id="L1556">        buffer.incrementIndent();</span>
+<span class="nc" id="L1557">        String prefix = &quot;&quot;;</span>
+<span class="nc bnc" id="L1558" title="All 2 branches missed.">        for (FieldSpec field : struct.fields()) {</span>
+<span class="nc" id="L1559">            generateFieldToString(prefix, field);</span>
+<span class="nc" id="L1560">            prefix = &quot;, &quot;;</span>
+<span class="nc" id="L1561">        }</span>
+<span class="nc" id="L1562">        buffer.printf(&quot;+ \&quot;)\&quot;;%n&quot;);</span>
+<span class="nc" id="L1563">        buffer.decrementIndent();</span>
+<span class="nc" id="L1564">        buffer.decrementIndent();</span>
+<span class="nc" id="L1565">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L1566">    }</span>
+
+    private void generateFieldToString(String prefix, FieldSpec field) {
+<span class="nc bnc" id="L1569" title="All 2 branches missed.">        if (field.type() instanceof FieldType.BoolFieldType) {</span>
+<span class="nc" id="L1570">            buffer.printf(&quot;+ \&quot;%s%s=\&quot; + (%s ? \&quot;true\&quot; : \&quot;false\&quot;)%n&quot;, prefix, field.camelCaseName(), field.camelCaseName());</span>
+<span class="nc bnc" id="L1571" title="All 2 branches missed.">        } else if ((field.type() instanceof FieldType.Int8FieldType) ||</span>
+<span class="nc bnc" id="L1572" title="All 2 branches missed.">                (field.type() instanceof FieldType.Int16FieldType) ||</span>
+<span class="nc bnc" id="L1573" title="All 2 branches missed.">                (field.type() instanceof FieldType.Uint16FieldType) ||</span>
+<span class="nc bnc" id="L1574" title="All 2 branches missed.">                (field.type() instanceof FieldType.Uint32FieldType) ||</span>
+<span class="nc bnc" id="L1575" title="All 2 branches missed.">                (field.type() instanceof FieldType.Int32FieldType) ||</span>
+<span class="nc bnc" id="L1576" title="All 2 branches missed.">                (field.type() instanceof FieldType.Int64FieldType) ||</span>
+<span class="nc bnc" id="L1577" title="All 2 branches missed.">                (field.type() instanceof FieldType.Float64FieldType)) {</span>
+<span class="nc" id="L1578">            buffer.printf(&quot;+ \&quot;%s%s=\&quot; + %s%n&quot;,</span>
+<span class="nc" id="L1579">                prefix, field.camelCaseName(), field.camelCaseName());</span>
+<span class="nc bnc" id="L1580" title="All 2 branches missed.">        } else if (field.type().isString()) {</span>
+<span class="nc" id="L1581">            buffer.printf(&quot;+ \&quot;%s%s=\&quot; + ((%s == null) ? \&quot;null\&quot; : \&quot;'\&quot; + %s.toString() + \&quot;'\&quot;)%n&quot;,</span>
+<span class="nc" id="L1582">                prefix, field.camelCaseName(), field.camelCaseName(), field.camelCaseName());</span>
+<span class="nc bnc" id="L1583" title="All 2 branches missed.">        } else if (field.type().isBytes()) {</span>
+<span class="nc bnc" id="L1584" title="All 2 branches missed.">            if (field.zeroCopy()) {</span>
+<span class="nc" id="L1585">                buffer.printf(&quot;+ \&quot;%s%s=\&quot; + %s%n&quot;,</span>
+<span class="nc" id="L1586">                    prefix, field.camelCaseName(), field.camelCaseName());</span>
+            } else {
+<span class="nc" id="L1588">                headerGenerator.addImport(MessageGenerator.ARRAYS_CLASS);</span>
+<span class="nc" id="L1589">                buffer.printf(&quot;+ \&quot;%s%s=\&quot; + Arrays.toString(%s)%n&quot;,</span>
+<span class="nc" id="L1590">                    prefix, field.camelCaseName(), field.camelCaseName());</span>
+            }
+<span class="nc bnc" id="L1592" title="All 2 branches missed.">        } else if (field.type().isRecords()) {</span>
+<span class="nc" id="L1593">            buffer.printf(&quot;+ \&quot;%s%s=\&quot; + %s%n&quot;,</span>
+<span class="nc" id="L1594">                    prefix, field.camelCaseName(), field.camelCaseName());</span>
+<span class="nc bnc" id="L1595" title="All 2 branches missed.">        } else if (field.type() instanceof FieldType.UUIDFieldType) {</span>
+<span class="nc" id="L1596">            buffer.printf(&quot;+ \&quot;%s%s=\&quot; + %s.toString()%n&quot;,</span>
+<span class="nc" id="L1597">                prefix, field.camelCaseName(), field.camelCaseName());</span>
+<span class="nc bnc" id="L1598" title="All 2 branches missed.">        } else if (field.type().isStruct()) {</span>
+<span class="nc bnc" id="L1599" title="All 2 branches missed.">            if (field.nullableVersions().empty()) {</span>
+<span class="nc" id="L1600">                buffer.printf(&quot;+ \&quot;%s%s=\&quot; + %s.toString()%n&quot;,</span>
+<span class="nc" id="L1601">                    prefix, field.camelCaseName(), field.camelCaseName());</span>
+            } else {
+<span class="nc" id="L1603">                buffer.printf(&quot;+ \&quot;%s%s=\&quot; + ((%s == null) ? \&quot;null\&quot; : %s.toString())%n&quot;,</span>
+<span class="nc" id="L1604">                    prefix, field.camelCaseName(), field.camelCaseName(), field.camelCaseName());</span>
+            }
+<span class="nc bnc" id="L1606" title="All 2 branches missed.">        } else if (field.type().isArray()) {</span>
+<span class="nc" id="L1607">            headerGenerator.addImport(MessageGenerator.MESSAGE_UTIL_CLASS);</span>
+<span class="nc bnc" id="L1608" title="All 2 branches missed.">            if (field.nullableVersions().empty()) {</span>
+<span class="nc" id="L1609">                buffer.printf(&quot;+ \&quot;%s%s=\&quot; + MessageUtil.deepToString(%s.iterator())%n&quot;,</span>
+<span class="nc" id="L1610">                    prefix, field.camelCaseName(), field.camelCaseName());</span>
+            } else {
+<span class="nc" id="L1612">                buffer.printf(&quot;+ \&quot;%s%s=\&quot; + ((%s == null) ? \&quot;null\&quot; : &quot; +</span>
+                    &quot;MessageUtil.deepToString(%s.iterator()))%n&quot;,
+<span class="nc" id="L1614">                    prefix, field.camelCaseName(), field.camelCaseName(), field.camelCaseName());</span>
+            }
+        } else {
+<span class="nc" id="L1617">            throw new RuntimeException(&quot;Unsupported field type &quot; + field.type());</span>
+        }
+<span class="nc" id="L1619">    }</span>
+
+    private void generateFieldAccessor(FieldSpec field) {
+<span class="nc" id="L1622">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L1623">        generateAccessor(field.fieldAbstractJavaType(headerGenerator, structRegistry),</span>
+<span class="nc" id="L1624">            field.camelCaseName(),</span>
+<span class="nc" id="L1625">            field.camelCaseName());</span>
+<span class="nc" id="L1626">    }</span>
+
+    private void generateAccessor(String javaType, String functionName, String memberName) {
+<span class="nc" id="L1629">        buffer.printf(&quot;public %s %s() {%n&quot;, javaType, functionName);</span>
+<span class="nc" id="L1630">        buffer.incrementIndent();</span>
+<span class="nc" id="L1631">        buffer.printf(&quot;return this.%s;%n&quot;, memberName);</span>
+<span class="nc" id="L1632">        buffer.decrementIndent();</span>
+<span class="nc" id="L1633">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L1634">    }</span>
+
+    private void generateFieldMutator(String className, FieldSpec field) {
+<span class="nc" id="L1637">        buffer.printf(&quot;%n&quot;);</span>
+<span class="nc" id="L1638">        buffer.printf(&quot;public %s set%s(%s v) {%n&quot;,</span>
+            className,
+<span class="nc" id="L1640">            field.capitalizedCamelCaseName(),</span>
+<span class="nc" id="L1641">            field.fieldAbstractJavaType(headerGenerator, structRegistry));</span>
+<span class="nc" id="L1642">        buffer.incrementIndent();</span>
+<span class="nc bnc" id="L1643" title="All 2 branches missed.">        if (field.type() instanceof FieldType.Uint16FieldType) {</span>
+<span class="nc" id="L1644">            buffer.printf(&quot;if (v &lt; 0 || v &gt; %d) {%n&quot;, MessageGenerator.UNSIGNED_SHORT_MAX);</span>
+<span class="nc" id="L1645">            buffer.incrementIndent();</span>
+<span class="nc" id="L1646">            buffer.printf(&quot;throw new RuntimeException(\&quot;Invalid value \&quot; + v + &quot; +</span>
+                    &quot;\&quot; for unsigned short field.\&quot;);%n&quot;);
+<span class="nc" id="L1648">            buffer.decrementIndent();</span>
+<span class="nc" id="L1649">            buffer.printf(&quot;}%n&quot;);</span>
+        }
+<span class="nc bnc" id="L1651" title="All 2 branches missed.">        if (field.type() instanceof FieldType.Uint32FieldType) {</span>
+<span class="nc" id="L1652">            buffer.printf(&quot;if (v &lt; 0 || v &gt; %dL) {%n&quot;, MessageGenerator.UNSIGNED_INT_MAX);</span>
+<span class="nc" id="L1653">            buffer.incrementIndent();</span>
+<span class="nc" id="L1654">            buffer.printf(&quot;throw new RuntimeException(\&quot;Invalid value \&quot; + v + &quot; +</span>
+                    &quot;\&quot; for unsigned int field.\&quot;);%n&quot;);
+<span class="nc" id="L1656">            buffer.decrementIndent();</span>
+<span class="nc" id="L1657">            buffer.printf(&quot;}%n&quot;);</span>
+        }
+<span class="nc" id="L1659">        buffer.printf(&quot;this.%s = v;%n&quot;, field.camelCaseName());</span>
+<span class="nc" id="L1660">        buffer.printf(&quot;return this;%n&quot;);</span>
+<span class="nc" id="L1661">        buffer.decrementIndent();</span>
+<span class="nc" id="L1662">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L1663">    }</span>
+
+    private void generateSetter(String javaType, String functionName, String memberName) {
+<span class="nc" id="L1666">        buffer.printf(&quot;public void %s(%s v) {%n&quot;, functionName, javaType);</span>
+<span class="nc" id="L1667">        buffer.incrementIndent();</span>
+<span class="nc" id="L1668">        buffer.printf(&quot;this.%s = v;%n&quot;, memberName);</span>
+<span class="nc" id="L1669">        buffer.decrementIndent();</span>
+<span class="nc" id="L1670">        buffer.printf(&quot;}%n&quot;);</span>
+<span class="nc" id="L1671">    }</span>
+
+    private Versions fieldFlexibleVersions(FieldSpec field) {
+<span class="nc bnc" id="L1674" title="All 2 branches missed.">        if (field.flexibleVersions().isPresent()) {</span>
+<span class="nc" id="L1675">            if (!messageFlexibleVersions.intersect(field.flexibleVersions().get()).</span>
+<span class="nc bnc" id="L1676" title="All 2 branches missed.">                    equals(field.flexibleVersions().get())) {</span>
+<span class="nc" id="L1677">                throw new RuntimeException(&quot;The flexible versions for field &quot; +</span>
+<span class="nc" id="L1678">                    field.name() + &quot; are &quot; + field.flexibleVersions().get() +</span>
+                    &quot;, which are not a subset of the flexible versions for the &quot; +
+                    &quot;message as a whole, which are &quot; + messageFlexibleVersions);
+            }
+<span class="nc" id="L1682">            return field.flexibleVersions().get();</span>
+        } else {
+<span class="nc" id="L1684">            return messageFlexibleVersions;</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

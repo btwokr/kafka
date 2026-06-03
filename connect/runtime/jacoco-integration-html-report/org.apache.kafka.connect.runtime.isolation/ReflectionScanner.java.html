@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ReflectionScanner.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.isolation</a> &gt; <span class="el_source">ReflectionScanner.java</span></div><h1>ReflectionScanner.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime.isolation;
+
+import org.apache.kafka.common.config.provider.ConfigProvider;
+import org.apache.kafka.connect.connector.policy.ConnectorClientConfigOverridePolicy;
+import org.apache.kafka.connect.rest.ConnectRestExtension;
+import org.apache.kafka.connect.sink.SinkConnector;
+import org.apache.kafka.connect.source.SourceConnector;
+import org.apache.kafka.connect.storage.Converter;
+import org.apache.kafka.connect.storage.HeaderConverter;
+import org.apache.kafka.connect.transforms.Transformation;
+import org.apache.kafka.connect.transforms.predicates.Predicate;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.ServiceLoader;
+import java.util.SortedSet;
+import java.util.TreeSet;
+
+import io.github.classgraph.ClassGraph;
+import io.github.classgraph.ClassInfoList;
+import io.github.classgraph.ScanResult;
+
+/**
+ * A {@link PluginScanner} implementation which uses reflection and {@link ServiceLoader} to discover plugins.
+ * &lt;p&gt;This implements the legacy discovery strategy, which uses a combination of reflection and service loading in
+ * order to discover plugins. Specifically, a plugin appears in the scan result if all the following conditions are true:
+ * &lt;ul&gt;
+ *     &lt;li&gt;The class and direct dependencies can be loaded&lt;/li&gt;
+ *     &lt;li&gt;The class is concrete&lt;/li&gt;
+ *     &lt;li&gt;The class is public&lt;/li&gt;
+ *     &lt;li&gt;The class has a no-args constructor&lt;/li&gt;
+ *     &lt;li&gt;The no-args constructor is public&lt;/li&gt;
+ *     &lt;li&gt;Static initialization of the class completes without throwing an exception&lt;/li&gt;
+ *     &lt;li&gt;The no-args constructor completes without throwing an exception&lt;/li&gt;
+ *     &lt;li&gt;One of the following is true:
+ *         &lt;ul&gt;
+ *             &lt;li&gt;Is a subclass of {@link SinkConnector}, {@link SourceConnector}, {@link Converter},
+ *             {@link HeaderConverter}, {@link Transformation}, or {@link Predicate}&lt;/li&gt;
+ *             &lt;li&gt;Is a subclass of {@link ConfigProvider}, {@link ConnectRestExtension}, or
+ *             {@link ConnectorClientConfigOverridePolicy}, and has a {@link ServiceLoader} compatible
+ *             manifest file or module declaration&lt;/li&gt;
+ *         &lt;/ul&gt;
+ *     &lt;/li&gt;
+ * &lt;/ul&gt;
+ * &lt;p&gt;Note: This scanner has a runtime proportional to the number of overall classes in the passed-in
+ * {@link PluginSource} objects, which may be significant for plugins with large dependencies. For a more performant
+ * implementation, consider using {@link ServiceLoaderScanner} and follow migration instructions for
+ * &lt;a href=&quot;https://cwiki.apache.org/confluence/display/KAFKA/KIP-898%3A+Modernize+Connect+plugin+discovery&quot;&gt;KIP-898&lt;/a&gt;.
+ */
+<span class="fc" id="L70">public class ReflectionScanner extends PluginScanner {</span>
+
+<span class="fc" id="L72">    private static final Logger log = LoggerFactory.getLogger(ReflectionScanner.class);</span>
+
+    private static &lt;T&gt; String versionFor(Class&lt;? extends T&gt; pluginKlass) throws ReflectiveOperationException {
+<span class="fc" id="L75">        T pluginImpl = pluginKlass.getDeclaredConstructor().newInstance();</span>
+<span class="fc" id="L76">        return versionFor(pluginImpl);</span>
+    }
+
+    @Override
+    protected PluginScanResult scanPlugins(PluginSource source) {
+<span class="fc" id="L81">        ClassGraph classGraphBuilder = new ClassGraph()</span>
+<span class="fc" id="L82">                .overrideClassLoaders(classLoaderOrder(source))</span>
+<span class="fc" id="L83">                .enableExternalClasses()</span>
+<span class="fc" id="L84">                .enableClassInfo();</span>
+<span class="fc" id="L85">        try (ScanResult classGraph = classGraphBuilder.scan()) {</span>
+<span class="fc" id="L86">            return new PluginScanResult(</span>
+<span class="fc" id="L87">                  getPluginDesc(classGraph, PluginType.SINK, source),</span>
+<span class="fc" id="L88">                  getPluginDesc(classGraph, PluginType.SOURCE, source),</span>
+<span class="fc" id="L89">                  getPluginDesc(classGraph, PluginType.CONVERTER, source),</span>
+<span class="fc" id="L90">                  getPluginDesc(classGraph, PluginType.HEADER_CONVERTER, source),</span>
+<span class="fc" id="L91">                  getTransformationPluginDesc(source, classGraph),</span>
+<span class="fc" id="L92">                  getPredicatePluginDesc(source, classGraph),</span>
+<span class="fc" id="L93">                  getServiceLoaderPluginDesc(PluginType.CONFIGPROVIDER, source),</span>
+<span class="fc" id="L94">                  getServiceLoaderPluginDesc(PluginType.REST_EXTENSION, source),</span>
+<span class="fc" id="L95">                  getServiceLoaderPluginDesc(PluginType.CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY, source)</span>
+          );
+        }
+    }
+
+    @SuppressWarnings({&quot;unchecked&quot;})
+    private SortedSet&lt;PluginDesc&lt;Predicate&lt;?&gt;&gt;&gt; getPredicatePluginDesc(PluginSource source, ScanResult classGraph) {
+<span class="fc" id="L102">        return (SortedSet&lt;PluginDesc&lt;Predicate&lt;?&gt;&gt;&gt;) (SortedSet&lt;?&gt;) getPluginDesc(classGraph, PluginType.PREDICATE, source);</span>
+    }
+
+    @SuppressWarnings({&quot;unchecked&quot;})
+    private SortedSet&lt;PluginDesc&lt;Transformation&lt;?&gt;&gt;&gt; getTransformationPluginDesc(PluginSource source, ScanResult classGraph) {
+<span class="fc" id="L107">        return (SortedSet&lt;PluginDesc&lt;Transformation&lt;?&gt;&gt;&gt;) (SortedSet&lt;?&gt;) getPluginDesc(classGraph, PluginType.TRANSFORMATION, source);</span>
+    }
+
+    private ClassLoader[] classLoaderOrder(PluginSource source) {
+        // Classgraph will first scan all the class URLs from the provided classloader chain and use said chain during classloading.
+        // We compute and provide the classloader chain starting from the isolated PluginClassLoader to ensure that it adheres
+        // to the child first delegation model used in connect. In addition, classgraph can fail to find URLs from the
+        // application classloader as it uses an illegal reflections access. Providing the entire chain of classloaders
+        // which included the application classloader forces classpath URLs to be scanned separately.
+<span class="fc" id="L116">        List&lt;ClassLoader&gt; classLoaderOrder = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L117">        ClassLoader cl = source.loader();</span>
+<span class="fc bfc" id="L118" title="All 2 branches covered.">        while (cl != null) {</span>
+<span class="fc" id="L119">            classLoaderOrder.add(cl);</span>
+<span class="fc" id="L120">            cl = cl.getParent();</span>
+        }
+<span class="fc" id="L122">        return classLoaderOrder.toArray(new ClassLoader[0]);</span>
+    }
+
+    @SuppressWarnings({&quot;unchecked&quot;})
+    private &lt;T&gt; SortedSet&lt;PluginDesc&lt;T&gt;&gt; getPluginDesc(
+            ScanResult classGraph,
+            PluginType type,
+            PluginSource source
+    ) {
+        ClassInfoList plugins;
+<span class="fc" id="L132">        Class&lt;T&gt; klass = (Class&lt;T&gt;) type.superClass();</span>
+        try {
+<span class="fc bfc" id="L134" title="All 2 branches covered.">            if (klass.isInterface()) {</span>
+<span class="fc" id="L135">                plugins = classGraph.getClassesImplementing(klass.getName());</span>
+            } else {
+<span class="fc" id="L137">                plugins = classGraph.getSubclasses(klass.getName());</span>
+            }
+<span class="nc" id="L139">        } catch (Exception e) {</span>
+<span class="nc" id="L140">            log.debug(&quot;Reflections scanner could not find any {} in {} for URLs: {}&quot;,</span>
+<span class="nc" id="L141">                    type, source, source.urls(), e);</span>
+<span class="nc" id="L142">            return Collections.emptySortedSet();</span>
+<span class="fc" id="L143">        }</span>
+
+<span class="fc" id="L145">        SortedSet&lt;PluginDesc&lt;T&gt;&gt; result = new TreeSet&lt;&gt;();</span>
+<span class="fc bfc" id="L146" title="All 2 branches covered.">        for (Class&lt;? extends T&gt; pluginKlass : plugins.getStandardClasses().loadClasses(klass, true)) {</span>
+<span class="fc bfc" id="L147" title="All 2 branches covered.">            if (!PluginUtils.isConcrete(pluginKlass)) {</span>
+<span class="fc" id="L148">                log.debug(&quot;Skipping {} in {} as it is not concrete implementation&quot;, pluginKlass, source);</span>
+<span class="fc" id="L149">                continue;</span>
+            }
+<span class="pc bpc" id="L151" title="1 of 2 branches missed.">            if (pluginKlass.getClassLoader() != source.loader()) {</span>
+<span class="nc" id="L152">                log.debug(&quot;{} from other classloader {} is visible from {}, excluding to prevent isolated loading&quot;,</span>
+<span class="nc" id="L153">                        pluginKlass, pluginKlass.getClassLoader(), source);</span>
+<span class="nc" id="L154">                continue;</span>
+            }
+<span class="fc" id="L156">            try (LoaderSwap loaderSwap = withClassLoader(source.loader())) {</span>
+<span class="fc" id="L157">                result.add(pluginDesc(pluginKlass, versionFor(pluginKlass), type, source));</span>
+<span class="nc" id="L158">            } catch (ReflectiveOperationException | LinkageError e) {</span>
+<span class="nc" id="L159">                log.error(&quot;Failed to discover {} in {}: Unable to instantiate {}{}&quot;,</span>
+<span class="nc" id="L160">                        type.simpleName(), source, pluginKlass.getSimpleName(),</span>
+<span class="nc" id="L161">                        reflectiveErrorDescription(e), e);</span>
+<span class="fc" id="L162">            }</span>
+<span class="fc" id="L163">        }</span>
+<span class="fc" id="L164">        return result;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

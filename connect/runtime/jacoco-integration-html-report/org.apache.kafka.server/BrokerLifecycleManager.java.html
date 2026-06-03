@@ -1,0 +1,798 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BrokerLifecycleManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server</a> &gt; <span class="el_source">BrokerLifecycleManager.java</span></div><h1>BrokerLifecycleManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.server;
+
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.BrokerHeartbeatRequestData;
+import org.apache.kafka.common.message.BrokerHeartbeatResponseData;
+import org.apache.kafka.common.message.BrokerRegistrationRequestData;
+import org.apache.kafka.common.message.BrokerRegistrationRequestData.ListenerCollection;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.BrokerHeartbeatRequest;
+import org.apache.kafka.common.requests.BrokerHeartbeatResponse;
+import org.apache.kafka.common.requests.BrokerRegistrationRequest;
+import org.apache.kafka.common.requests.BrokerRegistrationResponse;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.metadata.BrokerState;
+import org.apache.kafka.metadata.VersionRange;
+import org.apache.kafka.queue.EventQueue;
+import org.apache.kafka.queue.KafkaEventQueue;
+import org.apache.kafka.server.common.ControllerRequestCompletionHandler;
+import org.apache.kafka.server.common.NodeToControllerChannelManager;
+import org.apache.kafka.server.config.AbstractKafkaConfig;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
+
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+
+/**
+ * The broker lifecycle manager owns the broker state.
+ *
+ * Its inputs are messages passed in from other parts of the broker and from the
+ * controller: requests to start up, or shut down, for example. Its output are the broker
+ * state and various futures that can be used to wait for broker state transitions to
+ * occur.
+ *
+ * The lifecycle manager handles registering the broker with the controller, as described
+ * in KIP-631. After registration is complete, it handles sending periodic broker
+ * heartbeats and processing the responses.
+ *
+ * This code uses an event queue paradigm. Modifications get translated into events, which
+ * are placed on the queue to be processed sequentially. As described in the JavaDoc for
+ * each variable, most mutable state can be accessed only from that event queue thread.
+ * In some cases we expose a volatile variable which can be read from any thread, but only
+ * written from the event queue thread.
+ */
+public class BrokerLifecycleManager {
+
+    private final Logger logger;
+    private final KafkaEventQueue eventQueue;
+    private final AbstractKafkaConfig config;
+    private final Time time;
+    private final Set&lt;Uuid&gt; logDirs;
+    private final Runnable shutdownHook;
+    private final Supplier&lt;Boolean&gt; cordonedLogDirsSupported;
+
+    /**
+     * The broker id.
+     */
+    private final int nodeId;
+
+    /**
+     * The broker rack, or null if there is no configured rack.
+     */
+    private final Optional&lt;String&gt; rack;
+
+    /**
+     * How long to wait for registration to succeed before failing the startup process.
+     */
+    private final long initialTimeoutNs;
+
+    /**
+     * The broker incarnation ID.  This ID uniquely identifies each time we start the broker
+     */
+<span class="fc" id="L101">    private final Uuid incarnationId = Uuid.randomUuid();</span>
+
+    /**
+     * A future which is completed just as soon as the broker has caught up with the latest
+     * metadata offset for the first time.
+     */
+<span class="fc" id="L107">    private final CompletableFuture&lt;Void&gt; initialCatchUpFuture = new CompletableFuture&lt;&gt;();</span>
+
+    /**
+     * A future which is completed when the broker is unfenced for the first time.
+     */
+<span class="fc" id="L112">    private final CompletableFuture&lt;Void&gt; initialUnfenceFuture = new CompletableFuture&lt;&gt;();</span>
+
+    /**
+     * A future which is completed when controlled shutdown is done.
+     */
+<span class="fc" id="L117">    private final CompletableFuture&lt;Void&gt; controlledShutdownFuture = new CompletableFuture&lt;&gt;();</span>
+
+    /**
+     * The broker epoch, or -1 if the broker has not yet registered.  This variable can only
+     * be written from the event queue thread.
+     */
+<span class="fc" id="L123">    private volatile long brokerEpoch = -1L;</span>
+
+    /**
+     * The current broker state.  This variable can only be written from the event queue
+     * thread.
+     */
+<span class="fc" id="L129">    private volatile BrokerState state = BrokerState.NOT_RUNNING;</span>
+
+    /**
+     * A thread-safe callback function which gives this manager the current highest metadata
+     * offset.  This variable can only be read or written from the event queue thread.
+     */
+    private Supplier&lt;Long&gt; highestMetadataOffsetProvider;
+
+    /**
+     * True only if we are ready to unfence the broker.  This variable can only be read or
+     * written from the event queue thread.
+     */
+<span class="fc" id="L141">    private boolean readyToUnfence = false;</span>
+
+    /**
+     * Map of accumulated offline directories. The value is true if the directory has been successfully communicated
+     * to the Controller.
+     * This variable can only be read or written from the event queue thread.
+     */
+<span class="fc" id="L148">    private final Map&lt;Uuid, Boolean&gt; offlineDirs = new HashMap&lt;&gt;();</span>
+
+    /**
+     * Map of cordoned log directories. The value is true if the directory is cordoned.
+     * This variable can only be read or written from the event queue thread.
+     */
+<span class="fc" id="L154">    private final Map&lt;Uuid, Boolean&gt; cordonedLogDirs = new HashMap&lt;&gt;();</span>
+
+    /**
+     * True if we sent an event queue to the active controller requesting controlled
+     * shutdown.  This variable can only be read or written from the event queue thread.
+     */
+<span class="fc" id="L160">    private boolean gotControlledShutdownResponse = false;</span>
+
+    /**
+     * Whether this broker is registered with the controller quorum.
+     * This variable can only be read or written from the event queue thread.
+     */
+<span class="fc" id="L166">    private boolean registered = false;</span>
+
+    /**
+     * True if a request has been sent and a response or timeout has not yet been processed.
+     * This variable can only be read or written from the event queue thread.
+     */
+<span class="fc" id="L172">    private boolean communicationInFlight = false;</span>
+
+    /**
+     * True if we should schedule the next communication immediately. This is used to delay
+     * an immediate scheduling of a communication event if one is already in flight.
+     * This variable can only be read or written from the event queue thread.
+     */
+<span class="fc" id="L179">    private boolean nextSchedulingShouldBeImmediate = false;</span>
+
+    /**
+     * True if the initial registration succeeded.  This variable can only be read or
+     * written from the event queue thread.
+     */
+<span class="fc" id="L185">    private boolean initialRegistrationSucceeded = false;</span>
+
+    /**
+     * The cluster ID, or null if this manager has not been started yet.  This variable can
+     * only be read or written from the event queue thread.
+     */
+    private String clusterId;
+
+    /**
+     * The listeners which this broker advertises.  This variable can only be read or
+     * written from the event queue thread.
+     */
+    private ListenerCollection advertisedListeners;
+
+    /**
+     * The features supported by this broker.  This variable can only be read or written
+     * from the event queue thread.
+     */
+    private Map&lt;String, VersionRange&gt; supportedFeatures;
+
+    /**
+     * The channel manager, or null if this manager has not been started yet.  This variable
+     * can only be read or written from the event queue thread.
+     */
+    private NodeToControllerChannelManager channelManager;
+
+    /**
+     * The broker epoch from the previous run, or empty if the epoch is not found.
+     */
+<span class="fc" id="L214">    private volatile OptionalLong previousBrokerEpoch = OptionalLong.empty();</span>
+
+    public BrokerLifecycleManager(
+            AbstractKafkaConfig config,
+            Time time,
+            String threadNamePrefix,
+            Set&lt;Uuid&gt; logDirs) {
+<span class="nc" id="L221">        this(config, time, threadNamePrefix, logDirs, () -&gt; { }, () -&gt; false);</span>
+<span class="nc" id="L222">    }</span>
+
+    public BrokerLifecycleManager(
+            AbstractKafkaConfig config,
+            Time time,
+            String threadNamePrefix,
+            Set&lt;Uuid&gt; logDirs,
+            Runnable shutdownHook,
+<span class="fc" id="L230">            Supplier&lt;Boolean&gt; cordonedLogDirsSupported) {</span>
+<span class="fc" id="L231">        this.config = config;</span>
+<span class="fc" id="L232">        this.time = time;</span>
+<span class="fc" id="L233">        this.logDirs = logDirs;</span>
+<span class="fc" id="L234">        this.shutdownHook = shutdownHook;</span>
+<span class="fc" id="L235">        this.cordonedLogDirsSupported = cordonedLogDirsSupported;</span>
+<span class="fc" id="L236">        LogContext logContext = new LogContext(&quot;[BrokerLifecycleManager id=&quot; + this.config.nodeId() + &quot;] &quot;);</span>
+<span class="fc" id="L237">        this.logger = logContext.logger(BrokerLifecycleManager.class);</span>
+<span class="fc" id="L238">        this.nodeId = config.nodeId();</span>
+<span class="fc" id="L239">        this.rack = config.rack();</span>
+<span class="fc" id="L240">        this.initialTimeoutNs = MILLISECONDS.toNanos(config.initialRegistrationTimeoutMs());</span>
+<span class="fc" id="L241">        this.eventQueue = new KafkaEventQueue(</span>
+                time,
+                logContext,
+                threadNamePrefix + &quot;lifecycle-manager-&quot;,
+                new ShutdownEvent());
+<span class="fc" id="L246">    }</span>
+
+    /**
+     * Start the BrokerLifecycleManager.
+     *
+     * @param highestMetadataOffsetProvider Provides the current highest metadata offset.
+     * @param channelManager                The NodeToControllerChannelManager to use.
+     * @param clusterId                     The cluster ID.
+     * @param advertisedListeners           The advertised listeners for this broker.
+     * @param supportedFeatures             The features for this broker.
+     * @param previousBrokerEpoch           The broker epoch before the reboot.
+     */
+    public void start(Supplier&lt;Long&gt; highestMetadataOffsetProvider,
+               NodeToControllerChannelManager channelManager,
+               String clusterId,
+               ListenerCollection advertisedListeners,
+               Map&lt;String, VersionRange&gt; supportedFeatures,
+               OptionalLong previousBrokerEpoch,
+               Set&lt;Uuid&gt; cordonedLogDirs) {
+<span class="fc" id="L265">        this.previousBrokerEpoch = previousBrokerEpoch;</span>
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">        if (!cordonedLogDirs.isEmpty()) {</span>
+            // At this point we don't have fresh metadata yet so we don't know if the cordoned log dirs feature is supported.
+            // Queue an event, it will be ignored by the controller handling the broker registration if the feature is disabled.
+<span class="nc" id="L269">            eventQueue.append(new CordonedDirEvent(cordonedLogDirs));</span>
+        }
+<span class="fc" id="L271">        eventQueue.append(new StartupEvent(highestMetadataOffsetProvider,</span>
+                channelManager, clusterId, advertisedListeners, supportedFeatures));
+<span class="fc" id="L273">    }</span>
+
+    public CompletableFuture&lt;Void&gt; setReadyToUnfence() {
+<span class="fc" id="L276">        eventQueue.append(new SetReadyToUnfenceEvent());</span>
+<span class="fc" id="L277">        return initialUnfenceFuture;</span>
+    }
+
+    /**
+     * Propagate directory failures to the controller.
+     *
+     * @param directory The ID for the directory that failed.
+     */
+    public void propagateDirectoryFailure(Uuid directory, long timeout) {
+<span class="nc" id="L286">        eventQueue.append(new OfflineDirEvent(directory));</span>
+        // If we can't communicate the offline directory to the controller, we should shut down.
+<span class="nc" id="L288">        eventQueue.scheduleDeferred(&quot;offlineDirFailure&quot;,</span>
+<span class="nc" id="L289">                new EventQueue.DeadlineFunction(time.nanoseconds() + MILLISECONDS.toNanos(timeout)),</span>
+                new OfflineDirBrokerFailureEvent(directory));
+<span class="nc" id="L291">    }</span>
+
+    /**
+     * Propagate directory cordoned to the controller.
+     * @param directories The IDs for the directories that is cordoned.
+     */
+    public void propagateDirectoryCordoned(Set&lt;Uuid&gt; directories) {
+<span class="nc bnc" id="L298" title="All 2 branches missed.">        if (cordonedLogDirsSupported.get()) {</span>
+<span class="nc" id="L299">            eventQueue.append(new CordonedDirEvent(directories));</span>
+        }
+<span class="nc" id="L301">    }</span>
+
+    /**
+     * Propagate directory uncordoned to the controller.
+     * @param directories The IDs for the directories that is uncordoned.
+     */
+    public void propagateDirectoryUncordoned(Set&lt;Uuid&gt; directories) {
+<span class="nc bnc" id="L308" title="All 2 branches missed.">        if (cordonedLogDirsSupported.get()) {</span>
+<span class="nc" id="L309">            eventQueue.append(new UncordonedDirEvent(directories));</span>
+        }
+<span class="nc" id="L311">    }</span>
+
+    public void resendBrokerRegistration() {
+<span class="nc" id="L314">        eventQueue.append(new ResendBrokerRegistrationEvent());</span>
+<span class="nc" id="L315">    }</span>
+
+<span class="nc" id="L317">    private class ResendBrokerRegistrationEvent implements EventQueue.Event {</span>
+        @Override
+        public void run() {
+<span class="nc" id="L320">            registered = false;</span>
+<span class="nc" id="L321">            scheduleNextCommunicationImmediately();</span>
+<span class="nc" id="L322">        }</span>
+    }
+
+    public long brokerEpoch() {
+<span class="fc" id="L326">        return brokerEpoch;</span>
+    }
+
+    public BrokerState state() {
+<span class="fc" id="L330">        return state;</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; initialCatchUpFuture() {
+<span class="fc" id="L334">        return initialCatchUpFuture;</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; initialUnfenceFuture() {
+<span class="nc" id="L338">        return initialUnfenceFuture;</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; controlledShutdownFuture() {
+<span class="fc" id="L342">        return controlledShutdownFuture;</span>
+    }
+
+    public KafkaEventQueue eventQueue() {
+<span class="nc" id="L346">        return eventQueue;</span>
+    }
+
+<span class="fc" id="L349">    private class BeginControlledShutdownEvent implements EventQueue.Event {</span>
+        @Override
+        public void run() {
+<span class="pc bpc" id="L352" title="2 of 3 branches missed.">            switch (state) {</span>
+                case PENDING_CONTROLLED_SHUTDOWN -&gt;
+<span class="nc" id="L354">                    logger.info(&quot;Attempted to enter pending controlled shutdown state, but we are already in that state.&quot;);</span>
+                case RUNNING -&gt; {
+<span class="fc" id="L356">                    logger.info(&quot;Beginning controlled shutdown.&quot;);</span>
+<span class="fc" id="L357">                    state = BrokerState.PENDING_CONTROLLED_SHUTDOWN;</span>
+                    // Send the next heartbeat immediately in order to let the controller
+                    // begin processing the controlled shutdown as soon as possible.
+<span class="fc" id="L360">                    scheduleNextCommunicationImmediately();</span>
+<span class="fc" id="L361">                }</span>
+                default -&gt; {
+<span class="nc" id="L363">                    logger.info(&quot;Skipping controlled shutdown because we are in state {}.&quot;, state);</span>
+<span class="nc" id="L364">                    beginShutdown();</span>
+                }
+            }
+<span class="fc" id="L367">        }</span>
+    }
+
+    /**
+     * Enter the controlled shutdown state if we are in RUNNING state.
+     * Or, if we're not running, shut down immediately.
+     */
+    public void beginControlledShutdown() {
+<span class="fc" id="L375">        eventQueue.append(new BeginControlledShutdownEvent());</span>
+<span class="fc" id="L376">    }</span>
+
+    /**
+     * Start shutting down the BrokerLifecycleManager, but do not block.
+     */
+    public void beginShutdown() {
+<span class="fc" id="L382">        eventQueue.beginShutdown(&quot;beginShutdown&quot;);</span>
+<span class="fc" id="L383">    }</span>
+
+    /**
+     * Shut down the BrokerLifecycleManager and block until all threads are joined.
+     */
+    public void close() throws InterruptedException {
+<span class="fc" id="L389">        beginShutdown();</span>
+<span class="fc" id="L390">        eventQueue.close();</span>
+<span class="fc" id="L391">    }</span>
+
+<span class="fc" id="L393">    private class SetReadyToUnfenceEvent implements EventQueue.Event {</span>
+        @Override
+        public void run() {
+<span class="fc" id="L396">            readyToUnfence = true;</span>
+<span class="fc" id="L397">            scheduleNextCommunicationImmediately();</span>
+<span class="fc" id="L398">        }</span>
+    }
+
+    private class OfflineDirEvent implements EventQueue.Event {
+
+        private final Uuid dir;
+
+<span class="nc" id="L405">        OfflineDirEvent(Uuid dir) {</span>
+<span class="nc" id="L406">            this.dir = dir;</span>
+<span class="nc" id="L407">        }</span>
+
+        @Override
+        public void run() {
+<span class="nc" id="L411">            offlineDirs.put(dir, false);</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">            if (registered) {</span>
+<span class="nc" id="L413">                scheduleNextCommunicationImmediately();</span>
+            }
+<span class="nc" id="L415">        }</span>
+    }
+
+    private class OfflineDirBrokerFailureEvent implements EventQueue.Event {
+
+        private final Uuid offlineDir;
+
+<span class="nc" id="L422">        OfflineDirBrokerFailureEvent(Uuid offlineDir) {</span>
+<span class="nc" id="L423">            this.offlineDir = offlineDir;</span>
+<span class="nc" id="L424">        }</span>
+
+        @Override
+        public void run() {
+<span class="nc bnc" id="L428" title="All 2 branches missed.">            if (!offlineDirs.getOrDefault(offlineDir, false)) {</span>
+<span class="nc" id="L429">                logger.error(&quot;Shutting down because couldn't communicate offline log dir {} with controllers&quot;, offlineDir);</span>
+<span class="nc" id="L430">                shutdownHook.run();</span>
+            }
+<span class="nc" id="L432">        }</span>
+    }
+
+    private class CordonedDirEvent implements EventQueue.Event {
+
+        private final Set&lt;Uuid&gt; dirs;
+
+<span class="nc" id="L439">        CordonedDirEvent(Set&lt;Uuid&gt; dirs) {</span>
+<span class="nc" id="L440">            this.dirs = dirs;</span>
+<span class="nc" id="L441">        }</span>
+
+        @Override
+        public void run() {
+<span class="nc bnc" id="L445" title="All 2 branches missed.">            for (Uuid dir : dirs) {</span>
+<span class="nc" id="L446">                cordonedLogDirs.put(dir, true);</span>
+<span class="nc" id="L447">            }</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            if (registered) {</span>
+<span class="nc" id="L449">                scheduleNextCommunicationImmediately();</span>
+            }
+<span class="nc" id="L451">        }</span>
+    }
+
+    private class UncordonedDirEvent implements EventQueue.Event {
+
+        private final Set&lt;Uuid&gt; dirs;
+
+<span class="nc" id="L458">        UncordonedDirEvent(Set&lt;Uuid&gt; dirs) {</span>
+<span class="nc" id="L459">            this.dirs = dirs;</span>
+<span class="nc" id="L460">        }</span>
+
+        @Override
+        public void run() {
+<span class="nc bnc" id="L464" title="All 2 branches missed.">            for (Uuid dir : dirs) {</span>
+<span class="nc" id="L465">                cordonedLogDirs.put(dir, false);</span>
+<span class="nc" id="L466">            }</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">            if (registered) {</span>
+<span class="nc" id="L468">                scheduleNextCommunicationImmediately();</span>
+            }
+<span class="nc" id="L470">        }</span>
+    }
+
+    private class StartupEvent implements EventQueue.Event {
+
+        private final Supplier&lt;Long&gt; highestMetadataOffsetProvider;
+        private final NodeToControllerChannelManager channelManager;
+        private final String clusterId;
+        private final ListenerCollection advertisedListeners;
+        private final Map&lt;String, VersionRange&gt; supportedFeatures;
+
+        StartupEvent(Supplier&lt;Long&gt; highestMetadataOffsetProvider,
+                     NodeToControllerChannelManager channelManager,
+                     String clusterId,
+                     ListenerCollection advertisedListeners,
+<span class="fc" id="L485">                     Map&lt;String, VersionRange&gt; supportedFeatures) {</span>
+<span class="fc" id="L486">            this.highestMetadataOffsetProvider = highestMetadataOffsetProvider;</span>
+<span class="fc" id="L487">            this.channelManager = channelManager;</span>
+<span class="fc" id="L488">            this.clusterId = clusterId;</span>
+<span class="fc" id="L489">            this.advertisedListeners = advertisedListeners;</span>
+<span class="fc" id="L490">            this.supportedFeatures = supportedFeatures;</span>
+<span class="fc" id="L491">        }</span>
+
+        @Override
+        public void run() {
+<span class="fc" id="L495">            BrokerLifecycleManager.this.highestMetadataOffsetProvider = this.highestMetadataOffsetProvider;</span>
+<span class="fc" id="L496">            BrokerLifecycleManager.this.channelManager = channelManager;</span>
+<span class="fc" id="L497">            BrokerLifecycleManager.this.channelManager.start();</span>
+<span class="fc" id="L498">            state = BrokerState.STARTING;</span>
+<span class="fc" id="L499">            BrokerLifecycleManager.this.clusterId = clusterId;</span>
+<span class="fc" id="L500">            BrokerLifecycleManager.this.advertisedListeners = advertisedListeners.duplicate();</span>
+<span class="fc" id="L501">            BrokerLifecycleManager.this.supportedFeatures = Map.copyOf(supportedFeatures);</span>
+<span class="fc" id="L502">            eventQueue.scheduleDeferred(&quot;initialRegistrationTimeout&quot;,</span>
+<span class="fc" id="L503">                    new EventQueue.DeadlineFunction(time.nanoseconds() + initialTimeoutNs),</span>
+                    new RegistrationTimeoutEvent());
+<span class="fc" id="L505">            sendBrokerRegistration();</span>
+<span class="fc" id="L506">            logger.info(&quot;Incarnation {} of broker {} in cluster {} is now STARTING.&quot;, incarnationId, nodeId, clusterId);</span>
+<span class="fc" id="L507">        }</span>
+    }
+
+    private void sendBrokerRegistration() {
+<span class="fc" id="L511">        BrokerRegistrationRequestData.FeatureCollection features = new BrokerRegistrationRequestData.FeatureCollection();</span>
+<span class="fc" id="L512">        supportedFeatures.forEach((name, range) -&gt;</span>
+<span class="fc" id="L513">                features.add(new BrokerRegistrationRequestData.Feature()</span>
+<span class="fc" id="L514">                        .setName(name)</span>
+<span class="fc" id="L515">                        .setMinSupportedVersion(range.min())</span>
+<span class="fc" id="L516">                        .setMaxSupportedVersion(range.max()))</span>
+        );
+<span class="fc" id="L518">        List&lt;Uuid&gt; sortedLogDirs = new ArrayList&lt;&gt;(logDirs);</span>
+<span class="fc" id="L519">        sortedLogDirs.sort(Uuid::compareTo);</span>
+<span class="fc" id="L520">        BrokerRegistrationRequestData data = new BrokerRegistrationRequestData()</span>
+<span class="fc" id="L521">            .setBrokerId(nodeId)</span>
+<span class="fc" id="L522">            .setIsMigratingZkBroker(false)</span>
+<span class="fc" id="L523">            .setClusterId(clusterId)</span>
+<span class="fc" id="L524">            .setFeatures(features)</span>
+<span class="fc" id="L525">            .setIncarnationId(incarnationId)</span>
+<span class="fc" id="L526">            .setListeners(advertisedListeners)</span>
+<span class="fc" id="L527">            .setRack(rack.orElse(null))</span>
+<span class="fc" id="L528">            .setPreviousBrokerEpoch(previousBrokerEpoch.orElse(-1L))</span>
+<span class="fc" id="L529">            .setLogDirs(sortedLogDirs)</span>
+<span class="fc" id="L530">            .setCordonedLogDirs(cordonedLogDirs.entrySet().stream().filter(Map.Entry::getValue).map(Map.Entry::getKey).toList());</span>
+<span class="pc bpc" id="L531" title="1 of 2 branches missed.">        if (logger.isDebugEnabled()) {</span>
+<span class="nc" id="L532">            logger.debug(&quot;Sending broker registration {}&quot;, data);</span>
+        }
+<span class="fc" id="L534">        channelManager.sendRequest(new BrokerRegistrationRequest.Builder(data),</span>
+                new BrokerRegistrationResponseHandler());
+<span class="fc" id="L536">        communicationInFlight = true;</span>
+<span class="fc" id="L537">    }</span>
+
+    // the response handler is not invoked from the event handler thread,
+    // so it is not safe to update state here, instead, schedule an event
+    // to continue handling the response on the event handler thread
+<span class="fc" id="L542">    private class BrokerRegistrationResponseHandler implements ControllerRequestCompletionHandler {</span>
+        @Override
+        public void onComplete(ClientResponse response) {
+<span class="fc" id="L545">            eventQueue.prepend(new BrokerRegistrationResponseEvent(response, false));</span>
+<span class="fc" id="L546">        }</span>
+
+        @Override
+        public void onTimeout() {
+<span class="nc" id="L550">            logger.info(&quot;Unable to register the broker because the RPC got timed out before it could be sent.&quot;);</span>
+<span class="nc" id="L551">            eventQueue.prepend(new BrokerRegistrationResponseEvent(null, true));</span>
+<span class="nc" id="L552">        }</span>
+    }
+
+    private class BrokerRegistrationResponseEvent implements EventQueue.Event {
+
+        private final ClientResponse response;
+        private final boolean timedOut;
+
+<span class="fc" id="L560">        BrokerRegistrationResponseEvent(ClientResponse response, boolean timedOut) {</span>
+<span class="fc" id="L561">            this.response = response;</span>
+<span class="fc" id="L562">            this.timedOut = timedOut;</span>
+<span class="fc" id="L563">        }</span>
+
+        @Override
+        public void run() {
+<span class="fc" id="L567">            communicationInFlight = false;</span>
+<span class="pc bpc" id="L568" title="1 of 2 branches missed.">            if (timedOut) {</span>
+<span class="nc" id="L569">                scheduleNextCommunicationAfterFailure();</span>
+<span class="nc" id="L570">                return;</span>
+            }
+<span class="pc bpc" id="L572" title="1 of 2 branches missed.">            if (response.authenticationException() != null) {</span>
+<span class="nc" id="L573">                logger.error(&quot;Unable to register broker {} because of an authentication exception.&quot;, nodeId, response.authenticationException());</span>
+<span class="nc" id="L574">                scheduleNextCommunicationAfterFailure();</span>
+<span class="pc bpc" id="L575" title="1 of 2 branches missed.">            } else if (response.versionMismatch() != null) {</span>
+<span class="nc" id="L576">                logger.error(&quot;Unable to register broker {} because of an API version problem.&quot;, nodeId, response.versionMismatch());</span>
+<span class="nc" id="L577">                scheduleNextCommunicationAfterFailure();</span>
+<span class="pc bpc" id="L578" title="1 of 2 branches missed.">            } else if (response.responseBody() == null) {</span>
+<span class="nc" id="L579">                logger.warn(&quot;Unable to register broker {}.&quot;, nodeId);</span>
+<span class="nc" id="L580">                scheduleNextCommunicationAfterFailure();</span>
+<span class="pc bpc" id="L581" title="1 of 2 branches missed.">            } else if (!(response.responseBody() instanceof BrokerRegistrationResponse message)) {</span>
+<span class="nc" id="L582">                logger.error(&quot;Unable to register broker {} because the controller returned an invalid response type.&quot;, nodeId);</span>
+<span class="nc" id="L583">                scheduleNextCommunicationAfterFailure();</span>
+            } else {
+<span class="fc" id="L585">                Errors errorCode = Errors.forCode(message.data().errorCode());</span>
+<span class="pc bpc" id="L586" title="1 of 2 branches missed.">                if (errorCode == Errors.NONE) {</span>
+<span class="fc" id="L587">                    brokerEpoch = message.data().brokerEpoch();</span>
+<span class="fc" id="L588">                    registered = true;</span>
+<span class="fc" id="L589">                    initialRegistrationSucceeded = true;</span>
+<span class="fc" id="L590">                    logger.info(&quot;Successfully registered broker {} with broker epoch {}&quot;, nodeId, brokerEpoch);</span>
+<span class="fc" id="L591">                    scheduleNextCommunicationImmediately(); // Immediately send a heartbeat</span>
+                } else {
+<span class="nc" id="L593">                    logger.info(&quot;Unable to register broker {} because the controller returned error {}&quot;, nodeId, errorCode);</span>
+<span class="nc" id="L594">                    scheduleNextCommunicationAfterFailure();</span>
+                }
+            }
+<span class="fc" id="L597">        }</span>
+    }
+
+    private void sendBrokerHeartbeat() {
+<span class="fc" id="L601">        Long metadataOffset = highestMetadataOffsetProvider.get();</span>
+<span class="fc" id="L602">        BrokerHeartbeatRequestData data = new BrokerHeartbeatRequestData()</span>
+<span class="fc" id="L603">            .setBrokerEpoch(brokerEpoch)</span>
+<span class="fc" id="L604">            .setBrokerId(nodeId)</span>
+<span class="fc bfc" id="L605" title="All 2 branches covered.">            .setCurrentMetadataOffset(metadataOffset)</span>
+<span class="fc bfc" id="L606" title="All 2 branches covered.">            .setWantFence(!readyToUnfence)</span>
+<span class="fc" id="L607">            .setWantShutDown(state == BrokerState.PENDING_CONTROLLED_SHUTDOWN)</span>
+<span class="fc" id="L608">            .setOfflineLogDirs(new ArrayList&lt;&gt;(offlineDirs.keySet()))</span>
+<span class="fc" id="L609">            .setCordonedLogDirs(cordonedLogDirs.entrySet().stream().filter(Map.Entry::getValue).map(Map.Entry::getKey).toList());</span>
+<span class="pc bpc" id="L610" title="1 of 2 branches missed.">        if (logger.isTraceEnabled()) {</span>
+<span class="nc" id="L611">            logger.trace(&quot;Sending broker heartbeat {}&quot;, data);</span>
+        }
+<span class="fc" id="L613">        BrokerHeartbeatResponseHandler handler = new BrokerHeartbeatResponseHandler(offlineDirs.keySet());</span>
+<span class="fc" id="L614">        channelManager.sendRequest(new BrokerHeartbeatRequest.Builder(data), handler);</span>
+<span class="fc" id="L615">        communicationInFlight = true;</span>
+<span class="fc" id="L616">    }</span>
+
+    // the response handler is not invoked from the event handler thread,
+    // so it is not safe to update state here, instead, schedule an event
+    // to continue handling the response on the event handler thread
+    private class BrokerHeartbeatResponseHandler implements ControllerRequestCompletionHandler {
+
+        private final Iterable&lt;Uuid&gt; currentOfflineDirs;
+
+<span class="fc" id="L625">        BrokerHeartbeatResponseHandler(Iterable&lt;Uuid&gt; currentOfflineDirs) {</span>
+<span class="fc" id="L626">            this.currentOfflineDirs = currentOfflineDirs;</span>
+<span class="fc" id="L627">        }</span>
+
+        @Override
+        public void onComplete(ClientResponse response) {
+<span class="fc" id="L631">            eventQueue.prepend(new BrokerHeartbeatResponseEvent(response, false, currentOfflineDirs));</span>
+<span class="fc" id="L632">        }</span>
+
+        @Override
+        public void onTimeout() {
+<span class="nc" id="L636">            logger.info(&quot;Unable to send a heartbeat because the RPC got timed out before it could be sent.&quot;);</span>
+<span class="nc" id="L637">            eventQueue.prepend(new BrokerHeartbeatResponseEvent(null, true, currentOfflineDirs));</span>
+<span class="nc" id="L638">        }</span>
+    }
+
+    private class BrokerHeartbeatResponseEvent implements EventQueue.Event {
+
+        private final ClientResponse response;
+        private final boolean timedOut;
+        private final Iterable&lt;Uuid&gt; currentOfflineDirs;
+
+<span class="fc" id="L647">        BrokerHeartbeatResponseEvent(ClientResponse response, boolean timedOut, Iterable&lt;Uuid&gt; currentOfflineDirs) {</span>
+<span class="fc" id="L648">            this.response = response;</span>
+<span class="fc" id="L649">            this.timedOut = timedOut;</span>
+<span class="fc" id="L650">            this.currentOfflineDirs = currentOfflineDirs;</span>
+<span class="fc" id="L651">        }</span>
+
+        @Override
+        public void run() {
+<span class="fc" id="L655">            communicationInFlight = false;</span>
+<span class="pc bpc" id="L656" title="1 of 2 branches missed.">            if (timedOut) {</span>
+<span class="nc" id="L657">                scheduleNextCommunicationAfterFailure();</span>
+<span class="nc" id="L658">                return;</span>
+            }
+<span class="pc bpc" id="L660" title="1 of 2 branches missed.">            if (response.authenticationException() != null) {</span>
+<span class="nc" id="L661">                logger.error(&quot;Unable to send broker heartbeat for {} because of an authentication exception.&quot;,</span>
+<span class="nc" id="L662">                        nodeId, response.authenticationException());</span>
+<span class="nc" id="L663">                scheduleNextCommunicationAfterFailure();</span>
+<span class="pc bpc" id="L664" title="1 of 2 branches missed.">            } else if (response.versionMismatch() != null) {</span>
+<span class="nc" id="L665">                logger.error(&quot;Unable to send broker heartbeat for {} because of an API version problem.&quot;, nodeId, response.versionMismatch());</span>
+<span class="nc" id="L666">                scheduleNextCommunicationAfterFailure();</span>
+<span class="pc bpc" id="L667" title="1 of 2 branches missed.">            } else if (response.responseBody() == null) {</span>
+<span class="nc" id="L668">                logger.warn(&quot;Unable to send broker heartbeat for {}. Retrying.&quot;, nodeId);</span>
+<span class="nc" id="L669">                scheduleNextCommunicationAfterFailure();</span>
+<span class="pc bpc" id="L670" title="1 of 2 branches missed.">            } else if (!(response.responseBody() instanceof BrokerHeartbeatResponse message)) {</span>
+<span class="nc" id="L671">                logger.error(&quot;Unable to send broker heartbeat for {} because the controller returned an invalid response type.&quot;, nodeId);</span>
+<span class="nc" id="L672">                scheduleNextCommunicationAfterFailure();</span>
+            } else {
+<span class="fc" id="L674">                Errors errorCode = Errors.forCode(message.data().errorCode());</span>
+<span class="pc bpc" id="L675" title="1 of 2 branches missed.">                if (errorCode == Errors.NONE) {</span>
+<span class="fc" id="L676">                    BrokerHeartbeatResponseData responseData = message.data();</span>
+<span class="pc" id="L677">                    currentOfflineDirs.forEach(cur -&gt; offlineDirs.put(cur, true));</span>
+<span class="pc bpc" id="L678" title="2 of 6 branches missed.">                    switch (state) {</span>
+                        case STARTING -&gt; {
+<span class="fc bfc" id="L680" title="All 2 branches covered.">                            if (responseData.isCaughtUp()) {</span>
+<span class="fc" id="L681">                                logger.info(&quot;The broker has caught up. Transitioning from STARTING to RECOVERY.&quot;);</span>
+<span class="fc" id="L682">                                state = BrokerState.RECOVERY;</span>
+<span class="fc" id="L683">                                initialCatchUpFuture.complete(null);</span>
+                            } else {
+<span class="fc" id="L685">                                logger.debug(&quot;The broker is STARTING. Still waiting to catch up with cluster metadata.&quot;);</span>
+                            }
+                            // Schedule the heartbeat after only 10 ms so that in the case where
+                            // there is no recovery work to be done, we start up a bit quicker.
+<span class="fc" id="L689">                            scheduleNextCommunication(NANOSECONDS.convert(10, MILLISECONDS));</span>
+<span class="fc" id="L690">                        }</span>
+                        case RECOVERY -&gt; {
+<span class="pc bpc" id="L692" title="1 of 2 branches missed.">                            if (!responseData.isFenced()) {</span>
+<span class="fc" id="L693">                                logger.info(&quot;The broker has been unfenced. Transitioning from RECOVERY to RUNNING.&quot;);</span>
+<span class="fc" id="L694">                                initialUnfenceFuture.complete(null);</span>
+<span class="fc" id="L695">                                state = BrokerState.RUNNING;</span>
+                            } else {
+<span class="nc" id="L697">                                logger.info(&quot;The broker is in RECOVERY.&quot;);</span>
+                            }
+<span class="fc" id="L699">                            scheduleNextCommunicationAfterSuccess();</span>
+<span class="fc" id="L700">                        }</span>
+                        case RUNNING -&gt; {
+<span class="fc" id="L702">                            logger.debug(&quot;The broker is RUNNING. Processing heartbeat response.&quot;);</span>
+<span class="fc" id="L703">                            scheduleNextCommunicationAfterSuccess();</span>
+<span class="fc" id="L704">                        }</span>
+                        case PENDING_CONTROLLED_SHUTDOWN -&gt; {
+<span class="fc bfc" id="L706" title="All 2 branches covered.">                            if (!responseData.shouldShutDown()) {</span>
+<span class="fc" id="L707">                                logger.info(&quot;The broker is in PENDING_CONTROLLED_SHUTDOWN state, still waiting &quot; +</span>
+                                        &quot;for the active controller.&quot;);
+<span class="pc bpc" id="L709" title="1 of 2 branches missed.">                                if (!gotControlledShutdownResponse) {</span>
+                                    // If this is the first pending controlled shutdown response we got,
+                                    // schedule our next heartbeat a little bit sooner than we usually would.
+                                    // In the case where controlled shutdown completes quickly, this will
+                                    // speed things up a little bit.
+<span class="fc" id="L714">                                    scheduleNextCommunication(NANOSECONDS.convert(50, MILLISECONDS));</span>
+                                } else {
+<span class="nc" id="L716">                                    scheduleNextCommunicationAfterSuccess();</span>
+                                }
+                            } else {
+<span class="fc" id="L719">                                logger.info(&quot;The controller has asked us to exit controlled shutdown.&quot;);</span>
+<span class="fc" id="L720">                                beginShutdown();</span>
+                            }
+<span class="fc" id="L722">                            gotControlledShutdownResponse = true;</span>
+<span class="fc" id="L723">                        }</span>
+<span class="nc" id="L724">                        case SHUTTING_DOWN -&gt; logger.info(&quot;The broker is SHUTTING_DOWN. Ignoring heartbeat response.&quot;);</span>
+                        default -&gt; {
+<span class="nc" id="L726">                            logger.error(&quot;Unexpected broker state {}&quot;, state);</span>
+<span class="nc" id="L727">                            scheduleNextCommunicationAfterSuccess();</span>
+                        }
+                    }
+<span class="fc" id="L730">                } else {</span>
+<span class="nc" id="L731">                    logger.warn(&quot;Broker {} sent a heartbeat request but received error {}.&quot;, nodeId, errorCode);</span>
+<span class="nc" id="L732">                    scheduleNextCommunicationAfterFailure();</span>
+                }
+            }
+<span class="fc" id="L735">        }</span>
+    }
+
+    private void scheduleNextCommunicationImmediately() {
+<span class="fc" id="L739">        scheduleNextCommunication(0);</span>
+<span class="fc" id="L740">    }</span>
+
+    private void scheduleNextCommunicationAfterFailure() {
+<span class="nc" id="L743">        nextSchedulingShouldBeImmediate = false; // never immediately reschedule after a failure</span>
+<span class="nc" id="L744">        scheduleNextCommunication(NANOSECONDS.convert(config.brokerHeartbeatIntervalMs(), MILLISECONDS));</span>
+<span class="nc" id="L745">    }</span>
+
+    private void scheduleNextCommunicationAfterSuccess() {
+<span class="fc" id="L748">        scheduleNextCommunication(NANOSECONDS.convert(config.brokerHeartbeatIntervalMs(), MILLISECONDS));</span>
+<span class="fc" id="L749">    }</span>
+
+    private void scheduleNextCommunication(long intervalNs) {
+<span class="pc bpc" id="L752" title="1 of 2 branches missed.">        long adjustedIntervalNs = nextSchedulingShouldBeImmediate ? 0 : intervalNs;</span>
+<span class="fc" id="L753">        nextSchedulingShouldBeImmediate = false;</span>
+<span class="fc" id="L754">        logger.trace(&quot;Scheduling next communication at {}ms from now.&quot;, MILLISECONDS.convert(adjustedIntervalNs, NANOSECONDS));</span>
+<span class="fc" id="L755">        long deadlineNs = time.nanoseconds() + adjustedIntervalNs;</span>
+<span class="fc" id="L756">        eventQueue.scheduleDeferred(&quot;communication&quot;, new EventQueue.DeadlineFunction(deadlineNs), new CommunicationEvent());</span>
+<span class="fc" id="L757">    }</span>
+
+<span class="fc" id="L759">    private class RegistrationTimeoutEvent implements EventQueue.Event {</span>
+        @Override
+        public void run() {
+<span class="nc bnc" id="L762" title="All 2 branches missed.">            if (!initialRegistrationSucceeded) {</span>
+<span class="nc" id="L763">                logger.error(&quot;Shutting down because we were unable to register with the controller quorum.&quot;);</span>
+<span class="nc" id="L764">                eventQueue.beginShutdown(&quot;registrationTimeout&quot;);</span>
+            }
+<span class="nc" id="L766">        }</span>
+    }
+
+<span class="fc" id="L769">    private class CommunicationEvent implements EventQueue.Event {</span>
+        @Override
+        public void run() {
+<span class="pc bpc" id="L772" title="1 of 2 branches missed.">            if (communicationInFlight) {</span>
+<span class="nc" id="L773">                logger.trace(&quot;Delaying communication because there is already one in flight.&quot;);</span>
+<span class="nc" id="L774">                nextSchedulingShouldBeImmediate = true;</span>
+<span class="pc bpc" id="L775" title="1 of 2 branches missed.">            } else if (registered) {</span>
+<span class="fc" id="L776">                sendBrokerHeartbeat();</span>
+            } else {
+<span class="nc" id="L778">                sendBrokerRegistration();</span>
+            }
+<span class="fc" id="L780">        }</span>
+    }
+
+<span class="fc" id="L783">    private class ShutdownEvent implements EventQueue.Event {</span>
+        @Override
+        public void run() throws InterruptedException {
+<span class="fc" id="L786">            logger.info(&quot;Transitioning from {} to {}.&quot;, state, BrokerState.SHUTTING_DOWN);</span>
+<span class="fc" id="L787">            state = BrokerState.SHUTTING_DOWN;</span>
+<span class="fc" id="L788">            controlledShutdownFuture.complete(null);</span>
+<span class="fc" id="L789">            initialCatchUpFuture.cancel(false);</span>
+<span class="fc" id="L790">            initialUnfenceFuture.cancel(false);</span>
+<span class="pc bpc" id="L791" title="1 of 2 branches missed.">            if (channelManager != null) {</span>
+<span class="fc" id="L792">                channelManager.shutdown();</span>
+<span class="fc" id="L793">                channelManager = null;</span>
+            }
+<span class="fc" id="L795">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

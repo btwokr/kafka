@@ -1,0 +1,397 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Sensor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.metrics</a> &gt; <span class="el_source">Sensor.java</span></div><h1>Sensor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.metrics;
+
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.metrics.CompoundStat.NamedMeasurable;
+import org.apache.kafka.common.metrics.stats.TokenBucket;
+import org.apache.kafka.common.utils.Time;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+
+import static java.util.Arrays.asList;
+import static java.util.Collections.unmodifiableList;
+
+/**
+ * A sensor applies a continuous sequence of numerical values to a set of associated metrics. For example a sensor on
+ * message size would record a sequence of message sizes using the {@link #record(double)} api and would maintain a set
+ * of metrics about request sizes such as the average or max.
+ */
+public final class Sensor {
+
+    private final Metrics registry;
+    private final String name;
+    private final Sensor[] parents;
+    private final List&lt;StatAndConfig&gt; stats;
+    private final Map&lt;MetricName, KafkaMetric&gt; metrics;
+    private final MetricConfig config;
+    private final Time time;
+    private volatile long lastRecordTime;
+    private final long inactiveSensorExpirationTimeMs;
+    private final Object metricLock;
+
+    private static class StatAndConfig {
+        private final Stat stat;
+        private final Supplier&lt;MetricConfig&gt; configSupplier;
+
+<span class="fc" id="L60">        StatAndConfig(Stat stat, Supplier&lt;MetricConfig&gt; configSupplier) {</span>
+<span class="fc" id="L61">            this.stat = stat;</span>
+<span class="fc" id="L62">            this.configSupplier = configSupplier;</span>
+<span class="fc" id="L63">        }</span>
+
+        public Stat stat() {
+<span class="nc" id="L66">            return stat;</span>
+        }
+
+        public MetricConfig config() {
+<span class="fc" id="L70">            return configSupplier.get();</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L75">            return &quot;StatAndConfig(stat=&quot; + stat + ')';</span>
+        }
+    }
+
+<span class="fc" id="L79">    public enum RecordingLevel {</span>
+<span class="fc" id="L80">        INFO(0, &quot;INFO&quot;), DEBUG(1, &quot;DEBUG&quot;), TRACE(2, &quot;TRACE&quot;);</span>
+
+        private static final RecordingLevel[] ID_TO_TYPE;
+        private static final int MIN_RECORDING_LEVEL_KEY = 0;
+        public static final int MAX_RECORDING_LEVEL_KEY;
+
+        static {
+<span class="fc" id="L87">            int maxRL = -1;</span>
+<span class="fc bfc" id="L88" title="All 2 branches covered.">            for (RecordingLevel level : RecordingLevel.values()) {</span>
+<span class="fc" id="L89">                maxRL = Math.max(maxRL, level.id);</span>
+            }
+<span class="fc" id="L91">            RecordingLevel[] idToName = new RecordingLevel[maxRL + 1];</span>
+<span class="fc bfc" id="L92" title="All 2 branches covered.">            for (RecordingLevel level : RecordingLevel.values()) {</span>
+<span class="fc" id="L93">                idToName[level.id] = level;</span>
+            }
+<span class="fc" id="L95">            ID_TO_TYPE = idToName;</span>
+<span class="fc" id="L96">            MAX_RECORDING_LEVEL_KEY = maxRL;</span>
+<span class="fc" id="L97">        }</span>
+
+        /** an english description of the api--this is for debugging and can change */
+        public final String name;
+
+        /** the permanent and immutable id of an API--this can't change ever */
+        public final short id;
+
+<span class="fc" id="L105">        RecordingLevel(int id, String name) {</span>
+<span class="fc" id="L106">            this.id = (short) id;</span>
+<span class="fc" id="L107">            this.name = name;</span>
+<span class="fc" id="L108">        }</span>
+
+        public static RecordingLevel forId(int id) {
+<span class="nc bnc" id="L111" title="All 4 branches missed.">            if (id &lt; MIN_RECORDING_LEVEL_KEY || id &gt; MAX_RECORDING_LEVEL_KEY)</span>
+<span class="nc" id="L112">                throw new IllegalArgumentException(String.format(&quot;Unexpected RecordLevel id `%d`, it should be between `%d` &quot; +</span>
+<span class="nc" id="L113">                    &quot;and `%d` (inclusive)&quot;, id, MIN_RECORDING_LEVEL_KEY, MAX_RECORDING_LEVEL_KEY));</span>
+<span class="nc" id="L114">            return ID_TO_TYPE[id];</span>
+        }
+
+        /** Case insensitive lookup by protocol name */
+        public static RecordingLevel forName(String name) {
+<span class="fc" id="L119">            return RecordingLevel.valueOf(name.toUpperCase(Locale.ROOT));</span>
+        }
+
+        public boolean shouldRecord(final int configId) {
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">            if (configId == INFO.id) {</span>
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">                return this.id == INFO.id;</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">            } else if (configId == DEBUG.id) {</span>
+<span class="nc bnc" id="L126" title="All 4 branches missed.">                return this.id == INFO.id || this.id == DEBUG.id;</span>
+<span class="nc bnc" id="L127" title="All 2 branches missed.">            } else if (configId == TRACE.id) {</span>
+<span class="nc" id="L128">                return true;</span>
+            } else {
+<span class="nc" id="L130">                throw new IllegalStateException(&quot;Did not recognize recording level &quot; + configId);</span>
+            }
+        }
+    }
+
+    private final RecordingLevel recordingLevel;
+
+    Sensor(Metrics registry, String name, Sensor[] parents, MetricConfig config, Time time,
+           long inactiveSensorExpirationTimeSeconds, RecordingLevel recordingLevel) {
+<span class="fc" id="L139">        super();</span>
+<span class="fc" id="L140">        this.registry = registry;</span>
+<span class="fc" id="L141">        this.name = Objects.requireNonNull(name);</span>
+<span class="fc bfc" id="L142" title="All 2 branches covered.">        this.parents = parents == null ? new Sensor[0] : parents;</span>
+<span class="fc" id="L143">        this.metrics = new LinkedHashMap&lt;&gt;();</span>
+<span class="fc" id="L144">        this.stats = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L145">        this.config = config;</span>
+<span class="fc" id="L146">        this.time = time;</span>
+<span class="fc" id="L147">        this.inactiveSensorExpirationTimeMs = TimeUnit.MILLISECONDS.convert(inactiveSensorExpirationTimeSeconds, TimeUnit.SECONDS);</span>
+<span class="fc" id="L148">        this.lastRecordTime = time.milliseconds();</span>
+<span class="fc" id="L149">        this.recordingLevel = recordingLevel;</span>
+<span class="fc" id="L150">        this.metricLock = new Object();</span>
+<span class="fc" id="L151">        checkForest(new HashSet&lt;&gt;());</span>
+<span class="fc" id="L152">    }</span>
+
+    /* Validate that this sensor doesn't end up referencing itself */
+    private void checkForest(Set&lt;Sensor&gt; sensors) {
+<span class="pc bpc" id="L156" title="1 of 2 branches missed.">        if (!sensors.add(this))</span>
+<span class="nc" id="L157">            throw new IllegalArgumentException(&quot;Circular dependency in sensors: &quot; + name() + &quot; is its own parent.&quot;);</span>
+<span class="fc bfc" id="L158" title="All 2 branches covered.">        for (Sensor parent : parents)</span>
+<span class="fc" id="L159">            parent.checkForest(sensors);</span>
+<span class="fc" id="L160">    }</span>
+
+    /**
+     * The name this sensor is registered with. This name will be unique among all registered sensors.
+     */
+    public String name() {
+<span class="fc" id="L166">        return this.name;</span>
+    }
+
+    List&lt;Sensor&gt; parents() {
+<span class="fc" id="L170">        return unmodifiableList(asList(parents));</span>
+    }
+
+    /**
+     * @return true if the sensor's record level indicates that the metric will be recorded, false otherwise
+     */
+    public boolean shouldRecord() {
+<span class="fc" id="L177">        return this.recordingLevel.shouldRecord(config.recordLevel().id);</span>
+    }
+
+    /**
+     * Record an occurrence, this is just short-hand for {@link #record(double) record(1.0)}
+     */
+    public void record() {
+<span class="pc bpc" id="L184" title="1 of 2 branches missed.">        if (shouldRecord()) {</span>
+<span class="fc" id="L185">            recordInternal(1.0d, time.milliseconds(), true);</span>
+        }
+<span class="fc" id="L187">    }</span>
+
+    /**
+     * Record a value with this sensor
+     * @param value The value to record
+     * @throws QuotaViolationException if recording this value moves a metric beyond its configured maximum or minimum
+     *         bound
+     */
+    public void record(double value) {
+<span class="pc bpc" id="L196" title="1 of 2 branches missed.">        if (shouldRecord()) {</span>
+<span class="fc" id="L197">            recordInternal(value, time.milliseconds(), true);</span>
+        }
+<span class="fc" id="L199">    }</span>
+
+    /**
+     * Record a value at a known time. This method is slightly faster than {@link #record(double)} since it will reuse
+     * the time stamp.
+     * @param value The value we are recording
+     * @param timeMs The current POSIX time in milliseconds
+     * @throws QuotaViolationException if recording this value moves a metric beyond its configured maximum or minimum
+     *         bound
+     */
+    public void record(double value, long timeMs) {
+<span class="pc bpc" id="L210" title="1 of 2 branches missed.">        if (shouldRecord()) {</span>
+<span class="fc" id="L211">            recordInternal(value, timeMs, true);</span>
+        }
+<span class="fc" id="L213">    }</span>
+
+    /**
+     * Record a value at a known time. This method is slightly faster than {@link #record(double)} since it will reuse
+     * the time stamp.
+     * @param value The value we are recording
+     * @param timeMs The current POSIX time in milliseconds
+     * @param checkQuotas Indicate if quota must be enforced or not
+     * @throws QuotaViolationException if recording this value moves a metric beyond its configured maximum or minimum
+     *         bound
+     */
+    public void record(double value, long timeMs, boolean checkQuotas) {
+<span class="pc bpc" id="L225" title="1 of 2 branches missed.">        if (shouldRecord()) {</span>
+<span class="fc" id="L226">            recordInternal(value, timeMs, checkQuotas);</span>
+        }
+<span class="fc" id="L228">    }</span>
+
+    private void recordInternal(double value, long timeMs, boolean checkQuotas) {
+<span class="fc" id="L231">        this.lastRecordTime = timeMs;</span>
+<span class="fc" id="L232">        synchronized (this) {</span>
+<span class="fc" id="L233">            synchronized (metricLock()) {</span>
+                // increment all the stats
+<span class="fc bfc" id="L235" title="All 2 branches covered.">                for (StatAndConfig statAndConfig : this.stats) {</span>
+<span class="fc" id="L236">                    statAndConfig.stat.record(statAndConfig.config(), value, timeMs);</span>
+<span class="fc" id="L237">                }</span>
+<span class="fc" id="L238">            }</span>
+<span class="fc bfc" id="L239" title="All 2 branches covered.">            if (checkQuotas)</span>
+<span class="fc" id="L240">                checkQuotas(timeMs);</span>
+<span class="fc" id="L241">        }</span>
+<span class="fc bfc" id="L242" title="All 2 branches covered.">        for (Sensor parent : parents)</span>
+<span class="fc" id="L243">            parent.record(value, timeMs, checkQuotas);</span>
+<span class="fc" id="L244">    }</span>
+
+    /**
+     * Check if we have violated our quota for any metric that has a configured quota
+     */
+    public void checkQuotas() {
+<span class="nc" id="L250">        checkQuotas(time.milliseconds());</span>
+<span class="nc" id="L251">    }</span>
+
+    public void checkQuotas(long timeMs) {
+<span class="fc bfc" id="L254" title="All 2 branches covered.">        for (KafkaMetric metric : this.metrics.values()) {</span>
+<span class="fc" id="L255">            MetricConfig config = metric.config();</span>
+<span class="pc bpc" id="L256" title="1 of 2 branches missed.">            if (config != null) {</span>
+<span class="fc" id="L257">                Quota quota = config.quota();</span>
+<span class="fc bfc" id="L258" title="All 2 branches covered.">                if (quota != null) {</span>
+<span class="fc" id="L259">                    double value = metric.measurableValue(timeMs);</span>
+<span class="pc bpc" id="L260" title="1 of 2 branches missed.">                    if (metric.measurable() instanceof TokenBucket) {</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">                        if (value &lt; 0) {</span>
+<span class="nc" id="L262">                            throw new QuotaViolationException(metric, value, quota.bound());</span>
+                        }
+                    } else {
+<span class="pc bpc" id="L265" title="1 of 2 branches missed.">                        if (!quota.acceptable(value)) {</span>
+<span class="nc" id="L266">                            throw new QuotaViolationException(metric, value, quota.bound());</span>
+                        }
+                    }
+                }
+            }
+<span class="fc" id="L271">        }</span>
+<span class="fc" id="L272">    }</span>
+
+    /**
+     * Register a compound statistic with this sensor with no config override
+     * @param stat The stat to register
+     * @return true if stat is added to sensor, false if sensor is expired
+     */
+    public boolean add(CompoundStat stat) {
+<span class="fc" id="L280">        return add(stat, null);</span>
+    }
+
+    /**
+     * Register a compound statistic with this sensor which yields multiple measurable quantities (like a histogram)
+     * @param stat The stat to register
+     * @param config The configuration for this stat. If null then the stat will use the default configuration for this
+     *        sensor.
+     * @return true if stat is added to sensor, false if sensor is expired
+     */
+    public synchronized boolean add(CompoundStat stat, MetricConfig config) {
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">        if (hasExpired())</span>
+<span class="nc" id="L292">            return false;</span>
+
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">        final MetricConfig statConfig = config == null ? this.config : config;</span>
+<span class="fc" id="L295">        stats.add(new StatAndConfig(Objects.requireNonNull(stat), () -&gt; statConfig));</span>
+<span class="fc" id="L296">        Object lock = metricLock();</span>
+<span class="fc bfc" id="L297" title="All 2 branches covered.">        for (NamedMeasurable m : stat.stats()) {</span>
+<span class="fc" id="L298">            final KafkaMetric metric = new KafkaMetric(lock, m.name(), m.stat(), statConfig, time);</span>
+<span class="fc bfc" id="L299" title="All 2 branches covered.">            if (!metrics.containsKey(metric.metricName())) {</span>
+<span class="fc" id="L300">                KafkaMetric existingMetric = registry.registerMetric(metric);</span>
+<span class="pc bpc" id="L301" title="1 of 2 branches missed.">                if (existingMetric != null) {</span>
+<span class="nc" id="L302">                    throw new IllegalArgumentException(&quot;A metric named '&quot; + metric.metricName() + &quot;' already exists, can't register another one.&quot;);</span>
+                }
+<span class="fc" id="L304">                metrics.put(metric.metricName(), metric);</span>
+            }
+<span class="fc" id="L306">        }</span>
+<span class="fc" id="L307">        return true;</span>
+    }
+
+    /**
+     * Register a metric with this sensor
+     * @param metricName The name of the metric
+     * @param stat The statistic to keep
+     * @return true if metric is added to sensor, false if sensor is expired
+     */
+    public boolean add(MetricName metricName, MeasurableStat stat) {
+<span class="fc" id="L317">        return add(metricName, stat, null);</span>
+    }
+
+    /**
+     * Register a metric with this sensor
+     *
+     * @param metricName The name of the metric
+     * @param stat       The statistic to keep
+     * @param config     A special configuration for this metric. If null use the sensor default configuration.
+     * @return true if metric is added to sensor, false if sensor is expired
+     */
+    public synchronized boolean add(final MetricName metricName, final MeasurableStat stat, final MetricConfig config) {
+<span class="pc bpc" id="L329" title="1 of 2 branches missed.">        if (hasExpired()) {</span>
+<span class="nc" id="L330">            return false;</span>
+<span class="fc bfc" id="L331" title="All 2 branches covered.">        } else if (metrics.containsKey(metricName)) {</span>
+<span class="fc" id="L332">            return true;</span>
+        } else {
+<span class="pc bpc" id="L334" title="1 of 2 branches missed.">            final MetricConfig statConfig = config == null ? this.config : config;</span>
+<span class="fc" id="L335">            final KafkaMetric metric = new KafkaMetric(</span>
+<span class="fc" id="L336">                metricLock(),</span>
+<span class="fc" id="L337">                Objects.requireNonNull(metricName),</span>
+<span class="fc" id="L338">                Objects.requireNonNull(stat),</span>
+                statConfig,
+                time
+            );
+<span class="fc" id="L342">            KafkaMetric existingMetric = registry.registerMetric(metric);</span>
+<span class="pc bpc" id="L343" title="1 of 2 branches missed.">            if (existingMetric != null) {</span>
+<span class="nc" id="L344">                throw new IllegalArgumentException(&quot;A metric named '&quot; + metricName + &quot;' already exists, can't register another one.&quot;);</span>
+            }
+<span class="fc" id="L346">            metrics.put(metric.metricName(), metric);</span>
+<span class="fc" id="L347">            stats.add(new StatAndConfig(Objects.requireNonNull(stat), metric::config));</span>
+<span class="fc" id="L348">            return true;</span>
+        }
+    }
+
+    /**
+     * Return if metrics were registered with this sensor.
+     *
+     * @return true if metrics were registered, false otherwise
+     */
+    public synchronized boolean hasMetrics() {
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        return !metrics.isEmpty();</span>
+    }
+
+    /**
+     * Return true if the Sensor is eligible for removal due to inactivity.
+     *        false otherwise
+     */
+    public boolean hasExpired() {
+<span class="pc bpc" id="L366" title="1 of 2 branches missed.">        return (time.milliseconds() - this.lastRecordTime) &gt; this.inactiveSensorExpirationTimeMs;</span>
+    }
+
+    synchronized List&lt;KafkaMetric&gt; metrics() {
+<span class="fc" id="L370">        return List.copyOf(this.metrics.values());</span>
+    }
+
+    /**
+     * KafkaMetrics of sensors which use SampledStat should be synchronized on the same lock
+     * for sensor record and metric value read to allow concurrent reads and updates. For simplicity,
+     * all sensors are synchronized on this object.
+     * &lt;p&gt;
+     * Sensor object is not used as a lock for reading metric value since metrics reporter is
+     * invoked while holding Sensor and Metrics locks to report addition and removal of metrics
+     * and synchronized reporters may deadlock if Sensor lock is used for reading metrics values.
+     * Note that Sensor object itself is used as a lock to protect the access to stats and metrics
+     * while recording metric values, adding and deleting sensors.
+     * &lt;/p&gt;&lt;p&gt;
+     * Locking order (assume all MetricsReporter methods may be synchronized):
+     * &lt;ul&gt;
+     *   &lt;li&gt;Sensor#add: Sensor -&gt; Metrics -&gt; MetricsReporter&lt;/li&gt;
+     *   &lt;li&gt;Metrics#removeSensor: Sensor -&gt; Metrics -&gt; MetricsReporter&lt;/li&gt;
+     *   &lt;li&gt;KafkaMetric#metricValue: MetricsReporter -&gt; Sensor#metricLock&lt;/li&gt;
+     *   &lt;li&gt;Sensor#record: Sensor -&gt; Sensor#metricLock&lt;/li&gt;
+     * &lt;/ul&gt;
+     * &lt;/p&gt;
+     */
+    private Object metricLock() {
+<span class="fc" id="L394">        return metricLock;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

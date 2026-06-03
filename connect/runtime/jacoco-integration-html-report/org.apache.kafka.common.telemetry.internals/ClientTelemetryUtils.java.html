@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ClientTelemetryUtils.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.telemetry.internals</a> &gt; <span class="el_source">ClientTelemetryUtils.java</span></div><h1>ClientTelemetryUtils.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.telemetry.internals;
+
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.metrics.MetricsContext;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.internal.CompressionType;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.utils.ByteBufferOutputStream;
+import org.apache.kafka.common.utils.internals.BufferSupplier;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Predicate;
+
+import io.opentelemetry.proto.metrics.v1.MetricsData;
+
+<span class="nc" id="L47">public class ClientTelemetryUtils {</span>
+
+<span class="nc" id="L49">    private static final Logger log = LoggerFactory.getLogger(ClientTelemetryUtils.class);</span>
+
+<span class="nc" id="L51">    public static final Predicate&lt;? super MetricKeyable&gt; SELECTOR_NO_METRICS = k -&gt; false;</span>
+
+<span class="nc" id="L53">    public static final Predicate&lt;? super MetricKeyable&gt; SELECTOR_ALL_METRICS = k -&gt; true;</span>
+
+    /**
+     * Examine the response data and handle different error code accordingly:
+     *
+     * &lt;ul&gt;
+     *     &lt;li&gt;Invalid Request: Disable Telemetry&lt;/li&gt;
+     *     &lt;li&gt;Invalid Record: Disable Telemetry&lt;/li&gt;
+     *     &lt;li&gt;Unsupported Version: Disable Telemetry&lt;/li&gt;
+     *     &lt;li&gt;UnknownSubscription or Unsupported Compression: Retry immediately&lt;/li&gt;
+     *     &lt;li&gt;TelemetryTooLarge or ThrottlingQuotaExceeded: Retry as per next interval&lt;/li&gt;
+     * &lt;/ul&gt;
+     *
+     * @param errorCode response body error code
+     * @param intervalMs current push interval in milliseconds
+     *
+     * @return Optional of push interval in milliseconds
+     */
+    public static Optional&lt;Integer&gt; maybeFetchErrorIntervalMs(short errorCode, int intervalMs) {
+<span class="nc bnc" id="L72" title="All 2 branches missed.">        if (errorCode == Errors.NONE.code())</span>
+<span class="nc" id="L73">            return Optional.empty();</span>
+
+        int pushIntervalMs;
+        String reason;
+
+<span class="nc" id="L78">        Errors error = Errors.forCode(errorCode);</span>
+<span class="nc bnc" id="L79" title="All 4 branches missed.">        switch (error) {</span>
+            case INVALID_REQUEST:
+            case INVALID_RECORD:
+            case UNSUPPORTED_VERSION:
+<span class="nc" id="L83">                pushIntervalMs = Integer.MAX_VALUE;</span>
+<span class="nc" id="L84">                reason = &quot;The broker response indicates the client sent an request that cannot be resolved&quot;</span>
+                    + &quot; by re-trying, hence disable telemetry&quot;;
+<span class="nc" id="L86">                break;</span>
+            case UNKNOWN_SUBSCRIPTION_ID:
+            case UNSUPPORTED_COMPRESSION_TYPE:
+<span class="nc" id="L89">                pushIntervalMs = 0;</span>
+<span class="nc" id="L90">                reason = error.message();</span>
+<span class="nc" id="L91">                break;</span>
+            case TELEMETRY_TOO_LARGE:
+            case THROTTLING_QUOTA_EXCEEDED:
+<span class="nc" id="L94">                reason = error.message();</span>
+<span class="nc bnc" id="L95" title="All 2 branches missed.">                pushIntervalMs = (intervalMs != -1) ? intervalMs : ClientTelemetryReporter.DEFAULT_PUSH_INTERVAL_MS;</span>
+<span class="nc" id="L96">                break;</span>
+            default:
+<span class="nc" id="L98">                reason = &quot;Unwrapped error code&quot;;</span>
+<span class="nc" id="L99">                log.error(&quot;Error code: {}. Unmapped error for telemetry, disable telemetry.&quot;, errorCode);</span>
+<span class="nc" id="L100">                pushIntervalMs = Integer.MAX_VALUE;</span>
+        }
+
+<span class="nc" id="L103">        log.debug(&quot;Error code: {}, reason: {}. Push interval update to {} ms.&quot;, errorCode, reason, pushIntervalMs);</span>
+<span class="nc" id="L104">        return Optional.of(pushIntervalMs);</span>
+    }
+
+    public static Predicate&lt;? super MetricKeyable&gt; getSelectorFromRequestedMetrics(List&lt;String&gt; requestedMetrics) {
+<span class="nc bnc" id="L108" title="All 4 branches missed.">        if (requestedMetrics == null || requestedMetrics.isEmpty()) {</span>
+<span class="nc" id="L109">            log.debug(&quot;Telemetry subscription has specified no metric names; telemetry will record no metrics&quot;);</span>
+<span class="nc" id="L110">            return SELECTOR_NO_METRICS;</span>
+<span class="nc bnc" id="L111" title="All 6 branches missed.">        } else if (requestedMetrics.size() == 1 &amp;&amp; requestedMetrics.get(0) != null &amp;&amp; requestedMetrics.get(0).equals(&quot;*&quot;)) {</span>
+<span class="nc" id="L112">            log.debug(&quot;Telemetry subscription has specified a single '*' metric name; using all metrics&quot;);</span>
+<span class="nc" id="L113">            return SELECTOR_ALL_METRICS;</span>
+        } else {
+<span class="nc" id="L115">            log.debug(&quot;Telemetry subscription has specified to include only metrics that are prefixed with the following strings: {}&quot;, requestedMetrics);</span>
+<span class="nc" id="L116">            return k -&gt; requestedMetrics.stream().anyMatch(f -&gt; k.key().name().startsWith(f));</span>
+        }
+    }
+
+    public static List&lt;CompressionType&gt; getCompressionTypesFromAcceptedList(List&lt;Byte&gt; acceptedCompressionTypes) {
+<span class="nc bnc" id="L121" title="All 4 branches missed.">        if (acceptedCompressionTypes == null || acceptedCompressionTypes.isEmpty()) {</span>
+<span class="nc" id="L122">            return Collections.emptyList();</span>
+        }
+
+<span class="nc" id="L125">        List&lt;CompressionType&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        for (Byte compressionByte : acceptedCompressionTypes) {</span>
+<span class="nc" id="L127">            int compressionId = compressionByte.intValue();</span>
+            try {
+<span class="nc" id="L129">                CompressionType compressionType = CompressionType.forId(compressionId);</span>
+<span class="nc" id="L130">                result.add(compressionType);</span>
+<span class="nc" id="L131">            } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L132">                log.warn(&quot;Accepted compressionByte type with ID {} is not a known compressionByte type; ignoring&quot;, compressionId, e);</span>
+<span class="nc" id="L133">            }</span>
+<span class="nc" id="L134">        }</span>
+<span class="nc" id="L135">        return result;</span>
+    }
+
+    public static Uuid validateClientInstanceId(Uuid clientInstanceId) {
+<span class="nc bnc" id="L139" title="All 4 branches missed.">        if (clientInstanceId == null || clientInstanceId.equals(Uuid.ZERO_UUID)) {</span>
+<span class="nc" id="L140">            throw new IllegalArgumentException(&quot;clientInstanceId is not valid&quot;);</span>
+        }
+
+<span class="nc" id="L143">        return clientInstanceId;</span>
+    }
+
+    public static int validateIntervalMs(int intervalMs) {
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        if (intervalMs &lt;= 0) {</span>
+<span class="nc" id="L148">            log.warn(&quot;Telemetry subscription push interval value from broker was invalid ({}),&quot;</span>
+<span class="nc" id="L149">                + &quot; substituting with default value of {}&quot;, intervalMs, ClientTelemetryReporter.DEFAULT_PUSH_INTERVAL_MS);</span>
+<span class="nc" id="L150">            return ClientTelemetryReporter.DEFAULT_PUSH_INTERVAL_MS;</span>
+        }
+
+<span class="nc" id="L153">        log.debug(&quot;Telemetry subscription push interval value from broker: {}&quot;, intervalMs);</span>
+<span class="nc" id="L154">        return intervalMs;</span>
+    }
+
+    public static boolean validateResourceLabel(Map&lt;String, ?&gt; m, String key) {
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        if (!m.containsKey(key)) {</span>
+<span class="nc" id="L159">            log.trace(&quot;{} does not exist in map {}&quot;, key, m);</span>
+<span class="nc" id="L160">            return false;</span>
+        }
+
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        if (m.get(key) == null) {</span>
+<span class="nc" id="L164">            log.trace(&quot;{} is null. map {}&quot;, key, m);</span>
+<span class="nc" id="L165">            return false;</span>
+        }
+
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        if (!(m.get(key) instanceof String)) {</span>
+<span class="nc" id="L169">            log.trace(&quot;{} is not a string. map {}&quot;, key, m);</span>
+<span class="nc" id="L170">            return false;</span>
+        }
+
+<span class="nc" id="L173">        String val = (String) m.get(key);</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        if (val.isEmpty()) {</span>
+<span class="nc" id="L175">            log.trace(&quot;{} is empty string. value = {} map {}&quot;, key, val, m);</span>
+<span class="nc" id="L176">            return false;</span>
+        }
+<span class="nc" id="L178">        return true;</span>
+    }
+
+    public static boolean validateRequiredResourceLabels(Map&lt;String, String&gt; metadata) {
+<span class="nc" id="L182">        return validateResourceLabel(metadata, MetricsContext.NAMESPACE);</span>
+    }
+
+    /**
+     * Determines the preferred compression type from broker-accepted types, avoiding unsupported ones.
+     * 
+     * @param acceptedCompressionTypes the list of compression types accepted by the broker in order 
+     *                                of preference (must not be null, use empty list if no compression is accepted)
+     * @param unsupportedCompressionTypes the set of compression types that should be avoided due to 
+     *                                   missing libraries or previous failures (must not be null)
+     * @return the preferred compression type to use, or {@link CompressionType#NONE} if no acceptable
+     *         compression type is available
+     */
+    public static CompressionType preferredCompressionType(List&lt;CompressionType&gt; acceptedCompressionTypes, Set&lt;CompressionType&gt; unsupportedCompressionTypes) {
+        // Broker is providing the compression types in order of preference. Grab the
+        // first one that's supported.
+<span class="nc" id="L198">        return acceptedCompressionTypes.stream()</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">                .filter(t -&gt; !unsupportedCompressionTypes.contains(t))</span>
+<span class="nc" id="L200">                .findFirst()</span>
+<span class="nc" id="L201">                .orElse(CompressionType.NONE);</span>
+    }
+
+    public static ByteBuffer compress(MetricsData metrics, CompressionType compressionType) throws IOException {
+<span class="nc" id="L205">        try (ByteBufferOutputStream compressedOut = new ByteBufferOutputStream(512)) {</span>
+<span class="nc" id="L206">            Compression compression = Compression.of(compressionType).build();</span>
+<span class="nc" id="L207">            try (OutputStream out = compression.wrapForOutput(compressedOut, RecordBatch.CURRENT_MAGIC_VALUE)) {</span>
+<span class="nc" id="L208">                metrics.writeTo(out);</span>
+            }
+<span class="nc" id="L210">            compressedOut.buffer().flip();</span>
+<span class="nc" id="L211">            return compressedOut.buffer();</span>
+        }
+    }
+
+    public static ByteBuffer decompress(ByteBuffer metrics, CompressionType compressionType) {
+<span class="nc" id="L216">        Compression compression = Compression.of(compressionType).build();</span>
+<span class="nc" id="L217">        try (InputStream in = compression.wrapForInput(metrics, RecordBatch.CURRENT_MAGIC_VALUE, BufferSupplier.create());</span>
+<span class="nc" id="L218">            ByteBufferOutputStream out = new ByteBufferOutputStream(512)) {</span>
+<span class="nc" id="L219">            byte[] bytes = new byte[metrics.limit() * 2];</span>
+            int nRead;
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            while ((nRead = in.read(bytes, 0, bytes.length)) != -1) {</span>
+<span class="nc" id="L222">                out.write(bytes, 0, nRead);</span>
+            }
+<span class="nc" id="L224">            out.buffer().flip();</span>
+<span class="nc" id="L225">            return out.buffer();</span>
+<span class="nc" id="L226">        } catch (IOException e) {</span>
+<span class="nc" id="L227">            throw new KafkaException(&quot;Failed to decompress metrics data&quot;, e);</span>
+        }
+    }
+
+    public static MetricsData deserializeMetricsData(ByteBuffer serializedMetricsData) {
+        try {
+<span class="nc" id="L233">            return MetricsData.parseFrom(serializedMetricsData);</span>
+<span class="nc" id="L234">        } catch (IOException e) {</span>
+<span class="nc" id="L235">            throw new KafkaException(&quot;Unable to parse MetricsData payload&quot;, e);</span>
+        }
+    }
+
+    public static Uuid fetchClientInstanceId(ClientTelemetryReporter clientTelemetryReporter, Duration timeout) {
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        if (timeout.isNegative()) {</span>
+<span class="nc" id="L241">            throw new IllegalArgumentException(&quot;The timeout cannot be negative.&quot;);</span>
+        }
+
+<span class="nc" id="L244">        Optional&lt;Uuid&gt; optionalUuid = clientTelemetryReporter.telemetrySender().clientInstanceId(timeout);</span>
+<span class="nc" id="L245">        return optionalUuid.orElse(null);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

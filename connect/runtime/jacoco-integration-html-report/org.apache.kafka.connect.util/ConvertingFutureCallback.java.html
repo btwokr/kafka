@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConvertingFutureCallback.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.util</a> &gt; <span class="el_source">ConvertingFutureCallback.java</span></div><h1>ConvertingFutureCallback.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.util;
+
+import org.apache.kafka.connect.errors.ConnectException;
+
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+/**
+ * An abstract implementation of {@link Callback} that also implements the {@link Future} interface. This allows for
+ * operations like waiting until the callback is completed via {@link #onCompletion(Throwable, Object)}. The result
+ * from the callback can be converted by concrete implementations of this class before being retrieved via
+ * {@link Future#get}.
+ * @param &lt;U&gt; the callback result type
+ * @param &lt;T&gt; the future result type obtained after converting the callback result
+ */
+public abstract class ConvertingFutureCallback&lt;U, T&gt; implements Callback&lt;U&gt;, Future&lt;T&gt; {
+
+    private final Callback&lt;T&gt; underlying;
+    private final CountDownLatch finishedLatch;
+<span class="fc" id="L40">    private volatile T result = null;</span>
+<span class="fc" id="L41">    private volatile Throwable exception = null;</span>
+<span class="fc" id="L42">    private volatile boolean cancelled = false;</span>
+<span class="fc" id="L43">    private volatile Stage currentStage = null;</span>
+
+    public ConvertingFutureCallback() {
+<span class="fc" id="L46">        this(null);</span>
+<span class="fc" id="L47">    }</span>
+
+<span class="fc" id="L49">    public ConvertingFutureCallback(Callback&lt;T&gt; underlying) {</span>
+<span class="fc" id="L50">        this.underlying = underlying;</span>
+<span class="fc" id="L51">        this.finishedLatch = new CountDownLatch(1);</span>
+<span class="fc" id="L52">    }</span>
+
+    public abstract T convert(U result);
+
+    @Override
+    public void onCompletion(Throwable error, U result) {
+<span class="fc" id="L58">        synchronized (this) {</span>
+<span class="pc bpc" id="L59" title="1 of 2 branches missed.">            if (isDone()) {</span>
+<span class="nc" id="L60">                return;</span>
+            }
+            
+<span class="pc bpc" id="L63" title="1 of 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L64">                this.exception = error;</span>
+            } else {
+<span class="fc" id="L66">                this.result = convert(result);</span>
+            }
+
+<span class="pc bpc" id="L69" title="1 of 2 branches missed.">            if (underlying != null)</span>
+<span class="nc" id="L70">                underlying.onCompletion(error, this.result);</span>
+<span class="fc" id="L71">            finishedLatch.countDown();</span>
+<span class="fc" id="L72">        }</span>
+<span class="fc" id="L73">    }</span>
+
+    @Override
+    public boolean cancel(boolean mayInterruptIfRunning) {
+<span class="nc" id="L77">        synchronized (this) {</span>
+<span class="nc bnc" id="L78" title="All 2 branches missed.">            if (isDone()) {</span>
+<span class="nc" id="L79">                return false;</span>
+            }
+<span class="nc bnc" id="L81" title="All 2 branches missed.">            if (mayInterruptIfRunning) {</span>
+<span class="nc" id="L82">                this.cancelled = true;</span>
+<span class="nc" id="L83">                finishedLatch.countDown();</span>
+<span class="nc" id="L84">                return true;</span>
+            }
+<span class="nc" id="L86">        }</span>
+        try {
+<span class="nc" id="L88">            finishedLatch.await();</span>
+<span class="nc" id="L89">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L90">            throw new ConnectException(&quot;Interrupted while waiting for task to complete&quot;, e);</span>
+<span class="nc" id="L91">        }</span>
+<span class="nc" id="L92">        return false;</span>
+    }
+
+    @Override
+    public boolean isCancelled() {
+<span class="nc" id="L97">        return cancelled;</span>
+    }
+
+    @Override
+    public boolean isDone() {
+<span class="pc bpc" id="L102" title="1 of 2 branches missed.">        return finishedLatch.getCount() == 0;</span>
+    }
+
+    @Override
+    public T get() throws InterruptedException, ExecutionException {
+<span class="fc" id="L107">        finishedLatch.await();</span>
+<span class="fc" id="L108">        return result();</span>
+    }
+
+    @Override
+    public T get(long l, TimeUnit timeUnit)
+            throws InterruptedException, ExecutionException, TimeoutException {
+<span class="pc bpc" id="L114" title="1 of 2 branches missed.">        if (!finishedLatch.await(l, timeUnit)) {</span>
+<span class="nc" id="L115">            Stage stage = currentStage;</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">            if (stage != null) {</span>
+<span class="nc" id="L117">                throw new StagedTimeoutException(stage);</span>
+            } else {
+<span class="nc" id="L119">                throw new TimeoutException();</span>
+            }
+        }
+<span class="fc" id="L122">        return result();</span>
+    }
+
+    @Override
+    public void recordStage(Stage stage) {
+<span class="fc" id="L127">        this.currentStage = stage;</span>
+<span class="fc" id="L128">    }</span>
+
+    private T result() throws ExecutionException {
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">        if (cancelled) {</span>
+<span class="nc" id="L132">            throw new CancellationException();</span>
+        }
+<span class="pc bpc" id="L134" title="1 of 2 branches missed.">        if (exception != null) {</span>
+<span class="nc" id="L135">            throw new ExecutionException(exception);</span>
+        }
+<span class="fc" id="L137">        return result;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

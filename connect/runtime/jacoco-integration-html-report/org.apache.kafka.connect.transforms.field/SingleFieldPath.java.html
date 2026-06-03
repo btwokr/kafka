@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SingleFieldPath.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.transforms.field</a> &gt; <span class="el_source">SingleFieldPath.java</span></div><h1>SingleFieldPath.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.transforms.field;
+
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.Struct;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+import static org.apache.kafka.connect.transforms.util.Requirements.requireMapOrNull;
+import static org.apache.kafka.connect.transforms.util.Requirements.requireStructOrNull;
+
+/**
+ * A SingleFieldPath is composed of one or more field names, known as path steps,
+ * to access values within a data object (either {@code Struct} or {@code Map&lt;String, Object&gt;}).
+ *
+ * &lt;p&gt;The field path semantics are defined by the {@link FieldSyntaxVersion syntax version}.
+ *
+ * @see &lt;a href=&quot;https://cwiki.apache.org/confluence/display/KAFKA/KIP-821%3A+Connect+Transforms+support+for+nested+structures&quot;&gt;KIP-821&lt;/a&gt;
+ * @see FieldSyntaxVersion
+ */
+public class SingleFieldPath {
+    // Invariants:
+    // - A field path can contain one or more steps
+    private static final char BACKTICK = '`';
+    private static final char DOT = '.';
+    private static final char BACKSLASH = '\\';
+
+    private final FieldSyntaxVersion version;
+    private final List&lt;String&gt; steps;
+
+<span class="nc" id="L51">    public SingleFieldPath(String pathText, FieldSyntaxVersion version) {</span>
+<span class="nc" id="L52">        this.version = version;</span>
+<span class="nc bnc" id="L53" title="All 3 branches missed.">        switch (version) {</span>
+            case V1: // backward compatibility
+<span class="nc" id="L55">                this.steps = List.of(pathText);</span>
+<span class="nc" id="L56">                break;</span>
+            case V2:
+<span class="nc" id="L58">                this.steps = buildFieldPathV2(pathText);</span>
+<span class="nc" id="L59">                break;</span>
+            default:
+<span class="nc" id="L61">                throw new IllegalArgumentException(&quot;Unknown syntax version: &quot; + version);</span>
+        }
+<span class="nc" id="L63">    }</span>
+
+    private static List&lt;String&gt; buildFieldPathV2(String path) {
+<span class="nc" id="L66">        final List&lt;String&gt; steps = new ArrayList&lt;&gt;();</span>
+        // path character index to track backticks and dots and break path into steps
+<span class="nc" id="L68">        int idx = 0;</span>
+<span class="nc bnc" id="L69" title="All 4 branches missed.">        while (idx &lt; path.length() &amp;&amp; idx &gt;= 0) {</span>
+<span class="nc bnc" id="L70" title="All 2 branches missed.">            if (path.charAt(idx) != BACKTICK) {</span>
+<span class="nc" id="L71">                final int start = idx;</span>
+<span class="nc" id="L72">                idx = path.indexOf(String.valueOf(DOT), idx);</span>
+<span class="nc bnc" id="L73" title="All 2 branches missed.">                if (idx &gt;= 0) { // get path step and move forward</span>
+<span class="nc" id="L74">                    String field = path.substring(start, idx);</span>
+<span class="nc" id="L75">                    steps.add(field);</span>
+<span class="nc" id="L76">                    idx++;</span>
+<span class="nc" id="L77">                } else { // add all</span>
+<span class="nc" id="L78">                    String field = path.substring(start);</span>
+<span class="nc" id="L79">                    steps.add(field);</span>
+                }
+<span class="nc" id="L81">            } else { // has backtick</span>
+<span class="nc" id="L82">                int backtickAt = idx;</span>
+<span class="nc" id="L83">                idx++;</span>
+<span class="nc" id="L84">                StringBuilder field = new StringBuilder();</span>
+<span class="nc" id="L85">                int start = idx;</span>
+                while (true) {
+                    // find closing backtick
+<span class="nc" id="L88">                    idx = path.indexOf(String.valueOf(BACKTICK), idx);</span>
+<span class="nc bnc" id="L89" title="All 2 branches missed.">                    if (idx == -1) { // if not found, then fail</span>
+<span class="nc" id="L90">                        failWhenIncompleteBacktickPair(path, backtickAt);</span>
+                    }
+
+                    // backtick escaped if right after backslash
+<span class="nc bnc" id="L94" title="All 2 branches missed.">                    boolean escaped = path.charAt(idx - 1) == BACKSLASH;</span>
+
+<span class="nc bnc" id="L96" title="All 2 branches missed.">                    if (idx &gt;= path.length() - 1) { // at the end of path</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">                        if (escaped) { // but escaped, then fail</span>
+<span class="nc" id="L98">                            failWhenIncompleteBacktickPair(path, backtickAt);</span>
+                        }
+<span class="nc" id="L100">                        field.append(path, start, idx);</span>
+                        // we've reached the end of the path, and the last character is the backtick
+<span class="nc" id="L102">                        steps.add(field.toString());</span>
+<span class="nc" id="L103">                        idx++;</span>
+<span class="nc" id="L104">                        break;</span>
+                    }
+
+<span class="nc bnc" id="L107" title="All 2 branches missed.">                    if (path.charAt(idx + 1) != DOT) { // not followed by a dot</span>
+                        // this backtick isn't followed by a dot; include it in the field name, but continue
+                        // looking for a matching backtick that is followed by a dot
+<span class="nc" id="L110">                        idx++;</span>
+<span class="nc" id="L111">                        continue;</span>
+                    }
+
+<span class="nc bnc" id="L114" title="All 2 branches missed.">                    if (escaped) {</span>
+                        // this backtick was escaped; include it in the field name, but continue
+                        // looking for an unescaped matching backtick
+<span class="nc" id="L117">                        field.append(path, start, idx - 1)</span>
+<span class="nc" id="L118">                            .append(BACKTICK);</span>
+
+<span class="nc" id="L120">                        idx++;</span>
+<span class="nc" id="L121">                        start = idx;</span>
+<span class="nc" id="L122">                        continue;</span>
+                    }
+
+                    // we've found our matching backtick
+<span class="nc" id="L126">                    field.append(path, start, idx);</span>
+<span class="nc" id="L127">                    steps.add(field.toString());</span>
+<span class="nc" id="L128">                    idx += 2; // increment by two to include the backtick and the dot after it</span>
+<span class="nc" id="L129">                    break;</span>
+                }
+<span class="nc" id="L131">            }</span>
+        }
+        // add last step if last char is a dot
+<span class="nc bnc" id="L134" title="All 4 branches missed.">        if (!path.isEmpty() &amp;&amp; path.charAt(path.length() - 1) == DOT)</span>
+<span class="nc" id="L135">            steps.add(&quot;&quot;);</span>
+<span class="nc" id="L136">        return List.copyOf(steps);</span>
+    }
+
+    private static void failWhenIncompleteBacktickPair(String path, int backtickAt) {
+<span class="nc" id="L140">        throw new ConfigException(&quot;Incomplete backtick pair in path: [&quot; + path + &quot;],&quot;</span>
+                + &quot; consider adding a backslash before backtick at position &quot; + backtickAt
+                + &quot; to escape it&quot;);
+    }
+
+    /**
+     * Access a {@code Field} at the current path within a schema {@code Schema}
+     * If field is not found, then {@code null} is returned.
+     */
+    public Field fieldFrom(Schema schema) {
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        if (schema == null) return null;</span>
+
+<span class="nc" id="L152">        Schema current = schema;</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        for (String pathSegment : stepsWithoutLast()) {</span>
+<span class="nc" id="L154">            final Field field = current.field(pathSegment);</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">            if (field != null) {</span>
+<span class="nc" id="L156">                current = field.schema();</span>
+            } else {
+<span class="nc" id="L158">                return null;</span>
+            }
+<span class="nc" id="L160">        }</span>
+<span class="nc" id="L161">        return current.field(lastStep());</span>
+    }
+
+    /**
+     * Access a value at the current path within a schema-based {@code Struct}
+     * If object is not found, then {@code null} is returned.
+     */
+    public Object valueFrom(Struct struct) {
+
+<span class="nc" id="L170">        return valueFrom(struct, true);</span>
+    }
+
+    public Object valueFrom(Struct struct, boolean withDefault) {
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        if (struct == null) return null;</span>
+
+<span class="nc" id="L176">        Struct current = struct;</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        for (String pathSegment : stepsWithoutLast()) {</span>
+            // Check to see if the field actually exists
+<span class="nc bnc" id="L179" title="All 2 branches missed.">            if (current.schema().field(pathSegment) == null) {</span>
+<span class="nc" id="L180">                return null;</span>
+            }
+<span class="nc" id="L182">            Object subValue = current.get(pathSegment);</span>
+<span class="nc" id="L183">            current = requireStructOrNull(subValue, &quot;nested field access&quot;);</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            if (current == null) return null;</span>
+<span class="nc" id="L185">        }</span>
+
+<span class="nc" id="L187">        String lastStep = lastStep();</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        if (current.schema().field(lastStep) != null) {</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">            return withDefault ? current.get(lastStep) : current.getWithoutDefault(lastStep);</span>
+        } else {
+<span class="nc" id="L191">            return null;</span>
+        }
+    }
+
+    /**
+     * Access a value at the current path within a schemaless {@code Map&lt;String, Object&gt;}.
+     * If object is not found, then {@code null} is returned.
+     */
+    public Object valueFrom(Map&lt;String, Object&gt; map) {
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (map == null) return null;</span>
+
+<span class="nc" id="L202">        Map&lt;String, Object&gt; current = map;</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        for (String step : stepsWithoutLast()) {</span>
+<span class="nc" id="L204">            current = requireMapOrNull(current.get(step), &quot;nested field access&quot;);</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">            if (current == null) return null;</span>
+<span class="nc" id="L206">        }</span>
+<span class="nc" id="L207">        return current.get(lastStep());</span>
+    }
+
+    // For testing
+    String[] path() {
+<span class="nc" id="L212">        return steps.toArray(new String[0]);</span>
+    }
+
+    private String lastStep() {
+<span class="nc" id="L216">        return steps.get(lastStepIndex());</span>
+    }
+
+    private int lastStepIndex() {
+<span class="nc" id="L220">        return steps.size() - 1;</span>
+    }
+
+    private List&lt;String&gt; stepsWithoutLast() {
+<span class="nc" id="L224">        return steps.subList(0, lastStepIndex());</span>
+    }
+
+    @Override
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        if (this == o) return true;</span>
+<span class="nc bnc" id="L230" title="All 4 branches missed.">        if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="nc" id="L231">        SingleFieldPath that = (SingleFieldPath) o;</span>
+<span class="nc" id="L232">        return Objects.equals(steps, that.steps);</span>
+    }
+
+    @Override
+    public int hashCode() {
+<span class="nc" id="L237">        return Objects.hash(steps);</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L242">        return &quot;SingleFieldPath{&quot; +</span>
+            &quot;version=&quot; + version +
+<span class="nc" id="L244">            &quot;, path=&quot; + String.join(&quot;.&quot;, steps) +</span>
+            '}';
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

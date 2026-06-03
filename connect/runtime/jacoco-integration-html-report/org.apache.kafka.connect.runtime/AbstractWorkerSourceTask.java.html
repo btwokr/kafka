@@ -1,0 +1,699 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractWorkerSourceTask.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">AbstractWorkerSourceTask.java</span></div><h1>AbstractWorkerSourceTask.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.TopicDescription;
+import org.apache.kafka.clients.producer.Callback;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.internals.Plugin;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.Avg;
+import org.apache.kafka.common.metrics.stats.CumulativeSum;
+import org.apache.kafka.common.metrics.stats.Max;
+import org.apache.kafka.common.metrics.stats.Rate;
+import org.apache.kafka.common.metrics.stats.Value;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.errors.RetriableException;
+import org.apache.kafka.connect.header.Header;
+import org.apache.kafka.connect.header.Headers;
+import org.apache.kafka.connect.runtime.errors.ErrorHandlingMetrics;
+import org.apache.kafka.connect.runtime.errors.ErrorReporter;
+import org.apache.kafka.connect.runtime.errors.ProcessingContext;
+import org.apache.kafka.connect.runtime.errors.RetryWithToleranceOperator;
+import org.apache.kafka.connect.runtime.errors.Stage;
+import org.apache.kafka.connect.runtime.errors.ToleranceType;
+import org.apache.kafka.connect.runtime.isolation.LoaderSwap;
+import org.apache.kafka.connect.source.SourceRecord;
+import org.apache.kafka.connect.source.SourceTask;
+import org.apache.kafka.connect.source.SourceTaskContext;
+import org.apache.kafka.connect.storage.CloseableOffsetStorageReader;
+import org.apache.kafka.connect.storage.ClusterConfigState;
+import org.apache.kafka.connect.storage.ConnectorOffsetBackingStore;
+import org.apache.kafka.connect.storage.Converter;
+import org.apache.kafka.connect.storage.HeaderConverter;
+import org.apache.kafka.connect.storage.OffsetStorageWriter;
+import org.apache.kafka.connect.storage.StatusBackingStore;
+import org.apache.kafka.connect.util.ConnectUtils;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+import org.apache.kafka.connect.util.TopicAdmin;
+import org.apache.kafka.connect.util.TopicCreation;
+import org.apache.kafka.connect.util.TopicCreationGroup;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+import static org.apache.kafka.connect.runtime.WorkerConfig.TOPIC_TRACKING_ENABLE_CONFIG;
+
+/**
+ * WorkerTask that contains shared logic for running source tasks with either standard semantics
+ * (i.e., either at-least-once or at-most-once) or exactly-once semantics.
+ */
+public abstract class AbstractWorkerSourceTask extends WorkerTask&lt;SourceRecord, SourceRecord&gt; {
+<span class="fc" id="L84">    private static final Logger log = LoggerFactory.getLogger(AbstractWorkerSourceTask.class);</span>
+
+    private static final long SEND_FAILED_BACKOFF_MS = 100;
+
+    /**
+     * Hook to define custom startup behavior before the calling {@link SourceTask#initialize(SourceTaskContext)}
+     * and {@link SourceTask#start(Map)}.
+     */
+    protected abstract void prepareToInitializeTask();
+
+    /**
+     * Hook to define custom initialization behavior when preparing to begin the poll-convert-send loop for the first time,
+     * or when re-entering the loop after being paused.
+     */
+    protected abstract void prepareToEnterSendLoop();
+
+    /**
+     * Hook to define custom periodic behavior to be performed at the top of every iteration of the poll-convert-send loop.
+     */
+    protected abstract void beginSendIteration();
+
+    /**
+     * Hook to define custom periodic checks for health, metrics, etc. Called whenever {@link SourceTask#poll()} is about to be invoked.
+     */
+    protected abstract void prepareToPollTask();
+
+    /**
+     * Invoked when a record provided by the task has been filtered out by a transform or the converter,
+     * or will be discarded due to failures during transformation or conversion.
+     * @param record the pre-transform record that has been dropped; never null.
+     */
+    protected abstract void recordDropped(SourceRecord record);
+
+    /**
+     * Invoked when a record is about to be dispatched to the producer. May be invoked multiple times for the same
+     * record if retriable errors are encountered.
+     * @param sourceRecord the pre-transform {@link SourceRecord} provided by the source task; never null.
+     * @param producerRecord the {@link ProducerRecord} produced by transforming and converting the
+     * {@code sourceRecord}; never null;
+     * @return a {@link SubmittedRecords.SubmittedRecord} to be {@link SubmittedRecords.SubmittedRecord#ack() acknowledged}
+     * if the corresponding producer record is ack'd by Kafka or {@link SubmittedRecords.SubmittedRecord#drop() dropped}
+     * if synchronously rejected by the producer. Can also be {@link Optional#empty()} if it is not necessary to track the acknowledgment
+     * of individual producer records
+     */
+    protected abstract Optional&lt;SubmittedRecords.SubmittedRecord&gt; prepareToSendRecord(
+            SourceRecord sourceRecord,
+            ProducerRecord&lt;byte[], byte[]&gt; producerRecord
+    );
+
+    /**
+     * Invoked when a record has been transformed, converted, and dispatched to the producer successfully via
+     * {@link Producer#send}. Does not guarantee that the record has been sent to Kafka or ack'd by the required number
+     * of brokers, but does guarantee that it will never be re-processed.
+     * @param record the pre-transform {@link SourceRecord} that was successfully dispatched to the producer; never null.
+     */
+    protected abstract void recordDispatched(SourceRecord record);
+
+    /**
+     * Invoked when an entire batch of records returned from {@link SourceTask#poll} has been transformed, converted,
+     * and either discarded due to transform/conversion errors, filtered by a transform, or dispatched to the producer
+     * successfully via {@link Producer#send}. Does not guarantee that the records have been sent to Kafka or ack'd by the
+     * required number of brokers, but does guarantee that none of the records in the batch will ever be re-processed during
+     * the lifetime of this task. At most one record batch is polled from the task in between calls to this method.
+     */
+    protected abstract void batchDispatched();
+
+    /**
+     * Invoked when a record has been sent and ack'd by the Kafka cluster. Note that this method may be invoked
+     *  concurrently and should therefore be made thread-safe.
+     * @param sourceRecord  the pre-transform {@link SourceRecord} that was successfully sent to Kafka; never null.
+     * @param producerRecord the {@link ProducerRecord} produced by transforming and converting the
+     * {@code sourceRecord}; never null;
+     * @param recordMetadata the {@link RecordMetadata} for the corresponding producer record; never null.
+     */
+    protected abstract void recordSent(
+            SourceRecord sourceRecord,
+            ProducerRecord&lt;byte[], byte[]&gt; producerRecord,
+            RecordMetadata recordMetadata
+    );
+
+    /**
+     * Invoked when a record given to {@link Producer#send(ProducerRecord, Callback)} has failed with a non-retriable error.
+     * @param context the context for this record
+     * @param synchronous whether the error occurred during the invocation of {@link Producer#send(ProducerRecord, Callback)}.
+     *                    If {@code false}, indicates that the error was reported asynchronously by the producer by a {@link Callback}
+     * @param producerRecord the {@link ProducerRecord} that the producer failed to send; never null
+     * @param preTransformRecord the pre-transform {@link SourceRecord} that the producer record was derived from; never null
+     * @param e the exception that was either thrown from {@link Producer#send(ProducerRecord, Callback)}, or reported by the producer
+     *          via {@link Callback} after the call to {@link Producer#send(ProducerRecord, Callback)} completed
+     */
+    protected abstract void producerSendFailed(
+            ProcessingContext&lt;SourceRecord&gt; context,
+            boolean synchronous,
+            ProducerRecord&lt;byte[], byte[]&gt; producerRecord,
+            SourceRecord preTransformRecord,
+            Exception e
+    );
+
+    /**
+     * Invoked when no more records will be polled from the task or dispatched to the producer. Should attempt to
+     * commit the offsets for any outstanding records when possible.
+     * @param failed whether the task is undergoing a healthy or an unhealthy shutdown
+     */
+    protected abstract void finalOffsetCommit(boolean failed);
+
+
+    protected final WorkerConfig workerConfig;
+    protected final ConnectorOffsetBackingStore offsetStore;
+    protected final OffsetStorageWriter offsetWriter;
+    protected final Producer&lt;byte[], byte[]&gt; producer;
+
+    private final SourceTask task;
+    private final Plugin&lt;Converter&gt; keyConverterPlugin;
+    private final Plugin&lt;Converter&gt; valueConverterPlugin;
+    private final Plugin&lt;HeaderConverter&gt; headerConverterPlugin;
+    private final TopicAdmin admin;
+    private final CloseableOffsetStorageReader offsetReader;
+    private final SourceTaskMetricsGroup sourceTaskMetricsGroup;
+    private final CountDownLatch stopRequestedLatch;
+    private final boolean topicTrackingEnabled;
+    private final TopicCreation topicCreation;
+    private final Executor closeExecutor;
+    private final String version;
+
+    // Visible for testing
+    List&lt;SourceRecord&gt; toSend;
+    protected Map&lt;String, String&gt; taskConfig;
+    protected WorkerSourceTaskContext sourceTaskContext;
+<span class="fc" id="L212">    protected boolean started = false;</span>
+<span class="fc" id="L213">    private volatile boolean producerClosed = false;</span>
+
+    protected AbstractWorkerSourceTask(ConnectorTaskId id,
+                                       SourceTask task,
+                                       TaskStatus.Listener statusListener,
+                                       TargetState initialState,
+                                       ClusterConfigState configState,
+                                       Plugin&lt;Converter&gt; keyConverterPlugin,
+                                       Plugin&lt;Converter&gt; valueConverterPlugin,
+                                       Plugin&lt;HeaderConverter&gt; headerConverterPlugin,
+                                       TransformationChain&lt;SourceRecord, SourceRecord&gt; transformationChain,
+                                       WorkerTransactionContext workerTransactionContext,
+                                       Producer&lt;byte[], byte[]&gt; producer,
+                                       TopicAdmin admin,
+                                       Map&lt;String, TopicCreationGroup&gt; topicGroups,
+                                       CloseableOffsetStorageReader offsetReader,
+                                       OffsetStorageWriter offsetWriter,
+                                       ConnectorOffsetBackingStore offsetStore,
+                                       WorkerConfig workerConfig,
+                                       ConnectMetrics connectMetrics,
+                                       ErrorHandlingMetrics errorMetrics,
+                                       ClassLoader loader,
+                                       Time time,
+                                       RetryWithToleranceOperator&lt;SourceRecord&gt; retryWithToleranceOperator,
+                                       StatusBackingStore statusBackingStore,
+                                       Executor closeExecutor,
+                                       Supplier&lt;List&lt;ErrorReporter&lt;SourceRecord&gt;&gt;&gt; errorReportersSupplier,
+                                       TaskPluginsMetadata pluginsMetadata,
+                                       Function&lt;ClassLoader, LoaderSwap&gt; pluginLoaderSwapper) {
+
+<span class="fc" id="L243">        super(id, statusListener, initialState, loader, connectMetrics, errorMetrics,</span>
+                retryWithToleranceOperator, transformationChain, errorReportersSupplier,
+                time, statusBackingStore, pluginsMetadata, pluginLoaderSwapper);
+
+<span class="fc" id="L247">        this.workerConfig = workerConfig;</span>
+<span class="fc" id="L248">        this.task = task;</span>
+<span class="fc" id="L249">        this.keyConverterPlugin = keyConverterPlugin;</span>
+<span class="fc" id="L250">        this.valueConverterPlugin = valueConverterPlugin;</span>
+<span class="fc" id="L251">        this.headerConverterPlugin = headerConverterPlugin;</span>
+<span class="fc" id="L252">        this.producer = producer;</span>
+<span class="fc" id="L253">        this.admin = admin;</span>
+<span class="fc" id="L254">        this.offsetReader = offsetReader;</span>
+<span class="fc" id="L255">        this.offsetWriter = offsetWriter;</span>
+<span class="fc" id="L256">        this.offsetStore = Objects.requireNonNull(offsetStore, &quot;offset store cannot be null for source tasks&quot;);</span>
+<span class="fc" id="L257">        this.closeExecutor = closeExecutor;</span>
+<span class="fc" id="L258">        this.sourceTaskContext = new WorkerSourceTaskContext(offsetReader, id, configState, workerTransactionContext, pluginMetrics);</span>
+<span class="fc" id="L259">        this.stopRequestedLatch = new CountDownLatch(1);</span>
+<span class="fc" id="L260">        this.sourceTaskMetricsGroup = new SourceTaskMetricsGroup(id, connectMetrics);</span>
+<span class="fc" id="L261">        this.topicTrackingEnabled = workerConfig.getBoolean(TOPIC_TRACKING_ENABLE_CONFIG);</span>
+<span class="fc" id="L262">        this.topicCreation = TopicCreation.newTopicCreation(workerConfig, topicGroups);</span>
+<span class="fc" id="L263">        this.version = task.version();</span>
+<span class="fc" id="L264">    }</span>
+
+    @Override
+    public void initialize(TaskConfig taskConfig) {
+        try {
+<span class="fc" id="L269">            this.taskConfig = taskConfig.originalsStrings();</span>
+<span class="nc" id="L270">        } catch (Throwable t) {</span>
+<span class="nc" id="L271">            log.error(&quot;{} Task failed initialization and will not be started.&quot;, this, t);</span>
+<span class="nc" id="L272">            onFailure(t);</span>
+<span class="fc" id="L273">        }</span>
+<span class="fc" id="L274">    }</span>
+
+    @Override
+    protected void initializeAndStart() {
+<span class="fc" id="L278">        prepareToInitializeTask();</span>
+<span class="fc" id="L279">        offsetStore.start();</span>
+        // If we try to start the task at all by invoking initialize, then count this as
+        // &quot;started&quot; and expect a subsequent call to the task's stop() method
+        // to properly clean up any resources allocated by its initialize() or
+        // start() methods. If the task throws an exception during stop(),
+        // the worst thing that happens is another exception gets logged for an already-
+        // failed task
+<span class="fc" id="L286">        started = true;</span>
+<span class="fc" id="L287">        task.initialize(sourceTaskContext);</span>
+<span class="fc" id="L288">        task.start(taskConfig);</span>
+<span class="fc" id="L289">        log.info(&quot;{} Source task finished initialization and start&quot;, this);</span>
+<span class="fc" id="L290">    }</span>
+
+    @Override
+    public void cancel() {
+<span class="nc" id="L294">        super.cancel();</span>
+        // Preemptively close the offset reader in case the task is blocked on an offset read.
+<span class="nc" id="L296">        offsetReader.close();</span>
+        // We proactively close the producer here as the main work thread for the task may
+        // be blocked indefinitely in a call to Producer::send if automatic topic creation is
+        // not enabled on either the connector or the Kafka cluster. Closing the producer should
+        // unblock it in that case and allow shutdown to proceed normally.
+        // With a duration of 0, the producer's own shutdown logic should be fairly quick,
+        // but closing user-pluggable classes like interceptors may lag indefinitely. So, we
+        // call close on a separate thread in order to avoid blocking the herder's tick thread.
+<span class="nc" id="L304">        closeExecutor.execute(() -&gt; closeProducer(Duration.ZERO));</span>
+<span class="nc" id="L305">    }</span>
+
+    @Override
+    public void stop() {
+<span class="fc" id="L309">        super.stop();</span>
+<span class="fc" id="L310">        stopRequestedLatch.countDown();</span>
+<span class="fc" id="L311">    }</span>
+
+    @Override
+    public void removeMetrics() {
+<span class="fc" id="L315">        Utils.closeQuietly(sourceTaskMetricsGroup, &quot;source task metrics tracker&quot;);</span>
+<span class="fc" id="L316">        super.removeMetrics();</span>
+<span class="fc" id="L317">    }</span>
+
+    @Override
+    protected void close() {
+<span class="pc bpc" id="L321" title="1 of 2 branches missed.">        if (started) {</span>
+<span class="fc" id="L322">            Utils.closeQuietly(task::stop, &quot;source task&quot;);</span>
+        }
+
+<span class="fc" id="L325">        closeProducer(Duration.ofSeconds(30));</span>
+
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">        if (admin != null) {</span>
+<span class="fc" id="L328">            Utils.closeQuietly(() -&gt; admin.close(Duration.ofSeconds(30)), &quot;source task admin&quot;);</span>
+        }
+<span class="fc" id="L330">        Utils.closeQuietly(offsetReader, &quot;offset reader&quot;);</span>
+<span class="fc" id="L331">        Utils.closeQuietly(offsetStore::stop, &quot;offset backing store&quot;);</span>
+<span class="fc" id="L332">        Utils.closeQuietly(headerConverterPlugin, &quot;header converter&quot;);</span>
+<span class="fc" id="L333">        Utils.closeQuietly(keyConverterPlugin, &quot;key converter&quot;);</span>
+<span class="fc" id="L334">        Utils.closeQuietly(valueConverterPlugin, &quot;value converter&quot;);</span>
+<span class="fc" id="L335">        Utils.closeQuietly(pluginMetrics, &quot;pluginMetrics&quot;);</span>
+<span class="fc" id="L336">    }</span>
+
+    private void closeProducer(Duration duration) {
+<span class="pc bpc" id="L339" title="1 of 2 branches missed.">        if (producer != null) {</span>
+<span class="fc" id="L340">            producerClosed = true;</span>
+<span class="fc" id="L341">            Utils.closeQuietly(() -&gt; producer.close(duration), &quot;source task producer&quot;);</span>
+        }
+<span class="fc" id="L343">    }</span>
+
+    @Override
+    public void execute() {
+        try {
+<span class="fc" id="L348">            prepareToEnterSendLoop();</span>
+<span class="fc bfc" id="L349" title="All 2 branches covered.">            while (!isStopping()) {</span>
+<span class="fc" id="L350">                beginSendIteration();</span>
+
+<span class="pc bpc" id="L352" title="1 of 2 branches missed.">                if (shouldPause()) {</span>
+<span class="nc" id="L353">                    onPause();</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">                    if (awaitUnpause()) {</span>
+<span class="nc" id="L355">                        onResume();</span>
+<span class="nc" id="L356">                        prepareToEnterSendLoop();</span>
+                    }
+                    continue;
+                }
+
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">                if (toSend == null) {</span>
+<span class="fc" id="L362">                    prepareToPollTask();</span>
+
+<span class="fc" id="L364">                    log.trace(&quot;{} Nothing to send to Kafka. Polling source for additional records&quot;, this);</span>
+<span class="fc" id="L365">                    long start = time.milliseconds();</span>
+<span class="fc" id="L366">                    toSend = poll();</span>
+<span class="pc bpc" id="L367" title="1 of 2 branches missed.">                    if (toSend != null) {</span>
+<span class="fc" id="L368">                        recordPollReturned(toSend.size(), time.milliseconds() - start);</span>
+                    }
+                }
+<span class="pc bpc" id="L371" title="1 of 2 branches missed.">                if (toSend == null) {</span>
+<span class="nc" id="L372">                    batchDispatched();</span>
+<span class="nc" id="L373">                    continue;</span>
+                }
+<span class="fc" id="L375">                log.trace(&quot;{} About to send {} records to Kafka&quot;, this, toSend.size());</span>
+<span class="pc bpc" id="L376" title="1 of 2 branches missed.">                if (!sendRecords()) {</span>
+<span class="nc" id="L377">                    stopRequestedLatch.await(SEND_FAILED_BACKOFF_MS, TimeUnit.MILLISECONDS);</span>
+                }
+            }
+<span class="nc" id="L380">        } catch (InterruptedException e) {</span>
+            // Ignore and allow to exit.
+<span class="nc" id="L382">        } catch (RuntimeException e) {</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">            if (isCancelled()) {</span>
+<span class="nc" id="L384">                log.debug(&quot;Skipping final offset commit as task has been cancelled&quot;);</span>
+<span class="nc" id="L385">                throw e;</span>
+            }
+            try {
+<span class="nc" id="L388">                finalOffsetCommit(true);</span>
+<span class="nc" id="L389">            } catch (Exception offsetException) {</span>
+<span class="nc" id="L390">                log.error(&quot;Failed to commit offsets for already-failing task&quot;, offsetException);</span>
+<span class="nc" id="L391">            }</span>
+<span class="nc" id="L392">            throw e;</span>
+<span class="pc" id="L393">        }</span>
+<span class="fc" id="L394">        finalOffsetCommit(false);</span>
+<span class="fc" id="L395">    }</span>
+
+    @Override
+    public String taskVersion() {
+<span class="fc" id="L399">        return version;</span>
+    }
+
+    /**
+     * Try to send a batch of records. If a send fails and is retriable, this saves the remainder of the batch so it can
+     * be retried after backing off. If a send fails and is not retriable, this will throw a ConnectException.
+     * @return true if all messages were sent, false if some need to be retried
+     */
+    // Visible for testing
+    boolean sendRecords() {
+<span class="fc" id="L409">        int processed = 0;</span>
+<span class="fc" id="L410">        recordBatch(toSend.size());</span>
+        final SourceRecordWriteCounter counter =
+<span class="pc bpc" id="L412" title="1 of 2 branches missed.">                toSend.isEmpty() ? null : new SourceRecordWriteCounter(toSend.size(), sourceTaskMetricsGroup);</span>
+<span class="fc bfc" id="L413" title="All 2 branches covered.">        for (final SourceRecord preTransformRecord : toSend) {</span>
+<span class="fc" id="L414">            ProcessingContext&lt;SourceRecord&gt; context = new ProcessingContext&lt;&gt;(preTransformRecord);</span>
+<span class="fc" id="L415">            final SourceRecord record = transformationChain.apply(context, preTransformRecord);</span>
+<span class="fc" id="L416">            final ProducerRecord&lt;byte[], byte[]&gt; producerRecord = convertTransformedRecord(context, record);</span>
+<span class="pc bpc" id="L417" title="2 of 4 branches missed.">            if (producerRecord == null || context.failed()) {</span>
+<span class="nc" id="L418">                counter.skipRecord();</span>
+<span class="nc" id="L419">                recordDropped(preTransformRecord);</span>
+<span class="nc" id="L420">                processed++;</span>
+<span class="nc" id="L421">                continue;</span>
+            }
+
+<span class="fc" id="L424">            log.trace(&quot;{} Appending record to the topic {} with key {}, value {}&quot;, this, record.topic(), record.key(), record.value());</span>
+<span class="fc" id="L425">            Optional&lt;SubmittedRecords.SubmittedRecord&gt; submittedRecord = prepareToSendRecord(preTransformRecord, producerRecord);</span>
+            try {
+<span class="fc" id="L427">                final String topic = producerRecord.topic();</span>
+<span class="fc" id="L428">                maybeCreateTopic(topic);</span>
+<span class="fc" id="L429">                producer.send(</span>
+                    producerRecord,
+                    (recordMetadata, e) -&gt; {
+<span class="pc bpc" id="L432" title="1 of 2 branches missed.">                        if (e != null) {</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">                            if (producerClosed) {</span>
+<span class="nc" id="L434">                                log.trace(&quot;{} failed to send record to {}; this is expected as the producer has already been closed&quot;, AbstractWorkerSourceTask.this, topic, e);</span>
+                            } else {
+<span class="nc" id="L436">                                log.error(&quot;{} failed to send record to {}: &quot;, AbstractWorkerSourceTask.this, topic, e);</span>
+                            }
+<span class="nc" id="L438">                            log.trace(&quot;{} Failed record: {}&quot;, AbstractWorkerSourceTask.this, preTransformRecord);</span>
+<span class="nc" id="L439">                            producerSendFailed(context, false, producerRecord, preTransformRecord, e);</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">                            if (retryWithToleranceOperator.getErrorToleranceType() == ToleranceType.ALL) {</span>
+<span class="nc" id="L441">                                counter.skipRecord();</span>
+<span class="nc" id="L442">                                submittedRecord.ifPresent(SubmittedRecords.SubmittedRecord::ack);</span>
+                            }
+                        } else {
+<span class="fc" id="L445">                            counter.completeRecord();</span>
+<span class="fc" id="L446">                            log.trace(&quot;{} Wrote record successfully: topic {} partition {} offset {}&quot;,</span>
+                                    AbstractWorkerSourceTask.this,
+<span class="fc" id="L448">                                    recordMetadata.topic(), recordMetadata.partition(),</span>
+<span class="fc" id="L449">                                    recordMetadata.offset());</span>
+<span class="fc" id="L450">                            recordSent(preTransformRecord, producerRecord, recordMetadata);</span>
+<span class="fc" id="L451">                            submittedRecord.ifPresent(SubmittedRecords.SubmittedRecord::ack);</span>
+<span class="pc bpc" id="L452" title="1 of 2 branches missed.">                            if (topicTrackingEnabled) {</span>
+<span class="fc" id="L453">                                recordActiveTopic(producerRecord.topic());</span>
+                            }
+                        }
+<span class="fc" id="L456">                    });</span>
+                // Note that this will cause retries to take place within a transaction
+<span class="nc" id="L458">            } catch (RetriableException | org.apache.kafka.common.errors.RetriableException e) {</span>
+<span class="nc" id="L459">                log.warn(&quot;{} Failed to send record to topic '{}' and partition '{}'. Backing off before retrying: &quot;,</span>
+<span class="nc" id="L460">                        this, producerRecord.topic(), producerRecord.partition(), e);</span>
+<span class="nc" id="L461">                toSend = toSend.subList(processed, toSend.size());</span>
+<span class="nc" id="L462">                submittedRecord.ifPresent(SubmittedRecords.SubmittedRecord::drop);</span>
+<span class="nc" id="L463">                counter.retryRemaining();</span>
+<span class="nc" id="L464">                return false;</span>
+<span class="nc" id="L465">            } catch (ConnectException e) {</span>
+<span class="nc" id="L466">                log.warn(&quot;{} Failed to send record to topic '{}' and partition '{}' due to an unrecoverable exception: &quot;,</span>
+<span class="nc" id="L467">                        this, producerRecord.topic(), producerRecord.partition(), e);</span>
+<span class="nc" id="L468">                log.trace(&quot;{} Failed to send {} with unrecoverable exception: &quot;, this, producerRecord, e);</span>
+<span class="nc" id="L469">                throw e;</span>
+<span class="nc" id="L470">            } catch (KafkaException e) {</span>
+<span class="nc" id="L471">                producerSendFailed(context, true, producerRecord, preTransformRecord, e);</span>
+<span class="fc" id="L472">            }</span>
+<span class="fc" id="L473">            processed++;</span>
+<span class="fc" id="L474">            recordDispatched(preTransformRecord);</span>
+<span class="fc" id="L475">        }</span>
+<span class="fc" id="L476">        toSend = null;</span>
+<span class="fc" id="L477">        batchDispatched();</span>
+<span class="fc" id="L478">        return true;</span>
+    }
+
+    protected List&lt;SourceRecord&gt; poll() throws InterruptedException {
+        try {
+<span class="fc" id="L483">            return task.poll();</span>
+<span class="nc" id="L484">        } catch (RetriableException | org.apache.kafka.common.errors.RetriableException e) {</span>
+<span class="nc" id="L485">            log.warn(&quot;{} failed to poll records from SourceTask. Will retry operation.&quot;, this, e);</span>
+            // Do nothing. Let the framework poll whenever it's ready.
+<span class="nc" id="L487">            return null;</span>
+        }
+    }
+
+    /**
+     * Convert the source record into a producer record.
+     *
+     * @param record the transformed record
+     * @return the producer record which can sent over to Kafka. A null is returned if the input is null or
+     * if an error was encountered during any of the converter stages.
+     */
+    protected ProducerRecord&lt;byte[], byte[]&gt; convertTransformedRecord(ProcessingContext&lt;SourceRecord&gt; context, SourceRecord record) {
+<span class="pc bpc" id="L499" title="1 of 2 branches missed.">        if (record == null) {</span>
+<span class="nc" id="L500">            return null;</span>
+        }
+
+<span class="fc" id="L503">        RecordHeaders headers = retryWithToleranceOperator.execute(context, () -&gt; convertHeaderFor(record), Stage.HEADER_CONVERTER, headerConverterPlugin.get().getClass());</span>
+
+<span class="fc" id="L505">        byte[] key = retryWithToleranceOperator.execute(context, () -&gt; {</span>
+<span class="fc" id="L506">            try (LoaderSwap swap = pluginLoaderSwapper.apply(keyConverterPlugin.get().getClass().getClassLoader())) {</span>
+<span class="fc" id="L507">                return keyConverterPlugin.get().fromConnectData(record.topic(), headers, record.keySchema(), record.key());</span>
+            }
+<span class="fc" id="L509">        }, Stage.KEY_CONVERTER, keyConverterPlugin.get().getClass());</span>
+
+<span class="fc" id="L511">        byte[] value = retryWithToleranceOperator.execute(context, () -&gt; {</span>
+<span class="fc" id="L512">            try (LoaderSwap swap = pluginLoaderSwapper.apply(valueConverterPlugin.get().getClass().getClassLoader())) {</span>
+<span class="fc" id="L513">                return valueConverterPlugin.get().fromConnectData(record.topic(), headers, record.valueSchema(), record.value());</span>
+            }
+<span class="fc" id="L515">        }, Stage.VALUE_CONVERTER, valueConverterPlugin.get().getClass());</span>
+
+<span class="pc bpc" id="L517" title="1 of 2 branches missed.">        if (context.failed()) {</span>
+<span class="nc" id="L518">            return null;</span>
+        }
+
+<span class="fc" id="L521">        return new ProducerRecord&lt;&gt;(record.topic(), record.kafkaPartition(),</span>
+<span class="fc" id="L522">                ConnectUtils.checkAndConvertTimestamp(record.timestamp()), key, value, headers);</span>
+    }
+
+    // Due to transformations that may change the destination topic of a record (such as
+    // RegexRouter) topic creation can not be batched for multiple topics
+    private void maybeCreateTopic(String topic) {
+<span class="fc bfc" id="L528" title="All 2 branches covered.">        if (!topicCreation.isTopicCreationRequired(topic)) {</span>
+<span class="fc" id="L529">            log.trace(&quot;Topic creation by the connector is disabled or the topic {} was previously created.&quot; +</span>
+                    &quot;If auto.create.topics.enable is enabled on the broker, &quot; +
+                    &quot;the topic will be created with default settings&quot;, topic);
+<span class="fc" id="L532">            return;</span>
+        }
+<span class="fc" id="L534">        log.info(&quot;The task will send records to topic '{}' for the first time. Checking &quot;</span>
+                + &quot;whether topic exists&quot;, topic);
+<span class="fc" id="L536">        Map&lt;String, TopicDescription&gt; existing = admin.describeTopics(topic);</span>
+<span class="pc bpc" id="L537" title="1 of 2 branches missed.">        if (!existing.isEmpty()) {</span>
+<span class="fc" id="L538">            log.info(&quot;Topic '{}' already exists.&quot;, topic);</span>
+<span class="fc" id="L539">            topicCreation.addTopic(topic);</span>
+<span class="fc" id="L540">            return;</span>
+        }
+
+<span class="nc" id="L543">        log.info(&quot;Creating topic '{}'&quot;, topic);</span>
+<span class="nc" id="L544">        TopicCreationGroup topicGroup = topicCreation.findFirstGroup(topic);</span>
+<span class="nc" id="L545">        log.debug(&quot;Topic '{}' matched topic creation group: {}&quot;, topic, topicGroup);</span>
+<span class="nc" id="L546">        NewTopic newTopic = topicGroup.newTopic(topic);</span>
+
+<span class="nc" id="L548">        TopicAdmin.TopicCreationResponse response = admin.createOrFindTopics(newTopic);</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">        if (response.isCreated(newTopic.name())) {</span>
+<span class="nc" id="L550">            topicCreation.addTopic(topic);</span>
+<span class="nc" id="L551">            log.info(&quot;Created topic '{}' using creation group {}&quot;, newTopic, topicGroup);</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">        } else if (response.isExisting(newTopic.name())) {</span>
+<span class="nc" id="L553">            topicCreation.addTopic(topic);</span>
+<span class="nc" id="L554">            log.info(&quot;Found existing topic '{}'&quot;, newTopic);</span>
+        } else {
+            // The topic still does not exist and could not be created, so treat it as a task failure
+<span class="nc" id="L557">            log.warn(&quot;Request to create new topic '{}' failed&quot;, topic);</span>
+<span class="nc" id="L558">            throw new ConnectException(&quot;Task failed to create new topic &quot; + newTopic + &quot;. Ensure &quot;</span>
+                    + &quot;that the task is authorized to create topics or that the topic exists and &quot;
+                    + &quot;restart the task&quot;);
+        }
+<span class="nc" id="L562">    }</span>
+
+    protected RecordHeaders convertHeaderFor(SourceRecord record) {
+<span class="fc" id="L565">        Headers headers = record.headers();</span>
+<span class="fc" id="L566">        RecordHeaders result = new RecordHeaders();</span>
+<span class="pc bpc" id="L567" title="1 of 2 branches missed.">        if (headers != null) {</span>
+<span class="fc" id="L568">            String topic = record.topic();</span>
+<span class="fc bfc" id="L569" title="All 2 branches covered.">            for (Header header : headers) {</span>
+<span class="fc" id="L570">                String key = header.key();</span>
+<span class="fc" id="L571">                try (LoaderSwap swap = pluginLoaderSwapper.apply(headerConverterPlugin.get().getClass().getClassLoader())) {</span>
+<span class="fc" id="L572">                    byte[] rawHeader = headerConverterPlugin.get().fromConnectHeader(topic, key, header.schema(), header.value());</span>
+<span class="fc" id="L573">                    result.add(key, rawHeader);</span>
+                }
+
+<span class="fc" id="L576">            }</span>
+        }
+<span class="fc" id="L578">        return result;</span>
+    }
+
+    protected void commitTaskRecord(SourceRecord record, RecordMetadata metadata) {
+        try {
+<span class="fc" id="L583">            task.commitRecord(record, metadata);</span>
+<span class="nc" id="L584">        } catch (Throwable t) {</span>
+<span class="nc" id="L585">            log.error(&quot;{} Exception thrown while calling task.commitRecord()&quot;, this, t);</span>
+<span class="fc" id="L586">        }</span>
+<span class="fc" id="L587">    }</span>
+
+    protected void commitSourceTask() {
+        try {
+<span class="fc" id="L591">            this.task.commit();</span>
+<span class="nc" id="L592">        } catch (Throwable t) {</span>
+<span class="nc" id="L593">            log.error(&quot;{} Exception thrown while calling task.commit()&quot;, this, t);</span>
+<span class="fc" id="L594">        }</span>
+<span class="fc" id="L595">    }</span>
+
+    protected void recordPollReturned(int numRecordsInBatch, long duration) {
+<span class="fc" id="L598">        sourceTaskMetricsGroup.recordPoll(numRecordsInBatch, duration);</span>
+<span class="fc" id="L599">    }</span>
+
+    SourceTaskMetricsGroup sourceTaskMetricsGroup() {
+<span class="nc" id="L602">        return sourceTaskMetricsGroup;</span>
+    }
+
+<span class="fc" id="L605">    static class SourceRecordWriteCounter {</span>
+        private final SourceTaskMetricsGroup metricsGroup;
+        private final int batchSize;
+<span class="fc" id="L608">        private boolean completed = false;</span>
+        private int counter;
+        private int skipped; // Keeps track of filtered records
+
+<span class="fc" id="L612">        public SourceRecordWriteCounter(int batchSize, SourceTaskMetricsGroup metricsGroup) {</span>
+<span class="pc bpc" id="L613" title="1 of 2 branches missed.">            assert batchSize &gt; 0;</span>
+<span class="pc bpc" id="L614" title="1 of 2 branches missed.">            assert metricsGroup != null;</span>
+<span class="fc" id="L615">            this.batchSize = batchSize;</span>
+<span class="fc" id="L616">            counter = batchSize;</span>
+<span class="fc" id="L617">            this.metricsGroup = metricsGroup;</span>
+<span class="fc" id="L618">        }</span>
+        public void skipRecord() {
+<span class="nc" id="L620">            skipped += 1;</span>
+<span class="nc bnc" id="L621" title="All 4 branches missed.">            if (counter &gt; 0 &amp;&amp; --counter == 0) {</span>
+<span class="nc" id="L622">                finishedAllWrites();</span>
+            }
+<span class="nc" id="L624">        }</span>
+        public void completeRecord() {
+<span class="pc bpc" id="L626" title="2 of 4 branches missed.">            if (counter &gt; 0 &amp;&amp; --counter == 0) {</span>
+<span class="fc" id="L627">                finishedAllWrites();</span>
+            }
+<span class="fc" id="L629">        }</span>
+        public void retryRemaining() {
+<span class="nc" id="L631">            finishedAllWrites();</span>
+<span class="nc" id="L632">        }</span>
+        private void finishedAllWrites() {
+<span class="pc bpc" id="L634" title="1 of 2 branches missed.">            if (!completed) {</span>
+<span class="fc" id="L635">                metricsGroup.recordWrite(batchSize - counter, skipped);</span>
+<span class="fc" id="L636">                completed = true;</span>
+            }
+<span class="fc" id="L638">        }</span>
+    }
+
+    static class SourceTaskMetricsGroup implements AutoCloseable {
+        private final ConnectMetrics.MetricGroup metricGroup;
+        private final Sensor sourceRecordPoll;
+        private final Sensor sourceRecordWrite;
+        private final Sensor sourceRecordActiveCount;
+        private final Sensor pollTime;
+        private int activeRecordCount;
+
+<span class="fc" id="L649">        public SourceTaskMetricsGroup(ConnectorTaskId id, ConnectMetrics connectMetrics) {</span>
+<span class="fc" id="L650">            ConnectMetricsRegistry registry = connectMetrics.registry();</span>
+<span class="fc" id="L651">            metricGroup = connectMetrics.group(registry.sourceTaskGroupName(),</span>
+<span class="fc" id="L652">                    registry.connectorTagName(), id.connector(),</span>
+<span class="fc" id="L653">                    registry.taskTagName(), Integer.toString(id.task()));</span>
+            // remove any previously created metrics in this group to prevent collisions.
+<span class="fc" id="L655">            metricGroup.close();</span>
+
+<span class="fc" id="L657">            sourceRecordPoll = metricGroup.sensor(&quot;source-record-poll&quot;);</span>
+<span class="fc" id="L658">            sourceRecordPoll.add(metricGroup.metricName(registry.sourceRecordPollRate), new Rate());</span>
+<span class="fc" id="L659">            sourceRecordPoll.add(metricGroup.metricName(registry.sourceRecordPollTotal), new CumulativeSum());</span>
+
+<span class="fc" id="L661">            sourceRecordWrite = metricGroup.sensor(&quot;source-record-write&quot;);</span>
+<span class="fc" id="L662">            sourceRecordWrite.add(metricGroup.metricName(registry.sourceRecordWriteRate), new Rate());</span>
+<span class="fc" id="L663">            sourceRecordWrite.add(metricGroup.metricName(registry.sourceRecordWriteTotal), new CumulativeSum());</span>
+
+<span class="fc" id="L665">            pollTime = metricGroup.sensor(&quot;poll-batch-time&quot;);</span>
+<span class="fc" id="L666">            pollTime.add(metricGroup.metricName(registry.sourceRecordPollBatchTimeMax), new Max());</span>
+<span class="fc" id="L667">            pollTime.add(metricGroup.metricName(registry.sourceRecordPollBatchTimeAvg), new Avg());</span>
+
+<span class="fc" id="L669">            sourceRecordActiveCount = metricGroup.sensor(&quot;source-record-active-count&quot;);</span>
+<span class="fc" id="L670">            sourceRecordActiveCount.add(metricGroup.metricName(registry.sourceRecordActiveCount), new Value());</span>
+<span class="fc" id="L671">            sourceRecordActiveCount.add(metricGroup.metricName(registry.sourceRecordActiveCountMax), new Max());</span>
+<span class="fc" id="L672">            sourceRecordActiveCount.add(metricGroup.metricName(registry.sourceRecordActiveCountAvg), new Avg());</span>
+<span class="fc" id="L673">        }</span>
+
+        @Override
+        public void close() {
+<span class="fc" id="L677">            metricGroup.close();</span>
+<span class="fc" id="L678">        }</span>
+
+        void recordPoll(int batchSize, long duration) {
+<span class="fc" id="L681">            sourceRecordPoll.record(batchSize);</span>
+<span class="fc" id="L682">            pollTime.record(duration);</span>
+<span class="fc" id="L683">            activeRecordCount += batchSize;</span>
+<span class="fc" id="L684">            sourceRecordActiveCount.record(activeRecordCount);</span>
+<span class="fc" id="L685">        }</span>
+
+        void recordWrite(int recordCount, int skippedCount) {
+<span class="fc" id="L688">            sourceRecordWrite.record(recordCount - skippedCount);</span>
+<span class="fc" id="L689">            activeRecordCount -= recordCount;</span>
+<span class="fc" id="L690">            activeRecordCount = Math.max(0, activeRecordCount);</span>
+<span class="fc" id="L691">            sourceRecordActiveCount.record(activeRecordCount);</span>
+<span class="fc" id="L692">        }</span>
+
+        protected ConnectMetrics.MetricGroup metricGroup() {
+<span class="nc" id="L695">            return metricGroup;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

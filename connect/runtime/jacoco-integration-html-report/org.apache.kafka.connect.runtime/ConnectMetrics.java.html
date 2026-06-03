@@ -1,0 +1,513 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConnectMetrics.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">ConnectMetrics.java</span></div><h1>ConnectMetrics.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.MetricNameTemplate;
+import org.apache.kafka.common.internals.Plugin;
+import org.apache.kafka.common.metrics.Gauge;
+import org.apache.kafka.common.metrics.KafkaMetricsContext;
+import org.apache.kafka.common.metrics.MetricConfig;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.MetricsContext;
+import org.apache.kafka.common.metrics.MetricsReporter;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.internals.MetricsUtils;
+import org.apache.kafka.common.metrics.internals.PluginMetricsImpl;
+import org.apache.kafka.common.utils.AppInfoParser;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.runtime.distributed.DistributedConfig;
+import org.apache.kafka.connect.storage.Converter;
+import org.apache.kafka.connect.storage.HeaderConverter;
+import org.apache.kafka.connect.transforms.Transformation;
+import org.apache.kafka.connect.transforms.predicates.Predicate;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+
+/**
+ * The Connect metrics with configurable {@link MetricsReporter}s.
+ */
+public class ConnectMetrics {
+
+    public static final String JMX_PREFIX = &quot;kafka.connect&quot;;
+
+<span class="fc" id="L65">    private static final Logger LOG = LoggerFactory.getLogger(ConnectMetrics.class);</span>
+
+    private final Metrics metrics;
+    private final Time time;
+    private final String workerId;
+<span class="fc" id="L70">    private final ConcurrentMap&lt;MetricGroupId, MetricGroup&gt; groupsByName = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L71">    private final ConnectMetricsRegistry registry = new ConnectMetricsRegistry();</span>
+
+    /**
+     * Create an instance.
+     *
+     * @param workerId the worker identifier; may not be null
+     * @param config   the worker configuration; may not be null
+     * @param time     the time; may not be null
+     * @param clusterId the Kafka cluster ID
+     */
+<span class="fc" id="L81">    public ConnectMetrics(String workerId, WorkerConfig config, Time time, String clusterId) {</span>
+<span class="fc" id="L82">        this.workerId = workerId;</span>
+<span class="fc" id="L83">        this.time = time;</span>
+
+<span class="fc" id="L85">        int numSamples = config.getInt(CommonClientConfigs.METRICS_NUM_SAMPLES_CONFIG);</span>
+<span class="fc" id="L86">        long sampleWindowMs = config.getLong(CommonClientConfigs.METRICS_SAMPLE_WINDOW_MS_CONFIG);</span>
+<span class="fc" id="L87">        String metricsRecordingLevel = config.getString(CommonClientConfigs.METRICS_RECORDING_LEVEL_CONFIG);</span>
+<span class="fc" id="L88">        List&lt;MetricsReporter&gt; reporters = CommonClientConfigs.metricsReporters(workerId, config);</span>
+<span class="fc" id="L89">        MetricConfig metricConfig = new MetricConfig().samples(numSamples)</span>
+<span class="fc" id="L90">                .timeWindow(sampleWindowMs, TimeUnit.MILLISECONDS).recordLevel(</span>
+<span class="fc" id="L91">                        Sensor.RecordingLevel.forName(metricsRecordingLevel));</span>
+
+<span class="fc" id="L93">        Map&lt;String, Object&gt; contextLabels = new HashMap&lt;&gt;(config.originalsWithPrefix(CommonClientConfigs.METRICS_CONTEXT_PREFIX));</span>
+<span class="fc" id="L94">        contextLabels.put(WorkerConfig.CONNECT_KAFKA_CLUSTER_ID, clusterId);</span>
+<span class="fc" id="L95">        Object groupId = config.originals().get(DistributedConfig.GROUP_ID_CONFIG);</span>
+<span class="pc bpc" id="L96" title="1 of 2 branches missed.">        if (groupId != null) {</span>
+<span class="fc" id="L97">            contextLabels.put(WorkerConfig.CONNECT_GROUP_ID, groupId);</span>
+        }
+<span class="fc" id="L99">        MetricsContext metricsContext = new KafkaMetricsContext(JMX_PREFIX, contextLabels);</span>
+<span class="fc" id="L100">        this.metrics = new Metrics(metricConfig, reporters, time, metricsContext);</span>
+
+<span class="fc" id="L102">        LOG.debug(&quot;Registering Connect metrics with JMX for worker '{}'&quot;, workerId);</span>
+<span class="fc" id="L103">        AppInfoParser.registerAppInfo(JMX_PREFIX, workerId, metrics, time.milliseconds());</span>
+<span class="fc" id="L104">    }</span>
+
+    /**
+     * Get the worker identifier.
+     *
+     * @return the worker ID; never null
+     */
+    public String workerId() {
+<span class="nc" id="L112">        return workerId;</span>
+    }
+
+    /**
+     * Get the {@link Metrics Kafka Metrics} that are managed by this object and that should be used to
+     * add sensors and individual metrics.
+     *
+     * @return the Kafka Metrics instance; never null
+     */
+    public Metrics metrics() {
+<span class="fc" id="L122">        return metrics;</span>
+    }
+
+    /**
+     * Get the registry of metric names.
+     *
+     * @return the registry for the Connect metrics; never null
+     */
+    public ConnectMetricsRegistry registry() {
+<span class="fc" id="L131">        return registry;</span>
+    }
+
+    /**
+     * Get or create a {@link MetricGroup} with the specified group name and the given tags.
+     * Each group is uniquely identified by the name and tags.
+     *
+     * @param groupName    the name of the metric group; may not be null
+     * @param tagKeyValues pairs of tag name and values
+     * @return the {@link MetricGroup} that can be used to create metrics; never null
+     * @throws IllegalArgumentException if the group name is not valid
+     */
+    public MetricGroup group(String groupName, String... tagKeyValues) {
+<span class="fc" id="L144">        MetricGroupId groupId = groupId(groupName, tagKeyValues);</span>
+<span class="fc" id="L145">        MetricGroup group = groupsByName.get(groupId);</span>
+<span class="pc bpc" id="L146" title="1 of 2 branches missed.">        if (group == null) {</span>
+<span class="fc" id="L147">            group = new MetricGroup(groupId);</span>
+<span class="fc" id="L148">            MetricGroup previous = groupsByName.putIfAbsent(groupId, group);</span>
+<span class="pc bpc" id="L149" title="1 of 2 branches missed.">            if (previous != null)</span>
+<span class="nc" id="L150">                group = previous;</span>
+        }
+<span class="fc" id="L152">        return group;</span>
+    }
+
+    protected MetricGroupId groupId(String groupName, String... tagKeyValues) {
+<span class="fc" id="L156">        Map&lt;String, String&gt; tags = MetricsUtils.getTags(tagKeyValues);</span>
+<span class="fc" id="L157">        return new MetricGroupId(groupName, tags);</span>
+    }
+
+    /**
+     * Get the time.
+     *
+     * @return the time; never null
+     */
+    public Time time() {
+<span class="fc" id="L166">        return time;</span>
+    }
+
+    /**
+     * Stop and unregister the metrics from any reporters.
+     */
+    public void stop() {
+<span class="fc" id="L173">        metrics.close();</span>
+<span class="fc" id="L174">        LOG.debug(&quot;Unregistering Connect metrics with JMX for worker '{}'&quot;, workerId);</span>
+<span class="fc" id="L175">        AppInfoParser.unregisterAppInfo(JMX_PREFIX, workerId, metrics);</span>
+<span class="fc" id="L176">    }</span>
+
+    public PluginMetricsImpl connectorPluginMetrics(String connectorId) {
+<span class="fc" id="L179">        return new PluginMetricsImpl(metrics, connectorPluginTags(connectorId));</span>
+    }
+
+    private static Map&lt;String, String&gt; connectorPluginTags(String connectorId) {
+<span class="fc" id="L183">        Map&lt;String, String&gt; tags = new LinkedHashMap&lt;&gt;();</span>
+<span class="fc" id="L184">        tags.put(&quot;connector&quot;, connectorId);</span>
+<span class="fc" id="L185">        return tags;</span>
+    }
+
+    PluginMetricsImpl taskPluginMetrics(ConnectorTaskId connectorTaskId) {
+<span class="fc" id="L189">        return new PluginMetricsImpl(metrics, taskPluginTags(connectorTaskId));</span>
+    }
+
+    private static Map&lt;String, String&gt; taskPluginTags(ConnectorTaskId connectorTaskId) {
+<span class="fc" id="L193">        Map&lt;String, String&gt; tags = connectorPluginTags(connectorTaskId.connector());</span>
+<span class="fc" id="L194">        tags.put(&quot;task&quot;, String.valueOf(connectorTaskId.task()));</span>
+<span class="fc" id="L195">        return tags;</span>
+    }
+
+    private static Supplier&lt;Map&lt;String, String&gt;&gt; converterPluginTags(ConnectorTaskId connectorTaskId, boolean isKey) {
+<span class="fc" id="L199">        return () -&gt; {</span>
+<span class="nc" id="L200">            Map&lt;String, String&gt; tags = taskPluginTags(connectorTaskId);</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">            tags.put(&quot;converter&quot;, isKey ? &quot;key&quot; : &quot;value&quot;);</span>
+<span class="nc" id="L202">            return tags;</span>
+        };
+    }
+
+    private static Supplier&lt;Map&lt;String, String&gt;&gt; headerConverterPluginTags(ConnectorTaskId connectorTaskId) {
+<span class="fc" id="L207">        return () -&gt; {</span>
+<span class="nc" id="L208">            Map&lt;String, String&gt; tags = taskPluginTags(connectorTaskId);</span>
+<span class="nc" id="L209">            tags.put(&quot;converter&quot;, &quot;header&quot;);</span>
+<span class="nc" id="L210">            return tags;</span>
+        };
+    }
+
+    private static Supplier&lt;Map&lt;String, String&gt;&gt; transformationPluginTags(ConnectorTaskId connectorTaskId, String transformationAlias) {
+<span class="nc" id="L215">        return () -&gt; {</span>
+<span class="nc" id="L216">            Map&lt;String, String&gt; tags = taskPluginTags(connectorTaskId);</span>
+<span class="nc" id="L217">            tags.put(&quot;transformation&quot;, transformationAlias);</span>
+<span class="nc" id="L218">            return tags;</span>
+        };
+    }
+
+    private static Supplier&lt;Map&lt;String, String&gt;&gt; predicatePluginTags(ConnectorTaskId connectorTaskId, String predicateAlias) {
+<span class="nc" id="L223">        return () -&gt; {</span>
+<span class="nc" id="L224">            Map&lt;String, String&gt; tags = taskPluginTags(connectorTaskId);</span>
+<span class="nc" id="L225">            tags.put(&quot;predicate&quot;, predicateAlias);</span>
+<span class="nc" id="L226">            return tags;</span>
+        };
+    }
+
+    public Plugin&lt;HeaderConverter&gt; wrap(HeaderConverter headerConverter, ConnectorTaskId connectorTaskId) {
+<span class="fc" id="L231">        return Plugin.wrapInstance(headerConverter, metrics, headerConverterPluginTags(connectorTaskId));</span>
+    }
+
+    public Plugin&lt;Converter&gt; wrap(Converter converter, ConnectorTaskId connectorTaskId, boolean isKey) {
+<span class="fc" id="L235">        return Plugin.wrapInstance(converter, metrics, converterPluginTags(connectorTaskId, isKey));</span>
+    }
+
+    public &lt;R extends ConnectRecord&lt;R&gt;&gt; Plugin&lt;Transformation&lt;R&gt;&gt; wrap(Transformation&lt;R&gt; transformation, ConnectorTaskId connectorTaskId, String alias) {
+<span class="nc" id="L239">        return Plugin.wrapInstance(transformation, metrics, transformationPluginTags(connectorTaskId, alias));</span>
+    }
+
+    public &lt;R extends ConnectRecord&lt;R&gt;&gt; Plugin&lt;Predicate&lt;R&gt;&gt; wrap(Predicate&lt;R&gt; predicate, ConnectorTaskId connectorTaskId, String alias) {
+<span class="nc" id="L243">        return Plugin.wrapInstance(predicate, metrics, predicatePluginTags(connectorTaskId, alias));</span>
+    }
+
+    public static class MetricGroupId {
+        private final String groupName;
+        private final Map&lt;String, String&gt; tags;
+        private final int hc;
+        private final String str;
+
+<span class="fc" id="L252">        public MetricGroupId(String groupName, Map&lt;String, String&gt; tags) {</span>
+<span class="fc" id="L253">            Objects.requireNonNull(groupName);</span>
+<span class="fc" id="L254">            Objects.requireNonNull(tags);</span>
+<span class="fc" id="L255">            this.groupName = groupName;</span>
+<span class="fc" id="L256">            this.tags = Collections.unmodifiableMap(new LinkedHashMap&lt;&gt;(tags)); // To ensure the order of insertion, we have to use Collections.</span>
+<span class="fc" id="L257">            this.hc = Objects.hash(this.groupName, this.tags);</span>
+<span class="fc" id="L258">            StringBuilder sb = new StringBuilder(this.groupName);</span>
+<span class="fc bfc" id="L259" title="All 2 branches covered.">            for (Map.Entry&lt;String, String&gt; entry : this.tags.entrySet()) {</span>
+<span class="fc" id="L260">                sb.append(&quot;;&quot;).append(entry.getKey()).append('=').append(entry.getValue());</span>
+<span class="fc" id="L261">            }</span>
+<span class="fc" id="L262">            this.str = sb.toString();</span>
+<span class="fc" id="L263">        }</span>
+
+        /**
+         * Get the group name.
+         *
+         * @return the group name; never null
+         */
+        public String groupName() {
+<span class="nc" id="L271">            return groupName;</span>
+        }
+
+        /**
+         * Get the immutable map of tag names and values.
+         *
+         * @return the tags; never null
+         */
+        public Map&lt;String, String&gt; tags() {
+<span class="fc" id="L280">            return tags;</span>
+        }
+
+        /**
+         * Determine if the supplied metric name is part of this group identifier.
+         *
+         * @param metricName the metric name
+         * @return true if the metric name's group and tags match this group identifier, or false otherwise
+         */
+        public boolean includes(MetricName metricName) {
+<span class="pc bpc" id="L290" title="1 of 6 branches missed.">            return metricName != null &amp;&amp; groupName.equals(metricName.group()) &amp;&amp; tags.equals(metricName.tags());</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="fc" id="L295">            return hc;</span>
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            if (obj == this)</span>
+<span class="nc" id="L301">                return true;</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">            if (obj instanceof MetricGroupId that) {</span>
+<span class="nc bnc" id="L303" title="All 4 branches missed.">                return this.groupName.equals(that.groupName) &amp;&amp; this.tags.equals(that.tags);</span>
+            }
+<span class="nc" id="L305">            return false;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="fc" id="L310">            return str;</span>
+        }
+    }
+
+    /**
+     * A group of metrics. Each group maps to a JMX MBean and each metric maps to an MBean attribute.
+     * &lt;p&gt;
+     * Sensors should be added via the {@code sensor} methods on this class, rather than directly through
+     * the {@link Metrics} class, so that the sensor names are made to be unique (based on the group name)
+     * and so the sensors are removed when this group is {@link #close() closed}.
+     */
+    public class MetricGroup implements AutoCloseable {
+        private final MetricGroupId groupId;
+<span class="fc" id="L323">        private final Set&lt;String&gt; sensorNames = new HashSet&lt;&gt;();</span>
+        private final String sensorPrefix;
+
+        /**
+         * Create a group of Connect metrics.
+         *
+         * @param groupId the identifier of the group; may not be null and must be valid
+         */
+<span class="fc" id="L331">        protected MetricGroup(MetricGroupId groupId) {</span>
+<span class="fc" id="L332">            Objects.requireNonNull(groupId);</span>
+<span class="fc" id="L333">            this.groupId = groupId;</span>
+<span class="fc" id="L334">            sensorPrefix = &quot;connect-sensor-group: &quot; + groupId + &quot;;&quot;;</span>
+<span class="fc" id="L335">        }</span>
+
+        /**
+         * Get the group identifier.
+         *
+         * @return the group identifier; never null
+         */
+        public MetricGroupId groupId() {
+<span class="fc" id="L343">            return groupId;</span>
+        }
+
+        /**
+         * Create the name of a metric that belongs to this group and has the group's tags.
+         *
+         * @param template the name template for the metric; may not be null
+         * @return the metric name; never null
+         * @throws IllegalArgumentException if the name is not valid
+         */
+        public MetricName metricName(MetricNameTemplate template) {
+<span class="fc" id="L354">            return metrics.metricInstance(template, groupId.tags());</span>
+        }
+
+        // for testing only
+        MetricName metricName(String name) {
+<span class="nc" id="L359">            return metrics.metricName(name, groupId.groupName(), &quot;&quot;, groupId.tags());</span>
+        }
+
+        /**
+         * The {@link Metrics} that this group belongs to.
+         * &lt;p&gt;
+         * Do not use this to add {@link Sensor Sensors}, since they will not be removed when this group is
+         * {@link #close() closed}. Metrics can be added directly, as long as the metric names are obtained from
+         * this group via the {@link #metricName(MetricNameTemplate)} method.
+         *
+         * @return the metrics; never null
+         */
+        public Metrics metrics() {
+<span class="fc" id="L372">            return metrics;</span>
+        }
+
+        /**
+         * The tags of this group.
+         *
+         * @return the unmodifiable tags; never null but may be empty
+         */
+        Map&lt;String, String&gt; tags() {
+<span class="nc" id="L381">            return groupId.tags();</span>
+        }
+
+        /**
+         * Add to this group an indicator metric with a function that returns the current value.
+         *
+         * @param nameTemplate the name template for the metric; may not be null
+         * @param supplier     the function used to determine the literal value of the metric; may not be null
+         * @throws IllegalArgumentException if the name is not valid
+         */
+        public &lt;T&gt; void addValueMetric(MetricNameTemplate nameTemplate, final LiteralSupplier&lt;T&gt; supplier) {
+<span class="fc" id="L392">            MetricName metricName = metricName(nameTemplate);</span>
+<span class="pc" id="L393">            metrics().addMetricIfAbsent(metricName, null, (Gauge&lt;T&gt;) (config, now) -&gt; supplier.metricValue(now));</span>
+<span class="fc" id="L394">        }</span>
+
+        /**
+         * Add to this group an indicator metric that always returns the specified value.
+         *
+         * @param nameTemplate the name template for the metric; may not be null
+         * @param value        the value; may not be null
+         * @throws IllegalArgumentException if the name is not valid
+         */
+        public &lt;T&gt; void addImmutableValueMetric(MetricNameTemplate nameTemplate, final T value) {
+<span class="fc" id="L404">            MetricName metricName = metricName(nameTemplate);</span>
+<span class="pc" id="L405">            metrics().addMetricIfAbsent(metricName, null, (Gauge&lt;T&gt;) (config, now) -&gt; value);</span>
+<span class="fc" id="L406">        }</span>
+
+        /**
+         * Get or create a sensor with the given unique name and no parent sensors. This uses
+         * a default recording level of INFO.
+         *
+         * @param name The sensor name
+         * @return The sensor
+         */
+        public Sensor sensor(String name) {
+<span class="fc" id="L416">            return sensor(name, null, Sensor.RecordingLevel.INFO);</span>
+        }
+
+        /**
+         * Get or create a sensor with the given unique name and no parent sensors. This uses
+         * a default recording level of INFO.
+         *
+         * @param name The sensor name
+         * @return The sensor
+         */
+        public Sensor sensor(String name, Sensor... parents) {
+<span class="nc" id="L427">            return sensor(name, null, Sensor.RecordingLevel.INFO, parents);</span>
+        }
+
+        /**
+         * Get or create a sensor with the given unique name and zero or more parent sensors. All parent sensors will
+         * receive every value recorded with this sensor.
+         *
+         * @param name           The name of the sensor
+         * @param recordingLevel The recording level.
+         * @param parents        The parent sensors
+         * @return The sensor that is created
+         */
+        public Sensor sensor(String name, Sensor.RecordingLevel recordingLevel, Sensor... parents) {
+<span class="nc" id="L440">            return sensor(name, null, recordingLevel, parents);</span>
+        }
+
+        /**
+         * Get or create a sensor with the given unique name and zero or more parent sensors. All parent sensors will
+         * receive every value recorded with this sensor.
+         *
+         * @param name    The name of the sensor
+         * @param config  A default configuration to use for this sensor for metrics that don't have their own config
+         * @param parents The parent sensors
+         * @return The sensor that is created
+         */
+        public Sensor sensor(String name, MetricConfig config, Sensor... parents) {
+<span class="nc" id="L453">            return sensor(name, config, Sensor.RecordingLevel.INFO, parents);</span>
+        }
+
+        /**
+         * Get or create a sensor with the given unique name and zero or more parent sensors. All parent sensors will
+         * receive every value recorded with this sensor.
+         *
+         * @param name           The name of the sensor
+         * @param config         A default configuration to use for this sensor for metrics that don't have their own config
+         * @param recordingLevel The recording level.
+         * @param parents        The parent sensors
+         * @return The sensor that is created
+         */
+        public synchronized Sensor sensor(String name, MetricConfig config, Sensor.RecordingLevel recordingLevel, Sensor... parents) {
+            // We need to make sure that all sensor names are unique across all groups, so use the sensor prefix
+<span class="fc" id="L468">            Sensor result = metrics.sensor(sensorPrefix + name, config, Long.MAX_VALUE, recordingLevel, parents);</span>
+<span class="fc" id="L469">            sensorNames.add(result.name());</span>
+<span class="fc" id="L470">            return result;</span>
+        }
+
+        /**
+         * Remove all sensors and metrics associated with this group.
+         */
+        public synchronized void close() {
+<span class="fc bfc" id="L477" title="All 2 branches covered.">            for (String sensorName : sensorNames) {</span>
+<span class="fc" id="L478">                metrics.removeSensor(sensorName);</span>
+<span class="fc" id="L479">            }</span>
+<span class="fc" id="L480">            sensorNames.clear();</span>
+<span class="fc bfc" id="L481" title="All 2 branches covered.">            for (MetricName metricName : new HashSet&lt;&gt;(metrics.metrics().keySet())) {</span>
+<span class="fc bfc" id="L482" title="All 2 branches covered.">                if (groupId.includes(metricName)) {</span>
+<span class="fc" id="L483">                    metrics.removeMetric(metricName);</span>
+                }
+<span class="fc" id="L485">            }</span>
+<span class="fc" id="L486">        }</span>
+    }
+
+    /**
+     * A simple functional interface that returns a literal value.
+     */
+    public interface LiteralSupplier&lt;T&gt; {
+
+        /**
+         * Return the literal value for the metric.
+         *
+         * @param now the current time in milliseconds
+         * @return the literal metric value; may not be null
+         */
+        T metricValue(long now);
+    }
+
+    /**
+     * Utility to generate the documentation for the Connect metrics.
+     *
+     * @param args the arguments
+     */
+    public static void main(String[] args) {
+<span class="nc" id="L509">        ConnectMetricsRegistry metrics = new ConnectMetricsRegistry();</span>
+<span class="nc" id="L510">        System.out.println(Metrics.toHtmlTable(JMX_PREFIX, metrics.getAllTemplates()));</span>
+<span class="nc" id="L511">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

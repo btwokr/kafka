@@ -1,0 +1,976 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>IncrementalCooperativeAssignor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.distributed</a> &gt; <span class="el_source">IncrementalCooperativeAssignor.java</span></div><h1>IncrementalCooperativeAssignor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime.distributed;
+
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.ExponentialBackoff;
+import org.apache.kafka.connect.runtime.distributed.WorkerCoordinator.ConnectorsAndTasks;
+import org.apache.kafka.connect.runtime.distributed.WorkerCoordinator.WorkerLoad;
+import org.apache.kafka.connect.storage.ClusterConfigState;
+import org.apache.kafka.connect.util.ConnectUtils;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+
+import org.slf4j.Logger;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static org.apache.kafka.common.message.JoinGroupResponseData.JoinGroupResponseMember;
+import static org.apache.kafka.connect.runtime.distributed.ConnectProtocol.Assignment;
+import static org.apache.kafka.connect.runtime.distributed.DistributedConfig.SCHEDULED_REBALANCE_MAX_DELAY_MS_CONFIG;
+import static org.apache.kafka.connect.runtime.distributed.IncrementalCooperativeConnectProtocol.CONNECT_PROTOCOL_V2;
+import static org.apache.kafka.connect.runtime.distributed.WorkerCoordinator.LeaderState;
+import static org.apache.kafka.connect.util.ConnectUtils.combineCollections;
+import static org.apache.kafka.connect.util.ConnectUtils.transformValues;
+
+/**
+ * An assignor that computes a distribution of connectors and tasks according to the incremental
+ * cooperative strategy for rebalancing. Note that this class is NOT thread-safe.
+ * @see &lt;a href=&quot;https://cwiki.apache.org/confluence/display/KAFKA/KIP-415%3A+Incremental+Cooperative+Rebalancing+in+Kafka+Connect&quot;&gt;
+ * KIP-415 for a description of the assignment policy. &lt;/a&gt;
+ *
+ */
+public class IncrementalCooperativeAssignor implements ConnectAssignor {
+    private final Logger log;
+    private final Time time;
+    private final int maxDelay;
+    private ConnectorsAndTasks previousAssignment;
+    private final ConnectorsAndTasks previousRevocation;
+    private boolean revokedInPrevious;
+    protected final Set&lt;String&gt; candidateWorkersForReassignment;
+    protected long scheduledRebalance;
+    protected int delay;
+    protected int previousGenerationId;
+    protected Set&lt;String&gt; previousMembers;
+
+    private final ExponentialBackoff consecutiveRevokingRebalancesBackoff;
+
+    private int numSuccessiveRevokingRebalances;
+
+<span class="fc" id="L79">    public IncrementalCooperativeAssignor(LogContext logContext, Time time, int maxDelay) {</span>
+<span class="fc" id="L80">        this.log = logContext.logger(IncrementalCooperativeAssignor.class);</span>
+<span class="fc" id="L81">        this.time = time;</span>
+<span class="fc" id="L82">        this.maxDelay = maxDelay;</span>
+<span class="fc" id="L83">        this.previousAssignment = ConnectorsAndTasks.EMPTY;</span>
+<span class="fc" id="L84">        this.previousRevocation = new ConnectorsAndTasks.Builder().build();</span>
+<span class="fc" id="L85">        this.scheduledRebalance = 0;</span>
+<span class="fc" id="L86">        this.revokedInPrevious = false;</span>
+<span class="fc" id="L87">        this.candidateWorkersForReassignment = new LinkedHashSet&lt;&gt;();</span>
+<span class="fc" id="L88">        this.delay = 0;</span>
+<span class="fc" id="L89">        this.previousGenerationId = -1;</span>
+<span class="fc" id="L90">        this.previousMembers = Set.of();</span>
+<span class="fc" id="L91">        this.numSuccessiveRevokingRebalances = 0;</span>
+        // By default, initial interval is 1. The only corner case is when the user has set maxDelay to 0
+        // in which case, the exponential backoff delay should be 0 which would return the backoff delay to be 0 always
+<span class="pc bpc" id="L94" title="1 of 2 branches missed.">        this.consecutiveRevokingRebalancesBackoff = new ExponentialBackoff(maxDelay == 0 ? 0 : 1, 40, maxDelay, 0);</span>
+<span class="fc" id="L95">    }</span>
+
+    @Override
+    public Map&lt;String, ByteBuffer&gt; performAssignment(String leaderId, ConnectProtocolCompatibility protocol,
+                                                     List&lt;JoinGroupResponseMember&gt; allMemberMetadata,
+                                                     WorkerCoordinator coordinator) {
+<span class="fc" id="L101">        log.debug(&quot;Performing task assignment&quot;);</span>
+
+<span class="fc" id="L103">        Map&lt;String, ExtendedWorkerState&gt; memberConfigs = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L104" title="All 2 branches covered.">        for (JoinGroupResponseMember member : allMemberMetadata) {</span>
+<span class="fc" id="L105">            memberConfigs.put(</span>
+<span class="fc" id="L106">                    member.memberId(),</span>
+<span class="fc" id="L107">                    IncrementalCooperativeConnectProtocol.deserializeMetadata(ByteBuffer.wrap(member.metadata())));</span>
+<span class="fc" id="L108">        }</span>
+<span class="fc" id="L109">        log.debug(&quot;Member configs: {}&quot;, memberConfigs);</span>
+
+        // The new config offset is the maximum seen by any member. We always perform assignment using this offset,
+        // even if some members have fallen behind. The config offset used to generate the assignment is included in
+        // the response so members that have fallen behind will not use the assignment until they have caught up.
+<span class="fc" id="L114">        long maxOffset = memberConfigs.values().stream().map(ExtendedWorkerState::offset).max(Long::compare).get();</span>
+<span class="fc" id="L115">        log.debug(&quot;Max config offset root: {}, local snapshot config offsets root: {}&quot;,</span>
+<span class="fc" id="L116">                  maxOffset, coordinator.configSnapshot().offset());</span>
+
+<span class="fc" id="L118">        short protocolVersion = protocol.protocolVersion();</span>
+
+<span class="fc" id="L120">        Long leaderOffset = ensureLeaderConfig(maxOffset, coordinator);</span>
+<span class="pc bpc" id="L121" title="1 of 2 branches missed.">        if (leaderOffset == null) {</span>
+<span class="nc" id="L122">            Map&lt;String, ExtendedAssignment&gt; assignments = fillAssignments(</span>
+<span class="nc" id="L123">                    memberConfigs.keySet(), Assignment.CONFIG_MISMATCH,</span>
+<span class="nc" id="L124">                    leaderId, memberConfigs.get(leaderId).url(), maxOffset,</span>
+                    ClusterAssignment.EMPTY, 0, protocolVersion);
+<span class="nc" id="L126">            return serializeAssignments(assignments, protocolVersion);</span>
+        }
+<span class="fc" id="L128">        return performTaskAssignment(leaderId, leaderOffset, memberConfigs, coordinator, protocolVersion);</span>
+    }
+
+    private Long ensureLeaderConfig(long maxOffset, WorkerCoordinator coordinator) {
+        // If this leader is behind some other members, we can't do assignment
+<span class="pc bpc" id="L133" title="1 of 2 branches missed.">        if (coordinator.configSnapshot().offset() &lt; maxOffset) {</span>
+            // We might be able to take a new snapshot to catch up immediately and avoid another round of syncing here.
+            // Alternatively, if this node has already passed the maximum reported by any other member of the group, it
+            // is also safe to use this newer state.
+<span class="nc" id="L137">            ClusterConfigState updatedSnapshot = coordinator.configFreshSnapshot();</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">            if (updatedSnapshot.offset() &lt; maxOffset) {</span>
+<span class="nc" id="L139">                log.info(&quot;Was selected to perform assignments, but do not have latest config found in sync request. &quot;</span>
+                         + &quot;Returning an empty configuration to trigger re-sync.&quot;);
+<span class="nc" id="L141">                return null;</span>
+            } else {
+<span class="nc" id="L143">                coordinator.configSnapshot(updatedSnapshot);</span>
+<span class="nc" id="L144">                return updatedSnapshot.offset();</span>
+            }
+        }
+<span class="fc" id="L147">        return maxOffset;</span>
+    }
+
+    /**
+     * Performs task assignment based on the incremental cooperative connect protocol.
+     * Read more on the design and implementation in:
+     * &lt;a href=&quot;https://cwiki.apache.org/confluence/display/KAFKA/KIP-415%3A+Incremental+Cooperative+Rebalancing+in+Kafka+Connect&quot;&gt;
+     * KIP-415&lt;/a&gt;
+     *
+     * @param leaderId the ID of the group leader
+     * @param maxOffset the latest known offset of the configuration topic
+     * @param memberConfigs the metadata of all the members of the group as gather in the current
+     * round of rebalancing
+     * @param coordinator the worker coordinator instance that provide the configuration snapshot
+     * and get assigned the leader state during this assignment
+     * @param protocolVersion the Connect subprotocol version
+     * @return the serialized assignment of tasks to the whole group, including assigned or
+     * revoked tasks
+     */
+    protected Map&lt;String, ByteBuffer&gt; performTaskAssignment(String leaderId, long maxOffset,
+                                                            Map&lt;String, ExtendedWorkerState&gt; memberConfigs,
+                                                            WorkerCoordinator coordinator, short protocolVersion) {
+<span class="fc" id="L169">        log.debug(&quot;Performing task assignment during generation: {} with memberId: {}&quot;,</span>
+<span class="fc" id="L170">                coordinator.generationId(), coordinator.memberId());</span>
+<span class="fc" id="L171">        Map&lt;String, ConnectorsAndTasks&gt; memberAssignments = transformValues(</span>
+                memberConfigs,
+<span class="fc" id="L173">                memberConfig -&gt; new ConnectorsAndTasks.Builder()</span>
+<span class="fc" id="L174">                        .with(memberConfig.assignment().connectors(), memberConfig.assignment().tasks())</span>
+<span class="fc" id="L175">                        .build()</span>
+        );
+<span class="fc" id="L177">        ClusterAssignment clusterAssignment = performTaskAssignment(</span>
+<span class="fc" id="L178">                coordinator.configSnapshot(),</span>
+<span class="fc" id="L179">                coordinator.lastCompletedGenerationId(),</span>
+<span class="fc" id="L180">                coordinator.generationId(),</span>
+                memberAssignments
+        );
+
+<span class="fc" id="L184">        coordinator.leaderState(new LeaderState(memberConfigs, clusterAssignment.allAssignedConnectors(), clusterAssignment.allAssignedTasks()));</span>
+
+<span class="fc" id="L186">        Map&lt;String, ExtendedAssignment&gt; assignments =</span>
+<span class="fc" id="L187">                fillAssignments(memberConfigs.keySet(), Assignment.NO_ERROR, leaderId,</span>
+<span class="fc" id="L188">                        memberConfigs.get(leaderId).url(), maxOffset,</span>
+                        clusterAssignment,
+                        delay, protocolVersion);
+
+<span class="fc" id="L192">        log.debug(&quot;Actual assignments: {}&quot;, assignments);</span>
+<span class="fc" id="L193">        return serializeAssignments(assignments, protocolVersion);</span>
+    }
+
+    // Visible for testing
+    ClusterAssignment performTaskAssignment(
+            ClusterConfigState configSnapshot,
+            int lastCompletedGenerationId,
+            int currentGenerationId,
+            Map&lt;String, ConnectorsAndTasks&gt; memberAssignments
+    ) {
+        // Base set: The previous assignment of connectors-and-tasks is a standalone snapshot that
+        // can be used to calculate derived sets
+<span class="fc" id="L205">        log.debug(&quot;Previous assignments: {}&quot;, previousAssignment);</span>
+<span class="fc bfc" id="L206" title="All 2 branches covered.">        if (previousGenerationId != lastCompletedGenerationId) {</span>
+<span class="fc" id="L207">            log.debug(&quot;Clearing the view of previous assignments due to generation mismatch between &quot;</span>
+                    + &quot;previous generation ID {} and last completed generation ID {}. This can &quot;
+                    + &quot;happen if the leader fails to sync the assignment within a rebalancing round. &quot;
+                    + &quot;The following view of previous assignments might be outdated and will be &quot;
+                    + &quot;ignored by the leader in the current computation of new assignments. &quot;
+                    + &quot;Possibly outdated previous assignments: {}&quot;,
+<span class="fc" id="L213">                    previousGenerationId, lastCompletedGenerationId, previousAssignment);</span>
+<span class="fc" id="L214">            this.previousAssignment = ConnectorsAndTasks.EMPTY;</span>
+        }
+
+<span class="fc" id="L217">        Set&lt;String&gt; configuredConnectors = new TreeSet&lt;&gt;(configSnapshot.connectors());</span>
+<span class="fc" id="L218">        Set&lt;ConnectorTaskId&gt; configuredTasks = combineCollections(configuredConnectors, configSnapshot::tasks, Collectors.toSet());</span>
+
+        // Base set: The set of configured connectors-and-tasks is a standalone snapshot that can
+        // be used to calculate derived sets
+<span class="fc" id="L222">        ConnectorsAndTasks configured = new ConnectorsAndTasks.Builder()</span>
+<span class="fc" id="L223">                .with(configuredConnectors, configuredTasks).build();</span>
+<span class="fc" id="L224">        log.debug(&quot;Configured assignments: {}&quot;, configured);</span>
+
+        // Base set: The set of active connectors-and-tasks is a standalone snapshot that can be
+        // used to calculate derived sets
+<span class="fc" id="L228">        ConnectorsAndTasks activeAssignments = assignment(memberAssignments);</span>
+<span class="fc" id="L229">        log.debug(&quot;Active assignments: {}&quot;, activeAssignments);</span>
+
+        // This means that a previous revocation did not take effect. In this case, reset
+        // appropriately and be ready to re-apply revocation of tasks
+<span class="pc bpc" id="L233" title="1 of 2 branches missed.">        if (!previousRevocation.isEmpty()) {</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">            if (previousRevocation.connectors().stream().anyMatch(c -&gt; activeAssignments.connectors().contains(c))</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">                    || previousRevocation.tasks().stream().anyMatch(t -&gt; activeAssignments.tasks().contains(t))) {</span>
+<span class="nc" id="L236">                previousAssignment = activeAssignments;</span>
+            }
+<span class="nc" id="L238">            previousRevocation.connectors().clear();</span>
+<span class="nc" id="L239">            previousRevocation.tasks().clear();</span>
+        }
+
+        // Derived set: The set of deleted connectors-and-tasks is a derived set from the set
+        // difference of previous - configured
+<span class="fc" id="L244">        ConnectorsAndTasks deleted = diff(previousAssignment, configured);</span>
+<span class="fc" id="L245">        log.debug(&quot;Deleted assignments: {}&quot;, deleted);</span>
+
+        // The connectors and tasks that are currently running on more than one worker each
+<span class="fc" id="L248">        ConnectorsAndTasks duplicated = duplicatedAssignments(memberAssignments);</span>
+<span class="fc" id="L249">        log.trace(&quot;Duplicated assignments: {}&quot;, duplicated);</span>
+
+        // Derived set: The set of lost or unaccounted connectors-and-tasks is a derived set from
+        // the set difference of previous - active - deleted
+<span class="fc" id="L253">        ConnectorsAndTasks lostAssignments = diff(previousAssignment, activeAssignments, deleted);</span>
+<span class="fc" id="L254">        log.debug(&quot;Lost assignments: {}&quot;, lostAssignments);</span>
+
+        // Derived set: The set of new connectors-and-tasks is a derived set from the set
+        // difference of configured - previous - active
+<span class="fc" id="L258">        ConnectorsAndTasks created = diff(configured, previousAssignment, activeAssignments);</span>
+<span class="fc" id="L259">        log.debug(&quot;Created: {}&quot;, created);</span>
+
+        // A collection of the current assignment excluding the connectors-and-tasks to be deleted
+<span class="fc" id="L262">        List&lt;WorkerLoad&gt; currentWorkerAssignment = workerAssignment(memberAssignments, deleted);</span>
+
+<span class="fc" id="L264">        Map&lt;String, ConnectorsAndTasks.Builder&gt; toRevoke = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L266">        Map&lt;String, ConnectorsAndTasks&gt; deletedToRevoke = intersection(deleted, memberAssignments);</span>
+<span class="fc" id="L267">        log.debug(&quot;Deleted connectors and tasks to revoke from each worker: {}&quot;, deletedToRevoke);</span>
+<span class="fc" id="L268">        addAll(toRevoke, deletedToRevoke);</span>
+
+        // Revoking redundant connectors/tasks if the workers have duplicate assignments
+<span class="fc" id="L271">        Map&lt;String, ConnectorsAndTasks&gt; duplicatedToRevoke = intersection(duplicated, memberAssignments);</span>
+<span class="fc" id="L272">        log.debug(&quot;Duplicated connectors and tasks to revoke from each worker: {}&quot;, duplicatedToRevoke);</span>
+<span class="fc" id="L273">        addAll(toRevoke, duplicatedToRevoke);</span>
+
+        // Compute the assignment that will be applied across the cluster after this round of rebalance
+        // Later on, new submissions and lost-and-reassigned connectors and tasks will be added to these assignments,
+        // and load-balancing revocations will be removed from them.
+<span class="fc" id="L278">        List&lt;WorkerLoad&gt; nextWorkerAssignment = workerLoads(memberAssignments);</span>
+<span class="fc" id="L279">        removeAll(nextWorkerAssignment, deletedToRevoke);</span>
+<span class="fc" id="L280">        removeAll(nextWorkerAssignment, duplicatedToRevoke);</span>
+
+        // Collect the lost assignments that are ready to be reassigned because the workers that were
+        // originally responsible for them appear to have left the cluster instead of rejoining within
+        // the scheduled rebalance delay. These assignments will be re-allocated to the existing workers
+        // in the cluster later on
+<span class="fc" id="L286">        ConnectorsAndTasks.Builder lostAssignmentsToReassignBuilder = new ConnectorsAndTasks.Builder();</span>
+<span class="fc" id="L287">        handleLostAssignments(lostAssignments, lostAssignmentsToReassignBuilder, nextWorkerAssignment);</span>
+<span class="fc" id="L288">        ConnectorsAndTasks lostAssignmentsToReassign = lostAssignmentsToReassignBuilder.build();</span>
+
+        // Do not revoke resources for re-assignment while a delayed rebalance is active
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">        if (delay == 0) {</span>
+<span class="fc" id="L292">            Map&lt;String, ConnectorsAndTasks&gt; loadBalancingRevocations =</span>
+<span class="fc" id="L293">                    performLoadBalancingRevocations(configured, nextWorkerAssignment);</span>
+
+            // If this round and the previous round involved revocation, we will calculate a delay for
+            // the next round when revoking rebalance would be allowed. Note that delay could be 0, in which
+            // case we would always revoke.
+<span class="pc bpc" id="L298" title="3 of 4 branches missed.">            if (revokedInPrevious &amp;&amp; !loadBalancingRevocations.isEmpty()) {</span>
+<span class="nc" id="L299">                numSuccessiveRevokingRebalances++; // Should we consider overflow for this?</span>
+<span class="nc" id="L300">                log.debug(&quot;Consecutive revoking rebalances observed. Computing delay and next scheduled rebalance.&quot;);</span>
+<span class="nc" id="L301">                delay = (int) consecutiveRevokingRebalancesBackoff.backoff(numSuccessiveRevokingRebalances);</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">                if (delay != 0) {</span>
+<span class="nc" id="L303">                    scheduledRebalance = time.milliseconds() + delay;</span>
+<span class="nc" id="L304">                    log.debug(&quot;Skipping revocations in the current round with a delay of {}ms. Next scheduled rebalance:{}&quot;,</span>
+<span class="nc" id="L305">                            delay, scheduledRebalance);</span>
+                } else {
+<span class="nc" id="L307">                    log.debug(&quot;Revoking assignments immediately since scheduled.rebalance.max.delay.ms is set to 0&quot;);</span>
+<span class="nc" id="L308">                    addAll(toRevoke, loadBalancingRevocations);</span>
+                    // Remove all newly-revoked connectors and tasks from the next assignment, both to
+                    // ensure that they are not included in the assignments during this round, and to produce
+                    // an accurate allocation of all newly-created and lost-and-reassigned connectors and tasks
+                    // that will have to be distributed across the cluster during this round
+<span class="nc" id="L313">                    removeAll(nextWorkerAssignment, loadBalancingRevocations);</span>
+                }
+<span class="pc bpc" id="L315" title="1 of 2 branches missed.">            } else if (!loadBalancingRevocations.isEmpty()) {</span>
+                // We had a revocation in this round but not in the previous round. Let's store that state.
+<span class="nc" id="L317">                log.debug(&quot;Performing allocation-balancing revocation immediately as no revocations took place during the previous rebalance&quot;);</span>
+<span class="nc" id="L318">                addAll(toRevoke, loadBalancingRevocations);</span>
+<span class="nc" id="L319">                removeAll(nextWorkerAssignment, loadBalancingRevocations);</span>
+<span class="nc" id="L320">                revokedInPrevious = true;</span>
+<span class="pc bpc" id="L321" title="1 of 2 branches missed.">            } else if (revokedInPrevious) {</span>
+                // No revocations in this round but the previous round had one. Probably the workers
+                // have converged to a balanced load. We can reset the rebalance clock
+<span class="nc" id="L324">                log.debug(&quot;Previous round had revocations but this round didn't. Probably, the cluster has reached a &quot; +</span>
+                        &quot;balanced load. Resetting the exponential backoff clock&quot;);
+<span class="nc" id="L326">                revokedInPrevious = false;</span>
+<span class="nc" id="L327">                numSuccessiveRevokingRebalances = 0;</span>
+            } else {
+                // no-op
+<span class="fc" id="L330">                log.debug(&quot;No revocations in previous and current round.&quot;);</span>
+            }
+<span class="fc" id="L332">        } else {</span>
+<span class="nc" id="L333">            log.debug(&quot;Delayed rebalance is active. Delaying {}ms before revoking connectors and tasks: {}&quot;, delay, toRevoke);</span>
+<span class="nc" id="L334">            revokedInPrevious = false;</span>
+        }
+
+        // The complete set of connectors and tasks that should be newly-assigned during this round
+<span class="fc" id="L338">        ConnectorsAndTasks toAssign = new ConnectorsAndTasks.Builder()</span>
+<span class="fc" id="L339">                .addAll(created)</span>
+<span class="fc" id="L340">                .addAll(lostAssignmentsToReassign)</span>
+<span class="fc" id="L341">                .build();</span>
+
+<span class="fc" id="L343">        assignConnectors(nextWorkerAssignment, toAssign.connectors());</span>
+<span class="fc" id="L344">        assignTasks(nextWorkerAssignment, toAssign.tasks());</span>
+
+<span class="fc" id="L346">        Map&lt;String, Collection&lt;String&gt;&gt; nextConnectorAssignments = nextWorkerAssignment.stream()</span>
+<span class="fc" id="L347">                .collect(Collectors.toMap(</span>
+                        WorkerLoad::worker,
+                        WorkerLoad::connectors
+                ));
+<span class="fc" id="L351">        Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; nextTaskAssignments = nextWorkerAssignment.stream()</span>
+<span class="fc" id="L352">                .collect(Collectors.toMap(</span>
+                        WorkerLoad::worker,
+                        WorkerLoad::tasks
+                ));
+
+<span class="fc" id="L357">        Map&lt;String, Collection&lt;String&gt;&gt; currentConnectorAssignments =</span>
+<span class="fc" id="L358">                currentWorkerAssignment.stream().collect(Collectors.toMap(WorkerLoad::worker, WorkerLoad::connectors));</span>
+<span class="fc" id="L359">        Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; currentTaskAssignments =</span>
+<span class="fc" id="L360">                currentWorkerAssignment.stream().collect(Collectors.toMap(WorkerLoad::worker, WorkerLoad::tasks));</span>
+<span class="fc" id="L361">        Map&lt;String, Collection&lt;String&gt;&gt; incrementalConnectorAssignments =</span>
+<span class="fc" id="L362">                diff(nextConnectorAssignments, currentConnectorAssignments);</span>
+<span class="fc" id="L363">        Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; incrementalTaskAssignments =</span>
+<span class="fc" id="L364">                diff(nextTaskAssignments, currentTaskAssignments);</span>
+
+<span class="fc" id="L366">        Map&lt;String, ConnectorsAndTasks&gt; revoked = buildAll(toRevoke);</span>
+
+<span class="fc" id="L368">        previousAssignment = computePreviousAssignment(revoked, nextConnectorAssignments, nextTaskAssignments, lostAssignments);</span>
+<span class="fc" id="L369">        previousGenerationId = currentGenerationId;</span>
+<span class="fc" id="L370">        previousMembers = memberAssignments.keySet();</span>
+
+<span class="fc" id="L372">        log.debug(&quot;Incremental connector assignments: {}&quot;, incrementalConnectorAssignments);</span>
+<span class="fc" id="L373">        log.debug(&quot;Incremental task assignments: {}&quot;, incrementalTaskAssignments);</span>
+
+<span class="fc" id="L375">        Map&lt;String, Collection&lt;String&gt;&gt; revokedConnectors = transformValues(revoked, ConnectorsAndTasks::connectors);</span>
+<span class="fc" id="L376">        Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; revokedTasks = transformValues(revoked, ConnectorsAndTasks::tasks);</span>
+
+<span class="fc" id="L378">        return new ClusterAssignment(</span>
+                incrementalConnectorAssignments,
+                incrementalTaskAssignments,
+                revokedConnectors,
+                revokedTasks,
+<span class="fc" id="L383">                diff(nextConnectorAssignments, revokedConnectors),</span>
+<span class="fc" id="L384">                diff(nextTaskAssignments, revokedTasks)</span>
+        );
+    }
+
+    private ConnectorsAndTasks computePreviousAssignment(Map&lt;String, ConnectorsAndTasks&gt; toRevoke,
+                                                         Map&lt;String, Collection&lt;String&gt;&gt; connectorAssignments,
+                                                         Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; taskAssignments,
+                                                         ConnectorsAndTasks lostAssignments) {
+<span class="fc" id="L392">        ConnectorsAndTasks previousAssignment = new ConnectorsAndTasks.Builder().with(</span>
+<span class="fc" id="L393">                ConnectUtils.combineCollections(connectorAssignments.values()),</span>
+<span class="fc" id="L394">                ConnectUtils.combineCollections(taskAssignments.values())</span>
+<span class="fc" id="L395">        ).build();</span>
+
+<span class="fc bfc" id="L397" title="All 2 branches covered.">        for (ConnectorsAndTasks revoked : toRevoke.values()) {</span>
+<span class="fc" id="L398">            previousAssignment.connectors().removeAll(revoked.connectors());</span>
+<span class="fc" id="L399">            previousAssignment.tasks().removeAll(revoked.tasks());</span>
+<span class="fc" id="L400">            previousRevocation.connectors().addAll(revoked.connectors());</span>
+<span class="fc" id="L401">            previousRevocation.tasks().addAll(revoked.tasks());</span>
+<span class="fc" id="L402">        }</span>
+
+        // Depends on the previous assignment's collections being sets at the moment.
+        // TODO: make it independent
+<span class="fc" id="L406">        previousAssignment.connectors().addAll(lostAssignments.connectors());</span>
+<span class="fc" id="L407">        previousAssignment.tasks().addAll(lostAssignments.tasks());</span>
+
+<span class="fc" id="L409">        return previousAssignment;</span>
+    }
+
+    private ConnectorsAndTasks duplicatedAssignments(Map&lt;String, ConnectorsAndTasks&gt; memberAssignments) {
+<span class="fc" id="L413">        Map&lt;String, Long&gt; connectorInstanceCounts = combineCollections(</span>
+<span class="fc" id="L414">                memberAssignments.values(),</span>
+                ConnectorsAndTasks::connectors,
+<span class="fc" id="L416">                Collectors.groupingBy(Function.identity(), Collectors.counting())</span>
+        );
+<span class="fc" id="L418">        Set&lt;String&gt; duplicatedConnectors = connectorInstanceCounts</span>
+<span class="fc" id="L419">                .entrySet().stream()</span>
+<span class="pc bpc" id="L420" title="1 of 2 branches missed.">                .filter(entry -&gt; entry.getValue() &gt; 1L)</span>
+<span class="fc" id="L421">                .map(Entry::getKey)</span>
+<span class="fc" id="L422">                .collect(Collectors.toSet());</span>
+
+<span class="fc" id="L424">        Map&lt;ConnectorTaskId, Long&gt; taskInstanceCounts = combineCollections(</span>
+<span class="fc" id="L425">                memberAssignments.values(),</span>
+                ConnectorsAndTasks::tasks,
+<span class="fc" id="L427">                Collectors.groupingBy(Function.identity(), Collectors.counting())</span>
+        );
+<span class="fc" id="L429">        Set&lt;ConnectorTaskId&gt; duplicatedTasks = taskInstanceCounts</span>
+<span class="fc" id="L430">                .entrySet().stream()</span>
+<span class="pc bpc" id="L431" title="1 of 2 branches missed.">                .filter(entry -&gt; entry.getValue() &gt; 1L)</span>
+<span class="fc" id="L432">                .map(Entry::getKey)</span>
+<span class="fc" id="L433">                .collect(Collectors.toSet());</span>
+
+<span class="fc" id="L435">        return new ConnectorsAndTasks.Builder().with(duplicatedConnectors, duplicatedTasks).build();</span>
+    }
+
+    // visible for testing
+    protected void handleLostAssignments(ConnectorsAndTasks lostAssignments,
+                                         ConnectorsAndTasks.Builder lostAssignmentsToReassign,
+                                         List&lt;WorkerLoad&gt; completeWorkerAssignment) {
+        // There are no lost assignments and there have been no successive revoking rebalances
+<span class="pc bpc" id="L443" title="2 of 4 branches missed.">        if (lostAssignments.isEmpty() &amp;&amp; !revokedInPrevious) {</span>
+<span class="fc" id="L444">            resetDelay();</span>
+<span class="fc" id="L445">            return;</span>
+        }
+
+<span class="nc" id="L448">        final long now = time.milliseconds();</span>
+<span class="nc" id="L449">        log.debug(&quot;Found the following connectors and tasks missing from previous assignments: {}&quot;, lostAssignments);</span>
+
+<span class="nc" id="L451">        Set&lt;String&gt; activeMembers = completeWorkerAssignment.stream()</span>
+<span class="nc" id="L452">                .map(WorkerLoad::worker)</span>
+<span class="nc" id="L453">                .collect(Collectors.toSet());</span>
+<span class="nc bnc" id="L454" title="All 4 branches missed.">        if (scheduledRebalance &lt;= 0 &amp;&amp; activeMembers.containsAll(previousMembers)) {</span>
+<span class="nc" id="L455">            log.debug(&quot;No worker seems to have departed the group during the rebalance. The &quot;</span>
+                    + &quot;missing assignments that the leader is detecting are probably due to some &quot;
+                    + &quot;workers failing to receive the new assignments in the previous rebalance. &quot;
+                    + &quot;Will reassign missing tasks as new tasks&quot;);
+<span class="nc" id="L459">            lostAssignmentsToReassign.addAll(lostAssignments);</span>
+<span class="nc" id="L460">            return;</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">        } else if (maxDelay == 0) {</span>
+<span class="nc" id="L462">            log.debug(&quot;Scheduled rebalance delays are disabled ({} = 0); &quot;</span>
+                    + &quot;reassigning all lost connectors and tasks immediately&quot;,
+                    SCHEDULED_REBALANCE_MAX_DELAY_MS_CONFIG
+            );
+<span class="nc" id="L466">            lostAssignmentsToReassign.addAll(lostAssignments);</span>
+<span class="nc" id="L467">            return;</span>
+        }
+
+<span class="nc bnc" id="L470" title="All 4 branches missed.">        if (scheduledRebalance &gt; 0 &amp;&amp; now &gt;= scheduledRebalance) {</span>
+            // delayed rebalance expired and it's time to assign resources
+<span class="nc" id="L472">            log.debug(&quot;Delayed rebalance expired. Reassigning lost tasks&quot;);</span>
+<span class="nc" id="L473">            List&lt;WorkerLoad&gt; candidateWorkerLoad = List.of();</span>
+<span class="nc bnc" id="L474" title="All 2 branches missed.">            if (!candidateWorkersForReassignment.isEmpty()) {</span>
+<span class="nc" id="L475">                candidateWorkerLoad = pickCandidateWorkerForReassignment(completeWorkerAssignment);</span>
+            }
+
+<span class="nc bnc" id="L478" title="All 2 branches missed.">            if (!candidateWorkerLoad.isEmpty()) {</span>
+<span class="nc" id="L479">                log.debug(&quot;Assigning lost tasks to {} candidate workers: {}&quot;, </span>
+<span class="nc" id="L480">                        candidateWorkerLoad.size(),</span>
+<span class="nc" id="L481">                        candidateWorkerLoad.stream().map(WorkerLoad::worker).collect(Collectors.joining(&quot;,&quot;)));</span>
+<span class="nc" id="L482">                Iterator&lt;WorkerLoad&gt; candidateWorkerIterator = candidateWorkerLoad.iterator();</span>
+<span class="nc bnc" id="L483" title="All 2 branches missed.">                for (String connector : lostAssignments.connectors()) {</span>
+                    // Loop over the candidate workers as many times as it takes
+<span class="nc bnc" id="L485" title="All 2 branches missed.">                    if (!candidateWorkerIterator.hasNext()) {</span>
+<span class="nc" id="L486">                        candidateWorkerIterator = candidateWorkerLoad.iterator();</span>
+                    }
+<span class="nc" id="L488">                    WorkerLoad worker = candidateWorkerIterator.next();</span>
+<span class="nc" id="L489">                    log.debug(&quot;Assigning connector id {} to member {}&quot;, connector, worker.worker());</span>
+<span class="nc" id="L490">                    worker.assign(connector);</span>
+<span class="nc" id="L491">                }</span>
+<span class="nc" id="L492">                candidateWorkerIterator = candidateWorkerLoad.iterator();</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">                for (ConnectorTaskId task : lostAssignments.tasks()) {</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">                    if (!candidateWorkerIterator.hasNext()) {</span>
+<span class="nc" id="L495">                        candidateWorkerIterator = candidateWorkerLoad.iterator();</span>
+                    }
+<span class="nc" id="L497">                    WorkerLoad worker = candidateWorkerIterator.next();</span>
+<span class="nc" id="L498">                    log.debug(&quot;Assigning task id {} to member {}&quot;, task, worker.worker());</span>
+<span class="nc" id="L499">                    worker.assign(task);</span>
+<span class="nc" id="L500">                }</span>
+<span class="nc" id="L501">            } else {</span>
+<span class="nc" id="L502">                log.debug(&quot;No single candidate worker was found to assign lost tasks. Treating lost tasks as new tasks&quot;);</span>
+<span class="nc" id="L503">                lostAssignmentsToReassign.addAll(lostAssignments);</span>
+            }
+<span class="nc" id="L505">            resetDelay();</span>
+            // Resetting the flag as now we can permit successive revoking rebalances.
+            // since we have gone through the full rebalance delay
+<span class="nc" id="L508">            revokedInPrevious = false;</span>
+<span class="nc" id="L509">        } else {</span>
+<span class="nc" id="L510">            candidateWorkersForReassignment</span>
+<span class="nc" id="L511">                    .addAll(candidateWorkersForReassignment(completeWorkerAssignment));</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">            if (now &lt; scheduledRebalance) {</span>
+                // a delayed rebalance is in progress, but it's not yet time to reassign
+                // unaccounted resources
+<span class="nc" id="L515">                delay = calculateDelay(now);</span>
+<span class="nc" id="L516">                log.debug(&quot;Delayed rebalance in progress. Task reassignment is postponed. New computed rebalance delay: {}&quot;, delay);</span>
+            } else {
+                // This means scheduledRebalance == 0
+                // We could also extract the current minimum delay from the group, to make
+                // independent of consecutive leader failures, but this optimization is skipped
+                // at the moment
+<span class="nc" id="L522">                delay = maxDelay;</span>
+<span class="nc" id="L523">                log.debug(&quot;Resetting rebalance delay to the max: {}. scheduledRebalance: {} now: {} diff scheduledRebalance - now: {}&quot;,</span>
+<span class="nc" id="L524">                        delay, scheduledRebalance, now, scheduledRebalance - now);</span>
+            }
+<span class="nc" id="L526">            scheduledRebalance = now + delay;</span>
+        }
+<span class="nc" id="L528">    }</span>
+
+    private void resetDelay() {
+<span class="fc" id="L531">        candidateWorkersForReassignment.clear();</span>
+<span class="fc" id="L532">        scheduledRebalance = 0;</span>
+<span class="pc bpc" id="L533" title="1 of 2 branches missed.">        if (delay != 0) {</span>
+<span class="nc" id="L534">            log.debug(&quot;Resetting delay from previous value: {} to 0&quot;, delay);</span>
+        }
+<span class="fc" id="L536">        delay = 0;</span>
+<span class="fc" id="L537">    }</span>
+
+    private Set&lt;String&gt; candidateWorkersForReassignment(List&lt;WorkerLoad&gt; completeWorkerAssignment) {
+<span class="nc" id="L540">        return completeWorkerAssignment.stream()</span>
+<span class="nc" id="L541">                .filter(WorkerLoad::isEmpty)</span>
+<span class="nc" id="L542">                .map(WorkerLoad::worker)</span>
+<span class="nc" id="L543">                .collect(Collectors.toSet());</span>
+    }
+
+    private List&lt;WorkerLoad&gt; pickCandidateWorkerForReassignment(List&lt;WorkerLoad&gt; completeWorkerAssignment) {
+<span class="nc" id="L547">        Map&lt;String, WorkerLoad&gt; activeWorkers = completeWorkerAssignment.stream()</span>
+<span class="nc" id="L548">                .collect(Collectors.toMap(WorkerLoad::worker, Function.identity()));</span>
+<span class="nc" id="L549">        return candidateWorkersForReassignment.stream()</span>
+<span class="nc" id="L550">                .map(activeWorkers::get)</span>
+<span class="nc" id="L551">                .filter(Objects::nonNull)</span>
+<span class="nc" id="L552">                .collect(Collectors.toList());</span>
+    }
+
+    private Map&lt;String, ExtendedAssignment&gt; fillAssignments(Collection&lt;String&gt; members, short error,
+                                                            String leaderId, String leaderUrl, long maxOffset,
+                                                            ClusterAssignment clusterAssignment,
+                                                            int delay, short protocolVersion) {
+<span class="fc" id="L559">        Map&lt;String, ExtendedAssignment&gt; groupAssignment = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L560" title="All 2 branches covered.">        for (String member : members) {</span>
+<span class="fc" id="L561">            Collection&lt;String&gt; connectorsToStart = clusterAssignment.newlyAssignedConnectors(member);</span>
+<span class="fc" id="L562">            Collection&lt;ConnectorTaskId&gt; tasksToStart = clusterAssignment.newlyAssignedTasks(member);</span>
+<span class="fc" id="L563">            Collection&lt;String&gt; connectorsToStop = clusterAssignment.newlyRevokedConnectors(member);</span>
+<span class="fc" id="L564">            Collection&lt;ConnectorTaskId&gt; tasksToStop = clusterAssignment.newlyRevokedTasks(member);</span>
+<span class="fc" id="L565">            ExtendedAssignment assignment =</span>
+                    new ExtendedAssignment(protocolVersion, error, leaderId, leaderUrl, maxOffset,
+                            connectorsToStart, tasksToStart, connectorsToStop, tasksToStop, delay);
+<span class="fc" id="L568">            log.debug(&quot;Filling assignment: {} -&gt; {}&quot;, member, assignment);</span>
+<span class="fc" id="L569">            groupAssignment.put(member, assignment);</span>
+<span class="fc" id="L570">        }</span>
+<span class="fc" id="L571">        log.debug(&quot;Finished assignment&quot;);</span>
+<span class="fc" id="L572">        return groupAssignment;</span>
+    }
+
+    /**
+     * From a map of workers to assignment object generate the equivalent map of workers to byte
+     * buffers of serialized assignments.
+     *
+     * @param assignments the map of worker assignments
+     * @return the serialized map of assignments to workers
+     */
+    protected Map&lt;String, ByteBuffer&gt; serializeAssignments(Map&lt;String, ExtendedAssignment&gt; assignments, short protocolVersion) {
+<span class="pc bpc" id="L583" title="1 of 2 branches missed.">        boolean sessioned = protocolVersion &gt;= CONNECT_PROTOCOL_V2;</span>
+<span class="fc" id="L584">        return assignments.entrySet()</span>
+<span class="fc" id="L585">                .stream()</span>
+<span class="fc" id="L586">                .collect(Collectors.toMap(</span>
+                    Map.Entry::getKey,
+<span class="fc" id="L588">                    e -&gt; IncrementalCooperativeConnectProtocol.serializeAssignment(e.getValue(), sessioned)));</span>
+    }
+
+    private static ConnectorsAndTasks diff(ConnectorsAndTasks base,
+                                           ConnectorsAndTasks... toSubtract) {
+<span class="fc" id="L593">        Collection&lt;String&gt; connectors = new TreeSet&lt;&gt;(base.connectors());</span>
+<span class="fc" id="L594">        Collection&lt;ConnectorTaskId&gt; tasks = new TreeSet&lt;&gt;(base.tasks());</span>
+<span class="fc bfc" id="L595" title="All 2 branches covered.">        for (ConnectorsAndTasks sub : toSubtract) {</span>
+<span class="fc" id="L596">            connectors.removeAll(sub.connectors());</span>
+<span class="fc" id="L597">            tasks.removeAll(sub.tasks());</span>
+        }
+<span class="fc" id="L599">        return new ConnectorsAndTasks.Builder().with(connectors, tasks).build();</span>
+    }
+
+    private static &lt;T&gt; Map&lt;String, Collection&lt;T&gt;&gt; diff(Map&lt;String, Collection&lt;T&gt;&gt; base,
+                                                       Map&lt;String, Collection&lt;T&gt;&gt; toSubtract) {
+<span class="fc" id="L604">        Map&lt;String, Collection&lt;T&gt;&gt; incremental = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L605" title="All 2 branches covered.">        for (Map.Entry&lt;String, Collection&lt;T&gt;&gt; entry : base.entrySet()) {</span>
+<span class="fc" id="L606">            List&lt;T&gt; values = new ArrayList&lt;&gt;(entry.getValue());</span>
+<span class="fc" id="L607">            values.removeAll(toSubtract.getOrDefault(entry.getKey(), Set.of()));</span>
+<span class="fc" id="L608">            incremental.put(entry.getKey(), values);</span>
+<span class="fc" id="L609">        }</span>
+<span class="fc" id="L610">        return incremental;</span>
+    }
+
+    private ConnectorsAndTasks assignment(Map&lt;String, ConnectorsAndTasks&gt; memberAssignments) {
+<span class="fc" id="L614">        log.debug(&quot;Received assignments: {}&quot;, memberAssignments);</span>
+<span class="fc" id="L615">        return new ConnectorsAndTasks.Builder().with(</span>
+<span class="fc" id="L616">                ConnectUtils.combineCollections(memberAssignments.values(), ConnectorsAndTasks::connectors),</span>
+<span class="fc" id="L617">                ConnectUtils.combineCollections(memberAssignments.values(), ConnectorsAndTasks::tasks)</span>
+<span class="fc" id="L618">        ).build();</span>
+    }
+
+    /**
+     * Revoke connectors and tasks from each worker in the cluster until no worker is running more than it
+     * would be with a perfectly-balanced assignment.
+     * @param configured the set of configured connectors and tasks across the entire cluster
+     * @param workers the workers in the cluster, whose assignments should not include any deleted or duplicated connectors or tasks
+     *                that are already due to be revoked from the worker in this rebalance
+     * @return which connectors and tasks should be revoked from which workers; never null, but may be empty
+     * if no load-balancing revocations are necessary or possible
+     */
+    private Map&lt;String, ConnectorsAndTasks&gt; performLoadBalancingRevocations(
+            ConnectorsAndTasks configured,
+            Collection&lt;WorkerLoad&gt; workers
+    ) {
+<span class="pc bpc" id="L634" title="1 of 2 branches missed.">        if (log.isTraceEnabled()) {</span>
+<span class="nc" id="L635">            workers.forEach(wl -&gt; log.trace(</span>
+                    &quot;Per worker current load size; worker: {} connectors: {} tasks: {}&quot;,
+<span class="nc" id="L637">                    wl.worker(), wl.connectorsSize(), wl.tasksSize()));</span>
+        }
+
+<span class="fc bfc" id="L640" title="All 2 branches covered.">        if (workers.stream().allMatch(WorkerLoad::isEmpty)) {</span>
+<span class="fc" id="L641">            log.trace(&quot;No load-balancing revocations required; all workers are either new &quot;</span>
+                    + &quot;or will have all currently-assigned connectors and tasks revoked during this round&quot;
+            );
+<span class="fc" id="L644">            return Map.of();</span>
+        }
+<span class="pc bpc" id="L646" title="1 of 2 branches missed.">        if (configured.isEmpty()) {</span>
+<span class="nc" id="L647">            log.trace(&quot;No load-balancing revocations required; no connectors are currently configured on this cluster&quot;);</span>
+<span class="nc" id="L648">            return Map.of();</span>
+        }
+
+<span class="fc" id="L651">        Map&lt;String, ConnectorsAndTasks.Builder&gt; result = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L653">        Map&lt;String, Set&lt;String&gt;&gt; connectorRevocations = loadBalancingRevocations(</span>
+                &quot;connector&quot;,
+<span class="fc" id="L655">                configured.connectors().size(),</span>
+                workers,
+                WorkerLoad::connectors
+        );
+<span class="fc" id="L659">        Map&lt;String, Set&lt;ConnectorTaskId&gt;&gt; taskRevocations = loadBalancingRevocations(</span>
+                &quot;task&quot;,
+<span class="fc" id="L661">                configured.tasks().size(),</span>
+                workers,
+                WorkerLoad::tasks
+        );
+
+<span class="fc" id="L666">        connectorRevocations.forEach((worker, revoked) -&gt;</span>
+<span class="nc" id="L667">                result.computeIfAbsent(worker, w -&gt; new ConnectorsAndTasks.Builder()).addConnectors(revoked)</span>
+        );
+<span class="fc" id="L669">        taskRevocations.forEach((worker, revoked) -&gt;</span>
+<span class="nc" id="L670">                result.computeIfAbsent(worker, w -&gt; new ConnectorsAndTasks.Builder()).addTasks(revoked)</span>
+        );
+
+<span class="fc" id="L673">        return buildAll(result);</span>
+    }
+
+    private &lt;E&gt; Map&lt;String, Set&lt;E&gt;&gt; loadBalancingRevocations(
+            String allocatedResourceName,
+            int totalToAllocate,
+            Collection&lt;WorkerLoad&gt; workers,
+            Function&lt;WorkerLoad, Collection&lt;E&gt;&gt; workerAllocation
+    ) {
+<span class="fc" id="L682">        int totalWorkers = workers.size();</span>
+        // The minimum instances of this resource that should be assigned to each worker
+<span class="fc" id="L684">        int minAllocatedPerWorker = totalToAllocate / totalWorkers;</span>
+        // How many workers are going to have to be allocated exactly one extra instance
+        // (since the total number to allocate may not be a perfect multiple of the number of workers)
+<span class="fc" id="L687">        int workersToAllocateExtra = totalToAllocate % totalWorkers;</span>
+        // Useful function to determine exactly how many instances of the resource a given worker is currently allocated
+<span class="fc" id="L689">        Function&lt;WorkerLoad, Integer&gt; workerAllocationSize = workerAllocation.andThen(Collection::size);</span>
+
+<span class="fc" id="L691">        long workersAllocatedMinimum = workers.stream()</span>
+<span class="fc" id="L692">                .map(workerAllocationSize)</span>
+<span class="fc bfc" id="L693" title="All 2 branches covered.">                .filter(n -&gt; n == minAllocatedPerWorker)</span>
+<span class="fc" id="L694">                .count();</span>
+<span class="fc" id="L695">        long workersAllocatedSingleExtra = workers.stream()</span>
+<span class="fc" id="L696">                .map(workerAllocationSize)</span>
+<span class="fc bfc" id="L697" title="All 2 branches covered.">                .filter(n -&gt; n == minAllocatedPerWorker + 1)</span>
+<span class="fc" id="L698">                .count();</span>
+<span class="pc bpc" id="L699" title="1 of 4 branches missed.">        if (workersAllocatedSingleExtra == workersToAllocateExtra</span>
+                &amp;&amp; workersAllocatedMinimum + workersAllocatedSingleExtra == totalWorkers) {
+<span class="fc" id="L701">            log.trace(</span>
+                    &quot;No load-balancing {} revocations required; the current allocations, when combined with any newly-created {}s, should be balanced&quot;,
+                    allocatedResourceName,
+                    allocatedResourceName
+            );
+<span class="fc" id="L706">            return Map.of();</span>
+        }
+
+<span class="fc" id="L709">        Map&lt;String, Set&lt;E&gt;&gt; result = new HashMap&lt;&gt;();</span>
+        // How many workers we've allocated a single extra resource instance to
+<span class="fc" id="L711">        int allocatedExtras = 0;</span>
+        // Calculate how many (and which) connectors/tasks to revoke from each worker here
+<span class="fc bfc" id="L713" title="All 2 branches covered.">        for (WorkerLoad worker : workers) {</span>
+<span class="fc" id="L714">            int currentAllocationSizeForWorker = workerAllocationSize.apply(worker);</span>
+<span class="pc bpc" id="L715" title="1 of 2 branches missed.">            if (currentAllocationSizeForWorker &lt;= minAllocatedPerWorker) {</span>
+                // This worker isn't allocated more than the minimum; no need to revoke anything
+<span class="fc" id="L717">                continue;</span>
+            }
+            int maxAllocationForWorker;
+<span class="nc bnc" id="L720" title="All 2 branches missed.">            if (allocatedExtras &lt; workersToAllocateExtra) {</span>
+                // We'll allocate one of the extra resource instances to this worker
+<span class="nc" id="L722">                allocatedExtras++;</span>
+<span class="nc bnc" id="L723" title="All 2 branches missed.">                if (currentAllocationSizeForWorker == minAllocatedPerWorker + 1) {</span>
+                    // If the worker's running exactly one more than the minimum, and we're allowed to
+                    // allocate an extra to it, there's no need to revoke anything
+<span class="nc" id="L726">                    continue;</span>
+                }
+<span class="nc" id="L728">                maxAllocationForWorker = minAllocatedPerWorker + 1;</span>
+            } else {
+<span class="nc" id="L730">                maxAllocationForWorker = minAllocatedPerWorker;</span>
+            }
+
+<span class="nc" id="L733">            Set&lt;E&gt; revokedFromWorker = new LinkedHashSet&lt;&gt;();</span>
+<span class="nc" id="L734">            result.put(worker.worker(), revokedFromWorker);</span>
+
+<span class="nc" id="L736">            Iterator&lt;E&gt; currentWorkerAllocation = workerAllocation.apply(worker).iterator();</span>
+            // Revoke resources from the worker until it isn't allocated any more than it should be
+<span class="nc bnc" id="L738" title="All 2 branches missed.">            for (int numRevoked = 0; currentAllocationSizeForWorker - numRevoked &gt; maxAllocationForWorker; numRevoked++) {</span>
+<span class="nc bnc" id="L739" title="All 2 branches missed.">                if (!currentWorkerAllocation.hasNext()) {</span>
+                    // Should never happen, but better to log a warning and move on than die and fail the whole rebalance if it does
+<span class="nc" id="L741">                    log.warn(</span>
+                            &quot;Unexpectedly ran out of {}s to revoke from worker {} while performing load-balancing revocations; &quot; +
+                                    &quot;worker appears to still be allocated {} instances, which is more than the intended allocation of {}&quot;,
+                            allocatedResourceName,
+<span class="nc" id="L745">                            worker.worker(),</span>
+<span class="nc" id="L746">                            workerAllocationSize.apply(worker),</span>
+<span class="nc" id="L747">                            maxAllocationForWorker</span>
+                    );
+<span class="nc" id="L749">                    break;</span>
+                }
+<span class="nc" id="L751">                E revocation = currentWorkerAllocation.next();</span>
+<span class="nc" id="L752">                revokedFromWorker.add(revocation);</span>
+            }
+<span class="nc" id="L754">        }</span>
+<span class="fc" id="L755">        return result;</span>
+    }
+
+    private int calculateDelay(long now) {
+<span class="nc" id="L759">        long diff = scheduledRebalance - now;</span>
+<span class="nc bnc" id="L760" title="All 2 branches missed.">        return diff &gt; 0 ? (int) Math.min(diff, maxDelay) : 0;</span>
+    }
+
+    /**
+     * Perform a round-robin assignment of connectors to workers with existing worker load. This
+     * assignment tries to balance the load between workers, by assigning connectors to workers
+     * that have equal load, starting with the least loaded workers.
+     *
+     * @param workerAssignment the current worker assignment; assigned connectors are added to this list
+     * @param connectors the connectors to be assigned
+     */
+    protected void assignConnectors(List&lt;WorkerLoad&gt; workerAssignment, Collection&lt;String&gt; connectors) {
+<span class="fc" id="L772">        workerAssignment.sort(WorkerLoad.connectorComparator());</span>
+<span class="fc" id="L773">        WorkerLoad first = workerAssignment.get(0);</span>
+
+<span class="fc" id="L775">        Iterator&lt;String&gt; load = connectors.iterator();</span>
+<span class="fc bfc" id="L776" title="All 2 branches covered.">        while (load.hasNext()) {</span>
+<span class="fc" id="L777">            int firstLoad = first.connectorsSize();</span>
+<span class="fc" id="L778">            int upTo = IntStream.range(0, workerAssignment.size())</span>
+<span class="pc bpc" id="L779" title="1 of 2 branches missed.">                    .filter(i -&gt; workerAssignment.get(i).connectorsSize() &gt; firstLoad)</span>
+<span class="fc" id="L780">                    .findFirst()</span>
+<span class="fc" id="L781">                    .orElse(workerAssignment.size());</span>
+<span class="pc bpc" id="L782" title="1 of 2 branches missed.">            for (WorkerLoad worker : workerAssignment.subList(0, upTo)) {</span>
+<span class="fc" id="L783">                String connector = load.next();</span>
+<span class="fc" id="L784">                log.debug(&quot;Assigning connector {} to {}&quot;, connector, worker.worker());</span>
+<span class="fc" id="L785">                worker.assign(connector);</span>
+<span class="pc bpc" id="L786" title="1 of 2 branches missed.">                if (!load.hasNext()) {</span>
+<span class="fc" id="L787">                    break;</span>
+                }
+<span class="nc" id="L789">            }</span>
+<span class="fc" id="L790">        }</span>
+<span class="fc" id="L791">    }</span>
+
+    /**
+     * Perform a round-robin assignment of tasks to workers with existing worker load. This
+     * assignment tries to balance the load between workers, by assigning tasks to workers that
+     * have equal load, starting with the least loaded workers.
+     *
+     * @param workerAssignment the current worker assignment; assigned tasks are added to this list
+     * @param tasks the tasks to be assigned
+     */
+    protected void assignTasks(List&lt;WorkerLoad&gt; workerAssignment, Collection&lt;ConnectorTaskId&gt; tasks) {
+<span class="fc" id="L802">        workerAssignment.sort(WorkerLoad.taskComparator());</span>
+<span class="fc" id="L803">        WorkerLoad first = workerAssignment.get(0);</span>
+
+<span class="fc" id="L805">        Iterator&lt;ConnectorTaskId&gt; load = tasks.iterator();</span>
+<span class="fc bfc" id="L806" title="All 2 branches covered.">        while (load.hasNext()) {</span>
+<span class="fc" id="L807">            int firstLoad = first.tasksSize();</span>
+<span class="fc" id="L808">            int upTo = IntStream.range(0, workerAssignment.size())</span>
+<span class="pc bpc" id="L809" title="1 of 2 branches missed.">                    .filter(i -&gt; workerAssignment.get(i).tasksSize() &gt; firstLoad)</span>
+<span class="fc" id="L810">                    .findFirst()</span>
+<span class="fc" id="L811">                    .orElse(workerAssignment.size());</span>
+<span class="pc bpc" id="L812" title="1 of 2 branches missed.">            for (WorkerLoad worker : workerAssignment.subList(0, upTo)) {</span>
+<span class="fc" id="L813">                ConnectorTaskId task = load.next();</span>
+<span class="fc" id="L814">                log.debug(&quot;Assigning task {} to {}&quot;, task, worker.worker());</span>
+<span class="fc" id="L815">                worker.assign(task);</span>
+<span class="fc bfc" id="L816" title="All 2 branches covered.">                if (!load.hasNext()) {</span>
+<span class="fc" id="L817">                    break;</span>
+                }
+<span class="fc" id="L819">            }</span>
+<span class="fc" id="L820">        }</span>
+<span class="fc" id="L821">    }</span>
+
+    private static List&lt;WorkerLoad&gt; workerAssignment(Map&lt;String, ConnectorsAndTasks&gt; memberAssignments,
+                                                     ConnectorsAndTasks toExclude) {
+<span class="fc" id="L825">        ConnectorsAndTasks ignore = new ConnectorsAndTasks.Builder()</span>
+<span class="fc" id="L826">                .with(toExclude.connectors(), toExclude.tasks())</span>
+<span class="fc" id="L827">                .build();</span>
+
+<span class="fc" id="L829">        return memberAssignments.entrySet().stream()</span>
+<span class="fc" id="L830">                .map(e -&gt; new WorkerLoad.Builder(e.getKey()).with(</span>
+<span class="fc" id="L831">                        e.getValue().connectors().stream()</span>
+<span class="fc bfc" id="L832" title="All 2 branches covered.">                                .filter(v -&gt; !ignore.connectors().contains(v))</span>
+<span class="fc" id="L833">                                .collect(Collectors.toList()),</span>
+<span class="fc" id="L834">                        e.getValue().tasks().stream()</span>
+<span class="pc bpc" id="L835" title="1 of 2 branches missed.">                                .filter(v -&gt; !ignore.tasks().contains(v))</span>
+<span class="fc" id="L836">                                .collect(Collectors.toList())</span>
+<span class="fc" id="L837">                        ).build()</span>
+<span class="fc" id="L838">                ).collect(Collectors.toList());</span>
+    }
+
+    private static void addAll(Map&lt;String, ConnectorsAndTasks.Builder&gt; base, Map&lt;String, ConnectorsAndTasks&gt; toAdd) {
+<span class="fc" id="L842">        toAdd.forEach((worker, assignment) -&gt; base</span>
+<span class="fc" id="L843">                .computeIfAbsent(worker, w -&gt; new ConnectorsAndTasks.Builder())</span>
+<span class="fc" id="L844">                .addAll(assignment)</span>
+        );
+<span class="fc" id="L846">    }</span>
+
+    private static &lt;K&gt; Map&lt;K, ConnectorsAndTasks&gt; buildAll(Map&lt;K, ConnectorsAndTasks.Builder&gt; builders) {
+<span class="fc" id="L849">        return transformValues(builders, ConnectorsAndTasks.Builder::build);</span>
+    }
+
+    private static List&lt;WorkerLoad&gt; workerLoads(Map&lt;String, ConnectorsAndTasks&gt; memberAssignments) {
+<span class="fc" id="L853">        return memberAssignments.entrySet().stream()</span>
+<span class="fc" id="L854">                .map(e -&gt; new WorkerLoad.Builder(e.getKey()).with(e.getValue().connectors(), e.getValue().tasks()).build())</span>
+<span class="fc" id="L855">                .collect(Collectors.toList());</span>
+    }
+
+    private static void removeAll(List&lt;WorkerLoad&gt; workerLoads, Map&lt;String, ConnectorsAndTasks&gt; toRemove) {
+<span class="fc" id="L859">        workerLoads.forEach(workerLoad -&gt; {</span>
+<span class="fc" id="L860">            String worker = workerLoad.worker();</span>
+<span class="fc" id="L861">            ConnectorsAndTasks toRemoveFromWorker = toRemove.getOrDefault(worker, ConnectorsAndTasks.EMPTY);</span>
+<span class="fc" id="L862">            workerLoad.connectors().removeAll(toRemoveFromWorker.connectors());</span>
+<span class="fc" id="L863">            workerLoad.tasks().removeAll(toRemoveFromWorker.tasks());</span>
+<span class="fc" id="L864">        });</span>
+<span class="fc" id="L865">    }</span>
+
+    private static Map&lt;String, ConnectorsAndTasks&gt; intersection(ConnectorsAndTasks connectorsAndTasks, Map&lt;String, ConnectorsAndTasks&gt; assignments) {
+<span class="fc" id="L868">        return transformValues(assignments, assignment -&gt; {</span>
+<span class="fc" id="L869">            Collection&lt;String&gt; connectors = new HashSet&lt;&gt;(assignment.connectors());</span>
+<span class="fc" id="L870">            connectors.retainAll(connectorsAndTasks.connectors());</span>
+<span class="fc" id="L871">            Collection&lt;ConnectorTaskId&gt; tasks = new HashSet&lt;&gt;(assignment.tasks());</span>
+<span class="fc" id="L872">            tasks.retainAll(connectorsAndTasks.tasks());</span>
+<span class="fc" id="L873">            return new ConnectorsAndTasks.Builder().with(connectors, tasks).build();</span>
+        });
+    }
+
+    static class ClusterAssignment {
+
+        private final Map&lt;String, Collection&lt;String&gt;&gt; newlyAssignedConnectors;
+        private final Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; newlyAssignedTasks;
+        private final Map&lt;String, Collection&lt;String&gt;&gt; newlyRevokedConnectors;
+        private final Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; newlyRevokedTasks;
+        private final Map&lt;String, Collection&lt;String&gt;&gt; allAssignedConnectors;
+        private final Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; allAssignedTasks;
+        private final Set&lt;String&gt; allWorkers;
+
+<span class="fc" id="L887">        public static final ClusterAssignment EMPTY = new ClusterAssignment(</span>
+<span class="fc" id="L888">                Map.of(),</span>
+<span class="fc" id="L889">                Map.of(),</span>
+<span class="fc" id="L890">                Map.of(),</span>
+<span class="fc" id="L891">                Map.of(),</span>
+<span class="fc" id="L892">                Map.of(),</span>
+<span class="fc" id="L893">                Map.of()</span>
+        );
+
+        public ClusterAssignment(
+                Map&lt;String, Collection&lt;String&gt;&gt; newlyAssignedConnectors,
+                Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; newlyAssignedTasks,
+                Map&lt;String, Collection&lt;String&gt;&gt; newlyRevokedConnectors,
+                Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; newlyRevokedTasks,
+                Map&lt;String, Collection&lt;String&gt;&gt; allAssignedConnectors,
+                Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; allAssignedTasks
+<span class="fc" id="L903">        ) {</span>
+<span class="fc" id="L904">            this.newlyAssignedConnectors = newlyAssignedConnectors;</span>
+<span class="fc" id="L905">            this.newlyAssignedTasks = newlyAssignedTasks;</span>
+<span class="fc" id="L906">            this.newlyRevokedConnectors = newlyRevokedConnectors;</span>
+<span class="fc" id="L907">            this.newlyRevokedTasks = newlyRevokedTasks;</span>
+<span class="fc" id="L908">            this.allAssignedConnectors = allAssignedConnectors;</span>
+<span class="fc" id="L909">            this.allAssignedTasks = allAssignedTasks;</span>
+<span class="fc" id="L910">            this.allWorkers = combineCollections(</span>
+<span class="fc" id="L911">                    List.of(newlyAssignedConnectors, newlyAssignedTasks, newlyRevokedConnectors, newlyRevokedTasks, allAssignedConnectors, allAssignedTasks),</span>
+                    Map::keySet,
+<span class="fc" id="L913">                    Collectors.toSet()</span>
+            );
+<span class="fc" id="L915">        }</span>
+
+        public Map&lt;String, Collection&lt;String&gt;&gt; newlyAssignedConnectors() {
+<span class="nc" id="L918">            return newlyAssignedConnectors;</span>
+        }
+
+        public Collection&lt;String&gt; newlyAssignedConnectors(String worker) {
+<span class="fc" id="L922">            return newlyAssignedConnectors.getOrDefault(worker, Set.of());</span>
+        }
+
+        public Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; newlyAssignedTasks() {
+<span class="nc" id="L926">            return newlyAssignedTasks;</span>
+        }
+
+        public Collection&lt;ConnectorTaskId&gt; newlyAssignedTasks(String worker) {
+<span class="fc" id="L930">            return newlyAssignedTasks.getOrDefault(worker, Set.of());</span>
+        }
+
+        public Map&lt;String, Collection&lt;String&gt;&gt; newlyRevokedConnectors() {
+<span class="nc" id="L934">            return newlyRevokedConnectors;</span>
+        }
+
+        public Collection&lt;String&gt; newlyRevokedConnectors(String worker) {
+<span class="fc" id="L938">            return newlyRevokedConnectors.getOrDefault(worker, Set.of());</span>
+        }
+
+        public Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; newlyRevokedTasks() {
+<span class="nc" id="L942">            return newlyRevokedTasks;</span>
+        }
+
+        public Collection&lt;ConnectorTaskId&gt; newlyRevokedTasks(String worker) {
+<span class="fc" id="L946">            return newlyRevokedTasks.getOrDefault(worker, Set.of());</span>
+        }
+
+        public Map&lt;String, Collection&lt;String&gt;&gt; allAssignedConnectors() {
+<span class="fc" id="L950">            return allAssignedConnectors;</span>
+        }
+
+        public Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; allAssignedTasks() {
+<span class="fc" id="L954">            return allAssignedTasks;</span>
+        }
+
+        public Set&lt;String&gt; allWorkers() {
+<span class="nc" id="L958">            return allWorkers;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L963">            return &quot;ClusterAssignment{&quot;</span>
+                    + &quot;newlyAssignedConnectors=&quot; + newlyAssignedConnectors
+                    + &quot;, newlyAssignedTasks=&quot; + newlyAssignedTasks
+                    + &quot;, newlyRevokedConnectors=&quot; + newlyRevokedConnectors
+                    + &quot;, newlyRevokedTasks=&quot; + newlyRevokedTasks
+                    + &quot;, allAssignedConnectors=&quot; + allAssignedConnectors
+                    + &quot;, allAssignedTasks=&quot; + allAssignedTasks
+                    + &quot;, allWorkers=&quot; + allWorkers
+                    + '}';
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

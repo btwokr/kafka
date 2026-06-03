@@ -1,0 +1,304 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ShareFetchUtils.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">kafka.server.share</a> &gt; <span class="el_source">ShareFetchUtils.java</span></div><h1>ShareFetchUtils.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package kafka.server.share;
+
+import kafka.cluster.Partition;
+import kafka.server.ReplicaManager;
+
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
+import org.apache.kafka.common.errors.OffsetNotAvailableException;
+import org.apache.kafka.common.message.ShareFetchResponseData;
+import org.apache.kafka.common.message.ShareFetchResponseData.AcquiredRecords;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.internal.FileRecords;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.record.internal.Records;
+import org.apache.kafka.common.requests.ListOffsetsRequest;
+import org.apache.kafka.server.share.SharePartitionKey;
+import org.apache.kafka.server.share.fetch.ShareAcquiredRecords;
+import org.apache.kafka.server.share.fetch.ShareFetch;
+import org.apache.kafka.server.share.fetch.ShareFetchPartitionData;
+import org.apache.kafka.server.storage.log.FetchPartitionData;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.function.BiConsumer;
+
+import scala.Option;
+import scala.Some;
+
+/**
+ * Utility class for post-processing of share fetch operations.
+ */
+<span class="nc" id="L58">public class ShareFetchUtils {</span>
+<span class="nc" id="L59">    private static final Logger log = LoggerFactory.getLogger(ShareFetchUtils.class);</span>
+
+    /**
+     * Process the replica manager fetch response to create share fetch response. The response is created
+     * by acquiring records from the share partition.
+     */
+    static Map&lt;TopicIdPartition, ShareFetchResponseData.PartitionData&gt; processFetchResponse(
+            ShareFetch shareFetch,
+            List&lt;ShareFetchPartitionData&gt; shareFetchPartitionDataList,
+            LinkedHashMap&lt;TopicIdPartition, SharePartition&gt; sharePartitions,
+            ReplicaManager replicaManager,
+            BiConsumer&lt;SharePartitionKey, Throwable&gt; exceptionHandler
+    ) {
+<span class="nc" id="L72">        Map&lt;TopicIdPartition, ShareFetchResponseData.PartitionData&gt; response = new HashMap&lt;&gt;();</span>
+
+        // Acquired records count for the share fetch request.
+<span class="nc" id="L75">        int acquiredRecordsCount = 0;</span>
+<span class="nc bnc" id="L76" title="All 2 branches missed.">        for (ShareFetchPartitionData shareFetchPartitionData : shareFetchPartitionDataList) {</span>
+<span class="nc" id="L77">            TopicIdPartition topicIdPartition = shareFetchPartitionData.topicIdPartition();</span>
+<span class="nc" id="L78">            FetchPartitionData fetchPartitionData = shareFetchPartitionData.fetchPartitionData();</span>
+
+<span class="nc" id="L80">            SharePartition sharePartition = sharePartitions.get(topicIdPartition);</span>
+<span class="nc" id="L81">            ShareFetchResponseData.PartitionData partitionData = new ShareFetchResponseData.PartitionData()</span>
+<span class="nc" id="L82">                .setPartitionIndex(topicIdPartition.partition());</span>
+
+<span class="nc bnc" id="L84" title="All 2 branches missed.">            if (fetchPartitionData.error.code() != Errors.NONE.code()) {</span>
+<span class="nc" id="L85">                partitionData</span>
+<span class="nc" id="L86">                    .setRecords(MemoryRecords.EMPTY)</span>
+<span class="nc" id="L87">                    .setErrorCode(fetchPartitionData.error.code())</span>
+<span class="nc" id="L88">                    .setErrorMessage(fetchPartitionData.error.message())</span>
+<span class="nc" id="L89">                    .setAcquiredRecords(List.of());</span>
+
+                // In case we get OFFSET_OUT_OF_RANGE error, that's because the Log Start Offset is later than the fetch offset.
+                // So, we would update the start and end offset of the share partition and still return an empty
+                // response and let the client retry the fetch. This way we do not lose out on the data that
+                // would be returned for other share partitions in the fetch request.
+<span class="nc bnc" id="L95" title="All 2 branches missed.">                if (fetchPartitionData.error.code() == Errors.OFFSET_OUT_OF_RANGE.code()) {</span>
+                    try {
+<span class="nc" id="L97">                        sharePartition.updateCacheAndOffsets(offsetForEarliestTimestamp(topicIdPartition,</span>
+<span class="nc" id="L98">                            replicaManager, sharePartition.leaderEpoch()));</span>
+<span class="nc" id="L99">                    } catch (Exception e) {</span>
+<span class="nc" id="L100">                        log.error(&quot;Error while fetching offset for earliest timestamp for topicIdPartition: {}&quot;, topicIdPartition, e);</span>
+<span class="nc" id="L101">                        shareFetch.addErroneous(topicIdPartition, e);</span>
+<span class="nc" id="L102">                        exceptionHandler.accept(new SharePartitionKey(shareFetch.groupId(), topicIdPartition), e);</span>
+                        // Do not fill the response for this partition and continue.
+<span class="nc" id="L104">                        continue;</span>
+<span class="nc" id="L105">                    }</span>
+                    // We set the error code to NONE, as we have updated the start offset of the share partition
+                    // and the client can retry the fetch.
+<span class="nc" id="L108">                    partitionData.setErrorCode(Errors.NONE.code());</span>
+<span class="nc" id="L109">                    partitionData.setErrorMessage(Errors.NONE.message());</span>
+                }
+            } else {
+<span class="nc" id="L112">                ShareAcquiredRecords shareAcquiredRecords = sharePartition.acquire(</span>
+<span class="nc" id="L113">                    shareFetch.memberId(),</span>
+<span class="nc" id="L114">                    shareFetch.shareAcquireMode(),</span>
+<span class="nc" id="L115">                    shareFetch.batchSize(),</span>
+<span class="nc" id="L116">                    shareFetch.maxFetchRecords() - acquiredRecordsCount,</span>
+<span class="nc" id="L117">                    shareFetchPartitionData.fetchOffset(),</span>
+                    fetchPartitionData,
+<span class="nc" id="L119">                    shareFetch.fetchParams().isolation</span>
+                );
+<span class="nc" id="L121">                log.trace(&quot;Acquired records: {} for topicIdPartition: {}&quot;, shareAcquiredRecords, topicIdPartition);</span>
+                // Maybe, in the future, check if no records are acquired, and we want to retry
+                // replica manager fetch. Depends on the share partition manager implementation,
+                // if we want parallel requests for the same share partition or not.
+<span class="nc bnc" id="L125" title="All 2 branches missed.">                if (shareAcquiredRecords.acquiredRecords().isEmpty()) {</span>
+<span class="nc" id="L126">                    partitionData</span>
+<span class="nc" id="L127">                        .setRecords(MemoryRecords.EMPTY)</span>
+<span class="nc" id="L128">                        .setAcquiredRecords(List.of());</span>
+                } else {
+<span class="nc" id="L130">                    partitionData</span>
+<span class="nc" id="L131">                        .setRecords(maybeSliceFetchRecords(fetchPartitionData.records, shareAcquiredRecords))</span>
+<span class="nc" id="L132">                        .setAcquiredRecords(shareAcquiredRecords.acquiredRecords());</span>
+<span class="nc" id="L133">                    acquiredRecordsCount += shareAcquiredRecords.count();</span>
+                }
+            }
+<span class="nc" id="L136">            response.put(topicIdPartition, partitionData);</span>
+<span class="nc" id="L137">        }</span>
+<span class="nc" id="L138">        return response;</span>
+    }
+
+    /**
+     * The method is used to get the offset for the earliest timestamp for the topic-partition.
+     *
+     * @return The offset for the earliest timestamp.
+     */
+    static long offsetForEarliestTimestamp(TopicIdPartition topicIdPartition, ReplicaManager replicaManager, int leaderEpoch) {
+        // Isolation level is only required when reading from the latest offset hence use Option.empty() for now.
+<span class="nc" id="L148">        Optional&lt;FileRecords.TimestampAndOffset&gt; timestampAndOffset = replicaManager.fetchOffsetForTimestamp(</span>
+<span class="nc" id="L149">                topicIdPartition.topicPartition(), ListOffsetsRequest.EARLIEST_TIMESTAMP, Option.empty(),</span>
+<span class="nc" id="L150">                Optional.of(leaderEpoch), true).timestampAndOffsetOpt();</span>
+<span class="nc bnc" id="L151" title="All 2 branches missed.">        if (timestampAndOffset.isEmpty()) {</span>
+<span class="nc" id="L152">            throw new OffsetNotAvailableException(&quot;Offset for earliest timestamp not found for topic partition: &quot; + topicIdPartition);</span>
+        }
+<span class="nc" id="L154">        return timestampAndOffset.get().offset;</span>
+    }
+
+    /**
+     * The method is used to get the offset for the latest timestamp for the topic-partition.
+     *
+     * @return The offset for the latest timestamp.
+     */
+    static long offsetForLatestTimestamp(TopicIdPartition topicIdPartition, ReplicaManager replicaManager, int leaderEpoch) {
+        // Isolation level is set to READ_UNCOMMITTED, matching with that used in share fetch requests
+<span class="nc" id="L164">        Optional&lt;FileRecords.TimestampAndOffset&gt; timestampAndOffset = replicaManager.fetchOffsetForTimestamp(</span>
+<span class="nc" id="L165">            topicIdPartition.topicPartition(), ListOffsetsRequest.LATEST_TIMESTAMP, new Some&lt;&gt;(IsolationLevel.READ_UNCOMMITTED),</span>
+<span class="nc" id="L166">            Optional.of(leaderEpoch), true).timestampAndOffsetOpt();</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        if (timestampAndOffset.isEmpty()) {</span>
+<span class="nc" id="L168">            throw new OffsetNotAvailableException(&quot;Offset for latest timestamp not found for topic partition: &quot; + topicIdPartition);</span>
+        }
+<span class="nc" id="L170">        return timestampAndOffset.get().offset;</span>
+    }
+
+    /**
+     * The method is used to get the offset for the given timestamp for the topic-partition.
+     *
+     * @return The offset for the given timestamp.
+     */
+    static long offsetForTimestamp(TopicIdPartition topicIdPartition, ReplicaManager replicaManager, long timestampToSearch, int leaderEpoch) {
+<span class="nc" id="L179">        Optional&lt;FileRecords.TimestampAndOffset&gt; timestampAndOffset = replicaManager.fetchOffsetForTimestamp(</span>
+<span class="nc" id="L180">            topicIdPartition.topicPartition(), timestampToSearch, new Some&lt;&gt;(IsolationLevel.READ_UNCOMMITTED), Optional.of(leaderEpoch), true).timestampAndOffsetOpt();</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        if (timestampAndOffset.isEmpty()) {</span>
+<span class="nc" id="L182">            throw new OffsetNotAvailableException(&quot;Offset for timestamp &quot; + timestampToSearch + &quot; not found for topic partition: &quot; + topicIdPartition);</span>
+        }
+<span class="nc" id="L184">        return timestampAndOffset.get().offset;</span>
+    }
+
+    static int leaderEpoch(ReplicaManager replicaManager, TopicPartition tp) {
+<span class="nc" id="L188">        return partition(replicaManager, tp).getLeaderEpoch();</span>
+    }
+
+    static Partition partition(ReplicaManager replicaManager, TopicPartition tp) {
+<span class="nc" id="L192">        Partition partition = replicaManager.getPartitionOrException(tp);</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        if (!partition.isLeader()) {</span>
+<span class="nc" id="L194">            log.debug(&quot;The broker is not the leader for topic partition: {}-{}&quot;, tp.topic(), tp.partition());</span>
+<span class="nc" id="L195">            throw new NotLeaderOrFollowerException();</span>
+        }
+<span class="nc" id="L197">        return partition;</span>
+    }
+
+    /**
+     * Slice the fetch records based on the acquired records. The slicing is done based on the first
+     * and last offset of the acquired records from the list. The slicing doesn't consider individual
+     * acquired batches rather the boundaries of the acquired list. The method expects the acquired
+     * records list to be within the fetch records bounds.
+     *
+     * @param records The records to be sliced.
+     * @param shareAcquiredRecords The share acquired records containing the non-empty acquired records.
+     * @return The sliced records, if the acquired records are a subset of the fetched records. Otherwise,
+     *         the original records are returned.
+     */
+    static Records maybeSliceFetchRecords(Records records, ShareAcquiredRecords shareAcquiredRecords) {
+        // The acquired records should be non-empty, do not check as the method is called only when the
+        // acquired records are non-empty.
+<span class="nc" id="L214">        List&lt;AcquiredRecords&gt; acquiredRecords = shareAcquiredRecords.acquiredRecords();</span>
+        try {
+<span class="nc" id="L216">            final Iterator&lt;? extends RecordBatch&gt; iterator = records.batchIterator();</span>
+            // Track the first overlapping batch with the first acquired offset.
+<span class="nc" id="L218">            RecordBatch firstOverlapBatch = iterator.next();</span>
+            // If there exists single fetch batch, then return the original records.
+<span class="nc bnc" id="L220" title="All 2 branches missed.">            if (!iterator.hasNext()) {</span>
+<span class="nc" id="L221">                return records;</span>
+            }
+            // Find the first and last acquired offset to slice the records.
+<span class="nc" id="L224">            final long firstAcquiredOffset = acquiredRecords.get(0).firstOffset();</span>
+<span class="nc" id="L225">            final long lastAcquiredOffset = acquiredRecords.get(acquiredRecords.size() - 1).lastOffset();</span>
+<span class="nc" id="L226">            int startPosition = 0;</span>
+<span class="nc" id="L227">            int size = 0;</span>
+            // Start iterating from the second batch.
+<span class="nc bnc" id="L229" title="All 2 branches missed.">            while (iterator.hasNext()) {</span>
+<span class="nc" id="L230">                RecordBatch batch = iterator.next();</span>
+                // Iterate until finds the first overlap batch with the first acquired offset. All the
+                // batches before this first overlap batch should be sliced hence increment the start
+                // position.
+<span class="nc bnc" id="L234" title="All 2 branches missed.">                if (batch.baseOffset() &lt;= firstAcquiredOffset) {</span>
+<span class="nc" id="L235">                    startPosition += firstOverlapBatch.sizeInBytes();</span>
+<span class="nc" id="L236">                    firstOverlapBatch = batch;</span>
+<span class="nc" id="L237">                    continue;</span>
+                }
+                // Break if traversed all the batches till the last acquired offset.
+<span class="nc bnc" id="L240" title="All 2 branches missed.">                if (batch.baseOffset() &gt; lastAcquiredOffset) {</span>
+<span class="nc" id="L241">                    break;</span>
+                }
+<span class="nc" id="L243">                size += batch.sizeInBytes();</span>
+<span class="nc" id="L244">            }</span>
+            // Include the first overlap batch as it's the last batch traversed which overlapped the first
+            // acquired offset.
+<span class="nc" id="L247">            size += firstOverlapBatch.sizeInBytes();</span>
+            // Check if we do not need slicing i.e. neither start position nor size changed.
+<span class="nc bnc" id="L249" title="All 4 branches missed.">            if (startPosition == 0 &amp;&amp; size == records.sizeInBytes()) {</span>
+<span class="nc" id="L250">                return records;</span>
+            }
+<span class="nc" id="L252">            return records.slice(startPosition, size);</span>
+<span class="nc" id="L253">        } catch (Exception e) {</span>
+<span class="nc" id="L254">            log.error(&quot;Error while checking batches for acquired records: {}, skipping slicing.&quot;, acquiredRecords, e);</span>
+            // If there is an exception while slicing, return the original records so that the fetch
+            // can continue with the original records.
+<span class="nc" id="L257">            return records;</span>
+        }
+    }
+
+    /**
+     * Merges contiguous AcquiredRecords with the same delivery count into single records.
+     * &lt;p&gt;
+     * This method takes a list of AcquiredRecords where firstOffset and lastOffset typically are the
+     * same (representing single offsets), but not necessarily required, and merges contiguous offsets
+     * that have the same delivery count into ranges.
+     *
+     * @param result the list to accumulate merged AcquiredRecords into
+     * @param acquiredRecords the sorted list of AcquiredRecords to merge
+     */
+    static void accumulateAcquiredRecords(List&lt;AcquiredRecords&gt; result, List&lt;AcquiredRecords&gt; acquiredRecords) {
+<span class="nc bnc" id="L272" title="All 2 branches missed.">        if (acquiredRecords.isEmpty()) {</span>
+<span class="nc" id="L273">            return;</span>
+        }
+
+<span class="nc" id="L276">        long firstOffset = acquiredRecords.get(0).firstOffset();</span>
+<span class="nc" id="L277">        long lastOffset = acquiredRecords.get(0).lastOffset();</span>
+<span class="nc" id="L278">        short deliveryCount = acquiredRecords.get(0).deliveryCount();</span>
+
+<span class="nc bnc" id="L280" title="All 2 branches missed.">        for (int i = 1; i &lt; acquiredRecords.size(); i++) {</span>
+<span class="nc" id="L281">            AcquiredRecords current = acquiredRecords.get(i);</span>
+<span class="nc bnc" id="L282" title="All 4 branches missed.">            if (current.firstOffset() == lastOffset + 1 &amp;&amp; deliveryCount == current.deliveryCount()) {</span>
+                // Extend the last offset.
+<span class="nc" id="L284">                lastOffset = current.lastOffset();</span>
+            } else {
+                // Append the current accumulated batch and start a new batch.
+<span class="nc" id="L287">                result.add(new AcquiredRecords()</span>
+<span class="nc" id="L288">                    .setFirstOffset(firstOffset)</span>
+<span class="nc" id="L289">                    .setLastOffset(lastOffset)</span>
+<span class="nc" id="L290">                    .setDeliveryCount(deliveryCount));</span>
+                // Reset the accumulation variables to the current acquired records.
+<span class="nc" id="L292">                firstOffset = current.firstOffset();</span>
+<span class="nc" id="L293">                lastOffset = current.lastOffset();</span>
+<span class="nc" id="L294">                deliveryCount = current.deliveryCount();</span>
+            }
+        }
+        // Add the last accumulated batch.
+<span class="nc" id="L298">        result.add(new AcquiredRecords()</span>
+<span class="nc" id="L299">            .setFirstOffset(firstOffset)</span>
+<span class="nc" id="L300">            .setLastOffset(lastOffset)</span>
+<span class="nc" id="L301">            .setDeliveryCount(deliveryCount));</span>
+<span class="nc" id="L302">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

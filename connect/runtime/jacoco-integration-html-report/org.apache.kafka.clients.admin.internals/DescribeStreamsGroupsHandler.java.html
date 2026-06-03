@@ -1,0 +1,272 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DescribeStreamsGroupsHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.admin.internals</a> &gt; <span class="el_source">DescribeStreamsGroupsHandler.java</span></div><h1>DescribeStreamsGroupsHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.admin.internals;
+
+import org.apache.kafka.clients.admin.StreamsGroupDescription;
+import org.apache.kafka.clients.admin.StreamsGroupMemberAssignment;
+import org.apache.kafka.clients.admin.StreamsGroupMemberDescription;
+import org.apache.kafka.clients.admin.StreamsGroupSubtopologyDescription;
+import org.apache.kafka.common.GroupState;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.acl.AclOperation;
+import org.apache.kafka.common.message.StreamsGroupDescribeRequestData;
+import org.apache.kafka.common.message.StreamsGroupDescribeResponseData;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.AbstractResponse;
+import org.apache.kafka.common.requests.FindCoordinatorRequest.CoordinatorType;
+import org.apache.kafka.common.requests.StreamsGroupDescribeRequest;
+import org.apache.kafka.common.requests.StreamsGroupDescribeResponse;
+import org.apache.kafka.common.utils.LogContext;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.clients.admin.internals.AdminUtils.validAclOperations;
+
+public class DescribeStreamsGroupsHandler extends AdminApiHandler.Batched&lt;CoordinatorKey, StreamsGroupDescription&gt; {
+
+    private final boolean includeAuthorizedOperations;
+    private final Logger log;
+    private final AdminApiLookupStrategy&lt;CoordinatorKey&gt; lookupStrategy;
+
+    public DescribeStreamsGroupsHandler(
+          boolean includeAuthorizedOperations,
+<span class="nc" id="L57">          LogContext logContext) {</span>
+<span class="nc" id="L58">        this.includeAuthorizedOperations = includeAuthorizedOperations;</span>
+<span class="nc" id="L59">        this.log = logContext.logger(DescribeStreamsGroupsHandler.class);</span>
+<span class="nc" id="L60">        this.lookupStrategy = new CoordinatorStrategy(CoordinatorType.GROUP, logContext);</span>
+<span class="nc" id="L61">    }</span>
+
+    private static Set&lt;CoordinatorKey&gt; buildKeySet(Collection&lt;String&gt; groupIds) {
+<span class="nc" id="L64">        return groupIds.stream()</span>
+<span class="nc" id="L65">            .map(CoordinatorKey::byGroupId)</span>
+<span class="nc" id="L66">            .collect(Collectors.toSet());</span>
+    }
+
+    public static AdminApiFuture.SimpleAdminApiFuture&lt;CoordinatorKey, StreamsGroupDescription&gt; newFuture(Collection&lt;String&gt; groupIds) {
+<span class="nc" id="L70">        return AdminApiFuture.forKeys(buildKeySet(groupIds));</span>
+    }
+
+    @Override
+    public String apiName() {
+<span class="nc" id="L75">        return &quot;describeStreamsGroups&quot;;</span>
+    }
+
+    @Override
+    public AdminApiLookupStrategy&lt;CoordinatorKey&gt; lookupStrategy() {
+<span class="nc" id="L80">        return lookupStrategy;</span>
+    }
+
+    @Override
+    public StreamsGroupDescribeRequest.Builder buildBatchedRequest(int coordinatorId, Set&lt;CoordinatorKey&gt; keys) {
+<span class="nc" id="L85">        List&lt;String&gt; groupIds = keys.stream().map(key -&gt; {</span>
+<span class="nc bnc" id="L86" title="All 2 branches missed.">            if (key.type != CoordinatorType.GROUP) {</span>
+<span class="nc" id="L87">                throw new IllegalArgumentException(&quot;Invalid group coordinator key &quot; + key +</span>
+                    &quot; when building `DescribeStreamsGroups` request&quot;);
+            }
+<span class="nc" id="L90">            return key.idValue;</span>
+<span class="nc" id="L91">        }).collect(Collectors.toList());</span>
+<span class="nc" id="L92">        StreamsGroupDescribeRequestData data = new StreamsGroupDescribeRequestData()</span>
+<span class="nc" id="L93">            .setGroupIds(groupIds)</span>
+<span class="nc" id="L94">            .setIncludeAuthorizedOperations(includeAuthorizedOperations);</span>
+<span class="nc" id="L95">        return new StreamsGroupDescribeRequest.Builder(data);</span>
+    }
+
+    @Override
+    public ApiResult&lt;CoordinatorKey, StreamsGroupDescription&gt; handleResponse(
+            Node coordinator,
+            Set&lt;CoordinatorKey&gt; groupIds,
+            AbstractResponse abstractResponse) {
+<span class="nc" id="L103">        final StreamsGroupDescribeResponse response = (StreamsGroupDescribeResponse) abstractResponse;</span>
+<span class="nc" id="L104">        final Map&lt;CoordinatorKey, StreamsGroupDescription&gt; completed = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L105">        final Map&lt;CoordinatorKey, Throwable&gt; failed = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L106">        final Set&lt;CoordinatorKey&gt; groupsToUnmap = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L108" title="All 2 branches missed.">        for (StreamsGroupDescribeResponseData.DescribedGroup describedGroup : response.data().groups()) {</span>
+<span class="nc" id="L109">            CoordinatorKey groupIdKey = CoordinatorKey.byGroupId(describedGroup.groupId());</span>
+<span class="nc" id="L110">            Errors error = Errors.forCode(describedGroup.errorCode());</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">            if (error != Errors.NONE) {</span>
+<span class="nc" id="L112">                handleError(groupIdKey, describedGroup, coordinator, error, describedGroup.errorMessage(), completed, failed, groupsToUnmap);</span>
+<span class="nc" id="L113">                continue;</span>
+            }
+<span class="nc bnc" id="L115" title="All 2 branches missed.">            if (describedGroup.topology() == null) {</span>
+<span class="nc" id="L116">                log.error(&quot;`DescribeStreamsGroups` response for group id {} is missing the topology information&quot;, groupIdKey.idValue);</span>
+<span class="nc" id="L117">                failed.put(groupIdKey, new IllegalStateException(&quot;Topology information is missing&quot;));</span>
+<span class="nc" id="L118">                continue;</span>
+            }
+
+<span class="nc" id="L121">            final Set&lt;AclOperation&gt; authorizedOperations = validAclOperations(describedGroup.authorizedOperations());</span>
+
+<span class="nc" id="L123">            final StreamsGroupDescription streamsGroupDescription = new StreamsGroupDescription(</span>
+<span class="nc" id="L124">                    describedGroup.groupId(),</span>
+<span class="nc" id="L125">                    describedGroup.groupEpoch(),</span>
+<span class="nc" id="L126">                    describedGroup.assignmentEpoch(),</span>
+<span class="nc" id="L127">                    describedGroup.topology().epoch(),</span>
+<span class="nc" id="L128">                    convertSubtopologies(describedGroup.topology().subtopologies()),</span>
+<span class="nc" id="L129">                    convertMembers(describedGroup.members()),</span>
+<span class="nc" id="L130">                    GroupState.parse(describedGroup.groupState()),</span>
+                    coordinator,
+                    authorizedOperations
+            );
+<span class="nc" id="L134">            completed.put(groupIdKey, streamsGroupDescription);</span>
+<span class="nc" id="L135">        }</span>
+
+<span class="nc" id="L137">        return new ApiResult&lt;&gt;(completed, failed, new ArrayList&lt;&gt;(groupsToUnmap));</span>
+    }
+
+    private Collection&lt;StreamsGroupMemberDescription&gt; convertMembers(final List&lt;StreamsGroupDescribeResponseData.Member&gt; members) {
+<span class="nc" id="L141">        final List&lt;StreamsGroupMemberDescription&gt; memberDescriptions = new ArrayList&lt;&gt;(members.size());</span>
+<span class="nc" id="L142">        members.forEach(groupMember -&gt;</span>
+<span class="nc" id="L143">            memberDescriptions.add(new StreamsGroupMemberDescription(</span>
+<span class="nc" id="L144">                groupMember.memberId(),</span>
+<span class="nc" id="L145">                groupMember.memberEpoch(),</span>
+<span class="nc" id="L146">                Optional.ofNullable(groupMember.instanceId()),</span>
+<span class="nc" id="L147">                Optional.ofNullable(groupMember.rackId()),</span>
+<span class="nc" id="L148">                groupMember.clientId(),</span>
+<span class="nc" id="L149">                groupMember.clientHost(),</span>
+<span class="nc" id="L150">                groupMember.topologyEpoch(),</span>
+<span class="nc" id="L151">                groupMember.processId(),</span>
+<span class="nc" id="L152">                Optional.ofNullable(groupMember.userEndpoint()).map(this::convertEndpoint),</span>
+<span class="nc" id="L153">                convertClientTags(groupMember.clientTags()),</span>
+<span class="nc" id="L154">                convertTaskOffsets(groupMember.taskOffsets()),</span>
+<span class="nc" id="L155">                convertTaskOffsets(groupMember.taskEndOffsets()),</span>
+<span class="nc" id="L156">                convertAssignment(groupMember.assignment()),</span>
+<span class="nc" id="L157">                convertAssignment(groupMember.targetAssignment()),</span>
+<span class="nc" id="L158">                groupMember.isClassic()</span>
+            ))
+        );
+<span class="nc" id="L161">        return memberDescriptions;</span>
+    }
+
+    private Collection&lt;StreamsGroupSubtopologyDescription&gt; convertSubtopologies(final List&lt;StreamsGroupDescribeResponseData.Subtopology&gt; subtopologies) {
+<span class="nc" id="L165">        final List&lt;StreamsGroupSubtopologyDescription&gt; subtopologyDescriptions = new ArrayList&lt;&gt;(subtopologies.size());</span>
+<span class="nc" id="L166">        subtopologies.forEach(subtopology -&gt;</span>
+<span class="nc" id="L167">            subtopologyDescriptions.add(new StreamsGroupSubtopologyDescription(</span>
+<span class="nc" id="L168">                subtopology.subtopologyId(),</span>
+<span class="nc" id="L169">                subtopology.sourceTopics(),</span>
+<span class="nc" id="L170">                subtopology.repartitionSinkTopics(),</span>
+<span class="nc" id="L171">                convertTopicInfos(subtopology.stateChangelogTopics()),</span>
+<span class="nc" id="L172">                convertTopicInfos(subtopology.repartitionSourceTopics())</span>
+            ))
+        );
+<span class="nc" id="L175">        return subtopologyDescriptions;</span>
+    }
+
+    private Map&lt;String, StreamsGroupSubtopologyDescription.TopicInfo&gt; convertTopicInfos(final List&lt;StreamsGroupDescribeResponseData.TopicInfo&gt; topicInfos) {
+<span class="nc" id="L179">        return topicInfos.stream().collect(Collectors.toMap(</span>
+            StreamsGroupDescribeResponseData.TopicInfo::name,
+<span class="nc" id="L181">            topicInfo -&gt; new StreamsGroupSubtopologyDescription.TopicInfo(</span>
+<span class="nc" id="L182">                topicInfo.partitions(),</span>
+<span class="nc" id="L183">                topicInfo.replicationFactor(),</span>
+<span class="nc" id="L184">                topicInfo.topicConfigs().stream().collect(Collectors.toMap(</span>
+                    StreamsGroupDescribeResponseData.KeyValue::key,
+                    StreamsGroupDescribeResponseData.KeyValue::value
+                ))
+            )
+        ));
+    }
+
+    private StreamsGroupMemberAssignment.TaskIds convertTaskIds(final StreamsGroupDescribeResponseData.TaskIds taskIds) {
+<span class="nc" id="L193">        return new StreamsGroupMemberAssignment.TaskIds(</span>
+<span class="nc" id="L194">            taskIds.subtopologyId(),</span>
+<span class="nc" id="L195">            taskIds.partitions()</span>
+        );
+    }
+
+    private StreamsGroupMemberAssignment convertAssignment(final StreamsGroupDescribeResponseData.Assignment assignment) {
+<span class="nc" id="L200">        return new StreamsGroupMemberAssignment(</span>
+<span class="nc" id="L201">            assignment.activeTasks().stream().map(this::convertTaskIds).collect(Collectors.toList()),</span>
+<span class="nc" id="L202">            assignment.standbyTasks().stream().map(this::convertTaskIds).collect(Collectors.toList()),</span>
+<span class="nc" id="L203">            assignment.warmupTasks().stream().map(this::convertTaskIds).collect(Collectors.toList())</span>
+        );
+    }
+
+    private List&lt;StreamsGroupMemberDescription.TaskOffset&gt; convertTaskOffsets(final List&lt;StreamsGroupDescribeResponseData.TaskOffset&gt; taskOffsets) {
+<span class="nc" id="L208">        return taskOffsets.stream().map(taskOffset -&gt;</span>
+<span class="nc" id="L209">            new StreamsGroupMemberDescription.TaskOffset(</span>
+<span class="nc" id="L210">                taskOffset.subtopologyId(),</span>
+<span class="nc" id="L211">                taskOffset.partition(),</span>
+<span class="nc" id="L212">                taskOffset.offset()</span>
+            )
+<span class="nc" id="L214">        ).collect(Collectors.toList());</span>
+    }
+
+    private Map&lt;String, String&gt; convertClientTags(final List&lt;StreamsGroupDescribeResponseData.KeyValue&gt; keyValues) {
+<span class="nc" id="L218">        return keyValues.stream().collect(Collectors.toMap(</span>
+            StreamsGroupDescribeResponseData.KeyValue::key,
+            StreamsGroupDescribeResponseData.KeyValue::value
+        ));
+    }
+
+    private StreamsGroupMemberDescription.Endpoint convertEndpoint(final StreamsGroupDescribeResponseData.Endpoint endpoint) {
+<span class="nc" id="L225">        return new StreamsGroupMemberDescription.Endpoint(endpoint.host(), endpoint.port());</span>
+    }
+
+
+    private void handleError(
+            CoordinatorKey groupId,
+            StreamsGroupDescribeResponseData.DescribedGroup describedGroup,
+            Node coordinator,
+            Errors error,
+            String errorMsg,
+            Map&lt;CoordinatorKey, StreamsGroupDescription&gt; completed,
+            Map&lt;CoordinatorKey, Throwable&gt; failed,
+            Set&lt;CoordinatorKey&gt; groupsToUnmap) {
+<span class="nc bnc" id="L238" title="All 5 branches missed.">        switch (error) {</span>
+            case GROUP_AUTHORIZATION_FAILED:
+            case TOPIC_AUTHORIZATION_FAILED:
+<span class="nc" id="L241">                log.debug(&quot;`DescribeStreamsGroups` request for group id {} failed due to error {}&quot;, groupId.idValue, error);</span>
+<span class="nc" id="L242">                failed.put(groupId, error.exception(errorMsg));</span>
+<span class="nc" id="L243">                break;</span>
+
+            case COORDINATOR_LOAD_IN_PROGRESS:
+                // If the coordinator is in the middle of loading, then we just need to retry
+<span class="nc" id="L247">                log.debug(&quot;`DescribeStreamsGroups` request for group id {} failed because the coordinator &quot; +</span>
+                    &quot;is still in the process of loading state. Will retry&quot;, groupId.idValue);
+<span class="nc" id="L249">                break;</span>
+
+            case COORDINATOR_NOT_AVAILABLE:
+            case NOT_COORDINATOR:
+                // If the coordinator is unavailable or there was a coordinator change, then we unmap
+                // the key so that we retry the `FindCoordinator` request
+<span class="nc" id="L255">                log.debug(&quot;`DescribeStreamsGroups` request for group id {} returned error {}. &quot; +</span>
+                    &quot;Will attempt to find the coordinator again and retry&quot;, groupId.idValue, error);
+<span class="nc" id="L257">                groupsToUnmap.add(groupId);</span>
+<span class="nc" id="L258">                break;</span>
+
+            case GROUP_ID_NOT_FOUND:
+<span class="nc" id="L261">                log.debug(&quot;`DescribeStreamsGroups` request for group id {} failed because the group does not exist. {}&quot;,</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">                    groupId.idValue, errorMsg != null ? errorMsg : &quot;&quot;);</span>
+<span class="nc" id="L263">                failed.put(groupId, error.exception(errorMsg));</span>
+<span class="nc" id="L264">                break;</span>
+
+            default:
+<span class="nc" id="L267">                log.error(&quot;`DescribeStreamsGroups` request for group id {} failed due to unexpected error {}&quot;, groupId.idValue, error);</span>
+<span class="nc" id="L268">                failed.put(groupId, error.exception(errorMsg));</span>
+        }
+<span class="nc" id="L270">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

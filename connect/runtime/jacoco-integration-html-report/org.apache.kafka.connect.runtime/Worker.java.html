@@ -1,0 +1,2416 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Worker.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">Worker.java</span></div><h1>Worker.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.AlterConsumerGroupOffsetsOptions;
+import org.apache.kafka.clients.admin.AlterConsumerGroupOffsetsResult;
+import org.apache.kafka.clients.admin.DeleteConsumerGroupOffsetsOptions;
+import org.apache.kafka.clients.admin.DeleteConsumerGroupOffsetsResult;
+import org.apache.kafka.clients.admin.DeleteConsumerGroupsOptions;
+import org.apache.kafka.clients.admin.FenceProducersOptions;
+import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsOptions;
+import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsResult;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.MetricNameTemplate;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigValue;
+import org.apache.kafka.common.config.provider.ConfigProvider;
+import org.apache.kafka.common.errors.GroupIdNotFoundException;
+import org.apache.kafka.common.errors.GroupNotEmptyException;
+import org.apache.kafka.common.errors.GroupSubscribedToTopicException;
+import org.apache.kafka.common.errors.UnknownMemberIdException;
+import org.apache.kafka.common.internals.Plugin;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.ThreadUtils;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.connector.Connector;
+import org.apache.kafka.connect.connector.Task;
+import org.apache.kafka.connect.connector.policy.ConnectorClientConfigOverridePolicy;
+import org.apache.kafka.connect.connector.policy.ConnectorClientConfigRequest;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.health.ConnectorType;
+import org.apache.kafka.connect.json.JsonConverter;
+import org.apache.kafka.connect.json.JsonConverterConfig;
+import org.apache.kafka.connect.runtime.ConnectMetrics.MetricGroup;
+import org.apache.kafka.connect.runtime.distributed.DistributedConfig;
+import org.apache.kafka.connect.runtime.errors.DeadLetterQueueReporter;
+import org.apache.kafka.connect.runtime.errors.ErrorHandlingMetrics;
+import org.apache.kafka.connect.runtime.errors.ErrorReporter;
+import org.apache.kafka.connect.runtime.errors.LogReporter;
+import org.apache.kafka.connect.runtime.errors.RetryWithToleranceOperator;
+import org.apache.kafka.connect.runtime.errors.WorkerErrantRecordReporter;
+import org.apache.kafka.connect.runtime.isolation.LoaderSwap;
+import org.apache.kafka.connect.runtime.isolation.PluginUtils;
+import org.apache.kafka.connect.runtime.isolation.Plugins;
+import org.apache.kafka.connect.runtime.isolation.Plugins.ClassLoaderUsage;
+import org.apache.kafka.connect.runtime.isolation.VersionedPluginLoadingException;
+import org.apache.kafka.connect.runtime.rest.RestServer;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorOffset;
+import org.apache.kafka.connect.runtime.rest.entities.ConnectorOffsets;
+import org.apache.kafka.connect.runtime.rest.entities.Message;
+import org.apache.kafka.connect.sink.SinkConnector;
+import org.apache.kafka.connect.sink.SinkRecord;
+import org.apache.kafka.connect.sink.SinkTask;
+import org.apache.kafka.connect.source.SourceConnector;
+import org.apache.kafka.connect.source.SourceRecord;
+import org.apache.kafka.connect.source.SourceTask;
+import org.apache.kafka.connect.storage.CloseableOffsetStorageReader;
+import org.apache.kafka.connect.storage.ClusterConfigState;
+import org.apache.kafka.connect.storage.ConnectorOffsetBackingStore;
+import org.apache.kafka.connect.storage.Converter;
+import org.apache.kafka.connect.storage.HeaderConverter;
+import org.apache.kafka.connect.storage.KafkaOffsetBackingStore;
+import org.apache.kafka.connect.storage.OffsetBackingStore;
+import org.apache.kafka.connect.storage.OffsetStorageReader;
+import org.apache.kafka.connect.storage.OffsetStorageReaderImpl;
+import org.apache.kafka.connect.storage.OffsetStorageWriter;
+import org.apache.kafka.connect.storage.OffsetUtils;
+import org.apache.kafka.connect.util.Callback;
+import org.apache.kafka.connect.util.ConnectUtils;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+import org.apache.kafka.connect.util.FutureCallback;
+import org.apache.kafka.connect.util.LoggingContext;
+import org.apache.kafka.connect.util.SinkUtils;
+import org.apache.kafka.connect.util.TopicAdmin;
+import org.apache.kafka.connect.util.TopicCreationGroup;
+
+import org.apache.maven.artifact.versioning.InvalidVersionSpecificationException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static org.apache.kafka.clients.CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG;
+
+/**
+ * &lt;p&gt;
+ * Worker runs a (dynamic) set of tasks in a set of threads, doing the work of actually moving
+ * data to/from Kafka.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Since each task has a dedicated thread, this is mainly just a container for them.
+ * &lt;/p&gt;
+ */
+public final class Worker {
+
+<span class="fc" id="L142">    public static final long CONNECTOR_GRACEFUL_SHUTDOWN_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(5);</span>
+<span class="fc" id="L143">    public static final long EXECUTOR_SHUTDOWN_TERMINATION_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(1);</span>
+
+<span class="fc" id="L145">    private static final Logger log = LoggerFactory.getLogger(Worker.class);</span>
+
+    Herder herder;
+    private final ExecutorService executor;
+    private final Time time;
+    private final String workerId;
+    //kafka cluster id
+    private final String kafkaClusterId;
+    private final Plugins plugins;
+    private final ConnectMetrics metrics;
+    private final WorkerMetricsGroup workerMetricsGroup;
+    private ConnectorStatusMetricsGroup connectorStatusMetricsGroup;
+    private final WorkerConfig config;
+    private final Converter internalKeyConverter;
+    private final Converter internalValueConverter;
+    private final OffsetBackingStore globalOffsetBackingStore;
+
+<span class="fc" id="L162">    private final ConcurrentMap&lt;String, WorkerConnector&gt; connectors = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L163">    private final ConcurrentMap&lt;ConnectorTaskId, WorkerTask&lt;?, ?&gt;&gt; tasks = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L164">    private Optional&lt;SourceTaskOffsetCommitter&gt; sourceTaskOffsetCommitter = Optional.empty();</span>
+    private final WorkerConfigTransformer workerConfigTransformer;
+    private final ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy;
+    private final Function&lt;Map&lt;String, Object&gt;, Admin&gt; adminFactory;
+
+    public Worker(
+        String workerId,
+        Time time,
+        Plugins plugins,
+        WorkerConfig config,
+        OffsetBackingStore globalOffsetBackingStore,
+        ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy) {
+<span class="fc" id="L176">        this(workerId, time, plugins, config, globalOffsetBackingStore, Executors.newCachedThreadPool(), connectorClientConfigOverridePolicy, Admin::create);</span>
+<span class="fc" id="L177">    }</span>
+
+    Worker(
+            String workerId,
+            Time time,
+            Plugins plugins,
+            WorkerConfig config,
+            OffsetBackingStore globalOffsetBackingStore,
+            ExecutorService executorService,
+            ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
+            Function&lt;Map&lt;String, Object&gt;, Admin&gt; adminFactory
+<span class="fc" id="L188">    ) {</span>
+<span class="fc" id="L189">        this.kafkaClusterId = config.kafkaClusterId();</span>
+<span class="fc" id="L190">        this.metrics = new ConnectMetrics(workerId, config, time, kafkaClusterId);</span>
+<span class="fc" id="L191">        this.executor = executorService;</span>
+<span class="fc" id="L192">        this.workerId = workerId;</span>
+<span class="fc" id="L193">        this.time = time;</span>
+<span class="fc" id="L194">        this.plugins = plugins;</span>
+<span class="fc" id="L195">        this.config = config;</span>
+<span class="fc" id="L196">        this.connectorClientConfigOverridePolicy = connectorClientConfigOverridePolicy;</span>
+<span class="fc" id="L197">        this.workerMetricsGroup = new WorkerMetricsGroup(this.connectors, this.tasks, metrics);</span>
+
+<span class="fc" id="L199">        Map&lt;String, String&gt; internalConverterConfig = Map.of(JsonConverterConfig.SCHEMAS_ENABLE_CONFIG, &quot;false&quot;);</span>
+<span class="fc" id="L200">        this.internalKeyConverter = plugins.newInternalConverter(true, JsonConverter.class.getName(), internalConverterConfig);</span>
+<span class="fc" id="L201">        this.internalValueConverter = plugins.newInternalConverter(false, JsonConverter.class.getName(), internalConverterConfig);</span>
+
+<span class="fc" id="L203">        this.globalOffsetBackingStore = globalOffsetBackingStore;</span>
+
+<span class="fc" id="L205">        this.workerConfigTransformer = initConfigTransformer();</span>
+<span class="fc" id="L206">        this.adminFactory = adminFactory;</span>
+<span class="fc" id="L207">    }</span>
+
+    private WorkerConfigTransformer initConfigTransformer() {
+<span class="fc" id="L210">        final List&lt;String&gt; providerNames = config.getList(WorkerConfig.CONFIG_PROVIDERS_CONFIG);</span>
+<span class="fc" id="L211">        Map&lt;String, ConfigProvider&gt; providerMap = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L212" title="1 of 2 branches missed.">        for (String providerName : providerNames) {</span>
+<span class="nc" id="L213">            ConfigProvider configProvider = plugins.newConfigProvider(</span>
+                    config,
+                    WorkerConfig.CONFIG_PROVIDERS_CONFIG + &quot;.&quot; + providerName,
+                    ClassLoaderUsage.PLUGINS
+            );
+<span class="nc" id="L218">            providerMap.put(providerName, configProvider);</span>
+<span class="nc" id="L219">        }</span>
+<span class="fc" id="L220">        return new WorkerConfigTransformer(this, providerMap);</span>
+    }
+
+    public WorkerConfigTransformer configTransformer() {
+<span class="fc" id="L224">        return workerConfigTransformer;</span>
+    }
+
+    Herder herder() {
+<span class="nc" id="L228">        return herder;</span>
+    }
+
+    /**
+     * Start worker.
+     */
+    public void start() {
+<span class="fc" id="L235">        log.info(&quot;Worker starting&quot;);</span>
+
+<span class="fc" id="L237">        globalOffsetBackingStore.start();</span>
+
+<span class="pc bpc" id="L239" title="1 of 2 branches missed.">        sourceTaskOffsetCommitter = config.exactlyOnceSourceEnabled()</span>
+<span class="nc" id="L240">                ? Optional.empty()</span>
+<span class="fc" id="L241">                : Optional.of(new SourceTaskOffsetCommitter(config));</span>
+
+<span class="fc" id="L243">        connectorStatusMetricsGroup = new ConnectorStatusMetricsGroup(metrics, tasks, herder);</span>
+
+<span class="fc" id="L245">        log.info(&quot;Worker started&quot;);</span>
+<span class="fc" id="L246">    }</span>
+
+    /**
+     * Stop worker.
+     */
+    public void stop() {
+<span class="fc" id="L252">        log.info(&quot;Worker stopping&quot;);</span>
+
+<span class="fc" id="L254">        long started = time.milliseconds();</span>
+<span class="fc" id="L255">        long limit = started + config.getLong(WorkerConfig.TASK_SHUTDOWN_GRACEFUL_TIMEOUT_MS_CONFIG);</span>
+
+<span class="pc bpc" id="L257" title="1 of 2 branches missed.">        if (!connectors.isEmpty()) {</span>
+<span class="nc" id="L258">            log.warn(&quot;Shutting down connectors {} uncleanly; herder should have shut down connectors before the Worker is stopped&quot;, connectors.keySet());</span>
+<span class="nc" id="L259">            stopAndAwaitConnectors();</span>
+        }
+
+<span class="pc bpc" id="L262" title="1 of 2 branches missed.">        if (!tasks.isEmpty()) {</span>
+<span class="nc" id="L263">            log.warn(&quot;Shutting down tasks {} uncleanly; herder should have shut down tasks before the Worker is stopped&quot;, tasks.keySet());</span>
+<span class="nc" id="L264">            stopAndAwaitTasks();</span>
+        }
+
+<span class="fc" id="L267">        long timeoutMs = limit - time.milliseconds();</span>
+<span class="fc" id="L268">        sourceTaskOffsetCommitter.ifPresent(committer -&gt; committer.close(timeoutMs));</span>
+
+<span class="fc" id="L270">        globalOffsetBackingStore.stop();</span>
+<span class="fc" id="L271">        metrics.stop();</span>
+
+<span class="fc" id="L273">        log.info(&quot;Worker stopped&quot;);</span>
+
+<span class="fc" id="L275">        workerMetricsGroup.close();</span>
+<span class="pc bpc" id="L276" title="1 of 2 branches missed.">        if (connectorStatusMetricsGroup != null) {</span>
+<span class="fc" id="L277">            connectorStatusMetricsGroup.close();</span>
+        }
+
+<span class="fc" id="L280">        workerConfigTransformer.close();</span>
+<span class="fc" id="L281">        ThreadUtils.shutdownExecutorServiceQuietly(executor, EXECUTOR_SHUTDOWN_TERMINATION_TIMEOUT_MS, TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L282">        Utils.closeQuietly(internalKeyConverter, &quot;internal key converter&quot;);</span>
+<span class="fc" id="L283">        Utils.closeQuietly(internalValueConverter, &quot;internal value converter&quot;);</span>
+<span class="fc" id="L284">    }</span>
+
+    public WorkerConfig config() {
+<span class="fc" id="L287">        return config;</span>
+    }
+
+    /**
+     * Start a connector managed by this worker.
+     *
+     * @param connName the connector name.
+     * @param connProps the properties of the connector.
+     * @param ctx the connector runtime context.
+     * @param statusListener a listener for the runtime status transitions of the connector.
+     * @param initialState the initial state of the connector.
+     * @param onConnectorStateChange invoked when the initial state change of the connector is completed
+     */
+    public void startConnector(
+            String connName,
+            Map&lt;String, String&gt; connProps,
+            CloseableConnectorContext ctx,
+            ConnectorStatus.Listener statusListener,
+            TargetState initialState,
+            Callback&lt;TargetState&gt; onConnectorStateChange
+    ) {
+<span class="fc" id="L308">        final ConnectorStatus.Listener connectorStatusListener = workerMetricsGroup.wrapStatusListener(statusListener);</span>
+<span class="fc" id="L309">        try (LoggingContext loggingContext = LoggingContext.forConnector(connName)) {</span>
+<span class="pc bpc" id="L310" title="1 of 2 branches missed.">            if (connectors.containsKey(connName)) {</span>
+<span class="nc" id="L311">                onConnectorStateChange.onCompletion(</span>
+                        new ConnectException(&quot;Connector with name &quot; + connName + &quot; already exists&quot;),
+                        null);
+<span class="nc" id="L314">                return;</span>
+            }
+
+            final WorkerConnector workerConnector;
+<span class="fc" id="L318">            final String connClass = connProps.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG);</span>
+            final ClassLoader connectorLoader;
+
+            try {
+<span class="fc" id="L322">                connectorLoader = connectorClassLoader(connProps);</span>
+<span class="fc" id="L323">                try (LoaderSwap loaderSwap = plugins.withClassLoader(connectorLoader)) {</span>
+<span class="fc" id="L324">                    log.info(&quot;Creating connector {} of type {}&quot;, connName, connClass);</span>
+<span class="fc" id="L325">                    final Connector connector = instantiateConnector(connProps);</span>
+
+                    final ConnectorConfig connConfig;
+                    final CloseableOffsetStorageReader offsetReader;
+                    final ConnectorOffsetBackingStore offsetStore;
+
+<span class="fc bfc" id="L331" title="All 2 branches covered.">                    if (ConnectUtils.isSinkConnector(connector)) {</span>
+<span class="fc" id="L332">                        connConfig = new SinkConnectorConfig(plugins, connProps);</span>
+<span class="fc" id="L333">                        offsetReader = null;</span>
+<span class="fc" id="L334">                        offsetStore = null;</span>
+                    } else {
+<span class="fc" id="L336">                        SourceConnectorConfig sourceConfig = new SourceConnectorConfig(plugins, connProps, config.topicCreationEnable());</span>
+<span class="fc" id="L337">                        connConfig = sourceConfig;</span>
+
+                        // Set up the offset backing store for this connector instance
+<span class="pc bpc" id="L340" title="1 of 2 branches missed.">                        offsetStore = config.exactlyOnceSourceEnabled()</span>
+<span class="nc" id="L341">                            ? offsetStoreForExactlyOnceSourceConnector(sourceConfig, connName, connector, null)</span>
+<span class="fc" id="L342">                            : offsetStoreForRegularSourceConnector(sourceConfig, connName, connector, null);</span>
+<span class="fc" id="L343">                        offsetStore.configure(config);</span>
+<span class="fc" id="L344">                        offsetReader = new OffsetStorageReaderImpl(offsetStore, connName, internalKeyConverter, internalValueConverter);</span>
+                    }
+<span class="fc" id="L346">                    workerConnector = new WorkerConnector(</span>
+                        connName, connector, connConfig, ctx, metrics, connectorStatusListener, offsetReader, offsetStore, connectorLoader);
+<span class="fc" id="L348">                    log.info(&quot;Instantiated connector {} with version {} of type {}&quot;, connName, workerConnector.connectorVersion(), connector.getClass());</span>
+<span class="fc" id="L349">                    workerConnector.transitionTo(initialState, onConnectorStateChange);</span>
+                }
+<span class="nc" id="L351">            } catch (Throwable t) {</span>
+<span class="nc" id="L352">                log.error(&quot;Failed to start connector {}&quot;, connName, t);</span>
+<span class="nc" id="L353">                connectorStatusListener.onFailure(connName, t);</span>
+<span class="nc" id="L354">                onConnectorStateChange.onCompletion(t, null);</span>
+<span class="nc" id="L355">                return;</span>
+<span class="fc" id="L356">            }</span>
+
+<span class="fc" id="L358">            WorkerConnector existing = connectors.putIfAbsent(connName, workerConnector);</span>
+<span class="pc bpc" id="L359" title="1 of 2 branches missed.">            if (existing != null) {</span>
+<span class="nc" id="L360">                onConnectorStateChange.onCompletion(</span>
+                        new ConnectException(&quot;Connector with name &quot; + connName + &quot; already exists&quot;),
+                        null);
+                // Don't need to do any cleanup of the WorkerConnector instance (such as calling
+                // shutdown() on it) here because it hasn't actually started running yet
+<span class="nc" id="L365">                return;</span>
+            }
+
+<span class="fc" id="L368">            executor.submit(plugins.withClassLoader(connectorLoader, workerConnector));</span>
+
+<span class="fc" id="L370">            log.info(&quot;Finished creating connector {}&quot;, connName);</span>
+<span class="nc bnc" id="L371" title="All 6 branches missed.">        }</span>
+<span class="fc" id="L372">    }</span>
+
+    /**
+     * Return true if the connector associated with this worker is a sink connector.
+     *
+     * @param connName the connector name.
+     * @return true if the connector belongs to the worker and is a sink connector.
+     * @throws ConnectException if the worker does not manage a connector with the given name.
+     */
+    public boolean isSinkConnector(String connName) {
+<span class="fc" id="L382">        WorkerConnector workerConnector = connectors.get(connName);</span>
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">        if (workerConnector == null)</span>
+<span class="nc" id="L384">            throw new ConnectException(&quot;Connector &quot; + connName + &quot; not found in this worker.&quot;);</span>
+
+<span class="fc" id="L386">        try (LoaderSwap loaderSwap = plugins.withClassLoader(workerConnector.loader())) {</span>
+<span class="fc" id="L387">            return workerConnector.isSinkConnector();</span>
+        }
+    }
+
+    /**
+     * Get a list of updated task properties for the tasks of this connector.
+     *
+     * @param connName the connector name.
+     * @return a list of updated tasks properties.
+     */
+    public List&lt;Map&lt;String, String&gt;&gt; connectorTaskConfigs(String connName, ConnectorConfig connConfig) {
+<span class="fc" id="L398">        List&lt;Map&lt;String, String&gt;&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L399">        try (LoggingContext loggingContext = LoggingContext.forConnector(connName)) {</span>
+<span class="fc" id="L400">            log.trace(&quot;Reconfiguring connector tasks for {}&quot;, connName);</span>
+
+<span class="fc" id="L402">            WorkerConnector workerConnector = connectors.get(connName);</span>
+<span class="pc bpc" id="L403" title="1 of 2 branches missed.">            if (workerConnector == null)</span>
+<span class="nc" id="L404">                throw new ConnectException(&quot;Connector &quot; + connName + &quot; not found in this worker.&quot;);</span>
+
+<span class="fc" id="L406">            int maxTasks = connConfig.tasksMax();</span>
+<span class="fc" id="L407">            Map&lt;String, String&gt; connOriginals = connConfig.originalsStrings();</span>
+
+<span class="fc" id="L409">            Connector connector = workerConnector.connector();</span>
+<span class="fc" id="L410">            try (LoaderSwap loaderSwap = plugins.withClassLoader(workerConnector.loader())) {</span>
+<span class="fc" id="L411">                String taskClassName = connector.taskClass().getName();</span>
+<span class="fc" id="L412">                List&lt;Map&lt;String, String&gt;&gt; taskConfigs = connector.taskConfigs(maxTasks);</span>
+                try {
+<span class="fc" id="L414">                    checkTasksMax(connName, taskConfigs.size(), maxTasks, connConfig.enforceTasksMax());</span>
+<span class="nc" id="L415">                } catch (TooManyTasksException e) {</span>
+                    // TODO: This control flow is awkward. Push task config generation into WorkerConnector class?
+<span class="nc" id="L417">                    workerConnector.fail(e);</span>
+<span class="nc" id="L418">                    throw e;</span>
+<span class="fc" id="L419">                }</span>
+<span class="fc bfc" id="L420" title="All 2 branches covered.">                for (Map&lt;String, String&gt; taskProps : taskConfigs) {</span>
+                    // Ensure we don't modify the connector's copy of the config
+<span class="fc" id="L422">                    Map&lt;String, String&gt; taskConfig = new HashMap&lt;&gt;(taskProps);</span>
+<span class="fc" id="L423">                    taskConfig.put(TaskConfig.TASK_CLASS_CONFIG, taskClassName);</span>
+<span class="fc bfc" id="L424" title="All 2 branches covered.">                    if (connOriginals.containsKey(SinkTask.TOPICS_CONFIG)) {</span>
+<span class="fc" id="L425">                        taskConfig.put(SinkTask.TOPICS_CONFIG, connOriginals.get(SinkTask.TOPICS_CONFIG));</span>
+                    }
+<span class="pc bpc" id="L427" title="1 of 2 branches missed.">                    if (connOriginals.containsKey(SinkTask.TOPICS_REGEX_CONFIG)) {</span>
+<span class="nc" id="L428">                        taskConfig.put(SinkTask.TOPICS_REGEX_CONFIG, connOriginals.get(SinkTask.TOPICS_REGEX_CONFIG));</span>
+                    }
+<span class="fc" id="L430">                    result.add(taskConfig);</span>
+<span class="fc" id="L431">                }</span>
+            }
+        }
+
+<span class="fc" id="L435">        return result;</span>
+    }
+
+    private void checkTasksMax(String connName, int numTasks, int maxTasks, boolean enforce) {
+<span class="pc bpc" id="L439" title="1 of 2 branches missed.">        if (numTasks &gt; maxTasks) {</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">            if (enforce) {</span>
+<span class="nc" id="L441">                throw new TooManyTasksException(connName, numTasks, maxTasks);</span>
+            } else {
+<span class="nc" id="L443">                log.warn(</span>
+                        &quot;The connector {} has generated {} tasks, which is greater than {}, &quot;
+                                + &quot;the maximum number of tasks it is configured to create. &quot;
+                                + &quot;This behavior should be considered a bug and will be disallowed &quot;
+                                + &quot;in future releases of Kafka Connect. Please report this to the &quot;
+                                + &quot;maintainers of the connector and request that they adjust their &quot;
+                                + &quot;connector's taskConfigs() method to respect the maxTasks parameter.&quot;,
+                        connName,
+<span class="nc" id="L451">                        numTasks,</span>
+<span class="nc" id="L452">                        maxTasks</span>
+                );
+            }
+        }
+<span class="fc" id="L456">    }</span>
+
+    /**
+     * Stop a connector managed by this worker.
+     *
+     * @param connName the connector name.
+     */
+    private void stopConnector(String connName) {
+<span class="fc" id="L464">        try (LoggingContext loggingContext = LoggingContext.forConnector(connName)) {</span>
+<span class="fc" id="L465">            WorkerConnector workerConnector = connectors.get(connName);</span>
+<span class="fc" id="L466">            log.info(&quot;Stopping connector {}&quot;, connName);</span>
+
+<span class="pc bpc" id="L468" title="1 of 2 branches missed.">            if (workerConnector == null) {</span>
+<span class="nc" id="L469">                log.warn(&quot;Ignoring stop request for unowned connector {}&quot;, connName);</span>
+<span class="nc" id="L470">                return;</span>
+            }
+
+<span class="fc" id="L473">            try (LoaderSwap loaderSwap = plugins.withClassLoader(workerConnector.loader())) {</span>
+<span class="fc" id="L474">                workerConnector.shutdown();</span>
+            }
+<span class="nc bnc" id="L476" title="All 2 branches missed.">        }</span>
+<span class="fc" id="L477">    }</span>
+
+    private void stopConnectors(Collection&lt;String&gt; ids) {
+        // Herder is responsible for stopping connectors. This is an internal method to sequentially
+        // stop connectors that have not explicitly been stopped.
+<span class="pc bpc" id="L482" title="1 of 2 branches missed.">        for (String connector: ids)</span>
+<span class="nc" id="L483">            stopConnector(connector);</span>
+<span class="fc" id="L484">    }</span>
+
+    private void awaitStopConnector(String connName, long timeout) {
+<span class="fc" id="L487">        try (LoggingContext loggingContext = LoggingContext.forConnector(connName)) {</span>
+<span class="fc" id="L488">            WorkerConnector connector = connectors.remove(connName);</span>
+<span class="pc bpc" id="L489" title="1 of 2 branches missed.">            if (connector == null) {</span>
+<span class="nc" id="L490">                log.warn(&quot;Ignoring await stop request for non-present connector {}&quot;, connName);</span>
+<span class="nc" id="L491">                return;</span>
+            }
+
+<span class="pc bpc" id="L494" title="1 of 2 branches missed.">            if (!connector.awaitShutdown(timeout)) {</span>
+<span class="nc" id="L495">                log.error(&quot;Connector '{}' failed to properly shut down, has become unresponsive, and &quot;</span>
+                        + &quot;may be consuming external resources. Correct the configuration for &quot;
+                        + &quot;this connector or remove the connector. After fixing the connector, it &quot;
+                        + &quot;may be necessary to restart this worker to release any consumed &quot;
+                        + &quot;resources.&quot;, connName);
+<span class="nc" id="L500">                connector.cancel();</span>
+            } else {
+<span class="fc" id="L502">                log.debug(&quot;Graceful stop of connector {} succeeded.&quot;, connName);</span>
+            }
+<span class="nc bnc" id="L504" title="All 2 branches missed.">        }</span>
+<span class="fc" id="L505">    }</span>
+
+    private void awaitStopConnectors(Collection&lt;String&gt; ids) {
+<span class="fc" id="L508">        long now = time.milliseconds();</span>
+<span class="fc" id="L509">        long deadline = now + CONNECTOR_GRACEFUL_SHUTDOWN_TIMEOUT_MS;</span>
+<span class="fc bfc" id="L510" title="All 2 branches covered.">        for (String id : ids) {</span>
+<span class="fc" id="L511">            long remaining = Math.max(0, deadline - time.milliseconds());</span>
+<span class="fc" id="L512">            awaitStopConnector(id, remaining);</span>
+<span class="fc" id="L513">        }</span>
+<span class="fc" id="L514">    }</span>
+
+    /**
+     * Stop asynchronously all the worker's connectors and await their termination.
+     */
+    public void stopAndAwaitConnectors() {
+<span class="fc" id="L520">        stopAndAwaitConnectors(new ArrayList&lt;&gt;(connectors.keySet()));</span>
+<span class="fc" id="L521">    }</span>
+
+    /**
+     * Stop asynchronously a collection of connectors that belong to this worker and await their
+     * termination.
+     *
+     * @param ids the collection of connectors to be stopped.
+     */
+    public void stopAndAwaitConnectors(Collection&lt;String&gt; ids) {
+<span class="fc" id="L530">        stopConnectors(ids);</span>
+<span class="fc" id="L531">        awaitStopConnectors(ids);</span>
+<span class="fc" id="L532">    }</span>
+
+    /**
+     * Stop a connector that belongs to this worker and await its termination.
+     *
+     * @param connName the name of the connector to be stopped.
+     */
+    public void stopAndAwaitConnector(String connName) {
+<span class="fc" id="L540">        stopConnector(connName);</span>
+<span class="fc" id="L541">        awaitStopConnectors(List.of(connName));</span>
+<span class="fc" id="L542">    }</span>
+
+    /**
+     * Get the IDs of the connectors currently running in this worker.
+     *
+     * @return the set of connector IDs.
+     */
+    public Set&lt;String&gt; connectorNames() {
+<span class="nc" id="L550">        return connectors.keySet();</span>
+    }
+
+    /**
+     * Return true if a connector with the given name is managed by this worker and is currently running.
+     *
+     * @param connName the connector name.
+     * @return true if the connector is running, false if the connector is not running or is not manages by this worker.
+     */
+    public boolean isRunning(String connName) {
+<span class="fc" id="L560">        WorkerConnector workerConnector = connectors.get(connName);</span>
+<span class="pc bpc" id="L561" title="2 of 4 branches missed.">        return workerConnector != null &amp;&amp; workerConnector.isRunning();</span>
+    }
+
+    public String connectorVersion(String connName) {
+<span class="fc" id="L565">        WorkerConnector conn = connectors.get(connName);</span>
+<span class="fc bfc" id="L566" title="All 2 branches covered.">        if (conn == null) {</span>
+<span class="fc" id="L567">            return null;</span>
+        }
+<span class="fc" id="L569">        return conn.connectorVersion();</span>
+    }
+
+    public String taskVersion(ConnectorTaskId taskId) {
+<span class="fc" id="L573">        WorkerTask&lt;?, ?&gt; task = tasks.get(taskId);</span>
+<span class="fc bfc" id="L574" title="All 2 branches covered.">        if (task == null) {</span>
+<span class="fc" id="L575">            return null;</span>
+        }
+<span class="fc" id="L577">        return task.taskVersion();</span>
+    }
+
+    /**
+     * Start a sink task managed by this worker.
+     *
+     * @param id             the task ID.
+     * @param configState    the most recent {@link ClusterConfigState} known to the worker
+     * @param connProps      the connector properties.
+     * @param taskProps      the tasks properties.
+     * @param statusListener a listener for the runtime status transitions of the task.
+     * @param initialState   the initial state of the connector.
+     * @return true if the task started successfully.
+     */
+    public boolean startSinkTask(
+            ConnectorTaskId id,
+            ClusterConfigState configState,
+            Map&lt;String, String&gt; connProps,
+            Map&lt;String, String&gt; taskProps,
+            TaskStatus.Listener statusListener,
+            TargetState initialState
+    ) {
+<span class="fc" id="L599">        return startTask(id, connProps, taskProps, configState, statusListener,</span>
+                new SinkTaskBuilder(id, configState, statusListener, initialState));
+    }
+
+    /**
+     * Start a source task managed by this worker using older behavior that does not provide exactly-once support.
+     *
+     * @param id             the task ID.
+     * @param configState    the most recent {@link ClusterConfigState} known to the worker
+     * @param connProps      the connector properties.
+     * @param taskProps      the tasks properties.
+     * @param statusListener a listener for the runtime status transitions of the task.
+     * @param initialState   the initial state of the connector.
+     * @return true if the task started successfully.
+     */
+    public boolean startSourceTask(
+            ConnectorTaskId id,
+            ClusterConfigState configState,
+            Map&lt;String, String&gt; connProps,
+            Map&lt;String, String&gt; taskProps,
+            TaskStatus.Listener statusListener,
+            TargetState initialState
+    ) {
+<span class="fc" id="L622">        return startTask(id, connProps, taskProps, configState, statusListener,</span>
+                new SourceTaskBuilder(id, configState, statusListener, initialState));
+    }
+
+    /**
+     * Start a source task with exactly-once support managed by this worker.
+     *
+     * @param id                the task ID.
+     * @param configState       the most recent {@link ClusterConfigState} known to the worker
+     * @param connProps         the connector properties.
+     * @param taskProps         the tasks properties.
+     * @param statusListener    a listener for the runtime status transitions of the task.
+     * @param initialState      the initial state of the connector.
+     * @param preProducerCheck  a preflight check that should be performed before the task initializes its transactional producer.
+     * @param postProducerCheck a preflight check that should be performed after the task initializes its transactional producer,
+     *                          but before producing any source records or offsets.
+     * @return true if the task started successfully.
+     */
+    public boolean startExactlyOnceSourceTask(
+            ConnectorTaskId id,
+            ClusterConfigState configState,
+            Map&lt;String, String&gt; connProps,
+            Map&lt;String, String&gt; taskProps,
+            TaskStatus.Listener statusListener,
+            TargetState initialState,
+            Runnable preProducerCheck,
+            Runnable postProducerCheck
+    ) {
+<span class="nc" id="L650">        return startTask(id, connProps, taskProps, configState, statusListener,</span>
+                new ExactlyOnceSourceTaskBuilder(id, configState, statusListener, initialState, preProducerCheck, postProducerCheck));
+    }
+
+    /**
+     * Start a task managed by this worker.
+     *
+     * @param id the task ID.
+     * @param connProps the connector properties.
+     * @param taskProps the tasks properties.
+     * @param configState the most recent {@link ClusterConfigState} known to the worker
+     * @param statusListener a listener for the runtime status transitions of the task.
+     * @param taskBuilder the {@link TaskBuilder} used to create the {@link WorkerTask} that manages the lifecycle of the task.
+     * @return true if the task started successfully.
+     */
+    private boolean startTask(
+            ConnectorTaskId id,
+            Map&lt;String, String&gt; connProps,
+            Map&lt;String, String&gt; taskProps,
+            ClusterConfigState configState,
+            TaskStatus.Listener statusListener,
+            TaskBuilder&lt;?, ?&gt; taskBuilder
+    ) {
+        final WorkerTask&lt;?, ?&gt; workerTask;
+<span class="fc" id="L674">        final TaskStatus.Listener taskStatusListener = workerMetricsGroup.wrapStatusListener(statusListener);</span>
+<span class="fc" id="L675">        try (LoggingContext loggingContext = LoggingContext.forTask(id)) {</span>
+<span class="fc" id="L676">            log.info(&quot;Creating task {}&quot;, id);</span>
+
+<span class="pc bpc" id="L678" title="1 of 2 branches missed.">            if (tasks.containsKey(id))</span>
+<span class="nc" id="L679">                throw new ConnectException(&quot;Task already exists in this worker: &quot; + id);</span>
+
+<span class="fc" id="L681">            connectorStatusMetricsGroup.recordTaskAdded(id);</span>
+
+            final ClassLoader connectorLoader;
+            try {
+<span class="fc" id="L685">                connectorLoader = connectorClassLoader(connProps);</span>
+<span class="fc" id="L686">                try (LoaderSwap loaderSwap = plugins.withClassLoader(connectorLoader)) {</span>
+<span class="fc" id="L687">                    final ConnectorConfig connConfig = new ConnectorConfig(plugins, connProps);</span>
+
+<span class="fc" id="L689">                    int maxTasks = connConfig.tasksMax();</span>
+<span class="fc" id="L690">                    int numTasks = configState.taskCount(id.connector());</span>
+<span class="fc" id="L691">                    checkTasksMax(id.connector(), numTasks, maxTasks, connConfig.enforceTasksMax());</span>
+
+<span class="fc" id="L693">                    final TaskConfig taskConfig = new TaskConfig(taskProps);</span>
+<span class="fc" id="L694">                    final Class&lt;? extends Task&gt; taskClass = taskConfig.getClass(TaskConfig.TASK_CLASS_CONFIG).asSubclass(Task.class);</span>
+<span class="fc" id="L695">                    final Task task = plugins.newTask(taskClass);</span>
+<span class="fc" id="L696">                    log.info(&quot;Instantiated task {} with version {} of type {}&quot;, id, task.version(), taskClass.getName());</span>
+
+
+                    // By maintaining connector's specific class loader for this thread here, we first
+                    // search for converters within the connector dependencies.
+                    // If any of these aren't found, that means the connector didn't configure specific converters,
+                    // so we should instantiate based upon the worker configuration
+<span class="fc" id="L703">                    Converter keyConverter = plugins.newConverter(connConfig, ConnectorConfig.KEY_CONVERTER_CLASS_CONFIG, ConnectorConfig.KEY_CONVERTER_VERSION_CONFIG);</span>
+<span class="fc" id="L704">                    Converter valueConverter = plugins.newConverter(connConfig, WorkerConfig.VALUE_CONVERTER_CLASS_CONFIG, ConnectorConfig.VALUE_CONVERTER_VERSION_CONFIG);</span>
+<span class="fc" id="L705">                    HeaderConverter headerConverter = plugins.newHeaderConverter(connConfig, ConnectorConfig.HEADER_CONVERTER_CLASS_CONFIG, ConnectorConfig.HEADER_CONVERTER_VERSION_CONFIG);</span>
+
+<span class="pc bpc" id="L707" title="1 of 2 branches missed.">                    if (keyConverter == null) {</span>
+<span class="nc" id="L708">                        keyConverter = plugins.newConverter(config, WorkerConfig.KEY_CONVERTER_CLASS_CONFIG, WorkerConfig.KEY_CONVERTER_VERSION);</span>
+<span class="nc" id="L709">                        log.info(&quot;Set up the key converter {} for task {} using the worker config&quot;, keyConverter.getClass(), id);</span>
+                    } else {
+<span class="fc" id="L711">                        log.info(&quot;Set up the key converter {} for task {} using the connector config&quot;, keyConverter.getClass(), id);</span>
+                    }
+<span class="pc bpc" id="L713" title="1 of 2 branches missed.">                    if (valueConverter == null) {</span>
+<span class="nc" id="L714">                        valueConverter = plugins.newConverter(config, WorkerConfig.VALUE_CONVERTER_CLASS_CONFIG, WorkerConfig.VALUE_CONVERTER_VERSION);</span>
+<span class="nc" id="L715">                        log.info(&quot;Set up the value converter {} for task {} using the worker config&quot;, valueConverter.getClass(), id);</span>
+                    } else {
+<span class="fc" id="L717">                        log.info(&quot;Set up the value converter {} for task {} using the connector config&quot;, valueConverter.getClass(), id);</span>
+                    }
+<span class="pc bpc" id="L719" title="1 of 2 branches missed.">                    if (headerConverter == null) {</span>
+<span class="fc" id="L720">                        headerConverter = plugins.newHeaderConverter(config, WorkerConfig.HEADER_CONVERTER_CLASS_CONFIG, WorkerConfig.HEADER_CONVERTER_VERSION);</span>
+<span class="fc" id="L721">                        log.info(&quot;Set up the header converter {} for task {} using the worker config&quot;, headerConverter.getClass(), id);</span>
+                    } else {
+<span class="nc" id="L723">                        log.info(&quot;Set up the header converter {} for task {} using the connector config&quot;, headerConverter.getClass(), id);</span>
+                    }
+
+<span class="fc" id="L726">                    workerTask = taskBuilder</span>
+<span class="fc" id="L727">                        .withTask(task)</span>
+<span class="fc" id="L728">                        .withConnectorConfig(connConfig)</span>
+<span class="fc" id="L729">                        .withKeyConverterPlugin(metrics.wrap(keyConverter, id, true))</span>
+<span class="fc" id="L730">                        .withValueConverterPlugin(metrics.wrap(valueConverter, id, false))</span>
+<span class="fc" id="L731">                        .withHeaderConverterPlugin(metrics.wrap(headerConverter, id))</span>
+<span class="fc" id="L732">                        .withClassLoader(connectorLoader)</span>
+<span class="fc" id="L733">                        .build();</span>
+
+<span class="fc" id="L735">                    workerTask.initialize(taskConfig);</span>
+                }
+<span class="nc" id="L737">            } catch (Throwable t) {</span>
+<span class="nc" id="L738">                log.error(&quot;Failed to start task {}&quot;, id, t);</span>
+<span class="nc" id="L739">                connectorStatusMetricsGroup.recordTaskRemoved(id);</span>
+<span class="nc" id="L740">                taskStatusListener.onFailure(id, t);</span>
+<span class="nc" id="L741">                return false;</span>
+<span class="fc" id="L742">            }</span>
+
+<span class="fc" id="L744">            WorkerTask&lt;?, ?&gt; existing = tasks.putIfAbsent(id, workerTask);</span>
+<span class="pc bpc" id="L745" title="1 of 2 branches missed.">            if (existing != null)</span>
+<span class="nc" id="L746">                throw new ConnectException(&quot;Task already exists in this worker: &quot; + id);</span>
+
+<span class="fc" id="L748">            executor.submit(plugins.withClassLoader(connectorLoader, workerTask));</span>
+<span class="fc bfc" id="L749" title="All 2 branches covered.">            if (workerTask instanceof WorkerSourceTask) {</span>
+<span class="fc" id="L750">                sourceTaskOffsetCommitter.ifPresent(committer -&gt; committer.schedule(id, (WorkerSourceTask) workerTask));</span>
+            }
+<span class="fc" id="L752">            return true;</span>
+<span class="nc bnc" id="L753" title="All 2 branches missed.">        }</span>
+    }
+
+    /**
+     * Using the admin principal for this connector, perform a round of zombie fencing that disables transactional producers
+     * for the specified number of source tasks from sending any more records.
+     * @param connName the name of the connector
+     * @param numTasks the number of tasks to fence out
+     * @param connProps the configuration of the connector; may not be null
+     * @return a {@link KafkaFuture} that will complete when the producers have all been fenced out, or the attempt has failed
+     */
+    public KafkaFuture&lt;Void&gt; fenceZombies(String connName, int numTasks, Map&lt;String, String&gt; connProps) {
+<span class="nc" id="L765">        log.debug(&quot;Fencing out {} task producers for source connector {}&quot;, numTasks, connName);</span>
+<span class="nc" id="L766">        try (LoggingContext loggingContext = LoggingContext.forConnector(connName)) {</span>
+<span class="nc" id="L767">            Class&lt;? extends Connector&gt; connectorClass = connectorClass(connProps);</span>
+<span class="nc" id="L768">            ClassLoader classLoader = connectorClassLoader(connProps);</span>
+<span class="nc" id="L769">            try (LoaderSwap loaderSwap = plugins.withClassLoader(classLoader)) {</span>
+<span class="nc" id="L770">                final SourceConnectorConfig connConfig = new SourceConnectorConfig(plugins, connProps, config.topicCreationEnable());</span>
+
+<span class="nc" id="L772">                Map&lt;String, Object&gt; adminConfig = adminConfigs(</span>
+                        connName,
+                        &quot;connector-worker-adminclient-&quot; + connName,
+                        config,
+                        connConfig,
+                        connectorClass,
+                        connectorClientConfigOverridePolicy,
+                        kafkaClusterId,
+                        ConnectorType.SOURCE);
+<span class="nc" id="L781">                final Admin admin = adminFactory.apply(adminConfig);</span>
+
+                try {
+<span class="nc" id="L784">                    Collection&lt;String&gt; transactionalIds = IntStream.range(0, numTasks)</span>
+<span class="nc" id="L785">                            .mapToObj(i -&gt; new ConnectorTaskId(connName, i))</span>
+<span class="nc" id="L786">                            .map(this::taskTransactionalId)</span>
+<span class="nc" id="L787">                            .collect(Collectors.toList());</span>
+<span class="nc" id="L788">                    FenceProducersOptions fencingOptions = new FenceProducersOptions()</span>
+<span class="nc" id="L789">                            .timeoutMs((int) RestServer.DEFAULT_REST_REQUEST_TIMEOUT_MS);</span>
+<span class="nc" id="L790">                    return admin.fenceProducers(transactionalIds, fencingOptions).all().whenComplete((ignored, error) -&gt; {</span>
+<span class="nc bnc" id="L791" title="All 2 branches missed.">                        if (error == null)</span>
+<span class="nc" id="L792">                            log.debug(&quot;Finished fencing out {} task producers for source connector {}&quot;, numTasks, connName);</span>
+<span class="nc" id="L793">                        Utils.closeQuietly(admin, &quot;Zombie fencing admin for connector &quot; + connName);</span>
+<span class="nc" id="L794">                    });</span>
+<span class="nc" id="L795">                } catch (Exception e) {</span>
+<span class="nc" id="L796">                    Utils.closeQuietly(admin, &quot;Zombie fencing admin for connector &quot; + connName);</span>
+<span class="nc" id="L797">                    throw e;</span>
+                }
+            }
+        }
+    }
+
+    static Map&lt;String, Object&gt; exactlyOnceSourceTaskProducerConfigs(ConnectorTaskId id,
+                                                              WorkerConfig config,
+                                                              ConnectorConfig connConfig,
+                                                              Class&lt;? extends Connector&gt;  connectorClass,
+                                                              ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
+                                                              String clusterId) {
+<span class="nc" id="L809">        Map&lt;String, Object&gt; result = baseProducerConfigs(id.connector(), &quot;connector-producer-&quot; + id, config, connConfig, connectorClass, connectorClientConfigOverridePolicy, clusterId);</span>
+        // The base producer properties forcibly disable idempotence; remove it from those properties
+        // if not explicitly requested by the user
+<span class="nc" id="L812">        boolean connectorProducerIdempotenceConfigured = connConfig.originals().containsKey(</span>
+                ConnectorConfig.CONNECTOR_CLIENT_PRODUCER_OVERRIDES_PREFIX + ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG
+        );
+<span class="nc bnc" id="L815" title="All 2 branches missed.">        if (!connectorProducerIdempotenceConfigured) {</span>
+<span class="nc" id="L816">            boolean workerProducerIdempotenceConfigured = config.originals().containsKey(</span>
+                    &quot;producer.&quot; + ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG
+            );
+<span class="nc bnc" id="L819" title="All 2 branches missed.">            if (!workerProducerIdempotenceConfigured) {</span>
+<span class="nc" id="L820">                result.remove(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG);</span>
+            }
+        }
+<span class="nc" id="L823">        ConnectUtils.ensureProperty(</span>
+                result, ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, &quot;true&quot;,
+                &quot;for connectors when exactly-once source support is enabled&quot;,
+                false
+        );
+<span class="nc" id="L828">        String transactionalId = taskTransactionalId(config.groupId(), id.connector(), id.task());</span>
+<span class="nc" id="L829">        ConnectUtils.ensureProperty(</span>
+                result, ProducerConfig.TRANSACTIONAL_ID_CONFIG, transactionalId,
+                &quot;for connectors when exactly-once source support is enabled&quot;,
+                true
+        );
+<span class="nc" id="L834">        return result;</span>
+    }
+
+    static Map&lt;String, Object&gt; baseProducerConfigs(String connName,
+                                               String defaultClientId,
+                                               WorkerConfig config,
+                                               ConnectorConfig connConfig,
+                                               Class&lt;? extends Connector&gt;  connectorClass,
+                                               ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
+                                               String clusterId) {
+<span class="fc" id="L844">        Map&lt;String, Object&gt; producerProps = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L845">        producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, config.bootstrapServers());</span>
+<span class="fc" id="L846">        producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, &quot;org.apache.kafka.common.serialization.ByteArraySerializer&quot;);</span>
+<span class="fc" id="L847">        producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, &quot;org.apache.kafka.common.serialization.ByteArraySerializer&quot;);</span>
+        // These settings will execute infinite retries on retriable exceptions. They *may* be overridden via configs passed to the worker,
+        // but this may compromise the delivery guarantees of Kafka Connect.
+<span class="fc" id="L850">        producerProps.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, Long.toString(Long.MAX_VALUE));</span>
+        // By default, Connect disables idempotent behavior for all producers, even though idempotence became
+        // default for Kafka producers. This is to ensure Connect continues to work with many Kafka broker versions, including older brokers that do not support
+        // idempotent producers or require explicit steps to enable them (e.g. adding the IDEMPOTENT_WRITE ACL to brokers older than 2.8).
+        // These settings might change when https://cwiki.apache.org/confluence/display/KAFKA/KIP-318%3A+Make+Kafka+Connect+Source+idempotent
+        // gets approved and scheduled for release.
+<span class="fc" id="L856">        producerProps.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, &quot;false&quot;);</span>
+<span class="fc" id="L857">        producerProps.put(ProducerConfig.ACKS_CONFIG, &quot;all&quot;);</span>
+<span class="fc" id="L858">        producerProps.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, &quot;1&quot;);</span>
+<span class="fc" id="L859">        producerProps.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, Integer.toString(Integer.MAX_VALUE));</span>
+<span class="fc" id="L860">        producerProps.put(ProducerConfig.CLIENT_ID_CONFIG, defaultClientId);</span>
+        // User-specified overrides
+<span class="fc" id="L862">        producerProps.putAll(config.originalsWithPrefix(&quot;producer.&quot;));</span>
+        //add client metrics.context properties
+<span class="fc" id="L864">        ConnectUtils.addMetricsContextProperties(producerProps, config, clusterId);</span>
+
+        // Connector-specified overrides
+<span class="fc" id="L867">        Map&lt;String, Object&gt; producerOverrides =</span>
+<span class="fc" id="L868">            connectorClientConfigOverrides(connName, connConfig, connectorClass, ConnectorConfig.CONNECTOR_CLIENT_PRODUCER_OVERRIDES_PREFIX,</span>
+                                           ConnectorType.SOURCE, ConnectorClientConfigRequest.ClientType.PRODUCER,
+                                           connectorClientConfigOverridePolicy);
+<span class="fc" id="L871">        producerProps.putAll(producerOverrides);</span>
+
+<span class="fc" id="L873">        return producerProps;</span>
+    }
+
+    static Map&lt;String, Object&gt; exactlyOnceSourceOffsetsConsumerConfigs(String connName,
+                                                                       String defaultClientId,
+                                                                       WorkerConfig config,
+                                                                       ConnectorConfig connConfig,
+                                                                       Class&lt;? extends Connector&gt; connectorClass,
+                                                                       ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
+                                                                       String clusterId) {
+<span class="nc" id="L883">        Map&lt;String, Object&gt; result = baseConsumerConfigs(</span>
+                connName, defaultClientId, config, connConfig, connectorClass,
+                connectorClientConfigOverridePolicy, clusterId, ConnectorType.SOURCE);
+<span class="nc" id="L886">        ConnectUtils.ensureProperty(</span>
+<span class="nc" id="L887">                result, ConsumerConfig.ISOLATION_LEVEL_CONFIG, IsolationLevel.READ_COMMITTED.toString(),</span>
+                &quot;for source connectors' offset consumers when exactly-once source support is enabled&quot;,
+                false
+        );
+<span class="nc" id="L891">        return result;</span>
+    }
+
+    static Map&lt;String, Object&gt; regularSourceOffsetsConsumerConfigs(String connName,
+                                                                   String defaultClientId,
+                                                                   WorkerConfig config,
+                                                                   ConnectorConfig connConfig,
+                                                                   Class&lt;? extends Connector&gt; connectorClass,
+                                                                   ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
+                                                                   String clusterId) {
+<span class="nc" id="L901">        Map&lt;String, Object&gt; result = baseConsumerConfigs(</span>
+                connName, defaultClientId, config, connConfig, connectorClass,
+                connectorClientConfigOverridePolicy, clusterId, ConnectorType.SOURCE);
+        // Users can disable this if they want to since the task isn't exactly-once anyways
+<span class="nc" id="L905">        result.putIfAbsent(</span>
+                ConsumerConfig.ISOLATION_LEVEL_CONFIG,
+<span class="nc" id="L907">                IsolationLevel.READ_COMMITTED.toString());</span>
+<span class="nc" id="L908">        return result;</span>
+    }
+
+    static Map&lt;String, Object&gt; baseConsumerConfigs(String connName,
+                                               String defaultClientId,
+                                               WorkerConfig config,
+                                               ConnectorConfig connConfig,
+                                               Class&lt;? extends Connector&gt; connectorClass,
+                                               ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
+                                               String clusterId,
+                                               ConnectorType connectorType) {
+        // Include any unknown worker configs so consumer configs can be set globally on the worker
+        // and through to the task
+<span class="fc" id="L921">        Map&lt;String, Object&gt; consumerProps = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L923">        consumerProps.put(ConsumerConfig.GROUP_ID_CONFIG, SinkUtils.consumerGroupId(connName));</span>
+<span class="fc" id="L924">        consumerProps.put(ConsumerConfig.CLIENT_ID_CONFIG, defaultClientId);</span>
+<span class="fc" id="L925">        consumerProps.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, config.bootstrapServers());</span>
+<span class="fc" id="L926">        consumerProps.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, &quot;false&quot;);</span>
+<span class="fc" id="L927">        consumerProps.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, &quot;earliest&quot;);</span>
+<span class="fc" id="L928">        consumerProps.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, &quot;org.apache.kafka.common.serialization.ByteArrayDeserializer&quot;);</span>
+<span class="fc" id="L929">        consumerProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, &quot;org.apache.kafka.common.serialization.ByteArrayDeserializer&quot;);</span>
+
+<span class="fc" id="L931">        consumerProps.putAll(config.originalsWithPrefix(&quot;consumer.&quot;));</span>
+        //add client metrics.context properties
+<span class="fc" id="L933">        ConnectUtils.addMetricsContextProperties(consumerProps, config, clusterId);</span>
+        // Connector-specified overrides
+<span class="fc" id="L935">        Map&lt;String, Object&gt; consumerOverrides =</span>
+<span class="fc" id="L936">            connectorClientConfigOverrides(connName, connConfig, connectorClass, ConnectorConfig.CONNECTOR_CLIENT_CONSUMER_OVERRIDES_PREFIX,</span>
+                                           connectorType, ConnectorClientConfigRequest.ClientType.CONSUMER,
+                                           connectorClientConfigOverridePolicy);
+<span class="fc" id="L939">        consumerProps.putAll(consumerOverrides);</span>
+
+<span class="fc" id="L941">        return consumerProps;</span>
+    }
+
+    static Map&lt;String, Object&gt; adminConfigs(String connName,
+                                            String defaultClientId,
+                                            WorkerConfig config,
+                                            ConnectorConfig connConfig,
+                                            Class&lt;? extends Connector&gt; connectorClass,
+                                            ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy,
+                                            String clusterId,
+                                            ConnectorType connectorType) {
+<span class="fc" id="L952">        Map&lt;String, Object&gt; adminProps = new HashMap&lt;&gt;();</span>
+        // Use the top-level worker configs to retain backwards compatibility with older releases which
+        // did not require a prefix for connector admin client configs in the worker configuration file
+        // Ignore configs that begin with &quot;admin.&quot; since those will be added next (with the prefix stripped)
+        // and those that begin with &quot;producer.&quot; and &quot;consumer.&quot;, since we know they aren't intended for
+        // the admin client
+<span class="fc" id="L958">        Map&lt;String, Object&gt; nonPrefixedWorkerConfigs = config.originals().entrySet().stream()</span>
+<span class="pc bpc" id="L959" title="1 of 2 branches missed.">                .filter(e -&gt; !e.getKey().startsWith(&quot;admin.&quot;)</span>
+<span class="pc bpc" id="L960" title="1 of 2 branches missed.">                        &amp;&amp; !e.getKey().startsWith(&quot;producer.&quot;)</span>
+<span class="pc bpc" id="L961" title="1 of 2 branches missed.">                        &amp;&amp; !e.getKey().startsWith(&quot;consumer.&quot;))</span>
+<span class="fc" id="L962">                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+<span class="fc" id="L963">        adminProps.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, config.bootstrapServers());</span>
+<span class="fc" id="L964">        adminProps.put(AdminClientConfig.CLIENT_ID_CONFIG, defaultClientId);</span>
+<span class="fc" id="L965">        adminProps.putAll(nonPrefixedWorkerConfigs);</span>
+
+        // Admin client-specific overrides in the worker config
+<span class="fc" id="L968">        adminProps.putAll(config.originalsWithPrefix(&quot;admin.&quot;));</span>
+
+        // Connector-specified overrides
+<span class="fc" id="L971">        Map&lt;String, Object&gt; adminOverrides =</span>
+<span class="fc" id="L972">                connectorClientConfigOverrides(connName, connConfig, connectorClass, ConnectorConfig.CONNECTOR_CLIENT_ADMIN_OVERRIDES_PREFIX,</span>
+                        connectorType, ConnectorClientConfigRequest.ClientType.ADMIN,
+                        connectorClientConfigOverridePolicy);
+<span class="fc" id="L975">        adminProps.putAll(adminOverrides);</span>
+
+        //add client metrics.context properties
+<span class="fc" id="L978">        ConnectUtils.addMetricsContextProperties(adminProps, config, clusterId);</span>
+
+<span class="fc" id="L980">        return adminProps;</span>
+    }
+
+    private static Map&lt;String, Object&gt; connectorClientConfigOverrides(String connName,
+                                                                      ConnectorConfig connConfig,
+                                                                      Class&lt;? extends Connector&gt; connectorClass,
+                                                                      String clientConfigPrefix,
+                                                                      ConnectorType connectorType,
+                                                                      ConnectorClientConfigRequest.ClientType clientType,
+                                                                      ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy) {
+<span class="fc" id="L990">        Map&lt;String, Object&gt; clientOverrides = connConfig.originalsWithPrefix(clientConfigPrefix);</span>
+<span class="fc" id="L991">        ConnectorClientConfigRequest connectorClientConfigRequest = new ConnectorClientConfigRequest(</span>
+            connName,
+            connectorType,
+            connectorClass,
+            clientOverrides,
+            clientType
+        );
+<span class="fc" id="L998">        List&lt;ConfigValue&gt; configValues = connectorClientConfigOverridePolicy.validate(connectorClientConfigRequest);</span>
+<span class="fc" id="L999">        List&lt;ConfigValue&gt; errorConfigs = configValues.stream().</span>
+<span class="pc bnc" id="L1000" title="All 2 branches missed.">            filter(configValue -&gt; configValue.errorMessages().size() &gt; 0).toList();</span>
+        // These should be caught when the herder validates the connector configuration, but just in case
+<span class="pc bpc" id="L1002" title="1 of 2 branches missed.">        if (errorConfigs.size() &gt; 0) {</span>
+<span class="nc" id="L1003">            throw new ConnectException(&quot;Client Config Overrides not allowed &quot; + errorConfigs);</span>
+        }
+<span class="fc" id="L1005">        return clientOverrides;</span>
+    }
+
+    private String taskTransactionalId(ConnectorTaskId id) {
+<span class="nc" id="L1009">        return taskTransactionalId(config.groupId(), id.connector(), id.task());</span>
+    }
+
+    /**
+     * @return the {@link ProducerConfig#TRANSACTIONAL_ID_CONFIG transactional ID} to use for a task that writes
+     * records and/or offsets in a transaction. Not to be confused with {@link DistributedConfig#transactionalProducerId()},
+     * which is not used by tasks at all, but instead, by the worker itself.
+     */
+    public static String taskTransactionalId(String groupId, String connector, int taskId) {
+<span class="nc" id="L1018">        return String.format(&quot;%s-%s-%d&quot;, groupId, connector, taskId);</span>
+    }
+
+    ErrorHandlingMetrics errorHandlingMetrics(ConnectorTaskId id) {
+<span class="fc" id="L1022">        return new ErrorHandlingMetrics(id, metrics);</span>
+    }
+
+    private List&lt;ErrorReporter&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt;&gt; sinkTaskReporters(ConnectorTaskId id, SinkConnectorConfig connConfig,
+                                                     ErrorHandlingMetrics errorHandlingMetrics,
+                                                     Class&lt;? extends Connector&gt; connectorClass) {
+<span class="fc" id="L1028">        ArrayList&lt;ErrorReporter&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt;&gt; reporters = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1029">        LogReporter&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; logReporter = new LogReporter.Sink(id, connConfig, errorHandlingMetrics);</span>
+<span class="fc" id="L1030">        reporters.add(logReporter);</span>
+
+        // check if topic for dead letter queue exists
+<span class="fc" id="L1033">        String topic = connConfig.dlqTopicName();</span>
+<span class="pc bpc" id="L1034" title="2 of 4 branches missed.">        if (topic != null &amp;&amp; !topic.isEmpty()) {</span>
+<span class="nc" id="L1035">            Map&lt;String, Object&gt; producerProps = baseProducerConfigs(id.connector(), &quot;connector-dlq-producer-&quot; + id, config, connConfig, connectorClass,</span>
+                                                                connectorClientConfigOverridePolicy, kafkaClusterId);
+<span class="nc" id="L1037">            Map&lt;String, Object&gt; adminProps = adminConfigs(id.connector(), &quot;connector-dlq-adminclient-&quot; + id, config, connConfig, connectorClass, connectorClientConfigOverridePolicy, kafkaClusterId, ConnectorType.SINK);</span>
+<span class="nc" id="L1038">            DeadLetterQueueReporter reporter = DeadLetterQueueReporter.createAndSetup(adminProps, id, connConfig, producerProps, errorHandlingMetrics);</span>
+
+<span class="nc" id="L1040">            reporters.add(reporter);</span>
+        }
+
+<span class="fc" id="L1043">        return reporters;</span>
+    }
+
+    private List&lt;ErrorReporter&lt;SourceRecord&gt;&gt; sourceTaskReporters(ConnectorTaskId id, ConnectorConfig connConfig,
+                                                       ErrorHandlingMetrics errorHandlingMetrics) {
+<span class="fc" id="L1048">        List&lt;ErrorReporter&lt;SourceRecord&gt;&gt; reporters = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1049">        LogReporter&lt;SourceRecord&gt; logReporter = new LogReporter.Source(id, connConfig, errorHandlingMetrics);</span>
+<span class="fc" id="L1050">        reporters.add(logReporter);</span>
+
+<span class="fc" id="L1052">        return reporters;</span>
+    }
+
+    private WorkerErrantRecordReporter createWorkerErrantRecordReporter(
+        SinkConnectorConfig connConfig,
+        RetryWithToleranceOperator&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; retryWithToleranceOperator,
+        Converter keyConverter,
+        Converter valueConverter,
+        HeaderConverter headerConverter
+    ) {
+        // check if errant record reporter topic is configured
+<span class="pc bpc" id="L1063" title="1 of 2 branches missed.">        if (connConfig.enableErrantRecordReporter()) {</span>
+<span class="nc" id="L1064">            return new WorkerErrantRecordReporter(retryWithToleranceOperator, keyConverter, valueConverter, headerConverter);</span>
+        }
+<span class="fc" id="L1066">        return null;</span>
+    }
+
+    private void stopTask(ConnectorTaskId taskId) {
+<span class="fc" id="L1070">        try (LoggingContext loggingContext = LoggingContext.forTask(taskId)) {</span>
+<span class="fc" id="L1071">            WorkerTask&lt;?, ?&gt; task = tasks.get(taskId);</span>
+<span class="pc bpc" id="L1072" title="1 of 2 branches missed.">            if (task == null) {</span>
+<span class="nc" id="L1073">                log.warn(&quot;Ignoring stop request for unowned task {}&quot;, taskId);</span>
+<span class="nc" id="L1074">                return;</span>
+            }
+
+<span class="fc" id="L1077">            log.info(&quot;Stopping task {}&quot;, task.id());</span>
+<span class="fc bfc" id="L1078" title="All 2 branches covered.">            if (task instanceof WorkerSourceTask)</span>
+<span class="fc" id="L1079">                sourceTaskOffsetCommitter.ifPresent(committer -&gt; committer.remove(task.id()));</span>
+
+<span class="fc" id="L1081">            try (LoaderSwap loaderSwap = plugins.withClassLoader(task.loader())) {</span>
+<span class="fc" id="L1082">                task.stop();</span>
+            }
+<span class="nc bnc" id="L1084" title="All 2 branches missed.">        }</span>
+<span class="fc" id="L1085">    }</span>
+
+    private void stopTasks(Collection&lt;ConnectorTaskId&gt; ids) {
+        // Herder is responsible for stopping tasks. This is an internal method to sequentially
+        // stop the tasks that have not explicitly been stopped.
+<span class="pc bpc" id="L1090" title="1 of 2 branches missed.">        for (ConnectorTaskId taskId : ids) {</span>
+<span class="nc" id="L1091">            stopTask(taskId);</span>
+<span class="nc" id="L1092">        }</span>
+<span class="fc" id="L1093">    }</span>
+
+    private void awaitStopTask(ConnectorTaskId taskId, long timeout) {
+<span class="fc" id="L1096">        try (LoggingContext loggingContext = LoggingContext.forTask(taskId)) {</span>
+<span class="fc" id="L1097">            WorkerTask&lt;?, ?&gt; task = tasks.remove(taskId);</span>
+<span class="pc bpc" id="L1098" title="1 of 2 branches missed.">            if (task == null) {</span>
+<span class="nc" id="L1099">                log.warn(&quot;Ignoring await stop request for non-present task {}&quot;, taskId);</span>
+<span class="nc" id="L1100">                return;</span>
+            }
+
+<span class="pc bpc" id="L1103" title="1 of 2 branches missed.">            if (!task.awaitStop(timeout)) {</span>
+<span class="nc" id="L1104">                log.error(&quot;Graceful stop of task {} failed.&quot;, task.id());</span>
+<span class="nc" id="L1105">                task.cancel();</span>
+            } else {
+<span class="fc" id="L1107">                log.debug(&quot;Graceful stop of task {} succeeded.&quot;, task.id());</span>
+            }
+
+            try {
+<span class="fc" id="L1111">                task.removeMetrics();</span>
+            } finally {
+<span class="fc" id="L1113">                connectorStatusMetricsGroup.recordTaskRemoved(taskId);</span>
+            }
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">        }</span>
+<span class="fc" id="L1116">    }</span>
+
+    private void awaitStopTasks(Collection&lt;ConnectorTaskId&gt; ids) {
+<span class="fc" id="L1119">        long now = time.milliseconds();</span>
+<span class="fc" id="L1120">        long deadline = now + config.getLong(WorkerConfig.TASK_SHUTDOWN_GRACEFUL_TIMEOUT_MS_CONFIG);</span>
+<span class="fc bfc" id="L1121" title="All 2 branches covered.">        for (ConnectorTaskId id : ids) {</span>
+<span class="fc" id="L1122">            long remaining = Math.max(0, deadline - time.milliseconds());</span>
+<span class="fc" id="L1123">            awaitStopTask(id, remaining);</span>
+<span class="fc" id="L1124">        }</span>
+<span class="fc" id="L1125">    }</span>
+
+    /**
+     * Stop asynchronously all the worker's tasks and await their termination.
+     */
+    public void stopAndAwaitTasks() {
+<span class="fc" id="L1131">        stopAndAwaitTasks(new ArrayList&lt;&gt;(tasks.keySet()));</span>
+<span class="fc" id="L1132">    }</span>
+
+    /**
+     * Stop asynchronously a collection of tasks that belong to this worker and await their termination.
+     *
+     * @param ids the collection of tasks to be stopped.
+     */
+    public void stopAndAwaitTasks(Collection&lt;ConnectorTaskId&gt; ids) {
+<span class="fc" id="L1140">        stopTasks(ids);</span>
+<span class="fc" id="L1141">        awaitStopTasks(ids);</span>
+<span class="fc" id="L1142">    }</span>
+
+    /**
+     * Stop a task that belongs to this worker and await its termination.
+     *
+     * @param taskId the ID of the task to be stopped.
+     */
+    public void stopAndAwaitTask(ConnectorTaskId taskId) {
+<span class="fc" id="L1150">        stopTask(taskId);</span>
+<span class="fc" id="L1151">        awaitStopTasks(List.of(taskId));</span>
+<span class="fc" id="L1152">    }</span>
+
+    /**
+     * Get the IDs of the tasks currently running in this worker.
+     */
+    public Set&lt;ConnectorTaskId&gt; taskIds() {
+<span class="nc" id="L1158">        return tasks.keySet();</span>
+    }
+
+    public Converter getInternalValueConverter() {
+<span class="fc" id="L1162">        return internalValueConverter;</span>
+    }
+
+    public Plugins getPlugins() {
+<span class="fc" id="L1166">        return plugins;</span>
+    }
+
+    public String workerId() {
+<span class="fc" id="L1170">        return workerId;</span>
+    }
+
+    /**
+     * Returns whether this worker is configured to allow source connectors to create the topics
+     * that they use with custom configurations, if these topics don't already exist.
+     *
+     * @return true if topic creation by source connectors is allowed; false otherwise
+     */
+    public boolean isTopicCreationEnabled() {
+<span class="fc" id="L1180">        return config.topicCreationEnable();</span>
+    }
+
+    /**
+     * Get the {@link ConnectMetrics} that uses Kafka Metrics and manages the JMX reporter.
+     * @return the Connect-specific metrics; never null
+     */
+    public ConnectMetrics metrics() {
+<span class="fc" id="L1188">        return metrics;</span>
+    }
+
+    public void setTargetState(String connName, TargetState state, Callback&lt;TargetState&gt; stateChangeCallback) {
+<span class="nc" id="L1192">        log.info(&quot;Setting connector {} state to {}&quot;, connName, state);</span>
+
+<span class="nc" id="L1194">        WorkerConnector workerConnector = connectors.get(connName);</span>
+<span class="nc bnc" id="L1195" title="All 2 branches missed.">        if (workerConnector != null) {</span>
+<span class="nc" id="L1196">            try (LoaderSwap loaderSwap = plugins.withClassLoader(workerConnector.loader())) {</span>
+<span class="nc" id="L1197">                workerConnector.transitionTo(state, stateChangeCallback);</span>
+            }
+        }
+
+<span class="nc bnc" id="L1201" title="All 2 branches missed.">        for (Map.Entry&lt;ConnectorTaskId, WorkerTask&lt;?, ?&gt;&gt; taskEntry : tasks.entrySet()) {</span>
+<span class="nc bnc" id="L1202" title="All 2 branches missed.">            if (taskEntry.getKey().connector().equals(connName)) {</span>
+<span class="nc" id="L1203">                WorkerTask&lt;?, ?&gt; workerTask = taskEntry.getValue();</span>
+<span class="nc" id="L1204">                try (LoaderSwap loaderSwap = plugins.withClassLoader(workerTask.loader())) {</span>
+<span class="nc" id="L1205">                    workerTask.transitionTo(state);</span>
+                }
+            }
+<span class="nc" id="L1208">        }</span>
+<span class="nc" id="L1209">    }</span>
+
+    /**
+     * Get the current offsets for a connector. This method is asynchronous and the passed callback is completed when the
+     * request finishes processing.
+     *
+     * @param connName the name of the connector whose offsets are to be retrieved
+     * @param connectorConfig the connector's configurations
+     * @param cb callback to invoke upon completion of the request
+     */
+    public void connectorOffsets(String connName, Map&lt;String, String&gt; connectorConfig, Callback&lt;ConnectorOffsets&gt; cb) {
+<span class="nc" id="L1220">        Connector connector = instantiateConnector(connectorConfig);</span>
+<span class="nc" id="L1221">        ClassLoader connectorLoader = connectorClassLoader(connectorConfig);</span>
+<span class="nc" id="L1222">        try (LoaderSwap loaderSwap = plugins.withClassLoader(connectorLoader)) {</span>
+<span class="nc bnc" id="L1223" title="All 2 branches missed.">            if (ConnectUtils.isSinkConnector(connector)) {</span>
+<span class="nc" id="L1224">                log.debug(&quot;Fetching offsets for sink connector: {}&quot;, connName);</span>
+<span class="nc" id="L1225">                sinkConnectorOffsets(connName, connector, connectorConfig, cb);</span>
+            } else {
+<span class="nc" id="L1227">                log.debug(&quot;Fetching offsets for source connector: {}&quot;, connName);</span>
+<span class="nc" id="L1228">                sourceConnectorOffsets(connName, connector, connectorConfig, cb);</span>
+            }
+        }
+<span class="nc" id="L1231">    }</span>
+
+    private Connector instantiateConnector(Map&lt;String, String&gt; connProps) throws ConnectException {
+
+<span class="fc" id="L1235">        final String klass = connProps.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG);</span>
+<span class="fc" id="L1236">        final String version = connProps.get(ConnectorConfig.CONNECTOR_VERSION);</span>
+
+        try {
+<span class="fc" id="L1239">            return plugins.newConnector(klass, PluginUtils.connectorVersionRequirement(version));</span>
+<span class="nc" id="L1240">        } catch (InvalidVersionSpecificationException | VersionedPluginLoadingException e) {</span>
+<span class="nc" id="L1241">            throw new ConnectException(</span>
+<span class="nc" id="L1242">                    String.format(&quot;Failed to instantiate class for connector %s, class %s&quot;, klass, connProps.get(ConnectorConfig.NAME_CONFIG)), e);</span>
+        }
+    }
+
+    private ClassLoader connectorClassLoader(Map&lt;String, String&gt; connProps) throws ConnectException {
+<span class="fc" id="L1247">        final String klass = connProps.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG);</span>
+<span class="fc" id="L1248">        final String version = connProps.get(ConnectorConfig.CONNECTOR_VERSION);</span>
+
+        try {
+<span class="fc" id="L1251">            return plugins.connectorLoader(klass, PluginUtils.connectorVersionRequirement(version));</span>
+<span class="nc" id="L1252">        } catch (InvalidVersionSpecificationException  | VersionedPluginLoadingException e) {</span>
+<span class="nc" id="L1253">            throw new ConnectException(</span>
+<span class="nc" id="L1254">                    String.format(&quot;Failed to get class loader for connector %s, class %s&quot;, klass, connProps.get(ConnectorConfig.NAME_CONFIG)), e);</span>
+        }
+    }
+
+    private Class&lt;? extends Connector&gt; connectorClass(Map&lt;String, String&gt; connProps) throws ConnectException {
+<span class="fc" id="L1259">        final String klass = connProps.get(ConnectorConfig.CONNECTOR_CLASS_CONFIG);</span>
+<span class="fc" id="L1260">        final String version = connProps.get(ConnectorConfig.CONNECTOR_VERSION);</span>
+
+        try {
+<span class="fc" id="L1263">            return plugins.connectorClass(klass, PluginUtils.connectorVersionRequirement(version));</span>
+<span class="nc" id="L1264">        } catch (InvalidVersionSpecificationException | VersionedPluginLoadingException e) {</span>
+<span class="nc" id="L1265">            throw new ConnectException(</span>
+<span class="nc" id="L1266">                String.format(&quot;Failed to get class for connector %s, class %s&quot;, klass, connProps.get(ConnectorConfig.NAME_CONFIG)), e);</span>
+        }
+    }
+
+    /**
+     * Get the current consumer group offsets for a sink connector.
+     * &lt;p&gt;
+     * Visible for testing.
+     *
+     * @param connName the name of the sink connector whose offsets are to be retrieved
+     * @param connector the sink connector
+     * @param connectorConfig the sink connector's configurations
+     * @param cb callback to invoke upon completion of the request
+     */
+    void sinkConnectorOffsets(String connName, Connector connector, Map&lt;String, String&gt; connectorConfig,
+                              Callback&lt;ConnectorOffsets&gt; cb) {
+<span class="nc" id="L1282">        Map&lt;String, Object&gt; adminConfig = adminConfigs(</span>
+                connName,
+                &quot;connector-worker-adminclient-&quot; + connName,
+                config,
+                new SinkConnectorConfig(plugins, connectorConfig),
+<span class="nc" id="L1287">                connector.getClass(),</span>
+                connectorClientConfigOverridePolicy,
+                kafkaClusterId,
+                ConnectorType.SINK);
+<span class="nc" id="L1291">        String groupId = (String) baseConsumerConfigs(</span>
+                connName, &quot;connector-consumer-&quot;, config, new SinkConnectorConfig(plugins, connectorConfig),
+<span class="nc" id="L1293">                connector.getClass(), connectorClientConfigOverridePolicy, kafkaClusterId, ConnectorType.SINK).get(ConsumerConfig.GROUP_ID_CONFIG);</span>
+<span class="nc" id="L1294">        Admin admin = adminFactory.apply(adminConfig);</span>
+        try {
+<span class="nc" id="L1296">            ListConsumerGroupOffsetsOptions listOffsetsOptions = new ListConsumerGroupOffsetsOptions()</span>
+<span class="nc" id="L1297">                    .timeoutMs((int) RestServer.DEFAULT_REST_REQUEST_TIMEOUT_MS);</span>
+<span class="nc" id="L1298">            ListConsumerGroupOffsetsResult listConsumerGroupOffsetsResult = admin.listConsumerGroupOffsets(groupId, listOffsetsOptions);</span>
+<span class="nc" id="L1299">            listConsumerGroupOffsetsResult.partitionsToOffsetAndMetadata().whenComplete((result, error) -&gt; {</span>
+<span class="nc bnc" id="L1300" title="All 2 branches missed.">                if (error != null) {</span>
+<span class="nc" id="L1301">                    log.error(&quot;Failed to retrieve consumer group offsets for sink connector {}&quot;, connName, error);</span>
+<span class="nc" id="L1302">                    cb.onCompletion(new ConnectException(&quot;Failed to retrieve consumer group offsets for sink connector &quot; + connName, error), null);</span>
+                } else {
+<span class="nc" id="L1304">                    ConnectorOffsets offsets = SinkUtils.consumerGroupOffsetsToConnectorOffsets(result);</span>
+<span class="nc" id="L1305">                    cb.onCompletion(null, offsets);</span>
+                }
+<span class="nc" id="L1307">                Utils.closeQuietly(admin, &quot;Offset fetch admin for sink connector &quot; + connName);</span>
+<span class="nc" id="L1308">            });</span>
+<span class="nc" id="L1309">        } catch (Throwable t) {</span>
+<span class="nc" id="L1310">            Utils.closeQuietly(admin, &quot;Offset fetch admin for sink connector &quot; + connName);</span>
+<span class="nc" id="L1311">            log.error(&quot;Failed to retrieve consumer group offsets for sink connector {}&quot;, connName, t);</span>
+<span class="nc" id="L1312">            cb.onCompletion(new ConnectException(&quot;Failed to retrieve consumer group offsets for sink connector &quot; + connName, t), null);</span>
+<span class="nc" id="L1313">        }</span>
+<span class="nc" id="L1314">    }</span>
+
+    /**
+     * Get the current offsets for a source connector.
+     *
+     * @param connName the name of the source connector whose offsets are to be retrieved
+     * @param connector the source connector
+     * @param connectorConfig the source connector's configurations
+     * @param cb callback to invoke upon completion of the request
+     */
+    private void sourceConnectorOffsets(String connName, Connector connector, Map&lt;String, String&gt; connectorConfig,
+                                        Callback&lt;ConnectorOffsets&gt; cb) {
+<span class="nc" id="L1326">        SourceConnectorConfig sourceConfig = new SourceConnectorConfig(plugins, connectorConfig, config.topicCreationEnable());</span>
+<span class="nc bnc" id="L1327" title="All 2 branches missed.">        ConnectorOffsetBackingStore offsetStore = config.exactlyOnceSourceEnabled()</span>
+<span class="nc" id="L1328">                ? offsetStoreForExactlyOnceSourceConnector(sourceConfig, connName, connector, null)</span>
+<span class="nc" id="L1329">                : offsetStoreForRegularSourceConnector(sourceConfig, connName, connector, null);</span>
+<span class="nc" id="L1330">        CloseableOffsetStorageReader offsetReader = new OffsetStorageReaderImpl(offsetStore, connName, internalKeyConverter, internalValueConverter);</span>
+<span class="nc" id="L1331">        sourceConnectorOffsets(connName, offsetStore, offsetReader, cb);</span>
+<span class="nc" id="L1332">    }</span>
+
+    // Visible for testing
+    void sourceConnectorOffsets(String connName, ConnectorOffsetBackingStore offsetStore,
+                                CloseableOffsetStorageReader offsetReader, Callback&lt;ConnectorOffsets&gt; cb) {
+<span class="nc" id="L1337">        executor.submit(() -&gt; {</span>
+            try {
+<span class="nc" id="L1339">                offsetStore.configure(config);</span>
+<span class="nc" id="L1340">                offsetStore.start();</span>
+<span class="nc" id="L1341">                Set&lt;Map&lt;String, Object&gt;&gt; connectorPartitions = offsetStore.connectorPartitions(connName);</span>
+<span class="nc" id="L1342">                List&lt;ConnectorOffset&gt; connectorOffsets = offsetReader.offsets(connectorPartitions).entrySet().stream()</span>
+<span class="nc" id="L1343">                        .map(entry -&gt; new ConnectorOffset(entry.getKey(), entry.getValue()))</span>
+<span class="nc" id="L1344">                        .collect(Collectors.toList());</span>
+<span class="nc" id="L1345">                cb.onCompletion(null, new ConnectorOffsets(connectorOffsets));</span>
+<span class="nc" id="L1346">            } catch (Throwable t) {</span>
+<span class="nc" id="L1347">                log.error(&quot;Failed to retrieve offsets for source connector {}&quot;, connName, t);</span>
+<span class="nc" id="L1348">                cb.onCompletion(ConnectUtils.maybeWrap(t, &quot;Failed to retrieve offsets for source connector &quot; + connName), null);</span>
+            } finally {
+<span class="nc" id="L1350">                Utils.closeQuietly(offsetReader, &quot;Offset reader for connector &quot; + connName);</span>
+<span class="nc" id="L1351">                Utils.closeQuietly(offsetStore::stop, &quot;Offset store for connector &quot; + connName);</span>
+            }
+<span class="nc" id="L1353">        });</span>
+<span class="nc" id="L1354">    }</span>
+
+    /**
+     * Modify (alter / reset) a connector's offsets.
+     *
+     * @param connName the name of the connector whose offsets are to be modified
+     * @param connectorConfig the connector's configurations
+     * @param offsets a mapping from partitions (either source partitions for source connectors, or Kafka topic
+     *                partitions for sink connectors) to offsets that need to be written; this should be {@code null}
+     *                for offsets reset requests
+     * @param cb callback to invoke upon completion
+     */
+    public void modifyConnectorOffsets(String connName, Map&lt;String, String&gt; connectorConfig,
+                                      Map&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; offsets, Callback&lt;Message&gt; cb) {
+
+<span class="nc" id="L1369">        final Connector connector = instantiateConnector(connectorConfig);</span>
+<span class="nc" id="L1370">        ClassLoader connectorLoader = connectorClassLoader(connectorConfig);</span>
+<span class="nc" id="L1371">        try (LoaderSwap loaderSwap = plugins.withClassLoader(connectorLoader)) {</span>
+<span class="nc bnc" id="L1372" title="All 2 branches missed.">            if (ConnectUtils.isSinkConnector(connector)) {</span>
+<span class="nc" id="L1373">                log.debug(&quot;Modifying offsets for sink connector: {}&quot;, connName);</span>
+<span class="nc" id="L1374">                modifySinkConnectorOffsets(connName, connector, connectorConfig, offsets, connectorLoader, cb);</span>
+            } else {
+<span class="nc" id="L1376">                log.debug(&quot;Modifying offsets for source connector: {}&quot;, connName);</span>
+<span class="nc" id="L1377">                modifySourceConnectorOffsets(connName, connector, connectorConfig, offsets, connectorLoader, cb);</span>
+            }
+        }
+<span class="nc" id="L1380">    }</span>
+
+    /**
+     * Modify (alter / reset) a sink connector's consumer group offsets.
+     * &lt;p&gt;
+     * Visible for testing.
+     *
+     * @param connName the name of the sink connector whose offsets are to be modified
+     * @param connector an instance of the sink connector
+     * @param connectorConfig the sink connector's configuration
+     * @param offsets a mapping from topic partitions to offsets that need to be written; this should be {@code null}
+     *                for offsets reset requests
+     * @param connectorLoader the connector plugin's classloader to be used as the thread context classloader
+     * @param cb callback to invoke upon completion
+     */
+    void modifySinkConnectorOffsets(String connName, Connector connector, Map&lt;String, String&gt; connectorConfig,
+                                    Map&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; offsets, ClassLoader connectorLoader, Callback&lt;Message&gt; cb) {
+<span class="nc" id="L1397">        executor.submit(plugins.withClassLoader(connectorLoader, () -&gt; {</span>
+            try {
+<span class="nc" id="L1399">                Timer timer = time.timer(Duration.ofMillis(RestServer.DEFAULT_REST_REQUEST_TIMEOUT_MS));</span>
+<span class="nc bnc" id="L1400" title="All 2 branches missed.">                boolean isReset = offsets == null;</span>
+<span class="nc" id="L1401">                SinkConnectorConfig sinkConnectorConfig = new SinkConnectorConfig(plugins, connectorConfig);</span>
+<span class="nc" id="L1402">                Class&lt;? extends Connector&gt; sinkConnectorClass = connector.getClass();</span>
+<span class="nc" id="L1403">                Map&lt;String, Object&gt; adminConfig = adminConfigs(</span>
+                        connName,
+                        &quot;connector-worker-adminclient-&quot; + connName,
+                        config,
+                        sinkConnectorConfig,
+                        sinkConnectorClass,
+                        connectorClientConfigOverridePolicy,
+                        kafkaClusterId,
+                        ConnectorType.SINK);
+
+<span class="nc" id="L1413">                String groupId = (String) baseConsumerConfigs(</span>
+                        connName, &quot;connector-consumer-&quot;, config, sinkConnectorConfig,
+<span class="nc" id="L1415">                        sinkConnectorClass, connectorClientConfigOverridePolicy, kafkaClusterId, ConnectorType.SINK).get(ConsumerConfig.GROUP_ID_CONFIG);</span>
+
+<span class="nc" id="L1417">                Admin admin = adminFactory.apply(adminConfig);</span>
+
+                try {
+                    Map&lt;TopicPartition, Long&gt; offsetsToWrite;
+<span class="nc bnc" id="L1421" title="All 2 branches missed.">                    if (isReset) {</span>
+<span class="nc" id="L1422">                        offsetsToWrite = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1423">                        ListConsumerGroupOffsetsOptions listConsumerGroupOffsetsOptions = new ListConsumerGroupOffsetsOptions()</span>
+<span class="nc" id="L1424">                                .timeoutMs((int) timer.remainingMs());</span>
+                        try {
+<span class="nc" id="L1426">                            admin.listConsumerGroupOffsets(groupId, listConsumerGroupOffsetsOptions)</span>
+<span class="nc" id="L1427">                                    .partitionsToOffsetAndMetadata()</span>
+<span class="nc" id="L1428">                                    .get(timer.remainingMs(), TimeUnit.MILLISECONDS)</span>
+<span class="nc" id="L1429">                                    .forEach((topicPartition, offsetAndMetadata) -&gt; offsetsToWrite.put(topicPartition, null));</span>
+
+<span class="nc" id="L1431">                            timer.update();</span>
+<span class="nc" id="L1432">                            log.debug(&quot;Found the following topic partitions (to reset offsets) for sink connector {} and consumer group ID {}: {}&quot;,</span>
+<span class="nc" id="L1433">                                    connName, groupId, offsetsToWrite.keySet());</span>
+<span class="nc" id="L1434">                        } catch (Exception e) {</span>
+<span class="nc" id="L1435">                            Utils.closeQuietly(admin, &quot;Offset reset admin for sink connector &quot; + connName);</span>
+<span class="nc" id="L1436">                            log.error(&quot;Failed to list offsets prior to resetting offsets for sink connector {}&quot;, connName, e);</span>
+<span class="nc" id="L1437">                            cb.onCompletion(new ConnectException(&quot;Failed to list offsets prior to resetting offsets for sink connector &quot; + connName, e), null);</span>
+<span class="nc" id="L1438">                            return;</span>
+<span class="nc" id="L1439">                        }</span>
+<span class="nc" id="L1440">                    } else {</span>
+<span class="nc" id="L1441">                        offsetsToWrite = SinkUtils.parseSinkConnectorOffsets(offsets);</span>
+                    }
+
+                    boolean alterOffsetsResult;
+                    try {
+<span class="nc" id="L1446">                        alterOffsetsResult = ((SinkConnector) connector).alterOffsets(connectorConfig, offsetsToWrite);</span>
+<span class="nc" id="L1447">                    } catch (UnsupportedOperationException e) {</span>
+<span class="nc" id="L1448">                        log.error(&quot;Failed to modify offsets for connector {} because it doesn't support external modification of offsets&quot;,</span>
+                                connName, e);
+<span class="nc" id="L1450">                        throw new ConnectException(&quot;Failed to modify offsets for connector &quot; + connName + &quot; because it doesn't support external &quot; +</span>
+                                &quot;modification of offsets&quot;, e);
+<span class="nc" id="L1452">                    }</span>
+<span class="nc" id="L1453">                    updateTimerAndCheckExpiry(timer, &quot;Timed out while calling the 'alterOffsets' method for sink connector &quot; + connName);</span>
+
+<span class="nc bnc" id="L1455" title="All 2 branches missed.">                    if (isReset) {</span>
+<span class="nc" id="L1456">                        resetSinkConnectorOffsets(connName, groupId, admin, cb, alterOffsetsResult, timer);</span>
+                    } else {
+<span class="nc" id="L1458">                        alterSinkConnectorOffsets(connName, groupId, admin, offsetsToWrite, cb, alterOffsetsResult, timer);</span>
+                    }
+<span class="nc" id="L1460">                } catch (Throwable t) {</span>
+<span class="nc" id="L1461">                    Utils.closeQuietly(admin, &quot;Offset modification admin for sink connector &quot; + connName);</span>
+<span class="nc" id="L1462">                    throw t;</span>
+<span class="nc" id="L1463">                }</span>
+<span class="nc" id="L1464">            } catch (Throwable t) {</span>
+<span class="nc" id="L1465">                log.error(&quot;Failed to modify offsets for sink connector {}&quot;, connName, t);</span>
+<span class="nc" id="L1466">                cb.onCompletion(ConnectUtils.maybeWrap(t, &quot;Failed to modify offsets for sink connector &quot; + connName), null);</span>
+<span class="nc" id="L1467">            }</span>
+<span class="nc" id="L1468">        }));</span>
+<span class="nc" id="L1469">    }</span>
+
+    /**
+     * Alter a sink connector's consumer group offsets. This is done via calls to {@link Admin#alterConsumerGroupOffsets}
+     * and / or {@link Admin#deleteConsumerGroupOffsets}.
+     *
+     * @param connName the name of the sink connector whose offsets are to be altered
+     * @param groupId the sink connector's consumer group ID
+     * @param admin the {@link Admin admin client} to be used for altering the consumer group offsets; will be closed after use
+     * @param offsetsToWrite a mapping from topic partitions to offsets that need to be written; may not be null or empty
+     * @param cb callback to invoke upon completion
+     * @param alterOffsetsResult the result of the call to {@link SinkConnector#alterOffsets} for the connector
+     * @param timer {@link Timer} to bound the total runtime of admin client requests
+     */
+    private void alterSinkConnectorOffsets(String connName, String groupId, Admin admin, Map&lt;TopicPartition, Long&gt; offsetsToWrite,
+                                           Callback&lt;Message&gt; cb, boolean alterOffsetsResult, Timer timer) {
+<span class="nc" id="L1485">        List&lt;KafkaFuture&lt;Void&gt;&gt; adminFutures = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L1487">        Map&lt;TopicPartition, OffsetAndMetadata&gt; offsetsToAlter = offsetsToWrite.entrySet()</span>
+<span class="nc" id="L1488">                .stream()</span>
+<span class="nc bnc" id="L1489" title="All 2 branches missed.">                .filter(entry -&gt; entry.getValue() != null)</span>
+<span class="nc" id="L1490">                .collect(Collectors.toMap(Map.Entry::getKey, e -&gt; new OffsetAndMetadata(e.getValue())));</span>
+
+<span class="nc bnc" id="L1492" title="All 2 branches missed.">        if (!offsetsToAlter.isEmpty()) {</span>
+<span class="nc" id="L1493">            log.debug(&quot;Committing the following consumer group offsets using an admin client for sink connector {}: {}.&quot;,</span>
+                    connName, offsetsToAlter);
+<span class="nc" id="L1495">            AlterConsumerGroupOffsetsOptions alterConsumerGroupOffsetsOptions = new AlterConsumerGroupOffsetsOptions()</span>
+<span class="nc" id="L1496">                    .timeoutMs((int) timer.remainingMs());</span>
+<span class="nc" id="L1497">            AlterConsumerGroupOffsetsResult alterConsumerGroupOffsetsResult = admin.alterConsumerGroupOffsets(groupId, offsetsToAlter,</span>
+                    alterConsumerGroupOffsetsOptions);
+
+<span class="nc" id="L1500">            adminFutures.add(alterConsumerGroupOffsetsResult.all());</span>
+        }
+
+<span class="nc" id="L1503">        Set&lt;TopicPartition&gt; partitionsToReset = offsetsToWrite.entrySet()</span>
+<span class="nc" id="L1504">                .stream()</span>
+<span class="nc bnc" id="L1505" title="All 2 branches missed.">                .filter(entry -&gt; entry.getValue() == null)</span>
+<span class="nc" id="L1506">                .map(Map.Entry::getKey)</span>
+<span class="nc" id="L1507">                .collect(Collectors.toSet());</span>
+
+<span class="nc bnc" id="L1509" title="All 2 branches missed.">        if (!partitionsToReset.isEmpty()) {</span>
+<span class="nc" id="L1510">            log.debug(&quot;Deleting the consumer group offsets for the following topic partitions using an admin client for sink connector {}: {}.&quot;,</span>
+                    connName, partitionsToReset);
+<span class="nc" id="L1512">            DeleteConsumerGroupOffsetsOptions deleteConsumerGroupOffsetsOptions = new DeleteConsumerGroupOffsetsOptions()</span>
+<span class="nc" id="L1513">                    .timeoutMs((int) timer.remainingMs());</span>
+<span class="nc" id="L1514">            DeleteConsumerGroupOffsetsResult deleteConsumerGroupOffsetsResult = admin.deleteConsumerGroupOffsets(groupId, partitionsToReset,</span>
+                    deleteConsumerGroupOffsetsOptions);
+
+<span class="nc" id="L1517">            adminFutures.add(deleteConsumerGroupOffsetsResult.all());</span>
+        }
+
+        @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="nc" id="L1521">        KafkaFuture&lt;Void&gt; compositeAdminFuture = KafkaFuture.allOf(adminFutures.toArray(new KafkaFuture[0]));</span>
+
+<span class="nc" id="L1523">        compositeAdminFuture.whenComplete((ignored, error) -&gt; {</span>
+<span class="nc bnc" id="L1524" title="All 2 branches missed.">            if (error != null) {</span>
+                // When a consumer group is non-empty, only group members can commit offsets. An attempt to alter offsets via the admin client
+                // will result in an UnknownMemberIdException if the consumer group is non-empty (i.e. if the sink tasks haven't stopped
+                // completely or if the connector is resumed while the alter offsets request is being processed). Similarly, an attempt to
+                // delete consumer group offsets for a non-empty consumer group will result in a GroupSubscribedToTopicException
+<span class="nc bnc" id="L1529" title="All 4 branches missed.">                if (error instanceof UnknownMemberIdException || error instanceof GroupSubscribedToTopicException) {</span>
+<span class="nc" id="L1530">                    String errorMsg = &quot;Failed to alter consumer group offsets for connector &quot; + connName + &quot; either because its tasks &quot; +</span>
+                            &quot;haven't stopped completely yet or the connector was resumed before the request to alter its offsets could be successfully &quot; +
+                            &quot;completed. If the connector is in a stopped state, this operation can be safely retried. If it doesn't eventually succeed, the &quot; +
+                            &quot;Connect cluster may need to be restarted to get rid of the zombie sink tasks.&quot;;
+<span class="nc" id="L1534">                    log.error(errorMsg, error);</span>
+<span class="nc" id="L1535">                    cb.onCompletion(new ConnectException(errorMsg, error), null);</span>
+<span class="nc" id="L1536">                } else {</span>
+<span class="nc" id="L1537">                    log.error(&quot;Failed to alter consumer group offsets for connector {}&quot;, connName, error);</span>
+<span class="nc" id="L1538">                    cb.onCompletion(new ConnectException(&quot;Failed to alter consumer group offsets for connector &quot; + connName, error), null);</span>
+                }
+            } else {
+<span class="nc" id="L1541">                completeModifyOffsetsCallback(alterOffsetsResult, false, cb);</span>
+            }
+<span class="nc" id="L1543">        }).whenComplete((ignored, ignoredError) -&gt; {</span>
+            // errors originating from the original future are handled in the prior whenComplete invocation which isn't expected to throw
+            // an exception itself, and we can thus ignore the error here
+<span class="nc" id="L1546">            Utils.closeQuietly(admin, &quot;Offset alter admin for sink connector &quot; + connName);</span>
+<span class="nc" id="L1547">        });</span>
+<span class="nc" id="L1548">    }</span>
+
+    /**
+     * Reset a sink connector's consumer group offsets. This is done by deleting the consumer group via a call to
+     * {@link Admin#deleteConsumerGroups}
+     *
+     * @param connName the name of the sink connector whose offsets are to be reset
+     * @param groupId the sink connector's consumer group ID
+     * @param admin the {@link Admin admin client} to be used for resetting the consumer group offsets; will be closed after use
+     * @param cb callback to invoke upon completion
+     * @param alterOffsetsResult the result of the call to {@link SinkConnector#alterOffsets} for the connector
+     * @param timer {@link Timer} to bound the total runtime of admin client requests
+     */
+    private void resetSinkConnectorOffsets(String connName, String groupId, Admin admin, Callback&lt;Message&gt; cb, boolean alterOffsetsResult, Timer timer) {
+<span class="nc" id="L1562">        DeleteConsumerGroupsOptions deleteConsumerGroupsOptions = new DeleteConsumerGroupsOptions().timeoutMs((int) timer.remainingMs());</span>
+
+<span class="nc" id="L1564">        admin.deleteConsumerGroups(Set.of(groupId), deleteConsumerGroupsOptions)</span>
+<span class="nc" id="L1565">                .all()</span>
+<span class="nc" id="L1566">                .whenComplete((ignored, error) -&gt; {</span>
+                    // We treat GroupIdNotFoundException as a non-error here because resetting a connector's offsets is expected to be an idempotent operation
+                    // and the consumer group could have already been deleted in a prior offsets reset request
+<span class="nc bnc" id="L1569" title="All 4 branches missed.">                    if (error != null &amp;&amp; !(error instanceof GroupIdNotFoundException)) {</span>
+                        // When a consumer group is non-empty, attempts to delete it via the admin client result in a GroupNotEmptyException. This can occur
+                        // if the sink tasks haven't stopped completely or if the connector is resumed while the reset offsets request is being processed
+<span class="nc bnc" id="L1572" title="All 2 branches missed.">                        if (error instanceof GroupNotEmptyException) {</span>
+<span class="nc" id="L1573">                            String errorMsg = &quot;Failed to reset consumer group offsets for connector &quot; + connName + &quot; either because its tasks &quot; +</span>
+                                    &quot;haven't stopped completely yet or the connector was resumed before the request to reset its offsets could be successfully &quot; +
+                                    &quot;completed. If the connector is in a stopped state, this operation can be safely retried. If it doesn't eventually succeed, the &quot; +
+                                    &quot;Connect cluster may need to be restarted to get rid of the zombie sink tasks.&quot;;
+<span class="nc" id="L1577">                            log.error(errorMsg, error);</span>
+<span class="nc" id="L1578">                            cb.onCompletion(new ConnectException(errorMsg, error), null);</span>
+<span class="nc" id="L1579">                        } else {</span>
+<span class="nc" id="L1580">                            log.error(&quot;Failed to reset consumer group offsets for sink connector {}&quot;, connName, error);</span>
+<span class="nc" id="L1581">                            cb.onCompletion(new ConnectException(&quot;Failed to reset consumer group offsets for sink connector &quot; + connName, error), null);</span>
+                        }
+                    } else {
+<span class="nc" id="L1584">                        completeModifyOffsetsCallback(alterOffsetsResult, true, cb);</span>
+                    }
+<span class="nc" id="L1586">                }).whenComplete((ignored, ignoredError) -&gt; {</span>
+                    // errors originating from the original future are handled in the prior whenComplete invocation which isn't expected to throw
+                    // an exception itself, and we can thus ignore the error here
+<span class="nc" id="L1589">                    Utils.closeQuietly(admin, &quot;Offset reset admin for sink connector &quot; + connName);</span>
+<span class="nc" id="L1590">                });</span>
+<span class="nc" id="L1591">    }</span>
+
+    /**
+     * Modify (alter / reset) a source connector's offsets.
+     *
+     * @param connName the name of the source connector whose offsets are to be modified
+     * @param connector an instance of the source connector
+     * @param connectorConfig the source connector's configuration
+     * @param offsets a mapping from partitions to offsets that need to be written; this should be {@code null} for
+     *                offsets reset requests
+     * @param connectorLoader the connector plugin's classloader to be used as the thread context classloader
+     * @param cb callback to invoke upon completion
+     */
+    private void modifySourceConnectorOffsets(String connName, Connector connector, Map&lt;String, String&gt; connectorConfig,
+                                              Map&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; offsets, ClassLoader connectorLoader, Callback&lt;Message&gt; cb) {
+<span class="nc" id="L1606">        SourceConnectorConfig sourceConfig = new SourceConnectorConfig(plugins, connectorConfig, config.topicCreationEnable());</span>
+<span class="nc bnc" id="L1607" title="All 2 branches missed.">        Map&lt;String, Object&gt; producerProps = config.exactlyOnceSourceEnabled()</span>
+<span class="nc" id="L1608">                ? exactlyOnceSourceTaskProducerConfigs(new ConnectorTaskId(connName, 0), config, sourceConfig,</span>
+<span class="nc" id="L1609">                connector.getClass(), connectorClientConfigOverridePolicy, kafkaClusterId)</span>
+<span class="nc" id="L1610">                : baseProducerConfigs(connName, &quot;connector-offset-producer-&quot; + connName, config, sourceConfig,</span>
+<span class="nc" id="L1611">                connector.getClass(), connectorClientConfigOverridePolicy, kafkaClusterId);</span>
+<span class="nc" id="L1612">        KafkaProducer&lt;byte[], byte[]&gt; producer = new KafkaProducer&lt;&gt;(producerProps);</span>
+
+<span class="nc bnc" id="L1614" title="All 2 branches missed.">        ConnectorOffsetBackingStore offsetStore = config.exactlyOnceSourceEnabled()</span>
+<span class="nc" id="L1615">                ? offsetStoreForExactlyOnceSourceConnector(sourceConfig, connName, connector, producer)</span>
+<span class="nc" id="L1616">                : offsetStoreForRegularSourceConnector(sourceConfig, connName, connector, producer);</span>
+<span class="nc" id="L1617">        offsetStore.configure(config);</span>
+
+<span class="nc" id="L1619">        OffsetStorageWriter offsetWriter = new OffsetStorageWriter(offsetStore, connName, internalKeyConverter, internalValueConverter);</span>
+<span class="nc" id="L1620">        modifySourceConnectorOffsets(connName, connector, connectorConfig, offsets, offsetStore, producer, offsetWriter, connectorLoader, cb);</span>
+<span class="nc" id="L1621">    }</span>
+
+    // Visible for testing
+    void modifySourceConnectorOffsets(String connName, Connector connector, Map&lt;String, String&gt; connectorConfig,
+                                      Map&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; offsets, ConnectorOffsetBackingStore offsetStore,
+                                      KafkaProducer&lt;byte[], byte[]&gt; producer, OffsetStorageWriter offsetWriter,
+                                      ClassLoader connectorLoader, Callback&lt;Message&gt; cb) {
+<span class="nc" id="L1628">        executor.submit(plugins.withClassLoader(connectorLoader, () -&gt; {</span>
+            try {
+<span class="nc" id="L1630">                Timer timer = time.timer(Duration.ofMillis(RestServer.DEFAULT_REST_REQUEST_TIMEOUT_MS));</span>
+                // This reads to the end of the offsets topic and can be a potentially time-consuming operation
+<span class="nc" id="L1632">                offsetStore.start();</span>
+<span class="nc" id="L1633">                updateTimerAndCheckExpiry(timer, &quot;Timed out while trying to read to the end of the offsets topic prior to modifying &quot; +</span>
+                        &quot;offsets for source connector &quot; + connName);
+                Map&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; offsetsToWrite;
+
+                // If the offsets argument is null, it indicates an offsets reset operation - i.e. a null offset should
+                // be written for every source partition of the connector
+                boolean isReset;
+<span class="nc bnc" id="L1640" title="All 2 branches missed.">                if (offsets == null) {</span>
+<span class="nc" id="L1641">                    isReset = true;</span>
+<span class="nc" id="L1642">                    offsetsToWrite = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1643">                    offsetStore.connectorPartitions(connName).forEach(partition -&gt; offsetsToWrite.put(partition, null));</span>
+<span class="nc" id="L1644">                    log.debug(&quot;Found the following partitions (to reset offsets) for source connector {}: {}&quot;, connName, offsetsToWrite.keySet());</span>
+                } else {
+<span class="nc" id="L1646">                    isReset = false;</span>
+<span class="nc" id="L1647">                    offsetsToWrite = offsets;</span>
+                }
+
+<span class="nc" id="L1650">                Map&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; normalizedOffsets = normalizeSourceConnectorOffsets(offsetsToWrite);</span>
+
+                boolean alterOffsetsResult;
+                try {
+<span class="nc" id="L1654">                    alterOffsetsResult = ((SourceConnector) connector).alterOffsets(connectorConfig, normalizedOffsets);</span>
+<span class="nc" id="L1655">                } catch (UnsupportedOperationException e) {</span>
+<span class="nc" id="L1656">                    log.error(&quot;Failed to modify offsets for connector {} because it doesn't support external modification of offsets&quot;,</span>
+                            connName, e);
+<span class="nc" id="L1658">                    throw new ConnectException(&quot;Failed to modify offsets for connector &quot; + connName + &quot; because it doesn't support external &quot; +</span>
+                            &quot;modification of offsets&quot;, e);
+<span class="nc" id="L1660">                }</span>
+<span class="nc" id="L1661">                updateTimerAndCheckExpiry(timer, &quot;Timed out while calling the 'alterOffsets' method for source connector &quot; + connName);</span>
+
+                // This should only occur for an offsets reset request when there are no source partitions found for the source connector in the
+                // offset store - either because there was a prior attempt to reset offsets or if there are no offsets committed by this source
+                // connector so far
+<span class="nc bnc" id="L1666" title="All 2 branches missed.">                if (normalizedOffsets.isEmpty()) {</span>
+<span class="nc" id="L1667">                    log.info(&quot;No offsets found for source connector {} - this can occur due to a prior attempt to reset offsets or if the &quot; +</span>
+                            &quot;source connector hasn't committed any offsets yet&quot;, connName);
+<span class="nc" id="L1669">                    completeModifyOffsetsCallback(alterOffsetsResult, isReset, cb);</span>
+<span class="nc" id="L1670">                    return;</span>
+                }
+
+                // The modifySourceConnectorOffsets method should only be called after all the connector's tasks have been stopped, and it's
+                // safe to write offsets via an offset writer
+<span class="nc" id="L1675">                normalizedOffsets.forEach(offsetWriter::offset);</span>
+
+                // We can call begin flush without a timeout because this newly created single-purpose offset writer can't do concurrent
+                // offset writes. We can also ignore the return value since it returns false if and only if there is no data to be flushed,
+                // and we've just put some data in the previous statement
+<span class="nc" id="L1680">                offsetWriter.beginFlush();</span>
+
+<span class="nc bnc" id="L1682" title="All 2 branches missed.">                if (config.exactlyOnceSourceEnabled()) {</span>
+<span class="nc" id="L1683">                    producer.initTransactions();</span>
+<span class="nc" id="L1684">                    producer.beginTransaction();</span>
+                }
+<span class="nc" id="L1686">                log.debug(&quot;Committing the following offsets for source connector {}: {}&quot;, connName, normalizedOffsets);</span>
+<span class="nc" id="L1687">                FutureCallback&lt;Void&gt; offsetWriterCallback = new FutureCallback&lt;&gt;();</span>
+<span class="nc" id="L1688">                offsetWriter.doFlush(offsetWriterCallback);</span>
+<span class="nc bnc" id="L1689" title="All 2 branches missed.">                if (config.exactlyOnceSourceEnabled()) {</span>
+<span class="nc" id="L1690">                    producer.commitTransaction();</span>
+                }
+
+                try {
+<span class="nc" id="L1694">                    offsetWriterCallback.get(timer.remainingMs(), TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L1695">                } catch (ExecutionException e) {</span>
+<span class="nc" id="L1696">                    throw new ConnectException(&quot;Failed to modify offsets for source connector &quot; + connName, e.getCause());</span>
+<span class="nc" id="L1697">                } catch (TimeoutException e) {</span>
+<span class="nc" id="L1698">                    throw new ConnectException(&quot;Timed out while attempting to modify offsets for source connector &quot; + connName, e);</span>
+<span class="nc" id="L1699">                } catch (InterruptedException e) {</span>
+<span class="nc" id="L1700">                    throw new ConnectException(&quot;Unexpectedly interrupted while attempting to modify offsets for source connector &quot; + connName, e);</span>
+<span class="nc" id="L1701">                }</span>
+
+<span class="nc" id="L1703">                completeModifyOffsetsCallback(alterOffsetsResult, isReset, cb);</span>
+<span class="nc" id="L1704">            } catch (Throwable t) {</span>
+<span class="nc" id="L1705">                log.error(&quot;Failed to modify offsets for source connector {}&quot;, connName, t);</span>
+<span class="nc" id="L1706">                cb.onCompletion(ConnectUtils.maybeWrap(t, &quot;Failed to modify offsets for source connector &quot; + connName), null);</span>
+            } finally {
+<span class="nc" id="L1708">                Utils.closeQuietly(offsetStore::stop, &quot;Offset store for offset modification request for connector &quot; + connName);</span>
+            }
+<span class="nc" id="L1710">        }));</span>
+<span class="nc" id="L1711">    }</span>
+
+    /**
+     * &quot;Normalize&quot; source connector offsets by serializing and deserializing them using the internal {@link JsonConverter}.
+     * This is done in order to prevent type mismatches between the offsets passed to {@link SourceConnector#alterOffsets(Map, Map)}
+     * and the offsets that connectors and tasks retrieve via an instance of {@link OffsetStorageReader}.
+     * &lt;p&gt;
+     * Visible for testing.
+     *
+     * @param originalOffsets the offsets that are to be normalized
+     * @return the normalized offsets
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    Map&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; normalizeSourceConnectorOffsets(Map&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; originalOffsets) {
+<span class="nc" id="L1725">        Map&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; normalizedOffsets = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1726" title="All 2 branches missed.">        for (Map.Entry&lt;Map&lt;String, ?&gt;, Map&lt;String, ?&gt;&gt; entry : originalOffsets.entrySet()) {</span>
+<span class="nc" id="L1727">            OffsetUtils.validateFormat(entry.getKey());</span>
+<span class="nc" id="L1728">            OffsetUtils.validateFormat(entry.getValue());</span>
+<span class="nc" id="L1729">            byte[] serializedKey = internalKeyConverter.fromConnectData(&quot;&quot;, null, entry.getKey());</span>
+<span class="nc" id="L1730">            byte[] serializedValue = internalValueConverter.fromConnectData(&quot;&quot;, null, entry.getValue());</span>
+<span class="nc" id="L1731">            Object deserializedKey = internalKeyConverter.toConnectData(&quot;&quot;, serializedKey).value();</span>
+<span class="nc" id="L1732">            Object deserializedValue = internalValueConverter.toConnectData(&quot;&quot;, serializedValue).value();</span>
+<span class="nc" id="L1733">            normalizedOffsets.put((Map&lt;String, ?&gt;) deserializedKey, (Map&lt;String, ?&gt;) deserializedValue);</span>
+<span class="nc" id="L1734">        }</span>
+
+<span class="nc" id="L1736">        return normalizedOffsets;</span>
+    }
+
+    /**
+     * Update the provided timer, check if it's expired and throw a {@link ConnectException} with the provided error
+     * message if it is.
+     *
+     * @param timer {@link Timer} to check
+     * @param errorMessageIfExpired error message indicating the cause for the timer expiry
+     * @throws ConnectException if the timer has expired
+     */
+    private void updateTimerAndCheckExpiry(Timer timer, String errorMessageIfExpired) {
+<span class="nc" id="L1748">        timer.update();</span>
+<span class="nc bnc" id="L1749" title="All 2 branches missed.">        if (timer.isExpired()) {</span>
+<span class="nc" id="L1750">            log.error(errorMessageIfExpired);</span>
+<span class="nc" id="L1751">            throw new ConnectException(errorMessageIfExpired);</span>
+        }
+<span class="nc" id="L1753">    }</span>
+
+    /**
+     * Complete the alter / reset offsets callback with a potential-success or a definite-success message.
+     *
+     * @param alterOffsetsResult the result of the call to {@link SinkConnector#alterOffsets} / {@link SourceConnector#alterOffsets}
+     * @param isReset whether this callback if for an offsets reset operation
+     * @param cb the callback to complete
+     *
+     * @see &lt;a href=&quot;https://cwiki.apache.org/confluence/display/KAFKA/KIP-875%3A+First-class+offsets+support+in+Kafka+Connect&quot;&gt;KIP-875&lt;/a&gt;
+     */
+    private void completeModifyOffsetsCallback(boolean alterOffsetsResult, boolean isReset, Callback&lt;Message&gt; cb) {
+<span class="nc bnc" id="L1765" title="All 2 branches missed.">        String modificationType = isReset ? &quot;reset&quot; : &quot;altered&quot;;</span>
+<span class="nc bnc" id="L1766" title="All 2 branches missed.">        if (alterOffsetsResult) {</span>
+<span class="nc" id="L1767">            cb.onCompletion(null, new Message(&quot;The offsets for this connector have been &quot; + modificationType + &quot; successfully&quot;));</span>
+        } else {
+<span class="nc" id="L1769">            cb.onCompletion(null, new Message(&quot;The Connect framework-managed offsets for this connector have been &quot; +</span>
+                    modificationType + &quot; successfully. However, if this connector manages offsets externally, they will need to be &quot; +
+                    &quot;manually &quot; + modificationType + &quot; in the system that the connector uses.&quot;));
+        }
+<span class="nc" id="L1773">    }</span>
+
+    ConnectorStatusMetricsGroup connectorStatusMetricsGroup() {
+<span class="nc" id="L1776">        return connectorStatusMetricsGroup;</span>
+    }
+
+    WorkerMetricsGroup workerMetricsGroup() {
+<span class="nc" id="L1780">        return workerMetricsGroup;</span>
+    }
+
+    abstract class TaskBuilder&lt;T, R extends ConnectRecord&lt;R&gt;&gt; {
+
+        private final ConnectorTaskId id;
+        private final ClusterConfigState configState;
+        private final TaskStatus.Listener statusListener;
+        private final TargetState initialState;
+
+<span class="fc" id="L1790">        private Task task = null;</span>
+<span class="fc" id="L1791">        private ConnectorConfig connectorConfig = null;</span>
+<span class="fc" id="L1792">        private Plugin&lt;Converter&gt; keyConverterPlugin = null;</span>
+<span class="fc" id="L1793">        private Plugin&lt;Converter&gt; valueConverterPlugin = null;</span>
+<span class="fc" id="L1794">        private Plugin&lt;HeaderConverter&gt; headerConverterPlugin = null;</span>
+<span class="fc" id="L1795">        private ClassLoader classLoader = null;</span>
+
+        public TaskBuilder(ConnectorTaskId id,
+                           ClusterConfigState configState,
+                           TaskStatus.Listener statusListener,
+<span class="fc" id="L1800">                           TargetState initialState) {</span>
+<span class="fc" id="L1801">            this.id = id;</span>
+<span class="fc" id="L1802">            this.configState = configState;</span>
+<span class="fc" id="L1803">            this.statusListener = statusListener;</span>
+<span class="fc" id="L1804">            this.initialState = initialState;</span>
+<span class="fc" id="L1805">        }</span>
+
+        public TaskBuilder&lt;T, R&gt; withTask(Task task) {
+<span class="fc" id="L1808">            this.task = task;</span>
+<span class="fc" id="L1809">            return this;</span>
+        }
+
+        public TaskBuilder&lt;T, R&gt; withConnectorConfig(ConnectorConfig connectorConfig) {
+<span class="fc" id="L1813">            this.connectorConfig = connectorConfig;</span>
+<span class="fc" id="L1814">            return this;</span>
+        }
+
+        public TaskBuilder&lt;T, R&gt; withKeyConverterPlugin(Plugin&lt;Converter&gt; keyConverterPlugin) {
+<span class="fc" id="L1818">            this.keyConverterPlugin = keyConverterPlugin;</span>
+<span class="fc" id="L1819">            return this;</span>
+        }
+
+        public TaskBuilder&lt;T, R&gt; withValueConverterPlugin(Plugin&lt;Converter&gt; valueConverterPlugin) {
+<span class="fc" id="L1823">            this.valueConverterPlugin = valueConverterPlugin;</span>
+<span class="fc" id="L1824">            return this;</span>
+        }
+
+        public TaskBuilder&lt;T, R&gt; withHeaderConverterPlugin(Plugin&lt;HeaderConverter&gt; headerConverterPlugin) {
+<span class="fc" id="L1828">            this.headerConverterPlugin = headerConverterPlugin;</span>
+<span class="fc" id="L1829">            return this;</span>
+        }
+
+        public TaskBuilder&lt;T, R&gt; withClassLoader(ClassLoader classLoader) {
+<span class="fc" id="L1833">            this.classLoader = classLoader;</span>
+<span class="fc" id="L1834">            return this;</span>
+        }
+
+
+        public WorkerTask&lt;T, R&gt; build() {
+<span class="fc" id="L1839">            Objects.requireNonNull(task, &quot;Task cannot be null&quot;);</span>
+<span class="fc" id="L1840">            Objects.requireNonNull(connectorConfig, &quot;Connector config used by task cannot be null&quot;);</span>
+<span class="fc" id="L1841">            Objects.requireNonNull(keyConverterPlugin.get(), &quot;Key converter used by task cannot be null&quot;);</span>
+<span class="fc" id="L1842">            Objects.requireNonNull(valueConverterPlugin.get(), &quot;Value converter used by task cannot be null&quot;);</span>
+<span class="fc" id="L1843">            Objects.requireNonNull(headerConverterPlugin.get(), &quot;Header converter used by task cannot be null&quot;);</span>
+<span class="fc" id="L1844">            Objects.requireNonNull(classLoader, &quot;Classloader used by task cannot be null&quot;);</span>
+
+<span class="fc" id="L1846">            ErrorHandlingMetrics errorHandlingMetrics = errorHandlingMetrics(id);</span>
+<span class="fc" id="L1847">            final Class&lt;? extends Connector&gt; connectorClass = connectorClass(connectorConfig.originalsStrings());</span>
+
+<span class="fc" id="L1849">            RetryWithToleranceOperator&lt;T&gt; retryWithToleranceOperator = new RetryWithToleranceOperator&lt;&gt;(connectorConfig.errorRetryTimeout(),</span>
+<span class="fc" id="L1850">                    connectorConfig.errorMaxDelayInMillis(), connectorConfig.errorToleranceType(), Time.SYSTEM, errorHandlingMetrics);</span>
+
+<span class="fc" id="L1852">            TransformationChain&lt;T, R&gt; transformationChain = new TransformationChain&lt;&gt;(connectorConfig.&lt;R&gt;transformationStages(plugins, id, metrics), retryWithToleranceOperator);</span>
+<span class="fc" id="L1853">            log.info(&quot;Initializing: {}&quot;, transformationChain);</span>
+
+<span class="fc" id="L1855">            TaskPluginsMetadata taskPluginsMetadata = new TaskPluginsMetadata(</span>
+<span class="fc" id="L1856">                    connectorClass, task, keyConverterPlugin.get(), valueConverterPlugin.get(), headerConverterPlugin.get(), transformationChain.transformationChainInfo(), plugins);</span>
+
+<span class="fc" id="L1858">            return doBuild(task, id, configState, statusListener, initialState,</span>
+                connectorConfig, keyConverterPlugin, valueConverterPlugin, headerConverterPlugin, classLoader,
+                retryWithToleranceOperator, transformationChain,
+                errorHandlingMetrics, connectorClass, taskPluginsMetadata);
+        }
+
+        abstract WorkerTask&lt;T, R&gt; doBuild(
+                Task task,
+                ConnectorTaskId id,
+                ClusterConfigState configState,
+                TaskStatus.Listener statusListener,
+                TargetState initialState,
+                ConnectorConfig connectorConfig,
+                Plugin&lt;Converter&gt; keyConverterPlugin,
+                Plugin&lt;Converter&gt; valueConverterPlugin,
+                Plugin&lt;HeaderConverter&gt; headerConverterPlugin,
+                ClassLoader classLoader,
+                RetryWithToleranceOperator&lt;T&gt; retryWithToleranceOperator,
+                TransformationChain&lt;T, R&gt; transformationChain,
+                ErrorHandlingMetrics errorHandlingMetrics,
+                Class&lt;? extends Connector&gt; connectorClass,
+                TaskPluginsMetadata pluginsMetadata
+        );
+
+    }
+
+    class SinkTaskBuilder extends TaskBuilder&lt;ConsumerRecord&lt;byte[], byte[]&gt;, SinkRecord&gt; {
+        public SinkTaskBuilder(ConnectorTaskId id,
+                               ClusterConfigState configState,
+                               TaskStatus.Listener statusListener,
+<span class="fc" id="L1888">                               TargetState initialState) {</span>
+<span class="fc" id="L1889">            super(id, configState, statusListener, initialState);</span>
+<span class="fc" id="L1890">        }</span>
+
+        @Override
+        public WorkerTask&lt;ConsumerRecord&lt;byte[], byte[]&gt;, SinkRecord&gt; doBuild(
+                Task task,
+                ConnectorTaskId id,
+                ClusterConfigState configState,
+                TaskStatus.Listener statusListener,
+                TargetState initialState,
+                ConnectorConfig connectorConfig,
+                Plugin&lt;Converter&gt; keyConverterPlugin,
+                Plugin&lt;Converter&gt; valueConverterPlugin,
+                Plugin&lt;HeaderConverter&gt; headerConverterPlugin,
+                ClassLoader classLoader,
+                RetryWithToleranceOperator&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; retryWithToleranceOperator,
+                TransformationChain&lt;ConsumerRecord&lt;byte[], byte[]&gt;, SinkRecord&gt; transformationChain,
+                ErrorHandlingMetrics errorHandlingMetrics,
+                Class&lt;? extends Connector&gt; connectorClass,
+                TaskPluginsMetadata taskPluginsMetadata
+        ) {
+<span class="fc" id="L1910">            SinkConnectorConfig sinkConfig = new SinkConnectorConfig(plugins, connectorConfig.originalsStrings());</span>
+<span class="fc" id="L1911">            WorkerErrantRecordReporter workerErrantRecordReporter = createWorkerErrantRecordReporter(sinkConfig, retryWithToleranceOperator,</span>
+<span class="fc" id="L1912">                    keyConverterPlugin.get(), valueConverterPlugin.get(), headerConverterPlugin.get());</span>
+
+<span class="fc" id="L1914">            Map&lt;String, Object&gt; consumerProps = baseConsumerConfigs(</span>
+<span class="fc" id="L1915">                    id.connector(),  &quot;connector-consumer-&quot; + id, config, connectorConfig, connectorClass,</span>
+                    connectorClientConfigOverridePolicy, kafkaClusterId, ConnectorType.SINK);
+<span class="fc" id="L1917">            KafkaConsumer&lt;byte[], byte[]&gt; consumer = new KafkaConsumer&lt;&gt;(consumerProps);</span>
+
+<span class="fc" id="L1919">            return new WorkerSinkTask(id, (SinkTask) task, statusListener, initialState, config, configState, metrics, keyConverterPlugin,</span>
+                    valueConverterPlugin, errorHandlingMetrics, headerConverterPlugin, transformationChain, consumer, classLoader, time,
+<span class="fc" id="L1921">                    retryWithToleranceOperator, workerErrantRecordReporter, herder.statusBackingStore(),</span>
+<span class="fc" id="L1922">                    () -&gt; sinkTaskReporters(id, sinkConfig, errorHandlingMetrics, connectorClass), taskPluginsMetadata, plugins.safeLoaderSwapper());</span>
+        }
+    }
+
+    class SourceTaskBuilder extends TaskBuilder&lt;SourceRecord, SourceRecord&gt; {
+        public SourceTaskBuilder(ConnectorTaskId id,
+                               ClusterConfigState configState,
+                               TaskStatus.Listener statusListener,
+<span class="fc" id="L1930">                               TargetState initialState) {</span>
+<span class="fc" id="L1931">            super(id, configState, statusListener, initialState);</span>
+<span class="fc" id="L1932">        }</span>
+
+        @Override
+        public WorkerTask&lt;SourceRecord, SourceRecord&gt; doBuild(
+                Task task,
+                ConnectorTaskId id,
+                ClusterConfigState configState,
+                TaskStatus.Listener statusListener,
+                TargetState initialState,
+                ConnectorConfig connectorConfig,
+                Plugin&lt;Converter&gt; keyConverterPlugin,
+                Plugin&lt;Converter&gt; valueConverterPlugin,
+                Plugin&lt;HeaderConverter&gt; headerConverterPlugin,
+                ClassLoader classLoader,
+                RetryWithToleranceOperator&lt;SourceRecord&gt; retryWithToleranceOperator,
+                TransformationChain&lt;SourceRecord, SourceRecord&gt; transformationChain,
+                ErrorHandlingMetrics errorHandlingMetrics,
+                Class&lt;? extends Connector&gt; connectorClass,
+                TaskPluginsMetadata pluginsMetadata
+        ) {
+<span class="fc" id="L1952">            SourceConnectorConfig sourceConfig = new SourceConnectorConfig(plugins,</span>
+<span class="fc" id="L1953">                    connectorConfig.originalsStrings(), config.topicCreationEnable());</span>
+
+<span class="fc" id="L1955">            Map&lt;String, Object&gt; producerProps = baseProducerConfigs(id.connector(), &quot;connector-producer-&quot; + id, config, sourceConfig, connectorClass,</span>
+                    connectorClientConfigOverridePolicy, kafkaClusterId);
+<span class="fc" id="L1957">            KafkaProducer&lt;byte[], byte[]&gt; producer = new KafkaProducer&lt;&gt;(producerProps);</span>
+
+<span class="fc" id="L1959">            TopicAdmin topicAdmin = null;</span>
+<span class="fc" id="L1960">            final boolean topicCreationEnabled = sourceConnectorTopicCreationEnabled(sourceConfig);</span>
+<span class="pc bpc" id="L1961" title="3 of 4 branches missed.">            if (topicCreationEnabled || regularSourceTaskUsesConnectorSpecificOffsetsStore(sourceConfig)) {</span>
+<span class="fc" id="L1962">                Map&lt;String, Object&gt; adminOverrides = adminConfigs(id.connector(), &quot;connector-adminclient-&quot; + id, config,</span>
+                        sourceConfig, connectorClass, connectorClientConfigOverridePolicy, kafkaClusterId, ConnectorType.SOURCE);
+<span class="fc" id="L1964">                topicAdmin = new TopicAdmin(adminOverrides);</span>
+            }
+
+<span class="pc bpc" id="L1967" title="1 of 2 branches missed.">            Map&lt;String, TopicCreationGroup&gt; topicCreationGroups = topicCreationEnabled</span>
+<span class="fc" id="L1968">                    ? TopicCreationGroup.configuredGroups(sourceConfig)</span>
+<span class="pc" id="L1969">                    : null;</span>
+
+            // Set up the offset backing store for this task instance
+<span class="fc" id="L1972">            ConnectorOffsetBackingStore offsetStore = offsetStoreForRegularSourceTask(</span>
+                    id, sourceConfig, connectorClass, producer, producerProps, topicAdmin);
+<span class="fc" id="L1974">            offsetStore.configure(config);</span>
+
+<span class="fc" id="L1976">            CloseableOffsetStorageReader offsetReader = new OffsetStorageReaderImpl(offsetStore, id.connector(), internalKeyConverter, internalValueConverter);</span>
+<span class="fc" id="L1977">            OffsetStorageWriter offsetWriter = new OffsetStorageWriter(offsetStore, id.connector(), internalKeyConverter, internalValueConverter);</span>
+
+            // Note we pass the configState as it performs dynamic transformations under the covers
+<span class="fc" id="L1980">            return new WorkerSourceTask(id, (SourceTask) task, statusListener, initialState, keyConverterPlugin, valueConverterPlugin, errorHandlingMetrics,</span>
+                    headerConverterPlugin, transformationChain, producer, topicAdmin, topicCreationGroups,
+                    offsetReader, offsetWriter, offsetStore, config, configState, metrics, classLoader, time,
+<span class="fc" id="L1983">                    retryWithToleranceOperator, herder.statusBackingStore(), executor, () -&gt; sourceTaskReporters(id, sourceConfig, errorHandlingMetrics), pluginsMetadata, plugins.safeLoaderSwapper());</span>
+        }
+    }
+
+    class ExactlyOnceSourceTaskBuilder extends TaskBuilder&lt;SourceRecord, SourceRecord&gt; {
+        private final Runnable preProducerCheck;
+        private final Runnable postProducerCheck;
+
+        public ExactlyOnceSourceTaskBuilder(ConnectorTaskId id,
+                                            ClusterConfigState configState,
+                                            TaskStatus.Listener statusListener,
+                                            TargetState initialState,
+                                            Runnable preProducerCheck,
+<span class="nc" id="L1996">                                            Runnable postProducerCheck) {</span>
+<span class="nc" id="L1997">            super(id, configState, statusListener, initialState);</span>
+<span class="nc" id="L1998">            this.preProducerCheck = preProducerCheck;</span>
+<span class="nc" id="L1999">            this.postProducerCheck = postProducerCheck;</span>
+<span class="nc" id="L2000">        }</span>
+
+        @Override
+        public WorkerTask&lt;SourceRecord, SourceRecord&gt; doBuild(
+                Task task,
+                ConnectorTaskId id,
+                ClusterConfigState configState,
+                TaskStatus.Listener statusListener,
+                TargetState initialState,
+                ConnectorConfig connectorConfig,
+                Plugin&lt;Converter&gt; keyConverterPlugin,
+                Plugin&lt;Converter&gt; valueConverterPlugin,
+                Plugin&lt;HeaderConverter&gt; headerConverterPlugin,
+                ClassLoader classLoader,
+                RetryWithToleranceOperator&lt;SourceRecord&gt; retryWithToleranceOperator,
+                TransformationChain&lt;SourceRecord, SourceRecord&gt; transformationChain,
+                ErrorHandlingMetrics errorHandlingMetrics,
+                Class&lt;? extends Connector&gt; connectorClass,
+                TaskPluginsMetadata pluginsMetadata
+        ) {
+<span class="nc" id="L2020">            SourceConnectorConfig sourceConfig = new SourceConnectorConfig(plugins,</span>
+<span class="nc" id="L2021">                    connectorConfig.originalsStrings(), config.topicCreationEnable());</span>
+<span class="nc" id="L2022">            Map&lt;String, Object&gt; producerProps = exactlyOnceSourceTaskProducerConfigs(</span>
+                    id, config, sourceConfig, connectorClass,
+                    connectorClientConfigOverridePolicy, kafkaClusterId);
+<span class="nc" id="L2025">            KafkaProducer&lt;byte[], byte[]&gt; producer = new KafkaProducer&lt;&gt;(producerProps);</span>
+
+            // Create a topic admin that the task will use for its offsets topic and, potentially, automatic topic creation
+<span class="nc" id="L2028">            Map&lt;String, Object&gt; adminOverrides = adminConfigs(id.connector(), &quot;connector-adminclient-&quot; + id, config,</span>
+                    sourceConfig, connectorClass, connectorClientConfigOverridePolicy, kafkaClusterId, ConnectorType.SOURCE);
+<span class="nc" id="L2030">            TopicAdmin topicAdmin = new TopicAdmin(adminOverrides);</span>
+
+<span class="nc bnc" id="L2032" title="All 2 branches missed.">            Map&lt;String, TopicCreationGroup&gt; topicCreationGroups = sourceConnectorTopicCreationEnabled(sourceConfig)</span>
+<span class="nc" id="L2033">                    ? TopicCreationGroup.configuredGroups(sourceConfig)</span>
+<span class="nc" id="L2034">                    : null;</span>
+
+            // Set up the offset backing store for this task instance
+<span class="nc" id="L2037">            ConnectorOffsetBackingStore offsetStore = offsetStoreForExactlyOnceSourceTask(</span>
+                    id, sourceConfig, connectorClass, producer, producerProps, topicAdmin);
+<span class="nc" id="L2039">            offsetStore.configure(config);</span>
+
+<span class="nc" id="L2041">            CloseableOffsetStorageReader offsetReader = new OffsetStorageReaderImpl(offsetStore, id.connector(), internalKeyConverter, internalValueConverter);</span>
+<span class="nc" id="L2042">            OffsetStorageWriter offsetWriter = new OffsetStorageWriter(offsetStore, id.connector(), internalKeyConverter, internalValueConverter);</span>
+
+            // Note we pass the configState as it performs dynamic transformations under the covers
+<span class="nc" id="L2045">            return new ExactlyOnceWorkerSourceTask(id, (SourceTask) task, statusListener, initialState, keyConverterPlugin, valueConverterPlugin,</span>
+                    headerConverterPlugin, transformationChain, producer, topicAdmin, topicCreationGroups,
+                    offsetReader, offsetWriter, offsetStore, config, configState, metrics, errorHandlingMetrics, classLoader, time, retryWithToleranceOperator,
+<span class="nc" id="L2048">                    herder.statusBackingStore(), sourceConfig, executor, preProducerCheck, postProducerCheck,</span>
+<span class="nc" id="L2049">                    () -&gt; sourceTaskReporters(id, sourceConfig, errorHandlingMetrics), pluginsMetadata, plugins.safeLoaderSwapper());</span>
+        }
+    }
+
+    /**
+     * Builds and returns an offset backing store for a regular source connector (i.e. when exactly-once support for source connectors is disabled).
+     * The offset backing store will either be just the worker's global offset backing store (if the connector doesn't define a connector-specific
+     * offset topic via its configs), just a connector-specific offset backing store (if the connector defines a connector-specific offsets
+     * topic which appears to be the same as the worker's global offset topic) or a combination of both the worker's global offset backing store
+     * and a connector-specific offset backing store.
+     * &lt;p&gt;
+     * Visible for testing.
+     * @param sourceConfig the source connector's config
+     * @param connName the source connector's name
+     * @param connector the source connector
+     * @param producer the Kafka producer for the offset backing store; may be {@code null} if a read-only offset backing store is required
+     * @return An offset backing store for a regular source connector
+     */
+    ConnectorOffsetBackingStore offsetStoreForRegularSourceConnector(
+            SourceConnectorConfig sourceConfig,
+            String connName,
+            Connector connector,
+            Producer&lt;byte[], byte[]&gt; producer
+    ) {
+<span class="fc" id="L2073">        String connectorSpecificOffsetsTopic = sourceConfig.offsetsTopic();</span>
+
+<span class="fc" id="L2075">        Map&lt;String, Object&gt; producerProps = baseProducerConfigs(connName, &quot;connector-producer-&quot; + connName, config, sourceConfig, connector.getClass(),</span>
+                connectorClientConfigOverridePolicy, kafkaClusterId);
+
+        // We use a connector-specific store (i.e., a dedicated KafkaOffsetBackingStore for this connector)
+        // if the worker supports per-connector offsets topics (which may be the case in distributed but not standalone mode, for example)
+        // and if the connector is explicitly configured with an offsets topic
+<span class="pc bpc" id="L2081" title="1 of 2 branches missed.">        final boolean usesConnectorSpecificStore = connectorSpecificOffsetsTopic != null</span>
+<span class="pc bnc" id="L2082" title="All 2 branches missed.">                &amp;&amp; config.connectorOffsetsTopicsPermitted();</span>
+
+<span class="pc bpc" id="L2084" title="1 of 2 branches missed.">        if (usesConnectorSpecificStore) {</span>
+<span class="nc" id="L2085">            Map&lt;String, Object&gt; consumerProps = regularSourceOffsetsConsumerConfigs(</span>
+<span class="nc" id="L2086">                        connName, &quot;connector-consumer-&quot; + connName, config, sourceConfig, connector.getClass(),</span>
+                        connectorClientConfigOverridePolicy, kafkaClusterId);
+<span class="nc" id="L2088">            KafkaConsumer&lt;byte[], byte[]&gt; consumer = new KafkaConsumer&lt;&gt;(consumerProps);</span>
+
+<span class="nc" id="L2090">            Map&lt;String, Object&gt; adminOverrides = adminConfigs(connName, &quot;connector-adminclient-&quot; + connName, config,</span>
+<span class="nc" id="L2091">                    sourceConfig, connector.getClass(), connectorClientConfigOverridePolicy, kafkaClusterId, ConnectorType.SOURCE);</span>
+
+<span class="nc" id="L2093">            TopicAdmin admin = new TopicAdmin(adminOverrides);</span>
+
+<span class="nc bnc" id="L2095" title="All 2 branches missed.">            KafkaOffsetBackingStore connectorStore = producer == null</span>
+<span class="nc" id="L2096">                    ? KafkaOffsetBackingStore.readOnlyStore(connectorSpecificOffsetsTopic, consumer, admin, internalKeyConverter)</span>
+<span class="nc" id="L2097">                    : KafkaOffsetBackingStore.readWriteStore(connectorSpecificOffsetsTopic, producer, consumer, admin, internalKeyConverter);</span>
+
+            // If the connector's offsets topic is the same as the worker-global offsets topic, there's no need to construct
+            // an offset store that has a primary and a secondary store which both read from that same topic.
+            // So, if the user has explicitly configured the connector with a connector-specific offsets topic
+            // but we know that that topic is the same as the worker-global offsets topic, we ignore the worker-global
+            // offset store and build a store backed exclusively by a connector-specific offsets store.
+            // It may seem reasonable to instead build a store backed exclusively by the worker-global offset store, but that
+            // would prevent users from being able to customize the config properties used for the Kafka clients that
+            // access the offsets topic, and we would not be able to establish reasonable defaults like setting
+            // isolation.level=read_committed for the offsets topic consumer for this connector
+<span class="nc bnc" id="L2108" title="All 2 branches missed.">            if (sameOffsetTopicAsWorker(connectorSpecificOffsetsTopic, producerProps)) {</span>
+<span class="nc" id="L2109">                return ConnectorOffsetBackingStore.withOnlyConnectorStore(</span>
+<span class="nc" id="L2110">                        () -&gt; LoggingContext.forConnector(connName),</span>
+                        connectorStore,
+                        connectorSpecificOffsetsTopic,
+                        admin
+                );
+            } else {
+<span class="nc" id="L2116">                return ConnectorOffsetBackingStore.withConnectorAndWorkerStores(</span>
+<span class="nc" id="L2117">                        () -&gt; LoggingContext.forConnector(connName),</span>
+                        globalOffsetBackingStore,
+                        connectorStore,
+                        connectorSpecificOffsetsTopic,
+                        admin
+                );
+            }
+        } else {
+<span class="fc" id="L2125">            Utils.closeQuietly(producer, &quot;Unused producer for offset store&quot;);</span>
+<span class="fc" id="L2126">            return ConnectorOffsetBackingStore.withOnlyWorkerStore(</span>
+<span class="nc" id="L2127">                    () -&gt; LoggingContext.forConnector(connName),</span>
+                    globalOffsetBackingStore,
+<span class="fc" id="L2129">                    config.offsetsTopic()</span>
+            );
+        }
+    }
+
+    /**
+     * Builds and returns an offset backing store for an exactly-once source connector. The offset backing store will either be just
+     * a connector-specific offset backing store (if the connector's offsets topic is the same as the worker's global offset topic)
+     * or a combination of both the worker's global offset backing store and a connector-specific offset backing store.
+     * &lt;p&gt;
+     * Visible for testing.
+     * @param sourceConfig the source connector's config
+     * @param connName the source connector's name
+     * @param connector the source connector
+     * @param producer the Kafka producer for the offset backing store; may be {@code null} if a read-only offset backing store is required
+     * @return An offset backing store for an exactly-once source connector
+     */
+    ConnectorOffsetBackingStore offsetStoreForExactlyOnceSourceConnector(
+            SourceConnectorConfig sourceConfig,
+            String connName,
+            Connector connector,
+            Producer&lt;byte[], byte[]&gt; producer
+    ) {
+<span class="nc" id="L2152">        String connectorSpecificOffsetsTopic = Optional.ofNullable(sourceConfig.offsetsTopic()).orElse(config.offsetsTopic());</span>
+
+<span class="nc" id="L2154">        Map&lt;String, Object&gt; producerProps = baseProducerConfigs(connName, &quot;connector-producer-&quot; + connName, config, sourceConfig, connector.getClass(),</span>
+                connectorClientConfigOverridePolicy, kafkaClusterId);
+
+<span class="nc" id="L2157">        Map&lt;String, Object&gt; consumerProps = exactlyOnceSourceOffsetsConsumerConfigs(</span>
+<span class="nc" id="L2158">                    connName, &quot;connector-consumer-&quot; + connName, config, sourceConfig, connector.getClass(),</span>
+                    connectorClientConfigOverridePolicy, kafkaClusterId);
+<span class="nc" id="L2160">        KafkaConsumer&lt;byte[], byte[]&gt; consumer = new KafkaConsumer&lt;&gt;(consumerProps);</span>
+
+<span class="nc" id="L2162">        Map&lt;String, Object&gt; adminOverrides = adminConfigs(connName, &quot;connector-adminclient-&quot; + connName, config,</span>
+<span class="nc" id="L2163">                sourceConfig, connector.getClass(), connectorClientConfigOverridePolicy, kafkaClusterId, ConnectorType.SOURCE);</span>
+
+<span class="nc" id="L2165">        TopicAdmin admin = new TopicAdmin(adminOverrides);</span>
+
+<span class="nc bnc" id="L2167" title="All 2 branches missed.">        KafkaOffsetBackingStore connectorStore = producer == null</span>
+<span class="nc" id="L2168">                ? KafkaOffsetBackingStore.readOnlyStore(connectorSpecificOffsetsTopic, consumer, admin, internalKeyConverter)</span>
+<span class="nc" id="L2169">                : KafkaOffsetBackingStore.readWriteStore(connectorSpecificOffsetsTopic, producer, consumer, admin, internalKeyConverter);</span>
+
+        // If the connector's offsets topic is the same as the worker-global offsets topic, there's no need to construct
+        // an offset store that has a primary and a secondary store which both read from that same topic.
+        // So, even if the user has explicitly configured the connector with a connector-specific offsets topic,
+        // if we know that that topic is the same as the worker-global offsets topic, we ignore the worker-global
+        // offset store and build a store backed exclusively by a connector-specific offsets store.
+        // It may seem reasonable to instead build a store backed exclusively by the worker-global offset store, but that
+        // would prevent users from being able to customize the config properties used for the Kafka clients that
+        // access the offsets topic, and may lead to confusion for them when tasks are created for the connector
+        // since they will all have their own dedicated offsets stores anyways
+<span class="nc bnc" id="L2180" title="All 2 branches missed.">        if (sameOffsetTopicAsWorker(connectorSpecificOffsetsTopic, producerProps)) {</span>
+<span class="nc" id="L2181">            return ConnectorOffsetBackingStore.withOnlyConnectorStore(</span>
+<span class="nc" id="L2182">                    () -&gt; LoggingContext.forConnector(connName),</span>
+                    connectorStore,
+                    connectorSpecificOffsetsTopic,
+                    admin
+            );
+        } else {
+<span class="nc" id="L2188">            return ConnectorOffsetBackingStore.withConnectorAndWorkerStores(</span>
+<span class="nc" id="L2189">                    () -&gt; LoggingContext.forConnector(connName),</span>
+                    globalOffsetBackingStore,
+                    connectorStore,
+                    connectorSpecificOffsetsTopic,
+                    admin
+            );
+        }
+    }
+
+    // Visible for testing
+    ConnectorOffsetBackingStore offsetStoreForRegularSourceTask(
+            ConnectorTaskId id,
+            SourceConnectorConfig sourceConfig,
+            Class&lt;? extends Connector&gt; connectorClass,
+            Producer&lt;byte[], byte[]&gt; producer,
+            Map&lt;String, Object&gt; producerProps,
+            TopicAdmin topicAdmin
+    ) {
+<span class="fc" id="L2207">        String connectorSpecificOffsetsTopic = sourceConfig.offsetsTopic();</span>
+
+<span class="pc bpc" id="L2209" title="1 of 2 branches missed.">        if (regularSourceTaskUsesConnectorSpecificOffsetsStore(sourceConfig)) {</span>
+<span class="nc" id="L2210">            Objects.requireNonNull(topicAdmin, &quot;Source tasks require a non-null topic admin when configured to use their own offsets topic&quot;);</span>
+
+<span class="nc" id="L2212">            Map&lt;String, Object&gt; consumerProps = regularSourceOffsetsConsumerConfigs(</span>
+<span class="nc" id="L2213">                    id.connector(), &quot;connector-consumer-&quot; + id, config, sourceConfig, connectorClass,</span>
+                    connectorClientConfigOverridePolicy, kafkaClusterId);
+<span class="nc" id="L2215">            KafkaConsumer&lt;byte[], byte[]&gt; consumer = new KafkaConsumer&lt;&gt;(consumerProps);</span>
+
+<span class="nc" id="L2217">            KafkaOffsetBackingStore connectorStore =</span>
+<span class="nc" id="L2218">                    KafkaOffsetBackingStore.readWriteStore(sourceConfig.offsetsTopic(), producer, consumer, topicAdmin, internalKeyConverter);</span>
+
+            // If the connector's offsets topic is the same as the worker-global offsets topic, there's no need to construct
+            // an offset store that has a primary and a secondary store which both read from that same topic.
+            // So, if the user has (implicitly or explicitly) configured the connector with a connector-specific offsets topic
+            // but we know that that topic is the same as the worker-global offsets topic, we ignore the worker-global
+            // offset store and build a store backed exclusively by a connector-specific offsets store.
+            // It may seem reasonable to instead build a store backed exclusively by the worker-global offset store, but that
+            // would prevent users from being able to customize the config properties used for the Kafka clients that
+            // access the offsets topic, and we would not be able to establish reasonable defaults like setting
+            // isolation.level=read_committed for the offsets topic consumer for this task
+<span class="nc bnc" id="L2229" title="All 2 branches missed.">            if (sameOffsetTopicAsWorker(sourceConfig.offsetsTopic(), producerProps)) {</span>
+<span class="nc" id="L2230">                return ConnectorOffsetBackingStore.withOnlyConnectorStore(</span>
+<span class="nc" id="L2231">                        () -&gt; LoggingContext.forTask(id),</span>
+                        connectorStore,
+                        connectorSpecificOffsetsTopic,
+                        topicAdmin
+                );
+            } else {
+<span class="nc" id="L2237">                return ConnectorOffsetBackingStore.withConnectorAndWorkerStores(</span>
+<span class="nc" id="L2238">                        () -&gt; LoggingContext.forTask(id),</span>
+                        globalOffsetBackingStore,
+                        connectorStore,
+                        connectorSpecificOffsetsTopic,
+                        topicAdmin
+                );
+            }
+        } else {
+<span class="fc" id="L2246">            return ConnectorOffsetBackingStore.withOnlyWorkerStore(</span>
+<span class="fc" id="L2247">                    () -&gt; LoggingContext.forTask(id),</span>
+                    globalOffsetBackingStore,
+<span class="fc" id="L2249">                    config.offsetsTopic()</span>
+            );
+        }
+    }
+
+    // Visible for testing
+    ConnectorOffsetBackingStore offsetStoreForExactlyOnceSourceTask(
+            ConnectorTaskId id,
+            SourceConnectorConfig sourceConfig,
+            Class&lt;? extends Connector&gt; connectorClass,
+            Producer&lt;byte[], byte[]&gt; producer,
+            Map&lt;String, Object&gt; producerProps,
+            TopicAdmin topicAdmin
+    ) {
+<span class="nc" id="L2263">        Objects.requireNonNull(topicAdmin, &quot;Source tasks require a non-null topic admin when exactly-once support is enabled&quot;);</span>
+
+<span class="nc" id="L2265">        Map&lt;String, Object&gt; consumerProps = exactlyOnceSourceOffsetsConsumerConfigs(</span>
+<span class="nc" id="L2266">                id.connector(), &quot;connector-consumer-&quot; + id, config, sourceConfig, connectorClass,</span>
+                connectorClientConfigOverridePolicy, kafkaClusterId);
+<span class="nc" id="L2268">        KafkaConsumer&lt;byte[], byte[]&gt; consumer = new KafkaConsumer&lt;&gt;(consumerProps);</span>
+
+<span class="nc" id="L2270">        String connectorOffsetsTopic = Optional.ofNullable(sourceConfig.offsetsTopic()).orElse(config.offsetsTopic());</span>
+
+<span class="nc" id="L2272">        KafkaOffsetBackingStore connectorStore =</span>
+<span class="nc" id="L2273">                KafkaOffsetBackingStore.readWriteStore(connectorOffsetsTopic, producer, consumer, topicAdmin, internalKeyConverter);</span>
+
+        // If the connector's offsets topic is the same as the worker-global offsets topic, there's no need to construct
+        // an offset store that has a primary and a secondary store which both read from that same topic.
+        // So, if the user has (implicitly or explicitly) configured the connector with a connector-specific offsets topic
+        // but we know that that topic is the same as the worker-global offsets topic, we ignore the worker-global
+        // offset store and build a store backed exclusively by a connector-specific offsets store.
+        // We cannot under any circumstances build an offset store backed exclusively by the worker-global offset store
+        // as that would prevent us from being able to write source records and source offset information for the task
+        // with the same producer, and therefore, in the same transaction.
+<span class="nc bnc" id="L2283" title="All 2 branches missed.">        if (sameOffsetTopicAsWorker(connectorOffsetsTopic, producerProps)) {</span>
+<span class="nc" id="L2284">            return ConnectorOffsetBackingStore.withOnlyConnectorStore(</span>
+<span class="nc" id="L2285">                    () -&gt; LoggingContext.forTask(id),</span>
+                    connectorStore,
+                    connectorOffsetsTopic,
+                    topicAdmin
+            );
+        } else {
+<span class="nc" id="L2291">            return ConnectorOffsetBackingStore.withConnectorAndWorkerStores(</span>
+<span class="nc" id="L2292">                    () -&gt; LoggingContext.forTask(id),</span>
+                    globalOffsetBackingStore,
+                    connectorStore,
+                    connectorOffsetsTopic,
+                    topicAdmin
+            );
+        }
+    }
+
+    /**
+     * Gives a best-effort guess for whether the given offsets topic is the same topic as the worker-global offsets topic.
+     * Even if the name of the topic is the same as the name of the worker's offsets topic, the two may still be different topics
+     * if the connector is configured to produce to a different Kafka cluster than the one that hosts the worker's offsets topic.
+     * @param offsetsTopic the name of the offsets topic for the connector
+     * @param producerProps the producer configuration for the connector
+     * @return whether it appears that the connector's offsets topic is the same topic as the worker-global offsets topic.
+     * If {@code true}, it is guaranteed that the two are the same;
+     * if {@code false}, it is likely but not guaranteed that the two are not the same
+     */
+    private boolean sameOffsetTopicAsWorker(String offsetsTopic, Map&lt;String, Object&gt; producerProps) {
+        // We can check the offset topic name and the Kafka cluster's bootstrap servers,
+        // although this isn't exact and can lead to some false negatives if the user
+        // provides an overridden bootstrap servers value for their producer that is different than
+        // the worker's but still resolves to the same Kafka cluster used by the worker.
+        // At the moment this is probably adequate, especially since we don't want to put
+        // a network ping to a remote Kafka cluster inside the herder's tick thread (which is where this
+        // logic takes place right now) in case that takes a while.
+<span class="nc" id="L2319">        Set&lt;String&gt; workerBootstrapServers = new HashSet&lt;&gt;(config.getList(BOOTSTRAP_SERVERS_CONFIG));</span>
+<span class="nc" id="L2320">        Set&lt;String&gt; producerBootstrapServers = new HashSet&lt;&gt;();</span>
+        try {
+<span class="nc" id="L2322">            String rawBootstrapServers = producerProps.getOrDefault(BOOTSTRAP_SERVERS_CONFIG, &quot;&quot;).toString();</span>
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L2324">            List&lt;String&gt; parsedBootstrapServers = (List&lt;String&gt;) ConfigDef.parseType(BOOTSTRAP_SERVERS_CONFIG, rawBootstrapServers, ConfigDef.Type.LIST);</span>
+<span class="nc" id="L2325">            producerBootstrapServers.addAll(parsedBootstrapServers);</span>
+<span class="nc" id="L2326">        } catch (Exception e) {</span>
+            // Should never happen by this point, but if it does, make sure to present a readable error message to the user
+<span class="nc" id="L2328">            throw new ConnectException(&quot;Failed to parse bootstrap servers property in producer config&quot;, e);</span>
+<span class="nc" id="L2329">        }</span>
+<span class="nc bnc" id="L2330" title="All 2 branches missed.">        return offsetsTopic.equals(config.offsetsTopic())</span>
+<span class="nc bnc" id="L2331" title="All 2 branches missed.">                &amp;&amp; workerBootstrapServers.equals(producerBootstrapServers);</span>
+    }
+
+    private boolean regularSourceTaskUsesConnectorSpecificOffsetsStore(SourceConnectorConfig sourceConfig) {
+        // We use a connector-specific store (i.e., a dedicated KafkaOffsetBackingStore for this task)
+        // if the worker supports per-connector offsets topics (which may be the case in distributed mode but not standalone, for example)
+        // and the user has explicitly specified an offsets topic for the connector
+<span class="pc bpc" id="L2338" title="3 of 4 branches missed.">        return sourceConfig.offsetsTopic() != null &amp;&amp; config.connectorOffsetsTopicsPermitted();</span>
+    }
+
+    private boolean sourceConnectorTopicCreationEnabled(SourceConnectorConfig sourceConfig) {
+<span class="pc bpc" id="L2342" title="2 of 4 branches missed.">        return config.topicCreationEnable() &amp;&amp; sourceConfig.usesTopicCreation();</span>
+    }
+
+    static class ConnectorStatusMetricsGroup {
+        private final ConnectMetrics connectMetrics;
+        private final ConnectMetricsRegistry registry;
+<span class="fc" id="L2348">        private final ConcurrentMap&lt;String, MetricGroup&gt; connectorStatusMetrics = new ConcurrentHashMap&lt;&gt;();</span>
+        private final Herder herder;
+        private final ConcurrentMap&lt;ConnectorTaskId, WorkerTask&lt;?, ?&gt;&gt; tasks;
+
+
+        protected ConnectorStatusMetricsGroup(
+<span class="fc" id="L2354">                ConnectMetrics connectMetrics, ConcurrentMap&lt;ConnectorTaskId, WorkerTask&lt;?, ?&gt;&gt; tasks, Herder herder) {</span>
+<span class="fc" id="L2355">            this.connectMetrics = connectMetrics;</span>
+<span class="fc" id="L2356">            this.registry = connectMetrics.registry();</span>
+<span class="fc" id="L2357">            this.tasks = tasks;</span>
+<span class="fc" id="L2358">            this.herder = herder;</span>
+<span class="fc" id="L2359">        }</span>
+
+        protected ConnectMetrics.LiteralSupplier&lt;Long&gt; taskCounter(String connName) {
+<span class="pc" id="L2362">            return now -&gt; tasks.keySet()</span>
+<span class="nc" id="L2363">                .stream()</span>
+<span class="nc" id="L2364">                .filter(taskId -&gt; taskId.connector().equals(connName))</span>
+<span class="nc" id="L2365">                .count();</span>
+        }
+
+        protected ConnectMetrics.LiteralSupplier&lt;Long&gt; taskStatusCounter(String connName, TaskStatus.State state) {
+<span class="pc" id="L2369">            return now -&gt; tasks.values()</span>
+<span class="nc" id="L2370">                .stream()</span>
+<span class="nc" id="L2371">                .filter(task -&gt;</span>
+<span class="nc bnc" id="L2372" title="All 2 branches missed.">                    task.id().connector().equals(connName) &amp;&amp;</span>
+<span class="nc bnc" id="L2373" title="All 2 branches missed.">                    herder.taskStatus(task.id()).state().equalsIgnoreCase(state.toString()))</span>
+<span class="nc" id="L2374">                .count();</span>
+        }
+
+        protected synchronized void recordTaskAdded(ConnectorTaskId connectorTaskId) {
+<span class="pc bpc" id="L2378" title="1 of 2 branches missed.">            if (connectorStatusMetrics.containsKey(connectorTaskId.connector())) {</span>
+<span class="nc" id="L2379">                return;</span>
+            }
+
+<span class="fc" id="L2382">            String connName = connectorTaskId.connector();</span>
+
+<span class="fc" id="L2384">            MetricGroup metricGroup = connectMetrics.group(registry.workerGroupName(),</span>
+<span class="fc" id="L2385">                registry.connectorTagName(), connName);</span>
+
+<span class="fc" id="L2387">            metricGroup.addValueMetric(registry.connectorTotalTaskCount, taskCounter(connName));</span>
+<span class="fc bfc" id="L2388" title="All 2 branches covered.">            for (Map.Entry&lt;MetricNameTemplate, TaskStatus.State&gt; statusMetric : registry.connectorStatusMetrics</span>
+<span class="fc" id="L2389">                .entrySet()) {</span>
+<span class="fc" id="L2390">                metricGroup.addValueMetric(statusMetric.getKey(), taskStatusCounter(connName,</span>
+<span class="fc" id="L2391">                    statusMetric.getValue()));</span>
+<span class="fc" id="L2392">            }</span>
+<span class="fc" id="L2393">            connectorStatusMetrics.put(connectorTaskId.connector(), metricGroup);</span>
+<span class="fc" id="L2394">        }</span>
+
+        protected synchronized void recordTaskRemoved(ConnectorTaskId connectorTaskId) {
+            // Unregister connector task count metric if we remove the last task of the connector
+<span class="pc bpc" id="L2398" title="1 of 2 branches missed.">            if (tasks.keySet().stream().noneMatch(id -&gt; id.connector().equals(connectorTaskId.connector()))) {</span>
+<span class="fc" id="L2399">                MetricGroup metricGroup = connectorStatusMetrics.remove(connectorTaskId.connector());</span>
+<span class="pc bpc" id="L2400" title="1 of 2 branches missed.">                if (metricGroup != null) metricGroup.close();</span>
+            }
+<span class="fc" id="L2402">        }</span>
+
+        protected synchronized void close() {
+<span class="pc bpc" id="L2405" title="1 of 2 branches missed.">            for (MetricGroup metricGroup: connectorStatusMetrics.values()) {</span>
+<span class="nc" id="L2406">                metricGroup.close();</span>
+<span class="nc" id="L2407">            }</span>
+<span class="fc" id="L2408">        }</span>
+
+        protected MetricGroup metricGroup(String connectorId) {
+<span class="nc" id="L2411">            return connectorStatusMetrics.get(connectorId);</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

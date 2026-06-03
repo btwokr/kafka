@@ -1,0 +1,510 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TimestampConverter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.transforms</a> &gt; <span class="el_source">TimestampConverter.java</span></div><h1>TimestampConverter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.connect.transforms;
+
+import org.apache.kafka.common.cache.Cache;
+import org.apache.kafka.common.cache.LRUCache;
+import org.apache.kafka.common.cache.SynchronizedCache;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.utils.AppInfoParser;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.data.Time;
+import org.apache.kafka.connect.data.Timestamp;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.transforms.util.SchemaUtil;
+import org.apache.kafka.connect.transforms.util.SimpleConfig;
+
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.TimeZone;
+import java.util.concurrent.TimeUnit;
+
+import static org.apache.kafka.connect.transforms.util.Requirements.requireMap;
+import static org.apache.kafka.connect.transforms.util.Requirements.requireStructOrNull;
+
+<span class="fc" id="L51">public abstract class TimestampConverter&lt;R extends ConnectRecord&lt;R&gt;&gt; implements Transformation&lt;R&gt; {</span>
+
+<span class="fc" id="L53">    public static final String OVERVIEW_DOC =</span>
+            &quot;Convert timestamps between different formats such as Unix epoch, strings, and Connect Date/Timestamp types.&quot;
+                    + &quot;Applies to individual fields or to the entire value.&quot;
+<span class="fc" id="L56">                    + &quot;&lt;p/&gt;Use the concrete transformation type designed for the record key (&lt;code&gt;&quot; + TimestampConverter.Key.class.getName() + &quot;&lt;/code&gt;) &quot;</span>
+<span class="fc" id="L57">                    + &quot;or value (&lt;code&gt;&quot; + TimestampConverter.Value.class.getName() + &quot;&lt;/code&gt;).&quot;;</span>
+
+    public static final String FIELD_CONFIG = &quot;field&quot;;
+    private static final String FIELD_DEFAULT = &quot;&quot;;
+
+    public static final String TARGET_TYPE_CONFIG = &quot;target.type&quot;;
+
+    public static final String FORMAT_CONFIG = &quot;format&quot;;
+    private static final String FORMAT_DEFAULT = &quot;&quot;;
+
+    public static final String UNIX_PRECISION_CONFIG = &quot;unix.precision&quot;;
+    private static final String UNIX_PRECISION_DEFAULT = &quot;milliseconds&quot;;
+
+    public static final String REPLACE_NULL_WITH_DEFAULT_CONFIG = &quot;replace.null.with.default&quot;;
+
+    private static final String PURPOSE = &quot;converting timestamp formats&quot;;
+
+    private static final String TYPE_STRING = &quot;string&quot;;
+    private static final String TYPE_UNIX = &quot;unix&quot;;
+    private static final String TYPE_DATE = &quot;Date&quot;;
+    private static final String TYPE_TIME = &quot;Time&quot;;
+    private static final String TYPE_TIMESTAMP = &quot;Timestamp&quot;;
+
+    private static final String UNIX_PRECISION_MILLIS = &quot;milliseconds&quot;;
+    private static final String UNIX_PRECISION_MICROS = &quot;microseconds&quot;;
+    private static final String UNIX_PRECISION_NANOS = &quot;nanoseconds&quot;;
+    private static final String UNIX_PRECISION_SECONDS = &quot;seconds&quot;;
+
+<span class="fc" id="L85">    private static final TimeZone UTC = TimeZone.getTimeZone(&quot;UTC&quot;);</span>
+
+<span class="fc" id="L87">    public static final Schema OPTIONAL_DATE_SCHEMA = org.apache.kafka.connect.data.Date.builder().optional().schema();</span>
+<span class="fc" id="L88">    public static final Schema OPTIONAL_TIMESTAMP_SCHEMA = Timestamp.builder().optional().schema();</span>
+<span class="fc" id="L89">    public static final Schema OPTIONAL_TIME_SCHEMA = Time.builder().optional().schema();</span>
+
+<span class="fc" id="L91">    public static final ConfigDef CONFIG_DEF = new ConfigDef()</span>
+<span class="fc" id="L92">            .define(FIELD_CONFIG, ConfigDef.Type.STRING, FIELD_DEFAULT, ConfigDef.Importance.HIGH,</span>
+                    &quot;The field containing the timestamp, or empty if the entire value is a timestamp&quot;)
+<span class="fc" id="L94">            .define(TARGET_TYPE_CONFIG, ConfigDef.Type.STRING, ConfigDef.NO_DEFAULT_VALUE,</span>
+<span class="fc" id="L95">                    ConfigDef.ValidString.in(TYPE_STRING, TYPE_UNIX, TYPE_DATE, TYPE_TIME, TYPE_TIMESTAMP),</span>
+                    ConfigDef.Importance.HIGH,
+                    &quot;The desired timestamp representation: string, unix, Date, Time, or Timestamp&quot;)
+<span class="fc" id="L98">            .define(FORMAT_CONFIG, ConfigDef.Type.STRING, FORMAT_DEFAULT, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;A SimpleDateFormat-compatible format for the timestamp. Used to generate the output when type=string &quot;
+                            + &quot;or used to parse the input if the input is a string.&quot;)
+<span class="fc" id="L101">            .define(UNIX_PRECISION_CONFIG, ConfigDef.Type.STRING, UNIX_PRECISION_DEFAULT,</span>
+<span class="fc" id="L102">                    ConfigDef.ValidString.in(</span>
+                            UNIX_PRECISION_NANOS, UNIX_PRECISION_MICROS,
+                            UNIX_PRECISION_MILLIS, UNIX_PRECISION_SECONDS),
+                    ConfigDef.Importance.LOW,
+                    &quot;The desired Unix precision for the timestamp: seconds, milliseconds, microseconds, or nanoseconds. &quot; +
+                            &quot;Used to generate the output when type=unix or used to parse the input if the input is a Long.&quot; +
+                            &quot;Note: This SMT will cause precision loss during conversions from, and to, values with sub-millisecond components.&quot;)
+<span class="fc" id="L109">            .define(REPLACE_NULL_WITH_DEFAULT_CONFIG, ConfigDef.Type.BOOLEAN, true, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Whether to replace fields that have a default value and that are null to the default value. When set to true, the default value is used, otherwise null is used.&quot;);
+
+
+    private interface TimestampTranslator {
+        /**
+         * Convert from the type-specific format to the universal java.util.Date format
+         */
+        Date toRaw(Config config, Object orig);
+
+        /**
+         * Get the schema for this format.
+         */
+        Schema typeSchema(boolean isOptional);
+
+        /**
+         * Convert from the universal java.util.Date format to the type-specific format
+         */
+        Object toType(Config config, Date orig);
+    }
+
+    @Override
+    public String version() {
+<span class="fc" id="L132">        return AppInfoParser.getVersion();</span>
+    }
+
+<span class="fc" id="L135">    private static final Map&lt;String, TimestampTranslator&gt; TRANSLATORS = new HashMap&lt;&gt;();</span>
+    static {
+<span class="fc" id="L137">        TRANSLATORS.put(TYPE_STRING, new TimestampTranslator() {</span>
+            @Override
+            public Date toRaw(Config config, Object orig) {
+<span class="nc bnc" id="L140" title="All 2 branches missed.">                if (!(orig instanceof String))</span>
+<span class="nc" id="L141">                    throw new DataException(&quot;Expected string timestamp to be a String, but found &quot; + orig.getClass());</span>
+                try {
+<span class="nc" id="L143">                    return config.format.parse((String) orig);</span>
+<span class="nc" id="L144">                } catch (ParseException e) {</span>
+<span class="nc" id="L145">                    throw new DataException(&quot;Could not parse timestamp: value (&quot; + orig + &quot;) does not match pattern (&quot;</span>
+<span class="nc" id="L146">                            + config.format.toPattern() + &quot;)&quot;, e);</span>
+                }
+            }
+
+            @Override
+            public Schema typeSchema(boolean isOptional) {
+<span class="nc bnc" id="L152" title="All 2 branches missed.">                return isOptional ? Schema.OPTIONAL_STRING_SCHEMA : Schema.STRING_SCHEMA;</span>
+            }
+
+            @Override
+            public String toType(Config config, Date orig) {
+<span class="nc" id="L157">                synchronized (config.format) {</span>
+<span class="nc" id="L158">                    return config.format.format(orig);</span>
+                }
+            }
+        });
+
+<span class="fc" id="L163">        TRANSLATORS.put(TYPE_UNIX, new TimestampTranslator() {</span>
+            @Override
+            public Date toRaw(Config config, Object orig) {
+<span class="nc bnc" id="L166" title="All 2 branches missed.">                if (!(orig instanceof Long unixTime))</span>
+<span class="nc" id="L167">                    throw new DataException(&quot;Expected Unix timestamp to be a Long, but found &quot; + orig.getClass());</span>
+<span class="nc bnc" id="L168" title="All 4 branches missed.">                return switch (config.unixPrecision) {</span>
+                    case UNIX_PRECISION_SECONDS -&gt;
+<span class="nc" id="L170">                        Timestamp.toLogical(Timestamp.SCHEMA, TimeUnit.SECONDS.toMillis(unixTime));</span>
+                    case UNIX_PRECISION_MICROS -&gt;
+<span class="nc" id="L172">                        Timestamp.toLogical(Timestamp.SCHEMA, TimeUnit.MICROSECONDS.toMillis(unixTime));</span>
+                    case UNIX_PRECISION_NANOS -&gt;
+<span class="nc" id="L174">                        Timestamp.toLogical(Timestamp.SCHEMA, TimeUnit.NANOSECONDS.toMillis(unixTime));</span>
+<span class="nc" id="L175">                    default -&gt; Timestamp.toLogical(Timestamp.SCHEMA, unixTime);</span>
+                };
+            }
+
+            @Override
+            public Schema typeSchema(boolean isOptional) {
+<span class="nc bnc" id="L181" title="All 2 branches missed.">                return isOptional ? Schema.OPTIONAL_INT64_SCHEMA : Schema.INT64_SCHEMA;</span>
+            }
+
+            @Override
+            public Long toType(Config config, Date orig) {
+<span class="nc" id="L186">                long unixTimeMillis = Timestamp.fromLogical(Timestamp.SCHEMA, orig);</span>
+<span class="nc bnc" id="L187" title="All 4 branches missed.">                return switch (config.unixPrecision) {</span>
+<span class="nc" id="L188">                    case UNIX_PRECISION_SECONDS -&gt; TimeUnit.MILLISECONDS.toSeconds(unixTimeMillis);</span>
+<span class="nc" id="L189">                    case UNIX_PRECISION_MICROS -&gt; TimeUnit.MILLISECONDS.toMicros(unixTimeMillis);</span>
+<span class="nc" id="L190">                    case UNIX_PRECISION_NANOS -&gt; TimeUnit.MILLISECONDS.toNanos(unixTimeMillis);</span>
+<span class="nc" id="L191">                    default -&gt; unixTimeMillis;</span>
+                };
+            }
+        });
+
+<span class="fc" id="L196">        TRANSLATORS.put(TYPE_DATE, new TimestampTranslator() {</span>
+            @Override
+            public Date toRaw(Config config, Object orig) {
+<span class="nc bnc" id="L199" title="All 2 branches missed.">                if (!(orig instanceof Date))</span>
+<span class="nc" id="L200">                    throw new DataException(&quot;Expected Date to be a java.util.Date, but found &quot; + orig.getClass());</span>
+                // Already represented as a java.util.Date and Connect Dates are a subset of valid java.util.Date values
+<span class="nc" id="L202">                return (Date) orig;</span>
+            }
+
+            @Override
+            public Schema typeSchema(boolean isOptional) {
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                return isOptional ? OPTIONAL_DATE_SCHEMA : org.apache.kafka.connect.data.Date.SCHEMA;</span>
+            }
+
+            @Override
+            public Date toType(Config config, Date orig) {
+<span class="nc" id="L212">                Calendar result = Calendar.getInstance(UTC);</span>
+<span class="nc" id="L213">                result.setTime(orig);</span>
+<span class="nc" id="L214">                result.set(Calendar.HOUR_OF_DAY, 0);</span>
+<span class="nc" id="L215">                result.set(Calendar.MINUTE, 0);</span>
+<span class="nc" id="L216">                result.set(Calendar.SECOND, 0);</span>
+<span class="nc" id="L217">                result.set(Calendar.MILLISECOND, 0);</span>
+<span class="nc" id="L218">                return result.getTime();</span>
+            }
+        });
+
+<span class="fc" id="L222">        TRANSLATORS.put(TYPE_TIME, new TimestampTranslator() {</span>
+            @Override
+            public Date toRaw(Config config, Object orig) {
+<span class="nc bnc" id="L225" title="All 2 branches missed.">                if (!(orig instanceof Date))</span>
+<span class="nc" id="L226">                    throw new DataException(&quot;Expected Time to be a java.util.Date, but found &quot; + orig.getClass());</span>
+                // Already represented as a java.util.Date and Connect Times are a subset of valid java.util.Date values
+<span class="nc" id="L228">                return (Date) orig;</span>
+            }
+
+            @Override
+            public Schema typeSchema(boolean isOptional) {
+<span class="nc bnc" id="L233" title="All 2 branches missed.">                return isOptional ? OPTIONAL_TIME_SCHEMA : Time.SCHEMA;</span>
+            }
+
+            @Override
+            public Date toType(Config config, Date orig) {
+<span class="nc" id="L238">                Calendar origCalendar = Calendar.getInstance(UTC);</span>
+<span class="nc" id="L239">                origCalendar.setTime(orig);</span>
+<span class="nc" id="L240">                Calendar result = Calendar.getInstance(UTC);</span>
+<span class="nc" id="L241">                result.setTimeInMillis(0L);</span>
+<span class="nc" id="L242">                result.set(Calendar.HOUR_OF_DAY, origCalendar.get(Calendar.HOUR_OF_DAY));</span>
+<span class="nc" id="L243">                result.set(Calendar.MINUTE, origCalendar.get(Calendar.MINUTE));</span>
+<span class="nc" id="L244">                result.set(Calendar.SECOND, origCalendar.get(Calendar.SECOND));</span>
+<span class="nc" id="L245">                result.set(Calendar.MILLISECOND, origCalendar.get(Calendar.MILLISECOND));</span>
+<span class="nc" id="L246">                return result.getTime();</span>
+            }
+        });
+
+<span class="fc" id="L250">        TRANSLATORS.put(TYPE_TIMESTAMP, new TimestampTranslator() {</span>
+            @Override
+            public Date toRaw(Config config, Object orig) {
+<span class="nc bnc" id="L253" title="All 2 branches missed.">                if (!(orig instanceof Date))</span>
+<span class="nc" id="L254">                    throw new DataException(&quot;Expected Timestamp to be a java.util.Date, but found &quot; + orig.getClass());</span>
+<span class="nc" id="L255">                return (Date) orig;</span>
+            }
+
+            @Override
+            public Schema typeSchema(boolean isOptional) {
+<span class="nc bnc" id="L260" title="All 2 branches missed.">                return isOptional ? OPTIONAL_TIMESTAMP_SCHEMA : Timestamp.SCHEMA;</span>
+            }
+
+            @Override
+            public Date toType(Config config, Date orig) {
+<span class="nc" id="L265">                return orig;</span>
+            }
+        });
+<span class="fc" id="L268">    }</span>
+
+    // This is a bit unusual, but allows the transformation config to be passed to static anonymous classes to customize
+    // their behavior
+    private static class Config {
+<span class="nc" id="L273">        Config(String field, String type, SimpleDateFormat format, String unixPrecision) {</span>
+<span class="nc" id="L274">            this.field = field;</span>
+<span class="nc" id="L275">            this.type = type;</span>
+<span class="nc" id="L276">            this.format = format;</span>
+<span class="nc" id="L277">            this.unixPrecision = unixPrecision;</span>
+<span class="nc" id="L278">        }</span>
+        String field;
+        String type;
+        SimpleDateFormat format;
+        String unixPrecision;
+    }
+    private Config config;
+    private Cache&lt;Schema, Schema&gt; schemaUpdateCache;
+    private boolean replaceNullWithDefault;
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs) {
+<span class="nc" id="L290">        final SimpleConfig simpleConfig = new SimpleConfig(CONFIG_DEF, configs);</span>
+<span class="nc" id="L291">        final String field = simpleConfig.getString(FIELD_CONFIG);</span>
+<span class="nc" id="L292">        final String type = simpleConfig.getString(TARGET_TYPE_CONFIG);</span>
+<span class="nc" id="L293">        String formatPattern = simpleConfig.getString(FORMAT_CONFIG);</span>
+<span class="nc" id="L294">        final String unixPrecision = simpleConfig.getString(UNIX_PRECISION_CONFIG);</span>
+<span class="nc" id="L295">        schemaUpdateCache = new SynchronizedCache&lt;&gt;(new LRUCache&lt;&gt;(16));</span>
+<span class="nc" id="L296">        replaceNullWithDefault = simpleConfig.getBoolean(REPLACE_NULL_WITH_DEFAULT_CONFIG);</span>
+
+<span class="nc bnc" id="L298" title="All 4 branches missed.">        if (type.equals(TYPE_STRING) &amp;&amp; Utils.isBlank(formatPattern)) {</span>
+<span class="nc" id="L299">            throw new ConfigException(&quot;TimestampConverter requires format option to be specified when using string timestamps&quot;);</span>
+        }
+<span class="nc" id="L301">        SimpleDateFormat format = null;</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">        if (!Utils.isBlank(formatPattern)) {</span>
+            try {
+<span class="nc" id="L304">                format = new SimpleDateFormat(formatPattern);</span>
+<span class="nc" id="L305">                format.setTimeZone(UTC);</span>
+<span class="nc" id="L306">            } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L307">                throw new ConfigException(&quot;TimestampConverter requires a SimpleDateFormat-compatible pattern for string timestamps: &quot;</span>
+                        + formatPattern, e);
+<span class="nc" id="L309">            }</span>
+        }
+<span class="nc" id="L311">        config = new Config(field, type, format, unixPrecision);</span>
+<span class="nc" id="L312">    }</span>
+
+    @Override
+    public R apply(R record) {
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        if (operatingSchema(record) == null) {</span>
+<span class="nc" id="L317">            return applySchemaless(record);</span>
+        } else {
+<span class="nc" id="L319">            return applyWithSchema(record);</span>
+        }
+    }
+
+    @Override
+    public ConfigDef config() {
+<span class="nc" id="L325">        return CONFIG_DEF;</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L330">    }</span>
+
+<span class="fc" id="L332">    public static class Key&lt;R extends ConnectRecord&lt;R&gt;&gt; extends TimestampConverter&lt;R&gt; {</span>
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L335">            return record.keySchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L340">            return record.key();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue) {
+<span class="nc" id="L345">            return record.newRecord(record.topic(), record.kafkaPartition(), updatedSchema, updatedValue, record.valueSchema(), record.value(), record.timestamp());</span>
+        }
+    }
+
+<span class="fc" id="L349">    public static class Value&lt;R extends ConnectRecord&lt;R&gt;&gt; extends TimestampConverter&lt;R&gt; {</span>
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L352">            return record.valueSchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L357">            return record.value();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue) {
+<span class="nc" id="L362">            return record.newRecord(record.topic(), record.kafkaPartition(), record.keySchema(), record.key(), updatedSchema, updatedValue, record.timestamp());</span>
+        }
+    }
+
+    protected abstract Schema operatingSchema(R record);
+
+    protected abstract Object operatingValue(R record);
+
+    protected abstract R newRecord(R record, Schema updatedSchema, Object updatedValue);
+
+    private R applyWithSchema(R record) {
+<span class="nc" id="L373">        final Schema schema = operatingSchema(record);</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">        if (config.field.isEmpty()) {</span>
+<span class="nc" id="L375">            Object value = operatingValue(record);</span>
+            // New schema is determined by the requested target timestamp type
+<span class="nc" id="L377">            Schema updatedSchema = TRANSLATORS.get(config.type).typeSchema(schema.isOptional());</span>
+<span class="nc" id="L378">            return newRecord(record, updatedSchema, convertTimestamp(value, timestampTypeFromSchema(schema)));</span>
+        } else {
+<span class="nc" id="L380">            final Struct value = requireStructOrNull(operatingValue(record), PURPOSE);</span>
+<span class="nc" id="L381">            Schema updatedSchema = schemaUpdateCache.get(schema);</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">            if (updatedSchema == null) {</span>
+<span class="nc" id="L383">                SchemaBuilder builder = SchemaUtil.copySchemaBasics(schema, SchemaBuilder.struct());</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">                for (Field field : schema.fields()) {</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">                    if (field.name().equals(config.field)) {</span>
+<span class="nc" id="L386">                        builder.field(field.name(), TRANSLATORS.get(config.type).typeSchema(field.schema().isOptional()));</span>
+                    } else {
+<span class="nc" id="L388">                        builder.field(field.name(), field.schema());</span>
+                    }
+<span class="nc" id="L390">                }</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">                if (schema.isOptional())</span>
+<span class="nc" id="L392">                    builder.optional();</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">                if (schema.defaultValue() != null) {</span>
+<span class="nc" id="L394">                    Struct updatedDefaultValue = applyValueWithSchema((Struct) schema.defaultValue(), builder);</span>
+<span class="nc" id="L395">                    builder.defaultValue(updatedDefaultValue);</span>
+                }
+
+<span class="nc" id="L398">                updatedSchema = builder.build();</span>
+<span class="nc" id="L399">                schemaUpdateCache.put(schema, updatedSchema);</span>
+            }
+
+<span class="nc" id="L402">            Struct updatedValue = applyValueWithSchema(value, updatedSchema);</span>
+<span class="nc" id="L403">            return newRecord(record, updatedSchema, updatedValue);</span>
+        }
+    }
+
+    private Struct applyValueWithSchema(Struct value, Schema updatedSchema) {
+<span class="nc bnc" id="L408" title="All 2 branches missed.">        if (value == null) {</span>
+<span class="nc" id="L409">            return null;</span>
+        }
+<span class="nc" id="L411">        Struct updatedValue = new Struct(updatedSchema);</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">        for (Field field : value.schema().fields()) {</span>
+            final Object updatedFieldValue;
+<span class="nc bnc" id="L414" title="All 2 branches missed.">            if (field.name().equals(config.field)) {</span>
+<span class="nc" id="L415">                updatedFieldValue = convertTimestamp(getFieldValue(value, field), timestampTypeFromSchema(field.schema()));</span>
+            } else {
+<span class="nc" id="L417">                updatedFieldValue = getFieldValue(value, field);</span>
+            }
+<span class="nc" id="L419">            updatedValue.put(field.name(), updatedFieldValue);</span>
+<span class="nc" id="L420">        }</span>
+<span class="nc" id="L421">        return updatedValue;</span>
+    }
+
+    private Object getFieldValue(Struct value, Field field) {
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        if (replaceNullWithDefault) {</span>
+<span class="nc" id="L426">            return value.get(field);</span>
+        }
+<span class="nc" id="L428">        return value.getWithoutDefault(field.name());</span>
+    }
+
+    private R applySchemaless(R record) {
+<span class="nc" id="L432">        Object rawValue = operatingValue(record);</span>
+<span class="nc bnc" id="L433" title="All 4 branches missed.">        if (rawValue == null || config.field.isEmpty()) {</span>
+<span class="nc" id="L434">            return newRecord(record, null, convertTimestamp(rawValue));</span>
+        } else {
+<span class="nc" id="L436">            final Map&lt;String, Object&gt; value = requireMap(rawValue, PURPOSE);</span>
+<span class="nc" id="L437">            final HashMap&lt;String, Object&gt; updatedValue = new HashMap&lt;&gt;(value);</span>
+<span class="nc" id="L438">            updatedValue.put(config.field, convertTimestamp(value.get(config.field)));</span>
+<span class="nc" id="L439">            return newRecord(record, null, updatedValue);</span>
+        }
+    }
+
+    /**
+     * Determine the type/format of the timestamp based on the schema
+     */
+    private String timestampTypeFromSchema(Schema schema) {
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        if (Timestamp.LOGICAL_NAME.equals(schema.name())) {</span>
+<span class="nc" id="L448">            return TYPE_TIMESTAMP;</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">        } else if (org.apache.kafka.connect.data.Date.LOGICAL_NAME.equals(schema.name())) {</span>
+<span class="nc" id="L450">            return TYPE_DATE;</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">        } else if (Time.LOGICAL_NAME.equals(schema.name())) {</span>
+<span class="nc" id="L452">            return TYPE_TIME;</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        } else if (schema.type().equals(Schema.Type.STRING)) {</span>
+            // If not otherwise specified, string == user-specified string format for timestamps
+<span class="nc" id="L455">            return TYPE_STRING;</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">        } else if (schema.type().equals(Schema.Type.INT64)) {</span>
+            // If not otherwise specified, long == unix time
+<span class="nc" id="L458">            return TYPE_UNIX;</span>
+        }
+<span class="nc" id="L460">        throw new ConnectException(&quot;Schema &quot; + schema + &quot; does not correspond to a known timestamp type format&quot;);</span>
+    }
+
+    /**
+     * Infer the type/format of the timestamp based on the raw Java type
+     */
+    private String inferTimestampType(Object timestamp) {
+        // Note that we can't infer all types, e.g. Date/Time/Timestamp all have the same runtime representation as a
+        // java.util.Date
+<span class="nc bnc" id="L469" title="All 2 branches missed.">        if (timestamp instanceof Date) {</span>
+<span class="nc" id="L470">            return TYPE_TIMESTAMP;</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">        } else if (timestamp instanceof Long) {</span>
+<span class="nc" id="L472">            return TYPE_UNIX;</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">        } else if (timestamp instanceof String) {</span>
+<span class="nc" id="L474">            return TYPE_STRING;</span>
+        }
+<span class="nc" id="L476">        throw new DataException(&quot;TimestampConverter does not support &quot; + timestamp.getClass() + &quot; objects as timestamps&quot;);</span>
+    }
+
+    /**
+     * Convert the given timestamp to the target timestamp format.
+     * @param timestamp the input timestamp, may be null
+     * @param timestampFormat the format of the timestamp, or null if the format should be inferred
+     * @return the converted timestamp
+     */
+    private Object convertTimestamp(Object timestamp, String timestampFormat) {
+<span class="nc bnc" id="L486" title="All 2 branches missed.">        if (timestamp == null) {</span>
+<span class="nc" id="L487">            return null;</span>
+        }
+<span class="nc bnc" id="L489" title="All 2 branches missed.">        if (timestampFormat == null) {</span>
+<span class="nc" id="L490">            timestampFormat = inferTimestampType(timestamp);</span>
+        }
+
+<span class="nc" id="L493">        TimestampTranslator sourceTranslator = TRANSLATORS.get(timestampFormat);</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">        if (sourceTranslator == null) {</span>
+<span class="nc" id="L495">            throw new ConnectException(&quot;Unsupported timestamp type: &quot; + timestampFormat);</span>
+        }
+<span class="nc" id="L497">        Date rawTimestamp = sourceTranslator.toRaw(config, timestamp);</span>
+
+<span class="nc" id="L499">        TimestampTranslator targetTranslator = TRANSLATORS.get(config.type);</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">        if (targetTranslator == null) {</span>
+<span class="nc" id="L501">            throw new ConnectException(&quot;Unsupported timestamp type: &quot; + config.type);</span>
+        }
+<span class="nc" id="L503">        return targetTranslator.toType(config, rawTimestamp);</span>
+    }
+
+    private Object convertTimestamp(Object timestamp) {
+<span class="nc" id="L507">        return convertTimestamp(timestamp, null);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

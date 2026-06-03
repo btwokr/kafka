@@ -1,0 +1,660 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DefaultStatePersister.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.server.share.persister</a> &gt; <span class="el_source">DefaultStatePersister.java</span></div><h1>DefaultStatePersister.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.server.share.persister;
+
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.DeleteShareGroupStateResponse;
+import org.apache.kafka.common.requests.InitializeShareGroupStateResponse;
+import org.apache.kafka.common.requests.ReadShareGroupStateResponse;
+import org.apache.kafka.common.requests.ReadShareGroupStateSummaryResponse;
+import org.apache.kafka.common.requests.WriteShareGroupStateResponse;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * The default implementation of the {@link Persister} interface which is used by the
+ * group coordinator and share-partition leaders to manage the durable share-partition state.
+ * This implementation uses inter-broker RPCs to make requests to the share coordinator
+ * which is responsible for persisting the share-partition state.
+ */
+public class DefaultStatePersister implements Persister {
+    private final PersisterStateManager stateManager;
+
+<span class="fc" id="L46">    private static final Logger log = LoggerFactory.getLogger(DefaultStatePersister.class);</span>
+
+<span class="fc" id="L48">    public DefaultStatePersister(PersisterStateManager stateManager) {</span>
+<span class="fc" id="L49">        this.stateManager = stateManager;</span>
+<span class="fc" id="L50">        this.stateManager.start();</span>
+<span class="fc" id="L51">    }</span>
+
+    @Override
+    public void stop() {
+        try {
+<span class="pc bpc" id="L56" title="1 of 2 branches missed.">            if (stateManager != null) {</span>
+<span class="fc" id="L57">                stateManager.stop();</span>
+            }
+<span class="nc" id="L59">        } catch (Exception e) {</span>
+<span class="nc" id="L60">            log.error(&quot;Unable to stop state manager&quot;, e);</span>
+<span class="fc" id="L61">        }</span>
+<span class="fc" id="L62">    }</span>
+
+    /**
+     * Used by the group coordinator to initialize the share-partition state.
+     * This is an inter-broker RPC authorized as a cluster action.
+     *
+     * @param request InitializeShareGroupStateParameters
+     * @return A completable future of InitializeShareGroupStateResult
+     */
+    public CompletableFuture&lt;InitializeShareGroupStateResult&gt; initializeState(InitializeShareGroupStateParameters request) {
+        try {
+<span class="nc" id="L73">            validate(request);</span>
+<span class="nc" id="L74">        } catch (Exception e) {</span>
+<span class="nc" id="L75">            log.error(&quot;Unable to validate initialize state request&quot;, e);</span>
+<span class="nc" id="L76">            return CompletableFuture.failedFuture(e);</span>
+<span class="nc" id="L77">        }</span>
+<span class="nc" id="L78">        GroupTopicPartitionData&lt;PartitionStateData&gt; gtp = request.groupTopicPartitionData();</span>
+<span class="nc" id="L79">        String groupId = gtp.groupId();</span>
+
+<span class="nc" id="L81">        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;InitializeShareGroupStateResponse&gt;&gt;&gt; futureMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L82">        List&lt;PersisterStateManager.InitializeStateHandler&gt; handlers = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L84">        gtp.topicsData().forEach(topicData -&gt; {</span>
+<span class="nc" id="L85">            topicData.partitions().forEach(partitionData -&gt; {</span>
+<span class="nc" id="L86">                CompletableFuture&lt;InitializeShareGroupStateResponse&gt; future = futureMap</span>
+<span class="nc" id="L87">                    .computeIfAbsent(topicData.topicId(), k -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L88">                    .computeIfAbsent(partitionData.partition(), k -&gt; new CompletableFuture&lt;&gt;());</span>
+
+<span class="nc" id="L90">                handlers.add(</span>
+<span class="nc" id="L91">                    stateManager.new InitializeStateHandler(</span>
+                        groupId,
+<span class="nc" id="L93">                        topicData.topicId(),</span>
+<span class="nc" id="L94">                        partitionData.partition(),</span>
+<span class="nc" id="L95">                        partitionData.stateEpoch(),</span>
+<span class="nc" id="L96">                        partitionData.startOffset(),</span>
+                        future,
+                        null
+                    )
+                );
+<span class="nc" id="L101">            });</span>
+<span class="nc" id="L102">        });</span>
+
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        for (PersisterStateManager.PersisterStateManagerHandler handler : handlers) {</span>
+<span class="nc" id="L105">            stateManager.enqueue(handler);</span>
+<span class="nc" id="L106">        }</span>
+
+<span class="nc" id="L108">        CompletableFuture&lt;Void&gt; combinedFuture = CompletableFuture.allOf(</span>
+<span class="nc" id="L109">            handlers.stream()</span>
+<span class="nc" id="L110">                .map(PersisterStateManager.InitializeStateHandler::result)</span>
+<span class="nc" id="L111">                .toArray(CompletableFuture[]::new));</span>
+
+<span class="nc" id="L113">        return combinedFuture.thenApply(v -&gt; initializeResponsesToResult(futureMap));</span>
+    }
+
+    /**
+     * Used by share-partition leaders to write share-partition state to a share coordinator.
+     * This is an inter-broker RPC authorized as a cluster action.
+     *
+     * @param request WriteShareGroupStateParameters
+     * @return A completable future of WriteShareGroupStateResult
+     */
+    public CompletableFuture&lt;WriteShareGroupStateResult&gt; writeState(WriteShareGroupStateParameters request) {
+        try {
+<span class="nc" id="L125">            validate(request);</span>
+<span class="nc" id="L126">        } catch (Exception e) {</span>
+<span class="nc" id="L127">            log.error(&quot;Unable to validate write state request&quot;, e);</span>
+<span class="nc" id="L128">            return CompletableFuture.failedFuture(e);</span>
+<span class="nc" id="L129">        }</span>
+<span class="nc" id="L130">        GroupTopicPartitionData&lt;PartitionStateBatchData&gt; gtp = request.groupTopicPartitionData();</span>
+<span class="nc" id="L131">        String groupId = gtp.groupId();</span>
+
+<span class="nc" id="L133">        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;WriteShareGroupStateResponse&gt;&gt;&gt; futureMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L134">        List&lt;PersisterStateManager.WriteStateHandler&gt; handlers = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L136">        gtp.topicsData().forEach(topicData -&gt; {</span>
+<span class="nc" id="L137">            topicData.partitions().forEach(partitionData -&gt; {</span>
+<span class="nc" id="L138">                CompletableFuture&lt;WriteShareGroupStateResponse&gt; future = futureMap</span>
+<span class="nc" id="L139">                    .computeIfAbsent(topicData.topicId(), k -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L140">                    .computeIfAbsent(partitionData.partition(), k -&gt; new CompletableFuture&lt;&gt;());</span>
+
+<span class="nc" id="L142">                log.debug(&quot;{}-{}-{}: stateEpoch - {}, leaderEpoch - {}.&quot;,</span>
+<span class="nc" id="L143">                    groupId, topicData.topicId(), partitionData.partition(), partitionData.stateEpoch(), partitionData.leaderEpoch());</span>
+
+<span class="nc" id="L145">                handlers.add(</span>
+<span class="nc" id="L146">                    stateManager.new WriteStateHandler(</span>
+                        groupId,
+<span class="nc" id="L148">                        topicData.topicId(),</span>
+<span class="nc" id="L149">                        partitionData.partition(),</span>
+<span class="nc" id="L150">                        partitionData.stateEpoch(),</span>
+<span class="nc" id="L151">                        partitionData.leaderEpoch(),</span>
+<span class="nc" id="L152">                        partitionData.startOffset(),</span>
+<span class="nc" id="L153">                        partitionData.deliveryCompleteCount(),</span>
+<span class="nc" id="L154">                        partitionData.stateBatches(),</span>
+                        future, null)
+                );
+<span class="nc" id="L157">            });</span>
+<span class="nc" id="L158">        });</span>
+
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        for (PersisterStateManager.PersisterStateManagerHandler handler : handlers) {</span>
+<span class="nc" id="L161">            stateManager.enqueue(handler);</span>
+<span class="nc" id="L162">        }</span>
+
+<span class="nc" id="L164">        CompletableFuture&lt;Void&gt; combinedFuture = CompletableFuture.allOf(</span>
+<span class="nc" id="L165">            handlers.stream()</span>
+<span class="nc" id="L166">                .map(PersisterStateManager.WriteStateHandler::result)</span>
+<span class="nc" id="L167">                .toArray(CompletableFuture[]::new));</span>
+
+<span class="nc" id="L169">        return combinedFuture.thenApply(v -&gt; writeResponsesToResult(futureMap));</span>
+    }
+
+    /**
+     * Takes in a list of COMPLETED futures and combines the results,
+     * taking care of errors if any, into a single InitializeShareGroupStateResult
+     *
+     * @param futureMap - HashMap of {topic -&gt; {partition -&gt; future}}
+     * @return Object representing combined result of type InitializeShareGroupStateResult
+     */
+    // visible for testing
+    InitializeShareGroupStateResult initializeResponsesToResult(
+        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;InitializeShareGroupStateResponse&gt;&gt;&gt; futureMap
+    ) {
+<span class="nc" id="L183">        List&lt;TopicData&lt;PartitionErrorData&gt;&gt; topicsData = futureMap.keySet().stream()</span>
+<span class="nc" id="L184">            .map(topicId -&gt; {</span>
+<span class="nc" id="L185">                List&lt;PartitionErrorData&gt; partitionErrData = futureMap.get(topicId).entrySet().stream()</span>
+<span class="nc" id="L186">                    .map(partitionFuture -&gt; {</span>
+<span class="nc" id="L187">                        int partition = partitionFuture.getKey();</span>
+<span class="nc" id="L188">                        CompletableFuture&lt;InitializeShareGroupStateResponse&gt; future = partitionFuture.getValue();</span>
+                        try {
+                            // already completed because of allOf application in the caller
+<span class="nc" id="L191">                            InitializeShareGroupStateResponse partitionResponse = future.join();</span>
+<span class="nc" id="L192">                            return partitionResponse.data().results().get(0).partitions().stream()</span>
+<span class="nc" id="L193">                                .map(partitionResult -&gt; PartitionFactory.newPartitionErrorData(</span>
+<span class="nc" id="L194">                                    partitionResult.partition(),</span>
+<span class="nc" id="L195">                                    partitionResult.errorCode(),</span>
+<span class="nc" id="L196">                                    partitionResult.errorMessage()))</span>
+<span class="nc" id="L197">                                .toList();</span>
+<span class="nc" id="L198">                        } catch (Exception e) {</span>
+<span class="nc" id="L199">                            log.error(&quot;Unexpected exception while initializing data in share coordinator&quot;, e);</span>
+<span class="nc" id="L200">                            return List.of(PartitionFactory.newPartitionErrorData(</span>
+                                partition,
+<span class="nc" id="L202">                                Errors.UNKNOWN_SERVER_ERROR.code(),   // No specific public error code exists for InterruptedException / ExecutionException</span>
+<span class="nc" id="L203">                                &quot;Error initializing state in share coordinator: &quot; + e.getMessage())</span>
+                            );
+                        }
+                    })
+<span class="nc" id="L207">                    .flatMap(List::stream)</span>
+<span class="nc" id="L208">                    .toList();</span>
+<span class="nc" id="L209">                return new TopicData&lt;&gt;(topicId, partitionErrData);</span>
+            })
+<span class="nc" id="L211">            .toList();</span>
+<span class="nc" id="L212">        return new InitializeShareGroupStateResult.Builder()</span>
+<span class="nc" id="L213">            .setTopicsData(topicsData)</span>
+<span class="nc" id="L214">            .build();</span>
+    }
+
+    /**
+     * Takes in a list of COMPLETED futures and combines the results,
+     * taking care of errors if any, into a single WriteShareGroupStateResult
+     *
+     * @param futureMap - HashMap of {topic -&gt; {partition -&gt; future}}
+     * @return Object representing combined result of type WriteShareGroupStateResult
+     */
+    // visible for testing
+    WriteShareGroupStateResult writeResponsesToResult(
+        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;WriteShareGroupStateResponse&gt;&gt;&gt; futureMap
+    ) {
+<span class="nc" id="L228">        List&lt;TopicData&lt;PartitionErrorData&gt;&gt; topicsData = futureMap.keySet().stream()</span>
+<span class="nc" id="L229">            .map(topicId -&gt; {</span>
+<span class="nc" id="L230">                List&lt;PartitionErrorData&gt; partitionErrData = futureMap.get(topicId).entrySet().stream()</span>
+<span class="nc" id="L231">                    .map(partitionFuture -&gt; {</span>
+<span class="nc" id="L232">                        int partition = partitionFuture.getKey();</span>
+<span class="nc" id="L233">                        CompletableFuture&lt;WriteShareGroupStateResponse&gt; future = partitionFuture.getValue();</span>
+                        try {
+                            // already completed because of allOf application in the caller
+<span class="nc" id="L236">                            WriteShareGroupStateResponse partitionResponse = future.join();</span>
+<span class="nc" id="L237">                            return partitionResponse.data().results().get(0).partitions().stream()</span>
+<span class="nc" id="L238">                                .map(partitionResult -&gt; PartitionFactory.newPartitionErrorData(</span>
+<span class="nc" id="L239">                                    partitionResult.partition(),</span>
+<span class="nc" id="L240">                                    partitionResult.errorCode(),</span>
+<span class="nc" id="L241">                                    partitionResult.errorMessage()))</span>
+<span class="nc" id="L242">                                .toList();</span>
+<span class="nc" id="L243">                        } catch (Exception e) {</span>
+<span class="nc" id="L244">                            log.error(&quot;Unexpected exception while writing data to share coordinator&quot;, e);</span>
+<span class="nc" id="L245">                            return List.of(PartitionFactory.newPartitionErrorData(</span>
+                                partition,
+<span class="nc" id="L247">                                Errors.UNKNOWN_SERVER_ERROR.code(),   // No specific public error code exists for InterruptedException / ExecutionException</span>
+<span class="nc" id="L248">                                &quot;Error writing state to share coordinator: &quot; + e.getMessage())</span>
+                            );
+                        }
+                    })
+<span class="nc" id="L252">                    .flatMap(List::stream)</span>
+<span class="nc" id="L253">                    .toList();</span>
+<span class="nc" id="L254">                return new TopicData&lt;&gt;(topicId, partitionErrData);</span>
+            })
+<span class="nc" id="L256">            .toList();</span>
+<span class="nc" id="L257">        return new WriteShareGroupStateResult.Builder()</span>
+<span class="nc" id="L258">            .setTopicsData(topicsData)</span>
+<span class="nc" id="L259">            .build();</span>
+    }
+
+    /**
+     * Used by share-partition leaders to read share-partition state from a share coordinator.
+     * This is an inter-broker RPC authorized as a cluster action.
+     *
+     * @param request ReadShareGroupStateParameters
+     * @return A completable future of ReadShareGroupStateResult
+     */
+    public CompletableFuture&lt;ReadShareGroupStateResult&gt; readState(ReadShareGroupStateParameters request) {
+        try {
+<span class="nc" id="L271">            validate(request);</span>
+<span class="nc" id="L272">        } catch (Exception e) {</span>
+<span class="nc" id="L273">            log.error(&quot;Unable to validate read state request&quot;, e);</span>
+<span class="nc" id="L274">            return CompletableFuture.failedFuture(e);</span>
+<span class="nc" id="L275">        }</span>
+<span class="nc" id="L276">        GroupTopicPartitionData&lt;PartitionIdLeaderEpochData&gt; gtp = request.groupTopicPartitionData();</span>
+<span class="nc" id="L277">        String groupId = gtp.groupId();</span>
+<span class="nc" id="L278">        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;ReadShareGroupStateResponse&gt;&gt;&gt; futureMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L279">        List&lt;PersisterStateManager.ReadStateHandler&gt; handlers = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L281">        gtp.topicsData().forEach(topicData -&gt; {</span>
+<span class="nc" id="L282">            topicData.partitions().forEach(partitionData -&gt; {</span>
+<span class="nc" id="L283">                CompletableFuture&lt;ReadShareGroupStateResponse&gt; future = futureMap</span>
+<span class="nc" id="L284">                    .computeIfAbsent(topicData.topicId(), k -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L285">                    .computeIfAbsent(partitionData.partition(), k -&gt; new CompletableFuture&lt;&gt;());</span>
+
+<span class="nc" id="L287">                handlers.add(</span>
+<span class="nc" id="L288">                    stateManager.new ReadStateHandler(</span>
+                        groupId,
+<span class="nc" id="L290">                        topicData.topicId(),</span>
+<span class="nc" id="L291">                        partitionData.partition(),</span>
+<span class="nc" id="L292">                        partitionData.leaderEpoch(),</span>
+                        future,
+                        null)
+                );
+<span class="nc" id="L296">            });</span>
+<span class="nc" id="L297">        });</span>
+
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        for (PersisterStateManager.PersisterStateManagerHandler handler : handlers) {</span>
+<span class="nc" id="L300">            stateManager.enqueue(handler);</span>
+<span class="nc" id="L301">        }</span>
+
+        // Combine all futures into a single CompletableFuture&lt;Void&gt;
+<span class="nc" id="L304">        CompletableFuture&lt;Void&gt; combinedFuture = CompletableFuture.allOf(</span>
+<span class="nc" id="L305">            handlers.stream()</span>
+<span class="nc" id="L306">                .map(PersisterStateManager.ReadStateHandler::result)</span>
+<span class="nc" id="L307">                .toArray(CompletableFuture[]::new));</span>
+
+        // Transform the combined CompletableFuture&lt;Void&gt; into CompletableFuture&lt;ReadShareGroupStateResult&gt;
+<span class="nc" id="L310">        return combinedFuture.thenApply(v -&gt; readResponsesToResult(futureMap));</span>
+    }
+
+    /**
+     * Takes in a list of COMPLETED futures and combines the results,
+     * taking care of errors if any, into a single ReadShareGroupStateResult
+     *
+     * @param futureMap - HashMap of {topic -&gt; {partition -&gt; future}}
+     * @return Object representing combined result of type ReadShareGroupStateResult
+     */
+    // visible for testing
+    ReadShareGroupStateResult readResponsesToResult(
+        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;ReadShareGroupStateResponse&gt;&gt;&gt; futureMap
+    ) {
+<span class="nc" id="L324">        List&lt;TopicData&lt;PartitionAllData&gt;&gt; topicsData = futureMap.keySet().stream()</span>
+<span class="nc" id="L325">            .map(topicId -&gt; {</span>
+<span class="nc" id="L326">                List&lt;PartitionAllData&gt; partitionAllData = futureMap.get(topicId).entrySet().stream()</span>
+<span class="nc" id="L327">                    .map(partitionFuture -&gt; {</span>
+<span class="nc" id="L328">                        int partition = partitionFuture.getKey();</span>
+<span class="nc" id="L329">                        CompletableFuture&lt;ReadShareGroupStateResponse&gt; future = partitionFuture.getValue();</span>
+                        try {
+                            // already completed because of allOf call in the caller
+<span class="nc" id="L332">                            ReadShareGroupStateResponse partitionResponse = future.join();</span>
+<span class="nc" id="L333">                            return partitionResponse.data().results().get(0).partitions().stream()</span>
+<span class="nc" id="L334">                                .map(partitionResult -&gt; PartitionFactory.newPartitionAllData(</span>
+<span class="nc" id="L335">                                    partitionResult.partition(),</span>
+<span class="nc" id="L336">                                    partitionResult.stateEpoch(),</span>
+<span class="nc" id="L337">                                    partitionResult.startOffset(),</span>
+<span class="nc" id="L338">                                    partitionResult.errorCode(),</span>
+<span class="nc" id="L339">                                    partitionResult.errorMessage(),</span>
+<span class="nc" id="L340">                                    partitionResult.stateBatches().stream().map(PersisterStateBatch::from).toList()</span>
+                                ))
+<span class="nc" id="L342">                                .toList();</span>
+<span class="nc" id="L343">                        } catch (Exception e) {</span>
+<span class="nc" id="L344">                            log.error(&quot;Unexpected exception while getting data from share coordinator&quot;, e);</span>
+<span class="nc" id="L345">                            return List.of(PartitionFactory.newPartitionAllData(</span>
+                                partition,
+                                -1,
+                                -1,
+<span class="nc" id="L349">                                Errors.UNKNOWN_SERVER_ERROR.code(),   // No specific public error code exists for InterruptedException / ExecutionException</span>
+<span class="nc" id="L350">                                &quot;Error reading state from share coordinator: &quot; + e.getMessage(),</span>
+<span class="nc" id="L351">                                List.of())</span>
+                            );
+                        }
+                    })
+<span class="nc" id="L355">                    .flatMap(List::stream)</span>
+<span class="nc" id="L356">                    .toList();</span>
+<span class="nc" id="L357">                return new TopicData&lt;&gt;(topicId, partitionAllData);</span>
+            })
+<span class="nc" id="L359">            .toList();</span>
+<span class="nc" id="L360">        return new ReadShareGroupStateResult.Builder()</span>
+<span class="nc" id="L361">            .setTopicsData(topicsData)</span>
+<span class="nc" id="L362">            .build();</span>
+    }
+
+    /**
+     * Used by the group coordinator to delete share-partition state from a share coordinator.
+     * This is an inter-broker RPC authorized as a cluster action.
+     *
+     * @param request DeleteShareGroupStateParameters
+     * @return A completable future of DeleteShareGroupStateResult
+     */
+    public CompletableFuture&lt;DeleteShareGroupStateResult&gt; deleteState(DeleteShareGroupStateParameters request) {
+        try {
+<span class="nc" id="L374">            validate(request);</span>
+<span class="nc" id="L375">        } catch (Exception e) {</span>
+<span class="nc" id="L376">            log.error(&quot;Unable to validate delete state request&quot;, e);</span>
+<span class="nc" id="L377">            return CompletableFuture.failedFuture(e);</span>
+<span class="nc" id="L378">        }</span>
+<span class="nc" id="L379">        GroupTopicPartitionData&lt;PartitionIdData&gt; gtp = request.groupTopicPartitionData();</span>
+<span class="nc" id="L380">        String groupId = gtp.groupId();</span>
+
+<span class="nc" id="L382">        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;DeleteShareGroupStateResponse&gt;&gt;&gt; futureMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L383">        List&lt;PersisterStateManager.DeleteStateHandler&gt; handlers = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L385">        gtp.topicsData().forEach(topicData -&gt; {</span>
+<span class="nc" id="L386">            topicData.partitions().forEach(partitionData -&gt; {</span>
+<span class="nc" id="L387">                CompletableFuture&lt;DeleteShareGroupStateResponse&gt; future = futureMap</span>
+<span class="nc" id="L388">                    .computeIfAbsent(topicData.topicId(), k -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L389">                    .computeIfAbsent(partitionData.partition(), k -&gt; new CompletableFuture&lt;&gt;());</span>
+
+<span class="nc" id="L391">                handlers.add(</span>
+<span class="nc" id="L392">                    stateManager.new DeleteStateHandler(</span>
+                        groupId,
+<span class="nc" id="L394">                        topicData.topicId(),</span>
+<span class="nc" id="L395">                        partitionData.partition(),</span>
+                        future,
+                        null
+                    )
+                );
+<span class="nc" id="L400">            });</span>
+<span class="nc" id="L401">        });</span>
+
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        for (PersisterStateManager.PersisterStateManagerHandler handler : handlers) {</span>
+<span class="nc" id="L404">            stateManager.enqueue(handler);</span>
+<span class="nc" id="L405">        }</span>
+
+<span class="nc" id="L407">        CompletableFuture&lt;Void&gt; combinedFuture = CompletableFuture.allOf(</span>
+<span class="nc" id="L408">            handlers.stream()</span>
+<span class="nc" id="L409">                .map(PersisterStateManager.DeleteStateHandler::result)</span>
+<span class="nc" id="L410">                .toArray(CompletableFuture[]::new));</span>
+
+<span class="nc" id="L412">        return combinedFuture.thenApply(v -&gt; deleteResponsesToResult(futureMap));</span>
+    }
+
+    /**
+     * Used by the group coordinator to read the offset information from share-partition state from a share coordinator.
+     * This is an inter-broker RPC authorized as a cluster action.
+     *
+     * @param request ReadShareGroupStateSummaryParameters
+     * @return A completable future of  ReadShareGroupStateSummaryResult
+     */
+    public CompletableFuture&lt;ReadShareGroupStateSummaryResult&gt; readSummary(ReadShareGroupStateSummaryParameters request) {
+        try {
+<span class="nc" id="L424">            validate(request);</span>
+<span class="nc" id="L425">        } catch (Exception e) {</span>
+<span class="nc" id="L426">            log.error(&quot;Unable to validate read state summary request&quot;, e);</span>
+<span class="nc" id="L427">            return CompletableFuture.failedFuture(e);</span>
+<span class="nc" id="L428">        }</span>
+
+<span class="nc" id="L430">        GroupTopicPartitionData&lt;PartitionIdLeaderEpochData&gt; gtp = request.groupTopicPartitionData();</span>
+<span class="nc" id="L431">        String groupId = gtp.groupId();</span>
+<span class="nc" id="L432">        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;ReadShareGroupStateSummaryResponse&gt;&gt;&gt; futureMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L433">        List&lt;PersisterStateManager.ReadStateSummaryHandler&gt; handlers = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L435">        gtp.topicsData().forEach(topicData -&gt; {</span>
+<span class="nc" id="L436">            topicData.partitions().forEach(partitionData -&gt; {</span>
+<span class="nc" id="L437">                CompletableFuture&lt;ReadShareGroupStateSummaryResponse&gt; future = futureMap</span>
+<span class="nc" id="L438">                    .computeIfAbsent(topicData.topicId(), k -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L439">                    .computeIfAbsent(partitionData.partition(), k -&gt; new CompletableFuture&lt;&gt;());</span>
+
+<span class="nc" id="L441">                handlers.add(</span>
+<span class="nc" id="L442">                    stateManager.new ReadStateSummaryHandler(</span>
+                        groupId,
+<span class="nc" id="L444">                        topicData.topicId(),</span>
+<span class="nc" id="L445">                        partitionData.partition(),</span>
+<span class="nc" id="L446">                        partitionData.leaderEpoch(),</span>
+                        future,
+                        null
+                    )
+                );
+<span class="nc" id="L451">            });</span>
+<span class="nc" id="L452">        });</span>
+
+<span class="nc bnc" id="L454" title="All 2 branches missed.">        for (PersisterStateManager.PersisterStateManagerHandler handler : handlers) {</span>
+<span class="nc" id="L455">            stateManager.enqueue(handler);</span>
+<span class="nc" id="L456">        }</span>
+
+        // Combine all futures into a single CompletableFuture&lt;Void&gt;
+<span class="nc" id="L459">        CompletableFuture&lt;Void&gt; combinedFuture = CompletableFuture.allOf(</span>
+<span class="nc" id="L460">            handlers.stream()</span>
+<span class="nc" id="L461">                .map(PersisterStateManager.ReadStateSummaryHandler::result)</span>
+<span class="nc" id="L462">                .toArray(CompletableFuture[]::new));</span>
+
+        // Transform the combined CompletableFuture&lt;Void&gt; into CompletableFuture&lt;ReadShareGroupStateResult&gt;
+<span class="nc" id="L465">        return combinedFuture.thenApply(v -&gt; readSummaryResponsesToResult(futureMap));</span>
+    }
+
+    /**
+     * Takes in a list of COMPLETED futures and combines the results,
+     * taking care of errors if any, into a single ReadShareGroupStateSummaryResult
+     *
+     * @param futureMap - HashMap of {topic -&gt; {partition -&gt; future}}
+     * @return Object representing combined result of type ReadShareGroupStateSummaryResult
+     */
+    // visible for testing
+    ReadShareGroupStateSummaryResult readSummaryResponsesToResult(
+        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;ReadShareGroupStateSummaryResponse&gt;&gt;&gt; futureMap
+    ) {
+<span class="nc" id="L479">        List&lt;TopicData&lt;PartitionStateSummaryData&gt;&gt; topicsData = futureMap.keySet().stream()</span>
+<span class="nc" id="L480">            .map(topicId -&gt; {</span>
+<span class="nc" id="L481">                List&lt;PartitionStateSummaryData&gt; partitionStateErrorData = futureMap.get(topicId).entrySet().stream()</span>
+<span class="nc" id="L482">                    .map(partitionFuture -&gt; {</span>
+<span class="nc" id="L483">                        int partition = partitionFuture.getKey();</span>
+<span class="nc" id="L484">                        CompletableFuture&lt;ReadShareGroupStateSummaryResponse&gt; future = partitionFuture.getValue();</span>
+                        try {
+                            // already completed because of allOf call in the caller
+<span class="nc" id="L487">                            ReadShareGroupStateSummaryResponse partitionResponse = future.join();</span>
+<span class="nc" id="L488">                            return partitionResponse.data().results().get(0).partitions().stream()</span>
+<span class="nc" id="L489">                                .map(partitionResult -&gt; PartitionFactory.newPartitionStateSummaryData(</span>
+<span class="nc" id="L490">                                    partitionResult.partition(),</span>
+<span class="nc" id="L491">                                    partitionResult.stateEpoch(),</span>
+<span class="nc" id="L492">                                    partitionResult.startOffset(),</span>
+<span class="nc" id="L493">                                    partitionResult.deliveryCompleteCount(),</span>
+<span class="nc" id="L494">                                    partitionResult.leaderEpoch(),</span>
+<span class="nc" id="L495">                                    partitionResult.errorCode(),</span>
+<span class="nc" id="L496">                                    partitionResult.errorMessage()))</span>
+<span class="nc" id="L497">                                .toList();</span>
+<span class="nc" id="L498">                        } catch (Exception e) {</span>
+<span class="nc" id="L499">                            log.error(&quot;Unexpected exception while getting data from share coordinator&quot;, e);</span>
+<span class="nc" id="L500">                            return List.of(PartitionFactory.newPartitionStateSummaryData(</span>
+                                partition,
+                                -1,
+                                -1,
+                                -1,
+                                -1,
+<span class="nc" id="L506">                                Errors.UNKNOWN_SERVER_ERROR.code(),   // No specific public error code exists for InterruptedException / ExecutionException</span>
+<span class="nc" id="L507">                                &quot;Error reading state from share coordinator: &quot; + e.getMessage()));</span>
+                        }
+                    })
+<span class="nc" id="L510">                    .flatMap(List::stream)</span>
+<span class="nc" id="L511">                    .toList();</span>
+<span class="nc" id="L512">                return new TopicData&lt;&gt;(topicId, partitionStateErrorData);</span>
+            })
+<span class="nc" id="L514">            .toList();</span>
+<span class="nc" id="L515">        return new ReadShareGroupStateSummaryResult.Builder()</span>
+<span class="nc" id="L516">            .setTopicsData(topicsData)</span>
+<span class="nc" id="L517">            .build();</span>
+    }
+
+    /**
+     * Takes in a list of COMPLETED futures and combines the results,
+     * taking care of errors if any, into a single DeleteShareGroupStateResult
+     *
+     * @param futureMap - HashMap of {topic -&gt; {partition -&gt; future}}
+     * @return Object representing combined result of type DeleteShareGroupStateResult
+     */
+    // visible for testing
+    DeleteShareGroupStateResult deleteResponsesToResult(
+        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;DeleteShareGroupStateResponse&gt;&gt;&gt; futureMap
+    ) {
+<span class="nc" id="L531">        List&lt;TopicData&lt;PartitionErrorData&gt;&gt; topicsData = futureMap.keySet().stream()</span>
+<span class="nc" id="L532">            .map(topicId -&gt; {</span>
+<span class="nc" id="L533">                List&lt;PartitionErrorData&gt; partitionErrorData = futureMap.get(topicId).entrySet().stream()</span>
+<span class="nc" id="L534">                    .map(partitionFuture -&gt; {</span>
+<span class="nc" id="L535">                        int partition = partitionFuture.getKey();</span>
+<span class="nc" id="L536">                        CompletableFuture&lt;DeleteShareGroupStateResponse&gt; future = partitionFuture.getValue();</span>
+                        try {
+                            // already completed because of allOf call in the caller
+<span class="nc" id="L539">                            DeleteShareGroupStateResponse partitionResponse = future.join();</span>
+<span class="nc" id="L540">                            return partitionResponse.data().results().get(0).partitions().stream()</span>
+<span class="nc" id="L541">                                .map(partitionResult -&gt; PartitionFactory.newPartitionErrorData(</span>
+<span class="nc" id="L542">                                        partitionResult.partition(),</span>
+<span class="nc" id="L543">                                        partitionResult.errorCode(),</span>
+<span class="nc" id="L544">                                        partitionResult.errorMessage()</span>
+                                    )
+                                )
+<span class="nc" id="L547">                                .toList();</span>
+<span class="nc" id="L548">                        } catch (Exception e) {</span>
+<span class="nc" id="L549">                            log.error(&quot;Unexpected exception while getting data from share coordinator&quot;, e);</span>
+<span class="nc" id="L550">                            return List.of(</span>
+<span class="nc" id="L551">                                PartitionFactory.newPartitionErrorData(</span>
+                                    partition,
+<span class="nc" id="L553">                                    Errors.UNKNOWN_SERVER_ERROR.code(),   // No specific public error code exists for InterruptedException / ExecutionException</span>
+<span class="nc" id="L554">                                    &quot;Error deleting state from share coordinator: &quot; + e.getMessage()</span>
+                                )
+                            );
+                        }
+                    })
+<span class="nc" id="L559">                    .flatMap(List::stream)</span>
+<span class="nc" id="L560">                    .toList();</span>
+<span class="nc" id="L561">                return new TopicData&lt;&gt;(topicId, partitionErrorData);</span>
+            })
+<span class="nc" id="L563">            .toList();</span>
+<span class="nc" id="L564">        return new DeleteShareGroupStateResult.Builder()</span>
+<span class="nc" id="L565">            .setTopicsData(topicsData)</span>
+<span class="nc" id="L566">            .build();</span>
+    }
+
+    private static void validate(InitializeShareGroupStateParameters params) {
+<span class="nc" id="L570">        String prefix = &quot;Initialize share group parameters&quot;;</span>
+<span class="nc bnc" id="L571" title="All 2 branches missed.">        if (params == null) {</span>
+<span class="nc" id="L572">            throw new IllegalArgumentException(prefix + &quot; cannot be null.&quot;);</span>
+        }
+<span class="nc bnc" id="L574" title="All 2 branches missed.">        if (params.groupTopicPartitionData() == null) {</span>
+<span class="nc" id="L575">            throw new IllegalArgumentException(prefix + &quot; data cannot be null.&quot;);</span>
+        }
+
+<span class="nc" id="L578">        validateGroupTopicPartitionData(prefix, params.groupTopicPartitionData());</span>
+<span class="nc" id="L579">    }</span>
+
+    private static void validate(WriteShareGroupStateParameters params) {
+<span class="nc" id="L582">        String prefix = &quot;Write share group parameters&quot;;</span>
+<span class="nc bnc" id="L583" title="All 2 branches missed.">        if (params == null) {</span>
+<span class="nc" id="L584">            throw new IllegalArgumentException(prefix + &quot; cannot be null.&quot;);</span>
+        }
+<span class="nc bnc" id="L586" title="All 2 branches missed.">        if (params.groupTopicPartitionData() == null) {</span>
+<span class="nc" id="L587">            throw new IllegalArgumentException(prefix + &quot; data cannot be null.&quot;);</span>
+        }
+
+<span class="nc" id="L590">        validateGroupTopicPartitionData(prefix, params.groupTopicPartitionData());</span>
+<span class="nc" id="L591">    }</span>
+
+    private static void validate(ReadShareGroupStateParameters params) {
+<span class="nc" id="L594">        String prefix = &quot;Read share group parameters&quot;;</span>
+<span class="nc bnc" id="L595" title="All 2 branches missed.">        if (params == null) {</span>
+<span class="nc" id="L596">            throw new IllegalArgumentException(prefix + &quot; cannot be null.&quot;);</span>
+        }
+<span class="nc bnc" id="L598" title="All 2 branches missed.">        if (params.groupTopicPartitionData() == null) {</span>
+<span class="nc" id="L599">            throw new IllegalArgumentException(prefix + &quot; data cannot be null.&quot;);</span>
+        }
+
+<span class="nc" id="L602">        validateGroupTopicPartitionData(prefix, params.groupTopicPartitionData());</span>
+<span class="nc" id="L603">    }</span>
+
+    private static void validate(ReadShareGroupStateSummaryParameters params) {
+<span class="nc" id="L606">        String prefix = &quot;Read share group summary parameters&quot;;</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">        if (params == null) {</span>
+<span class="nc" id="L608">            throw new IllegalArgumentException(prefix + &quot; cannot be null.&quot;);</span>
+        }
+<span class="nc bnc" id="L610" title="All 2 branches missed.">        if (params.groupTopicPartitionData() == null) {</span>
+<span class="nc" id="L611">            throw new IllegalArgumentException(prefix + &quot; data cannot be null.&quot;);</span>
+        }
+
+<span class="nc" id="L614">        validateGroupTopicPartitionData(prefix, params.groupTopicPartitionData());</span>
+<span class="nc" id="L615">    }</span>
+
+    private static void validate(DeleteShareGroupStateParameters params) {
+<span class="nc" id="L618">        String prefix = &quot;Delete share group parameters&quot;;</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">        if (params == null) {</span>
+<span class="nc" id="L620">            throw new IllegalArgumentException(prefix + &quot; cannot be null.&quot;);</span>
+        }
+<span class="nc bnc" id="L622" title="All 2 branches missed.">        if (params.groupTopicPartitionData() == null) {</span>
+<span class="nc" id="L623">            throw new IllegalArgumentException(prefix + &quot; data cannot be null.&quot;);</span>
+        }
+
+<span class="nc" id="L626">        validateGroupTopicPartitionData(prefix, params.groupTopicPartitionData());</span>
+<span class="nc" id="L627">    }</span>
+
+    private static void validateGroupTopicPartitionData(String prefix, GroupTopicPartitionData&lt;? extends PartitionIdData&gt; data) {
+<span class="nc" id="L630">        String groupId = data.groupId();</span>
+<span class="nc bnc" id="L631" title="All 4 branches missed.">        if (groupId == null || groupId.isEmpty()) {</span>
+<span class="nc" id="L632">            throw new IllegalArgumentException(prefix + &quot; groupId cannot be null or empty.&quot;);</span>
+        }
+
+<span class="nc" id="L635">        List&lt;? extends TopicData&lt;? extends PartitionIdData&gt;&gt; topicsData = data.topicsData();</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">        if (isEmpty(topicsData)) {</span>
+<span class="nc" id="L637">            throw new IllegalArgumentException(prefix + &quot; topics data cannot be null or empty.&quot;);</span>
+        }
+
+<span class="nc bnc" id="L640" title="All 2 branches missed.">        for (TopicData&lt;? extends PartitionIdData&gt; topicData : topicsData) {</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">            if (topicData.topicId() == null) {</span>
+<span class="nc" id="L642">                throw new IllegalArgumentException(prefix + &quot; topicId cannot be null.&quot;);</span>
+            }
+<span class="nc bnc" id="L644" title="All 2 branches missed.">            if (isEmpty(topicData.partitions())) {</span>
+<span class="nc" id="L645">                throw new IllegalArgumentException(prefix + &quot; partitions cannot be null or empty.&quot;);</span>
+            }
+<span class="nc bnc" id="L647" title="All 2 branches missed.">            for (PartitionIdData partitionData : topicData.partitions()) {</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">                if (partitionData.partition() &lt; 0) {</span>
+<span class="nc" id="L649">                    throw new IllegalArgumentException(</span>
+<span class="nc" id="L650">                        String.format(&quot;%s has invalid partitionId - %s %s %d&quot;, prefix, groupId, topicData.topicId(), partitionData.partition()));</span>
+                }
+<span class="nc" id="L652">            }</span>
+<span class="nc" id="L653">        }</span>
+<span class="nc" id="L654">    }</span>
+
+    private static boolean isEmpty(List&lt;?&gt; list) {
+<span class="nc bnc" id="L657" title="All 4 branches missed.">        return list == null || list.isEmpty();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

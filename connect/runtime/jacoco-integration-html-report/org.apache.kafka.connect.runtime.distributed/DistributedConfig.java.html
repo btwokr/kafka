@@ -1,0 +1,734 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DistributedConfig.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (partial)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.distributed</a> &gt; <span class="el_source">DistributedConfig.java</span></div><h1>DistributedConfig.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime.distributed;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.MetadataRecoveryStrategy;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.security.auth.SecurityProtocol;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.runtime.WorkerConfig;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.security.InvalidParameterException;
+import java.security.NoSuchAlgorithmException;
+import java.security.Provider;
+import java.security.Security;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import javax.crypto.KeyGenerator;
+
+import static org.apache.kafka.common.config.ConfigDef.CaseInsensitiveValidString.in;
+import static org.apache.kafka.common.config.ConfigDef.Range.atLeast;
+import static org.apache.kafka.common.config.ConfigDef.Range.between;
+import static org.apache.kafka.common.utils.Utils.enumOptions;
+import static org.apache.kafka.connect.runtime.TopicCreationConfig.PARTITIONS_VALIDATOR;
+import static org.apache.kafka.connect.runtime.TopicCreationConfig.REPLICATION_FACTOR_VALIDATOR;
+
+/**
+ * Provides configuration for Kafka Connect workers running in distributed mode.
+ */
+public final class DistributedConfig extends WorkerConfig {
+
+<span class="fc" id="L61">    private static final Logger log = LoggerFactory.getLogger(DistributedConfig.class);</span>
+
+    /*
+     * NOTE: DO NOT CHANGE EITHER CONFIG STRINGS OR THEIR JAVA VARIABLE NAMES AS
+     * THESE ARE PART OF THE PUBLIC API AND CHANGE WILL BREAK USER CODE.
+     */
+
+    /**
+     * &lt;code&gt;group.id&lt;/code&gt;
+     */
+    public static final String GROUP_ID_CONFIG = CommonClientConfigs.GROUP_ID_CONFIG;
+    private static final String GROUP_ID_DOC = &quot;A unique string that identifies the Connect cluster group this worker belongs to.&quot;;
+
+    /**
+     * &lt;code&gt;session.timeout.ms&lt;/code&gt;
+     */
+    public static final String SESSION_TIMEOUT_MS_CONFIG = CommonClientConfigs.SESSION_TIMEOUT_MS_CONFIG;
+    private static final String SESSION_TIMEOUT_MS_DOC = &quot;The timeout used to detect worker failures. &quot; +
+            &quot;The worker sends periodic heartbeats to indicate its liveness to the broker. If no heartbeats are &quot; +
+            &quot;received by the broker before the expiration of this session timeout, then the broker will remove the &quot; +
+            &quot;worker from the group and initiate a rebalance. Note that the value must be in the allowable range as &quot; +
+            &quot;configured in the broker configuration by &lt;code&gt;group.min.session.timeout.ms&lt;/code&gt; &quot; +
+            &quot;and &lt;code&gt;group.max.session.timeout.ms&lt;/code&gt;.&quot;;
+
+    /**
+     * &lt;code&gt;heartbeat.interval.ms&lt;/code&gt;
+     */
+    public static final String HEARTBEAT_INTERVAL_MS_CONFIG = CommonClientConfigs.HEARTBEAT_INTERVAL_MS_CONFIG;
+    private static final String HEARTBEAT_INTERVAL_MS_DOC = &quot;The expected time between heartbeats to the group &quot; +
+            &quot;coordinator when using Kafka's group management facilities. Heartbeats are used to ensure that the &quot; +
+            &quot;worker's session stays active and to facilitate rebalancing when new members join or leave the group. &quot; +
+            &quot;The value must be set lower than &lt;code&gt;session.timeout.ms&lt;/code&gt;, but typically should be set no higher &quot; +
+            &quot;than 1/3 of that value. It can be adjusted even lower to control the expected time for normal rebalances.&quot;;
+
+    /**
+     * &lt;code&gt;rebalance.timeout.ms&lt;/code&gt;
+     */
+    public static final String REBALANCE_TIMEOUT_MS_CONFIG = CommonClientConfigs.REBALANCE_TIMEOUT_MS_CONFIG;
+    private static final String REBALANCE_TIMEOUT_MS_DOC = CommonClientConfigs.REBALANCE_TIMEOUT_MS_DOC;
+
+    public static final String METADATA_RECOVERY_STRATEGY_CONFIG = CommonClientConfigs.METADATA_RECOVERY_STRATEGY_CONFIG;
+    private static final String METADATA_RECOVERY_STRATEGY_DOC = CommonClientConfigs.METADATA_RECOVERY_STRATEGY_DOC;
+<span class="fc" id="L103">    public static final String DEFAULT_METADATA_RECOVERY_STRATEGY = CommonClientConfigs.DEFAULT_METADATA_RECOVERY_STRATEGY;</span>
+
+    public static final String METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS_CONFIG = CommonClientConfigs.METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS_CONFIG;
+    private static final String METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS_DOC = CommonClientConfigs.METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS_DOC;
+    public static final long DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS = CommonClientConfigs.DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS;
+
+    public static final String METADATA_CLUSTER_CHECK_ENABLE_CONFIG = CommonClientConfigs.METADATA_CLUSTER_CHECK_ENABLE_CONFIG;
+    private static final String METADATA_CLUSTER_CHECK_ENABLE_DOC = CommonClientConfigs.METADATA_CLUSTER_CHECK_ENABLE_DOC;
+
+    /**
+     * &lt;code&gt;worker.sync.timeout.ms&lt;/code&gt;
+     */
+    public static final String WORKER_SYNC_TIMEOUT_MS_CONFIG = &quot;worker.sync.timeout.ms&quot;;
+    private static final String WORKER_SYNC_TIMEOUT_MS_DOC = &quot;When the worker is out of sync with other workers and needs&quot; +
+            &quot; to resynchronize configurations, wait up to this amount of time before giving up, leaving the group, and&quot; +
+            &quot; waiting a backoff period before rejoining.&quot;;
+
+    /**
+     * &lt;code&gt;group.unsync.timeout.ms&lt;/code&gt;
+     */
+    public static final String WORKER_UNSYNC_BACKOFF_MS_CONFIG = &quot;worker.unsync.backoff.ms&quot;;
+    private static final String WORKER_UNSYNC_BACKOFF_MS_DOC = &quot;When the worker is out of sync with other workers and &quot; +
+            &quot; fails to catch up within the &lt;code&gt;worker.sync.timeout.ms&lt;/code&gt;, leave the Connect cluster for this long before rejoining.&quot;;
+    public static final int WORKER_UNSYNC_BACKOFF_MS_DEFAULT = 5 * 60 * 1000;
+
+    public static final String CONFIG_STORAGE_PREFIX = &quot;config.storage.&quot;;
+    public static final String OFFSET_STORAGE_PREFIX = &quot;offset.storage.&quot;;
+    public static final String STATUS_STORAGE_PREFIX = &quot;status.storage.&quot;;
+    public static final String TOPIC_SUFFIX = &quot;topic&quot;;
+    public static final String PARTITIONS_SUFFIX = &quot;partitions&quot;;
+    public static final String REPLICATION_FACTOR_SUFFIX = &quot;replication.factor&quot;;
+
+    /**
+     * &lt;code&gt;offset.storage.topic&lt;/code&gt;
+     */
+    public static final String OFFSET_STORAGE_TOPIC_CONFIG = OFFSET_STORAGE_PREFIX + TOPIC_SUFFIX;
+    private static final String OFFSET_STORAGE_TOPIC_CONFIG_DOC = &quot;The name of the Kafka topic where source connector offsets are stored&quot;;
+
+    /**
+     * &lt;code&gt;offset.storage.partitions&lt;/code&gt;
+     */
+    public static final String OFFSET_STORAGE_PARTITIONS_CONFIG = OFFSET_STORAGE_PREFIX + PARTITIONS_SUFFIX;
+    private static final String OFFSET_STORAGE_PARTITIONS_CONFIG_DOC = &quot;The number of partitions used when creating the offset storage topic&quot;;
+
+    /**
+     * &lt;code&gt;offset.storage.replication.factor&lt;/code&gt;
+     */
+    public static final String OFFSET_STORAGE_REPLICATION_FACTOR_CONFIG = OFFSET_STORAGE_PREFIX + REPLICATION_FACTOR_SUFFIX;
+    private static final String OFFSET_STORAGE_REPLICATION_FACTOR_CONFIG_DOC = &quot;Replication factor used when creating the offset storage topic&quot;;
+
+    /**
+     * &lt;code&gt;config.storage.topic&lt;/code&gt;
+     */
+    public static final String CONFIG_TOPIC_CONFIG = CONFIG_STORAGE_PREFIX + TOPIC_SUFFIX;
+    private static final String CONFIG_TOPIC_CONFIG_DOC = &quot;The name of the Kafka topic where connector configurations are stored&quot;;
+
+    /**
+     * &lt;code&gt;config.storage.replication.factor&lt;/code&gt;
+     */
+    public static final String CONFIG_STORAGE_REPLICATION_FACTOR_CONFIG = CONFIG_STORAGE_PREFIX + REPLICATION_FACTOR_SUFFIX;
+    private static final String CONFIG_STORAGE_REPLICATION_FACTOR_CONFIG_DOC = &quot;Replication factor used when creating the configuration storage topic&quot;;
+
+    /**
+     * &lt;code&gt;status.storage.topic&lt;/code&gt;
+     */
+    public static final String STATUS_STORAGE_TOPIC_CONFIG = STATUS_STORAGE_PREFIX + TOPIC_SUFFIX;
+    public static final String STATUS_STORAGE_TOPIC_CONFIG_DOC = &quot;The name of the Kafka topic where connector and task status are stored&quot;;
+
+    /**
+     * &lt;code&gt;status.storage.partitions&lt;/code&gt;
+     */
+    public static final String STATUS_STORAGE_PARTITIONS_CONFIG = STATUS_STORAGE_PREFIX + PARTITIONS_SUFFIX;
+    private static final String STATUS_STORAGE_PARTITIONS_CONFIG_DOC = &quot;The number of partitions used when creating the status storage topic&quot;;
+
+    /**
+     * &lt;code&gt;status.storage.replication.factor&lt;/code&gt;
+     */
+    public static final String STATUS_STORAGE_REPLICATION_FACTOR_CONFIG = STATUS_STORAGE_PREFIX + REPLICATION_FACTOR_SUFFIX;
+    private static final String STATUS_STORAGE_REPLICATION_FACTOR_CONFIG_DOC = &quot;Replication factor used when creating the status storage topic&quot;;
+
+    /**
+     * &lt;code&gt;connect.protocol&lt;/code&gt;
+     */
+    public static final String CONNECT_PROTOCOL_CONFIG = &quot;connect.protocol&quot;;
+    public static final String CONNECT_PROTOCOL_DOC = &quot;Compatibility mode for Kafka Connect Protocol&quot;;
+<span class="fc" id="L188">    public static final String CONNECT_PROTOCOL_DEFAULT = ConnectProtocolCompatibility.SESSIONED.toString();</span>
+
+    /**
+     * &lt;code&gt;scheduled.rebalance.max.delay.ms&lt;/code&gt;
+     */
+    public static final String SCHEDULED_REBALANCE_MAX_DELAY_MS_CONFIG = &quot;scheduled.rebalance.max.delay.ms&quot;;
+    public static final String SCHEDULED_REBALANCE_MAX_DELAY_MS_DOC = &quot;The maximum delay that is &quot;
+            + &quot;scheduled in order to wait for the return of one or more departed workers before &quot;
+            + &quot;rebalancing and reassigning their connectors and tasks to the group. During this &quot;
+            + &quot;period the connectors and tasks of the departed workers remain unassigned&quot;;
+<span class="fc" id="L198">    public static final int SCHEDULED_REBALANCE_MAX_DELAY_MS_DEFAULT = Math.toIntExact(TimeUnit.SECONDS.toMillis(300));</span>
+
+    public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG = &quot;inter.worker.key.generation.algorithm&quot;;
+    public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT = &quot;HmacSHA256&quot;;
+    public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DOC = &quot;The algorithm to use for generating internal request keys. &quot;
+            + &quot;The algorithm '&quot; + INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT + &quot;' will be used as a default on JVMs that support it; &quot;
+            + &quot;on other JVMs, no default is used and a value for this property must be manually specified in the worker config.&quot;;
+
+    public static final String INTER_WORKER_KEY_SIZE_CONFIG = &quot;inter.worker.key.size&quot;;
+    public static final String INTER_WORKER_KEY_SIZE_DOC = &quot;The size of the key to use for signing internal requests, in bits. &quot;
+        + &quot;If null, the default key size for the key generation algorithm will be used.&quot;;
+<span class="fc" id="L209">    public static final Long INTER_WORKER_KEY_SIZE_DEFAULT = null;</span>
+
+    public static final String INTER_WORKER_KEY_TTL_MS_CONFIG = &quot;inter.worker.key.ttl.ms&quot;;
+    public static final String INTER_WORKER_KEY_TTL_MS_DOC = &quot;The TTL of generated session keys used for &quot;
+        + &quot;internal request validation (in milliseconds)&quot;;
+<span class="fc" id="L214">    public static final int INTER_WORKER_KEY_TTL_MS_DEFAULT = Math.toIntExact(TimeUnit.HOURS.toMillis(1));</span>
+
+    public static final String INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG = &quot;inter.worker.signature.algorithm&quot;;
+    public static final String INTER_WORKER_SIGNATURE_ALGORITHM_DEFAULT = &quot;HmacSHA256&quot;;
+    public static final String INTER_WORKER_SIGNATURE_ALGORITHM_DOC = &quot;The algorithm used to sign internal requests. &quot;
+            + &quot;The algorithm '&quot; + INTER_WORKER_SIGNATURE_ALGORITHM_DEFAULT + &quot;' will be used as a default on JVMs that support it; &quot;
+            + &quot;on other JVMs, no default is used and a value for this property must be manually specified in the worker config.&quot;;
+
+    public static final String INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG = &quot;inter.worker.verification.algorithms&quot;;
+<span class="fc" id="L223">    public static final List&lt;String&gt; INTER_WORKER_VERIFICATION_ALGORITHMS_DEFAULT = List.of(INTER_WORKER_SIGNATURE_ALGORITHM_DEFAULT);</span>
+<span class="fc" id="L224">    public static final String INTER_WORKER_VERIFICATION_ALGORITHMS_DOC = &quot;A list of permitted algorithms for verifying internal requests, &quot;</span>
+        + &quot;which must include the algorithm used for the &lt;code&gt;&quot; + INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG + &quot;&lt;/code&gt; property. &quot;
+        + &quot;The algorithm(s) '&quot; + INTER_WORKER_VERIFICATION_ALGORITHMS_DEFAULT + &quot;' will be used as a default on JVMs that provide them; &quot;
+        + &quot;on other JVMs, no default is used and a value for this property must be manually specified in the worker config.&quot;;
+    private final Crypto crypto;
+
+<span class="fc" id="L230">    public enum ExactlyOnceSourceSupport {</span>
+<span class="fc" id="L231">        DISABLED(false),</span>
+<span class="fc" id="L232">        PREPARING(true),</span>
+<span class="fc" id="L233">        ENABLED(true);</span>
+
+        public final boolean usesTransactionalLeader;
+
+<span class="fc" id="L237">        ExactlyOnceSourceSupport(boolean usesTransactionalLeader) {</span>
+<span class="fc" id="L238">            this.usesTransactionalLeader = usesTransactionalLeader;</span>
+<span class="fc" id="L239">        }</span>
+
+        public static ExactlyOnceSourceSupport fromProperty(String property) {
+<span class="fc" id="L242">            return ExactlyOnceSourceSupport.valueOf(property.toUpperCase(Locale.ROOT));</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="fc" id="L247">            return name().toLowerCase(Locale.ROOT);</span>
+        }
+    }
+
+    public static final String EXACTLY_ONCE_SOURCE_SUPPORT_CONFIG = &quot;exactly.once.source.support&quot;;
+<span class="fc" id="L252">    public static final String EXACTLY_ONCE_SOURCE_SUPPORT_DOC = &quot;Whether to enable exactly-once support for source connectors in the cluster &quot;</span>
+            + &quot;by using transactions to write source records and their source offsets, and by proactively fencing out old task generations before bringing up new ones.\n&quot;
+            + &quot;To enable exactly-once source support on a new cluster, set this property to '&quot; + ExactlyOnceSourceSupport.ENABLED + &quot;'. &quot;
+            + &quot;To enable support on an existing cluster, first set to '&quot; + ExactlyOnceSourceSupport.PREPARING + &quot;' on every worker in the cluster, &quot;
+            + &quot;then set to '&quot; + ExactlyOnceSourceSupport.ENABLED + &quot;'. A rolling upgrade may be used for both changes. &quot;
+            + &quot;For more information on this feature, see the &quot;
+            + &quot;&lt;a href=\&quot;https://kafka.apache.org/documentation.html#connect_exactlyoncesource\&quot;&gt;exactly-once source support documentation&lt;/a&gt;.&quot;;
+<span class="fc" id="L259">    public static final String EXACTLY_ONCE_SOURCE_SUPPORT_DEFAULT = ExactlyOnceSourceSupport.DISABLED.toString();</span>
+
+    private static Object defaultKeyGenerationAlgorithm(Crypto crypto) {
+        try {
+<span class="fc" id="L263">            validateKeyAlgorithm(crypto, INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG, INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT);</span>
+<span class="fc" id="L264">            return INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT;</span>
+<span class="nc" id="L265">        } catch (Throwable t) {</span>
+<span class="nc" id="L266">            log.info(</span>
+                    &quot;The default key generation algorithm '{}' does not appear to be available on this worker.&quot;
+                            + &quot;A key algorithm will have to be manually specified via the '{}' worker property&quot;,
+                    INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT,
+                    INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG
+            );
+<span class="nc" id="L272">            return ConfigDef.NO_DEFAULT_VALUE;</span>
+        }
+    }
+
+    private static Object defaultSignatureAlgorithm(Crypto crypto) {
+        try {
+<span class="fc" id="L278">            validateSignatureAlgorithm(crypto, INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG, INTER_WORKER_SIGNATURE_ALGORITHM_DEFAULT);</span>
+<span class="fc" id="L279">            return INTER_WORKER_SIGNATURE_ALGORITHM_DEFAULT;</span>
+<span class="nc" id="L280">        } catch (Throwable t) {</span>
+<span class="nc" id="L281">            log.info(</span>
+                    &quot;The default signature algorithm '{}' does not appear to be available on this worker.&quot;
+                            + &quot;A signature algorithm will have to be manually specified via the '{}' worker property&quot;,
+                    INTER_WORKER_SIGNATURE_ALGORITHM_DEFAULT,
+                    INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG
+            );
+<span class="nc" id="L287">            return ConfigDef.NO_DEFAULT_VALUE;</span>
+        }
+    }
+
+    private static Object defaultVerificationAlgorithms(Crypto crypto) {
+<span class="fc" id="L292">        List&lt;String&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L293" title="All 2 branches covered.">        for (String verificationAlgorithm : INTER_WORKER_VERIFICATION_ALGORITHMS_DEFAULT) {</span>
+            try {
+<span class="fc" id="L295">                validateSignatureAlgorithm(crypto, INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG, verificationAlgorithm);</span>
+<span class="fc" id="L296">                result.add(verificationAlgorithm);</span>
+<span class="nc" id="L297">            } catch (Throwable t) {</span>
+<span class="nc" id="L298">                log.trace(&quot;Verification algorithm '{}' not found&quot;, verificationAlgorithm);</span>
+<span class="fc" id="L299">            }</span>
+<span class="fc" id="L300">        }</span>
+<span class="pc bpc" id="L301" title="1 of 2 branches missed.">        if (result.isEmpty()) {</span>
+<span class="nc" id="L302">            log.info(</span>
+                    &quot;The default verification algorithm '{}' does not appear to be available on this worker.&quot;
+                            + &quot;One or more verification algorithms will have to be manually specified via the '{}' worker property&quot;,
+                    INTER_WORKER_VERIFICATION_ALGORITHMS_DEFAULT,
+                    INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG
+            );
+<span class="nc" id="L308">            return ConfigDef.NO_DEFAULT_VALUE;</span>
+        }
+<span class="fc" id="L310">        return result;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private static ConfigDef config(Crypto crypto) {
+<span class="fc" id="L315">        return baseConfigDef()</span>
+<span class="fc" id="L316">            .define(GROUP_ID_CONFIG,</span>
+                    ConfigDef.Type.STRING,
+                    ConfigDef.Importance.HIGH,
+                    GROUP_ID_DOC)
+<span class="fc" id="L320">            .define(SESSION_TIMEOUT_MS_CONFIG,</span>
+                    ConfigDef.Type.INT,
+<span class="fc" id="L322">                    Math.toIntExact(TimeUnit.SECONDS.toMillis(10)),</span>
+                    ConfigDef.Importance.HIGH,
+                    SESSION_TIMEOUT_MS_DOC)
+<span class="fc" id="L325">            .define(REBALANCE_TIMEOUT_MS_CONFIG,</span>
+                    ConfigDef.Type.INT,
+<span class="fc" id="L327">                    Math.toIntExact(TimeUnit.MINUTES.toMillis(1)),</span>
+                    ConfigDef.Importance.HIGH,
+                    REBALANCE_TIMEOUT_MS_DOC)
+<span class="fc" id="L330">            .define(HEARTBEAT_INTERVAL_MS_CONFIG,</span>
+                    ConfigDef.Type.INT,
+<span class="fc" id="L332">                    Math.toIntExact(TimeUnit.SECONDS.toMillis(3)),</span>
+                    ConfigDef.Importance.HIGH,
+                    HEARTBEAT_INTERVAL_MS_DOC)
+<span class="fc" id="L335">            .define(EXACTLY_ONCE_SOURCE_SUPPORT_CONFIG,</span>
+                    ConfigDef.Type.STRING,
+                    EXACTLY_ONCE_SOURCE_SUPPORT_DEFAULT,
+<span class="fc" id="L338">                    in(enumOptions(ExactlyOnceSourceSupport.class)),</span>
+                    ConfigDef.Importance.HIGH,
+                    EXACTLY_ONCE_SOURCE_SUPPORT_DOC)
+<span class="fc" id="L341">            .define(CommonClientConfigs.METADATA_MAX_AGE_CONFIG,</span>
+                    ConfigDef.Type.LONG,
+<span class="fc" id="L343">                    TimeUnit.MINUTES.toMillis(5),</span>
+<span class="fc" id="L344">                    atLeast(0),</span>
+                    ConfigDef.Importance.LOW,
+                    CommonClientConfigs.METADATA_MAX_AGE_DOC)
+<span class="fc" id="L347">            .define(CommonClientConfigs.CLIENT_ID_CONFIG,</span>
+                    ConfigDef.Type.STRING,
+                    &quot;&quot;,
+                    ConfigDef.Importance.LOW,
+                    CommonClientConfigs.CLIENT_ID_DOC)
+<span class="fc" id="L352">            .define(CommonClientConfigs.SEND_BUFFER_CONFIG,</span>
+                    ConfigDef.Type.INT,
+<span class="fc" id="L354">                    128 * 1024,</span>
+<span class="fc" id="L355">                    atLeast(CommonClientConfigs.SEND_BUFFER_LOWER_BOUND),</span>
+                    ConfigDef.Importance.MEDIUM,
+                    CommonClientConfigs.SEND_BUFFER_DOC)
+<span class="fc" id="L358">            .define(CommonClientConfigs.RECEIVE_BUFFER_CONFIG,</span>
+                    ConfigDef.Type.INT,
+<span class="fc" id="L360">                    32 * 1024,</span>
+<span class="fc" id="L361">                    atLeast(CommonClientConfigs.RECEIVE_BUFFER_LOWER_BOUND),</span>
+                    ConfigDef.Importance.MEDIUM,
+                    CommonClientConfigs.RECEIVE_BUFFER_DOC)
+<span class="fc" id="L364">            .define(CommonClientConfigs.RECONNECT_BACKOFF_MS_CONFIG,</span>
+                    ConfigDef.Type.LONG,
+<span class="fc" id="L366">                    50L,</span>
+<span class="fc" id="L367">                    atLeast(0L),</span>
+                    ConfigDef.Importance.LOW,
+                    CommonClientConfigs.RECONNECT_BACKOFF_MS_DOC)
+<span class="fc" id="L370">            .define(CommonClientConfigs.RECONNECT_BACKOFF_MAX_MS_CONFIG,</span>
+                    ConfigDef.Type.LONG,
+<span class="fc" id="L372">                    TimeUnit.SECONDS.toMillis(1),</span>
+<span class="fc" id="L373">                    atLeast(0L),</span>
+                    ConfigDef.Importance.LOW,
+                    CommonClientConfigs.RECONNECT_BACKOFF_MAX_MS_DOC)
+<span class="fc" id="L376">            .define(CommonClientConfigs.SOCKET_CONNECTION_SETUP_TIMEOUT_MS_CONFIG,</span>
+                    ConfigDef.Type.LONG,
+                    CommonClientConfigs.DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MS,
+<span class="fc" id="L379">                    atLeast(0L),</span>
+                    ConfigDef.Importance.LOW,
+                    CommonClientConfigs.SOCKET_CONNECTION_SETUP_TIMEOUT_MS_DOC)
+<span class="fc" id="L382">            .define(CommonClientConfigs.SOCKET_CONNECTION_SETUP_TIMEOUT_MAX_MS_CONFIG,</span>
+                    ConfigDef.Type.LONG,
+                    CommonClientConfigs.DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MAX_MS,
+<span class="fc" id="L385">                    atLeast(0L),</span>
+                    ConfigDef.Importance.LOW,
+                    CommonClientConfigs.SOCKET_CONNECTION_SETUP_TIMEOUT_MAX_MS_DOC)
+<span class="fc" id="L388">            .define(CommonClientConfigs.RETRY_BACKOFF_MS_CONFIG,</span>
+                    ConfigDef.Type.LONG,
+                    CommonClientConfigs.DEFAULT_RETRY_BACKOFF_MS,
+<span class="fc" id="L391">                    atLeast(0L),</span>
+                    ConfigDef.Importance.LOW,
+                    CommonClientConfigs.RETRY_BACKOFF_MS_DOC)
+<span class="fc" id="L394">            .define(CommonClientConfigs.RETRY_BACKOFF_MAX_MS_CONFIG,</span>
+                    ConfigDef.Type.LONG,
+                    CommonClientConfigs.DEFAULT_RETRY_BACKOFF_MAX_MS,
+<span class="fc" id="L397">                    atLeast(0L),</span>
+                    ConfigDef.Importance.LOW,
+                    CommonClientConfigs.RETRY_BACKOFF_MAX_MS_DOC)
+<span class="fc" id="L400">            .define(CommonClientConfigs.REQUEST_TIMEOUT_MS_CONFIG,</span>
+                    ConfigDef.Type.INT,
+<span class="fc" id="L402">                    Math.toIntExact(TimeUnit.SECONDS.toMillis(40)),</span>
+<span class="fc" id="L403">                    atLeast(0),</span>
+                    ConfigDef.Importance.MEDIUM,
+                    CommonClientConfigs.REQUEST_TIMEOUT_MS_DOC)
+            /* default is set to be a bit lower than the server default (10 min), to avoid both client and server closing connection at same time */
+<span class="fc" id="L407">            .define(CommonClientConfigs.CONNECTIONS_MAX_IDLE_MS_CONFIG,</span>
+                    ConfigDef.Type.LONG,
+<span class="fc" id="L409">                    TimeUnit.MINUTES.toMillis(9),</span>
+                    ConfigDef.Importance.MEDIUM,
+                    CommonClientConfigs.CONNECTIONS_MAX_IDLE_MS_DOC)
+            // security support
+<span class="fc" id="L413">            .define(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG,</span>
+                    ConfigDef.Type.STRING,
+                    CommonClientConfigs.DEFAULT_SECURITY_PROTOCOL,
+<span class="fc" id="L416">                    in(Utils.enumOptions(SecurityProtocol.class)),</span>
+                    ConfigDef.Importance.MEDIUM,
+                    CommonClientConfigs.SECURITY_PROTOCOL_DOC)
+<span class="fc" id="L419">            .withClientSaslSupport()</span>
+<span class="fc" id="L420">            .define(WORKER_SYNC_TIMEOUT_MS_CONFIG,</span>
+                    ConfigDef.Type.INT,
+<span class="fc" id="L422">                    3000,</span>
+                    ConfigDef.Importance.MEDIUM,
+                    WORKER_SYNC_TIMEOUT_MS_DOC)
+<span class="fc" id="L425">            .define(WORKER_UNSYNC_BACKOFF_MS_CONFIG,</span>
+                    ConfigDef.Type.INT,
+<span class="fc" id="L427">                    WORKER_UNSYNC_BACKOFF_MS_DEFAULT,</span>
+                    ConfigDef.Importance.MEDIUM,
+                    WORKER_UNSYNC_BACKOFF_MS_DOC)
+<span class="fc" id="L430">            .define(OFFSET_STORAGE_TOPIC_CONFIG,</span>
+                    ConfigDef.Type.STRING,
+                    ConfigDef.Importance.HIGH,
+                    OFFSET_STORAGE_TOPIC_CONFIG_DOC)
+<span class="fc" id="L434">            .define(OFFSET_STORAGE_PARTITIONS_CONFIG,</span>
+                    ConfigDef.Type.INT,
+<span class="fc" id="L436">                    25,</span>
+                    PARTITIONS_VALIDATOR,
+                    ConfigDef.Importance.LOW,
+                    OFFSET_STORAGE_PARTITIONS_CONFIG_DOC)
+<span class="fc" id="L440">            .define(OFFSET_STORAGE_REPLICATION_FACTOR_CONFIG,</span>
+                    ConfigDef.Type.SHORT,
+<span class="fc" id="L442">                    (short) 3,</span>
+                    REPLICATION_FACTOR_VALIDATOR,
+                    ConfigDef.Importance.LOW,
+                    OFFSET_STORAGE_REPLICATION_FACTOR_CONFIG_DOC)
+<span class="fc" id="L446">            .define(CONFIG_TOPIC_CONFIG,</span>
+                    ConfigDef.Type.STRING,
+                    ConfigDef.Importance.HIGH,
+                    CONFIG_TOPIC_CONFIG_DOC)
+<span class="fc" id="L450">            .define(CONFIG_STORAGE_REPLICATION_FACTOR_CONFIG,</span>
+                    ConfigDef.Type.SHORT,
+<span class="fc" id="L452">                    (short) 3,</span>
+                    REPLICATION_FACTOR_VALIDATOR,
+                    ConfigDef.Importance.LOW,
+                    CONFIG_STORAGE_REPLICATION_FACTOR_CONFIG_DOC)
+<span class="fc" id="L456">            .define(STATUS_STORAGE_TOPIC_CONFIG,</span>
+                    ConfigDef.Type.STRING,
+                    ConfigDef.Importance.HIGH,
+                    STATUS_STORAGE_TOPIC_CONFIG_DOC)
+<span class="fc" id="L460">            .define(STATUS_STORAGE_PARTITIONS_CONFIG,</span>
+                    ConfigDef.Type.INT,
+<span class="fc" id="L462">                    5,</span>
+                    PARTITIONS_VALIDATOR,
+                    ConfigDef.Importance.LOW,
+                    STATUS_STORAGE_PARTITIONS_CONFIG_DOC)
+<span class="fc" id="L466">            .define(STATUS_STORAGE_REPLICATION_FACTOR_CONFIG,</span>
+                    ConfigDef.Type.SHORT,
+<span class="fc" id="L468">                    (short) 3,</span>
+                    REPLICATION_FACTOR_VALIDATOR,
+                    ConfigDef.Importance.LOW,
+                    STATUS_STORAGE_REPLICATION_FACTOR_CONFIG_DOC)
+<span class="fc" id="L472">            .define(CONNECT_PROTOCOL_CONFIG,</span>
+                    ConfigDef.Type.STRING,
+                    CONNECT_PROTOCOL_DEFAULT,
+<span class="fc" id="L475">                    ConfigDef.LambdaValidator.with(</span>
+                        (name, value) -&gt; {
+                            try {
+<span class="fc" id="L478">                                ConnectProtocolCompatibility.compatibility((String) value);</span>
+<span class="nc" id="L479">                            } catch (Throwable t) {</span>
+<span class="nc" id="L480">                                throw new ConfigException(name, value, &quot;Invalid Connect protocol &quot;</span>
+                                        + &quot;compatibility&quot;);
+<span class="fc" id="L482">                            }</span>
+<span class="fc" id="L483">                        },</span>
+<span class="nc" id="L484">                        () -&gt; Arrays.stream(ConnectProtocolCompatibility.values()).map(ConnectProtocolCompatibility::toString)</span>
+<span class="nc" id="L485">                                .collect(Collectors.joining(&quot;, &quot;, &quot;[&quot;, &quot;]&quot;))),</span>
+                    ConfigDef.Importance.LOW,
+                    CONNECT_PROTOCOL_DOC)
+<span class="fc" id="L488">            .define(SCHEDULED_REBALANCE_MAX_DELAY_MS_CONFIG,</span>
+                    ConfigDef.Type.INT,
+<span class="fc" id="L490">                    SCHEDULED_REBALANCE_MAX_DELAY_MS_DEFAULT,</span>
+<span class="fc" id="L491">                    between(0, Integer.MAX_VALUE),</span>
+                    ConfigDef.Importance.LOW,
+                    SCHEDULED_REBALANCE_MAX_DELAY_MS_DOC)
+<span class="fc" id="L494">            .define(INTER_WORKER_KEY_TTL_MS_CONFIG,</span>
+                    ConfigDef.Type.INT,
+<span class="fc" id="L496">                    INTER_WORKER_KEY_TTL_MS_DEFAULT,</span>
+<span class="fc" id="L497">                    between(0, Integer.MAX_VALUE),</span>
+                    ConfigDef.Importance.LOW,
+                    INTER_WORKER_KEY_TTL_MS_DOC)
+<span class="fc" id="L500">            .define(INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG,</span>
+                    ConfigDef.Type.STRING,
+<span class="fc" id="L502">                    defaultKeyGenerationAlgorithm(crypto),</span>
+<span class="fc" id="L503">                    ConfigDef.LambdaValidator.with(</span>
+<span class="fc" id="L504">                            (name, value) -&gt; validateKeyAlgorithm(crypto, name, (String) value),</span>
+<span class="nc" id="L505">                            () -&gt; &quot;Any KeyGenerator algorithm supported by the worker JVM&quot;),</span>
+                    ConfigDef.Importance.LOW,
+                    INTER_WORKER_KEY_GENERATION_ALGORITHM_DOC)
+<span class="fc" id="L508">            .define(INTER_WORKER_KEY_SIZE_CONFIG,</span>
+                    ConfigDef.Type.INT,
+                    INTER_WORKER_KEY_SIZE_DEFAULT,
+                    ConfigDef.Importance.LOW,
+                    INTER_WORKER_KEY_SIZE_DOC)
+<span class="fc" id="L513">            .define(INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG,</span>
+                    ConfigDef.Type.STRING,
+<span class="fc" id="L515">                    defaultSignatureAlgorithm(crypto),</span>
+<span class="fc" id="L516">                    ConfigDef.LambdaValidator.with(</span>
+<span class="fc" id="L517">                            (name, value) -&gt; validateSignatureAlgorithm(crypto, name, (String) value),</span>
+<span class="nc" id="L518">                            () -&gt; &quot;Any MAC algorithm supported by the worker JVM&quot;),</span>
+                    ConfigDef.Importance.LOW,
+                    INTER_WORKER_SIGNATURE_ALGORITHM_DOC)
+<span class="fc" id="L521">            .define(INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG,</span>
+                    ConfigDef.Type.LIST,
+<span class="fc" id="L523">                    defaultVerificationAlgorithms(crypto),</span>
+<span class="fc" id="L524">                    ConfigDef.LambdaValidator.with(</span>
+<span class="fc" id="L525">                            (name, value) -&gt; validateVerificationAlgorithms(crypto, name, (List&lt;String&gt;) value),</span>
+<span class="nc" id="L526">                            () -&gt; &quot;A list of one or more MAC algorithms, each supported by the worker JVM&quot;),</span>
+                    ConfigDef.Importance.LOW,
+                    INTER_WORKER_VERIFICATION_ALGORITHMS_DOC)
+<span class="fc" id="L529">            .define(METADATA_RECOVERY_STRATEGY_CONFIG,</span>
+                    ConfigDef.Type.STRING,
+                    DEFAULT_METADATA_RECOVERY_STRATEGY,
+                    ConfigDef.CaseInsensitiveValidString
+<span class="fc" id="L533">                            .in(Utils.enumOptions(MetadataRecoveryStrategy.class)),</span>
+                    ConfigDef.Importance.LOW,
+                    METADATA_RECOVERY_STRATEGY_DOC)
+<span class="fc" id="L536">            .define(METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS_CONFIG,</span>
+                    ConfigDef.Type.LONG,
+<span class="fc" id="L538">                    DEFAULT_METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS,</span>
+<span class="fc" id="L539">                    atLeast(0),</span>
+                    ConfigDef.Importance.LOW,
+                    METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS_DOC)
+<span class="fc" id="L542">            .define(METADATA_CLUSTER_CHECK_ENABLE_CONFIG,</span>
+                    ConfigDef.Type.BOOLEAN,
+<span class="fc" id="L544">                    true,</span>
+                    ConfigDef.Importance.LOW,
+                    METADATA_CLUSTER_CHECK_ENABLE_DOC);
+
+    }
+
+    private final ExactlyOnceSourceSupport exactlyOnceSourceSupport;
+
+    @Override
+    public Integer rebalanceTimeout() {
+<span class="fc" id="L554">        return getInt(DistributedConfig.REBALANCE_TIMEOUT_MS_CONFIG);</span>
+    }
+
+    @Override
+    public boolean exactlyOnceSourceEnabled() {
+<span class="pc bpc" id="L559" title="1 of 2 branches missed.">        return exactlyOnceSourceSupport == ExactlyOnceSourceSupport.ENABLED;</span>
+    }
+
+    /**
+     * @return whether the Connect cluster's leader should use a transactional producer to perform writes to the config
+     * topic, which is useful for ensuring that zombie leaders are fenced out and unable to write to the topic after a
+     * new leader has been elected.
+     */
+    public boolean transactionalLeaderEnabled() {
+<span class="fc" id="L568">        return exactlyOnceSourceSupport.usesTransactionalLeader;</span>
+    }
+
+    /**
+     * @return the {@link ProducerConfig#TRANSACTIONAL_ID_CONFIG transactional ID} to use for the worker's producer if
+     * using a transactional producer for writes to internal topics such as the config topic.
+     */
+    public String transactionalProducerId() {
+<span class="fc" id="L576">        return transactionalProducerId(groupId());</span>
+    }
+
+    public static String transactionalProducerId(String groupId) {
+<span class="fc" id="L580">        return &quot;connect-cluster-&quot; + groupId;</span>
+    }
+
+    @Override
+    public String offsetsTopic() {
+<span class="fc" id="L585">        return getString(OFFSET_STORAGE_TOPIC_CONFIG);</span>
+    }
+
+    @Override
+    public boolean connectorOffsetsTopicsPermitted() {
+<span class="nc" id="L590">        return true;</span>
+    }
+
+    @Override
+    public String groupId() {
+<span class="fc" id="L595">        return getString(GROUP_ID_CONFIG);</span>
+    }
+
+    @Override
+    protected Map&lt;String, Object&gt; postProcessParsedConfig(final Map&lt;String, Object&gt; parsedValues) {
+<span class="fc" id="L600">        CommonClientConfigs.warnDisablingExponentialBackoff(this);</span>
+<span class="fc" id="L601">        return super.postProcessParsedConfig(parsedValues);</span>
+    }
+
+    public DistributedConfig(Map&lt;String, String&gt; props) {
+<span class="fc" id="L605">        this(Crypto.SYSTEM, props);</span>
+<span class="fc" id="L606">    }</span>
+
+    // Visible for testing
+    DistributedConfig(Crypto crypto, Map&lt;String, String&gt; props) {
+<span class="fc" id="L610">        super(config(crypto), props);</span>
+<span class="fc" id="L611">        this.crypto = crypto;</span>
+<span class="fc" id="L612">        exactlyOnceSourceSupport = ExactlyOnceSourceSupport.fromProperty(getString(EXACTLY_ONCE_SOURCE_SUPPORT_CONFIG));</span>
+<span class="fc" id="L613">        validateInterWorkerKeyConfigs();</span>
+<span class="fc" id="L614">    }</span>
+
+    public static void main(String[] args) {
+<span class="nc" id="L617">        System.out.println(config(Crypto.SYSTEM).toHtml(4, config -&gt; &quot;connectconfigs_&quot; + config));</span>
+<span class="nc" id="L618">    }</span>
+
+    public KeyGenerator getInternalRequestKeyGenerator() {
+        try {
+<span class="fc" id="L622">            KeyGenerator result = crypto.keyGenerator(getString(INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG));</span>
+<span class="fc" id="L623">            Optional.ofNullable(getInt(INTER_WORKER_KEY_SIZE_CONFIG)).ifPresent(result::init);</span>
+<span class="fc" id="L624">            return result;</span>
+<span class="nc" id="L625">        } catch (NoSuchAlgorithmException | InvalidParameterException e) {</span>
+<span class="nc" id="L626">            throw new ConfigException(String.format(</span>
+                &quot;Unable to create key generator with algorithm %s and key size %d: %s&quot;,
+<span class="nc" id="L628">                getString(INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG),</span>
+<span class="nc" id="L629">                getInt(INTER_WORKER_KEY_SIZE_CONFIG),</span>
+<span class="nc" id="L630">                e.getMessage()</span>
+            ));
+        }
+    }
+
+    private Map&lt;String, Object&gt; topicSettings(String prefix) {
+<span class="fc" id="L636">        Map&lt;String, Object&gt; result = originalsWithPrefix(prefix);</span>
+<span class="pc bpc" id="L637" title="1 of 4 branches missed.">        if (CONFIG_STORAGE_PREFIX.equals(prefix) &amp;&amp; result.containsKey(PARTITIONS_SUFFIX)) {</span>
+<span class="nc" id="L638">            log.warn(&quot;Ignoring '{}{}={}' setting, since config topic partitions is always 1&quot;, prefix, PARTITIONS_SUFFIX, result.get(&quot;partitions&quot;));</span>
+        }
+<span class="fc" id="L640">        Object removedPolicy = result.remove(TopicConfig.CLEANUP_POLICY_CONFIG);</span>
+<span class="pc bpc" id="L641" title="1 of 2 branches missed.">        if (removedPolicy != null) {</span>
+<span class="nc" id="L642">            log.warn(&quot;Ignoring '{}cleanup.policy={}' setting, since compaction is always used&quot;, prefix, removedPolicy);</span>
+        }
+<span class="fc" id="L644">        result.remove(TOPIC_SUFFIX);</span>
+<span class="fc" id="L645">        result.remove(REPLICATION_FACTOR_SUFFIX);</span>
+<span class="fc" id="L646">        result.remove(PARTITIONS_SUFFIX);</span>
+<span class="fc" id="L647">        return result;</span>
+    }
+
+    public Map&lt;String, Object&gt; configStorageTopicSettings() {
+<span class="fc" id="L651">        return topicSettings(CONFIG_STORAGE_PREFIX);</span>
+    }
+
+    public Map&lt;String, Object&gt; offsetStorageTopicSettings() {
+<span class="fc" id="L655">        return topicSettings(OFFSET_STORAGE_PREFIX);</span>
+    }
+
+    public Map&lt;String, Object&gt; statusStorageTopicSettings() {
+<span class="fc" id="L659">        return topicSettings(STATUS_STORAGE_PREFIX);</span>
+    }
+
+    private void validateInterWorkerKeyConfigs() {
+<span class="fc" id="L663">        getInternalRequestKeyGenerator();</span>
+<span class="fc" id="L664">        ensureVerificationAlgorithmsIncludeSignatureAlgorithm();</span>
+<span class="fc" id="L665">    }</span>
+
+    private void ensureVerificationAlgorithmsIncludeSignatureAlgorithm() {
+<span class="fc" id="L668">        String signatureAlgorithm = getString(INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG);</span>
+<span class="fc" id="L669">        List&lt;String&gt; verificationAlgorithms = getList(INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG);</span>
+<span class="pc bpc" id="L670" title="1 of 2 branches missed.">        if (!verificationAlgorithms.contains(signatureAlgorithm)) {</span>
+<span class="nc" id="L671">            throw new ConfigException(</span>
+                INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG,
+                signatureAlgorithm,
+<span class="nc" id="L674">                String.format(&quot;Signature algorithm must be present in %s list&quot;, INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG)</span>
+            );
+        }
+<span class="fc" id="L677">    }</span>
+
+    private static void validateVerificationAlgorithms(Crypto crypto, String configName, List&lt;String&gt; algorithms) {
+<span class="pc bpc" id="L680" title="1 of 2 branches missed.">        if (algorithms.isEmpty()) {</span>
+<span class="nc" id="L681">            throw new ConfigException(</span>
+                    configName,
+                    algorithms,
+                    &quot;At least one signature verification algorithm must be provided&quot;
+            );
+        }
+<span class="fc bfc" id="L687" title="All 2 branches covered.">        for (String algorithm : algorithms) {</span>
+            try {
+<span class="fc" id="L689">                crypto.mac(algorithm);</span>
+<span class="nc" id="L690">            } catch (NoSuchAlgorithmException e) {</span>
+<span class="nc" id="L691">                throw unsupportedAlgorithmException(configName, algorithm, &quot;Mac&quot;);</span>
+<span class="fc" id="L692">            }</span>
+<span class="fc" id="L693">        }</span>
+<span class="fc" id="L694">    }</span>
+
+    private static void validateSignatureAlgorithm(Crypto crypto, String configName, String algorithm) {
+        try {
+<span class="fc" id="L698">            crypto.mac(algorithm);</span>
+<span class="nc" id="L699">        } catch (NoSuchAlgorithmException e) {</span>
+<span class="nc" id="L700">            throw unsupportedAlgorithmException(configName, algorithm, &quot;Mac&quot;);</span>
+<span class="fc" id="L701">        }</span>
+<span class="fc" id="L702">    }</span>
+
+    private static void validateKeyAlgorithm(Crypto crypto, String configName, String algorithm) {
+        try {
+<span class="fc" id="L706">            crypto.keyGenerator(algorithm);</span>
+<span class="nc" id="L707">        } catch (NoSuchAlgorithmException e) {</span>
+<span class="nc" id="L708">            throw unsupportedAlgorithmException(configName, algorithm, &quot;KeyGenerator&quot;);</span>
+<span class="fc" id="L709">        }</span>
+<span class="fc" id="L710">    }</span>
+
+    private static ConfigException unsupportedAlgorithmException(String name, Object value, String type) {
+<span class="nc" id="L713">        return new ConfigException(</span>
+                name,
+                value,
+<span class="nc" id="L716">                &quot;the algorithm is not supported by this JVM; the supported algorithms are: &quot; + supportedAlgorithms(type)</span>
+        );
+    }
+
+    // Visible for testing
+    static Set&lt;String&gt; supportedAlgorithms(String type) {
+<span class="nc" id="L722">        Set&lt;String&gt; result = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L723" title="All 2 branches missed.">        for (Provider provider : Security.getProviders()) {</span>
+<span class="nc bnc" id="L724" title="All 2 branches missed.">            for (Provider.Service service : provider.getServices()) {</span>
+<span class="nc bnc" id="L725" title="All 2 branches missed.">                if (type.equals(service.getType())) {</span>
+<span class="nc" id="L726">                    result.add(service.getAlgorithm());</span>
+                }
+<span class="nc" id="L728">            }</span>
+        }
+<span class="nc" id="L730">        return result;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>
