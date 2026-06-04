@@ -1,0 +1,427 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StickyTaskAssignor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.coordinator.group.streams.assignor</a> &gt; <span class="el_source">StickyTaskAssignor.java</span></div><h1>StickyTaskAssignor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.coordinator.group.streams.assignor;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+<span class="fc" id="L34">public class StickyTaskAssignor implements TaskAssignor {</span>
+
+    private static final String STICKY_ASSIGNOR_NAME = &quot;sticky&quot;;
+<span class="fc" id="L37">    private static final Logger log = LoggerFactory.getLogger(StickyTaskAssignor.class);</span>
+
+    private LocalState localState;
+
+
+    @Override
+    public String name() {
+<span class="fc" id="L44">        return STICKY_ASSIGNOR_NAME;</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L49">        return name();</span>
+    }
+
+    @Override
+    public GroupAssignment assign(final GroupSpec groupSpec, final TopologyDescriber topologyDescriber) throws TaskAssignorException {
+<span class="nc" id="L54">        initialize(groupSpec, topologyDescriber);</span>
+<span class="nc" id="L55">        final GroupAssignment assignments =  doAssign(groupSpec, topologyDescriber);</span>
+<span class="nc" id="L56">        localState = null;</span>
+<span class="nc" id="L57">        return assignments;</span>
+    }
+
+    private GroupAssignment doAssign(final GroupSpec groupSpec, final TopologyDescriber topologyDescriber) {
+<span class="nc" id="L61">        final LinkedList&lt;TaskId&gt; activeTasks = taskIds(topologyDescriber, true);</span>
+<span class="nc" id="L62">        assignActive(activeTasks);</span>
+
+<span class="nc bnc" id="L64" title="All 2 branches missed.">        if (localState.numStandbyReplicas &gt; 0) {</span>
+<span class="nc" id="L65">            final LinkedList&lt;TaskId&gt; statefulTasks = taskIds(topologyDescriber, false);</span>
+<span class="nc" id="L66">            assignStandby(statefulTasks);</span>
+        }
+
+<span class="nc" id="L69">        return buildGroupAssignment(groupSpec.members().keySet());</span>
+    }
+
+    private LinkedList&lt;TaskId&gt; taskIds(final TopologyDescriber topologyDescriber, final boolean isActive) {
+<span class="nc" id="L73">        final LinkedList&lt;TaskId&gt; ret = new LinkedList&lt;&gt;();</span>
+<span class="nc bnc" id="L74" title="All 2 branches missed.">        for (final String subtopology : topologyDescriber.subtopologies()) {</span>
+<span class="nc bnc" id="L75" title="All 4 branches missed.">            if (isActive || topologyDescriber.isStateful(subtopology)) {</span>
+<span class="nc" id="L76">                final int numberOfPartitions = topologyDescriber.maxNumInputPartitions(subtopology);</span>
+<span class="nc bnc" id="L77" title="All 2 branches missed.">                for (int i = 0; i &lt; numberOfPartitions; i++) {</span>
+<span class="nc" id="L78">                    ret.add(new TaskId(subtopology, i));</span>
+                }
+            }
+<span class="nc" id="L81">        }</span>
+<span class="nc" id="L82">        return ret;</span>
+    }
+
+    private void initialize(final GroupSpec groupSpec, final TopologyDescriber topologyDescriber) {
+<span class="nc" id="L86">        localState = new LocalState();</span>
+<span class="nc" id="L87">        localState.numStandbyReplicas =</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">            groupSpec.assignmentConfigs().isEmpty() ? 0</span>
+<span class="nc" id="L89">                : Integer.parseInt(groupSpec.assignmentConfigs().get(&quot;num.standby.replicas&quot;));</span>
+
+        // Helpers for computing active tasks per member, and tasks per member
+<span class="nc" id="L92">        localState.totalActiveTasks = 0;</span>
+<span class="nc" id="L93">        localState.totalTasks = 0;</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">        for (final String subtopology : topologyDescriber.subtopologies()) {</span>
+<span class="nc" id="L95">            final int numberOfPartitions = topologyDescriber.maxNumInputPartitions(subtopology);</span>
+<span class="nc" id="L96">            localState.totalTasks += numberOfPartitions;</span>
+<span class="nc" id="L97">            localState.totalActiveTasks += numberOfPartitions;</span>
+<span class="nc bnc" id="L98" title="All 2 branches missed.">            if (topologyDescriber.isStateful(subtopology))</span>
+<span class="nc" id="L99">                localState.totalTasks += numberOfPartitions * localState.numStandbyReplicas;</span>
+<span class="nc" id="L100">        }</span>
+<span class="nc" id="L101">        localState.totalMembersWithActiveTaskCapacity = groupSpec.members().size();</span>
+<span class="nc" id="L102">        localState.totalMembersWithTaskCapacity = groupSpec.members().size();</span>
+<span class="nc" id="L103">        localState.activeTasksPerMember = computeTasksPerMember(localState.totalActiveTasks, localState.totalMembersWithActiveTaskCapacity);</span>
+<span class="nc" id="L104">        localState.totalTasksPerMember = computeTasksPerMember(localState.totalTasks, localState.totalMembersWithTaskCapacity);</span>
+
+<span class="nc" id="L106">        localState.processIdToState = new HashMap&lt;&gt;(localState.totalMembersWithActiveTaskCapacity);</span>
+<span class="nc" id="L107">        localState.activeTaskToPrevMember = new HashMap&lt;&gt;(localState.totalActiveTasks);</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">        localState.standbyTaskToPrevMember = new HashMap&lt;&gt;(localState.numStandbyReplicas &gt; 0 ? (localState.totalTasks - localState.totalActiveTasks) / localState.numStandbyReplicas : 0);</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">        for (final Map.Entry&lt;String, AssignmentMemberSpec&gt; memberEntry : groupSpec.members().entrySet()) {</span>
+<span class="nc" id="L110">            final String memberId = memberEntry.getKey();</span>
+<span class="nc" id="L111">            final String processId = memberEntry.getValue().processId();</span>
+<span class="nc" id="L112">            final Member member = new Member(processId, memberId);</span>
+<span class="nc" id="L113">            final AssignmentMemberSpec memberSpec = memberEntry.getValue();</span>
+
+<span class="nc" id="L115">            localState.processIdToState.putIfAbsent(processId, new ProcessState(processId));</span>
+<span class="nc" id="L116">            localState.processIdToState.get(processId).addMember(memberId);</span>
+
+            // prev active tasks
+<span class="nc bnc" id="L119" title="All 2 branches missed.">            for (final Map.Entry&lt;String, Set&lt;Integer&gt;&gt; entry : memberSpec.activeTasks().entrySet()) {</span>
+<span class="nc" id="L120">                final Set&lt;Integer&gt; partitionNoSet = entry.getValue();</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">                for (final int partitionNo : partitionNoSet) {</span>
+<span class="nc" id="L122">                    localState.activeTaskToPrevMember.put(new TaskId(entry.getKey(), partitionNo), member);</span>
+<span class="nc" id="L123">                }</span>
+<span class="nc" id="L124">            }</span>
+
+            // prev standby tasks
+<span class="nc bnc" id="L127" title="All 2 branches missed.">            for (final Map.Entry&lt;String, Set&lt;Integer&gt;&gt; entry : memberSpec.standbyTasks().entrySet()) {</span>
+<span class="nc" id="L128">                final Set&lt;Integer&gt; partitionNoSet = entry.getValue();</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">                for (final int partitionNo : partitionNoSet) {</span>
+<span class="nc" id="L130">                    final TaskId taskId = new TaskId(entry.getKey(), partitionNo);</span>
+<span class="nc" id="L131">                    localState.standbyTaskToPrevMember.putIfAbsent(taskId, new ArrayList&lt;&gt;(localState.numStandbyReplicas));</span>
+<span class="nc" id="L132">                    localState.standbyTaskToPrevMember.get(taskId).add(member);</span>
+<span class="nc" id="L133">                }</span>
+<span class="nc" id="L134">            }</span>
+<span class="nc" id="L135">        }</span>
+<span class="nc" id="L136">    }</span>
+
+    private GroupAssignment buildGroupAssignment(final Set&lt;String&gt; members) {
+<span class="nc" id="L139">        final Map&lt;String, MemberAssignment&gt; memberAssignments = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L141">        final Map&lt;String, Set&lt;TaskId&gt;&gt; activeTasksAssignments = localState.processIdToState.entrySet().stream()</span>
+<span class="nc" id="L142">            .flatMap(entry -&gt; entry.getValue().assignedActiveTasksByMember().entrySet().stream())</span>
+<span class="nc" id="L143">            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue, (set1, set2) -&gt; {</span>
+<span class="nc" id="L144">                set1.addAll(set2);</span>
+<span class="nc" id="L145">                return set1;</span>
+            }));
+
+<span class="nc" id="L148">        final Map&lt;String, Set&lt;TaskId&gt;&gt; standbyTasksAssignments = localState.processIdToState.entrySet().stream()</span>
+<span class="nc" id="L149">            .flatMap(entry -&gt; entry.getValue().assignedStandbyTasksByMember().entrySet().stream())</span>
+<span class="nc" id="L150">            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue, (set1, set2) -&gt; {</span>
+<span class="nc" id="L151">                set1.addAll(set2);</span>
+<span class="nc" id="L152">                return set1;</span>
+            }));
+
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        for (final String memberId : members) {</span>
+<span class="nc" id="L156">            final Map&lt;String, Set&lt;Integer&gt;&gt; activeTasks = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">            if (activeTasksAssignments.containsKey(memberId)) {</span>
+<span class="nc" id="L158">                activeTasks.putAll(toCompactedTaskIds(activeTasksAssignments.get(memberId)));</span>
+            }
+<span class="nc" id="L160">            final Map&lt;String, Set&lt;Integer&gt;&gt; standByTasks = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            if (standbyTasksAssignments.containsKey(memberId)) {</span>
+<span class="nc" id="L163">                standByTasks.putAll(toCompactedTaskIds(standbyTasksAssignments.get(memberId)));</span>
+            }
+<span class="nc" id="L165">            memberAssignments.put(memberId, new MemberAssignment(activeTasks, standByTasks, new HashMap&lt;&gt;()));</span>
+<span class="nc" id="L166">        }</span>
+
+<span class="nc" id="L168">        return new GroupAssignment(memberAssignments);</span>
+    }
+
+    private Map&lt;String, Set&lt;Integer&gt;&gt; toCompactedTaskIds(final Set&lt;TaskId&gt; taskIds) {
+<span class="nc" id="L172">        final Map&lt;String, Set&lt;Integer&gt;&gt; ret = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        for (final TaskId taskId : taskIds) {</span>
+<span class="nc" id="L174">            ret.putIfAbsent(taskId.subtopologyId(), new HashSet&lt;&gt;());</span>
+<span class="nc" id="L175">            ret.get(taskId.subtopologyId()).add(taskId.partition());</span>
+<span class="nc" id="L176">        }</span>
+<span class="nc" id="L177">        return ret;</span>
+    }
+
+    private void assignActive(final LinkedList&lt;TaskId&gt; activeTasks) {
+
+        // Assuming our current assignment pairs same partitions (range-based), we want to sort by partition first
+<span class="nc" id="L183">        activeTasks.sort(Comparator.comparing(TaskId::partition).thenComparing(TaskId::subtopologyId));</span>
+
+        // 1. re-assigning existing active tasks to clients that previously had the same active tasks
+<span class="nc bnc" id="L186" title="All 2 branches missed.">        for (final Iterator&lt;TaskId&gt; it = activeTasks.iterator(); it.hasNext();) {</span>
+<span class="nc" id="L187">            final TaskId task = it.next();</span>
+<span class="nc" id="L188">            final Member prevMember = localState.activeTaskToPrevMember.get(task);</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">            if (prevMember != null) {</span>
+<span class="nc" id="L190">                final ProcessState processState = localState.processIdToState.get(prevMember.processId);</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">                if (hasUnfulfilledActiveTaskQuota(processState, prevMember)) {</span>
+<span class="nc" id="L192">                    int newActiveTasks = processState.addTask(prevMember.memberId, task, true);</span>
+<span class="nc" id="L193">                    maybeUpdateActiveTasksPerMember(newActiveTasks);</span>
+<span class="nc" id="L194">                    maybeUpdateTotalTasksPerMember(newActiveTasks);</span>
+<span class="nc" id="L195">                    it.remove();</span>
+                }
+            }
+<span class="nc" id="L198">        }</span>
+
+        // 2. re-assigning tasks to clients that previously have seen the same task (as standby task)
+<span class="nc bnc" id="L201" title="All 2 branches missed.">        for (final Iterator&lt;TaskId&gt; it = activeTasks.iterator(); it.hasNext();) {</span>
+<span class="nc" id="L202">            final TaskId task = it.next();</span>
+<span class="nc" id="L203">            final ArrayList&lt;Member&gt; prevMembers = localState.standbyTaskToPrevMember.get(task);</span>
+<span class="nc" id="L204">            final Member prevMember = findPrevMemberWithLeastLoad(prevMembers, null);</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">            if (prevMember != null) {</span>
+<span class="nc" id="L206">                final ProcessState processState = localState.processIdToState.get(prevMember.processId);</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                if (hasUnfulfilledActiveTaskQuota(processState, prevMember)) {</span>
+<span class="nc" id="L208">                    int newActiveTasks = processState.addTask(prevMember.memberId, task, true);</span>
+<span class="nc" id="L209">                    maybeUpdateActiveTasksPerMember(newActiveTasks);</span>
+<span class="nc" id="L210">                    maybeUpdateTotalTasksPerMember(newActiveTasks);</span>
+<span class="nc" id="L211">                    it.remove();</span>
+                }
+            }
+<span class="nc" id="L214">        }</span>
+
+        // To achieve an initially range-based assignment, sort by subtopology
+<span class="nc" id="L217">        activeTasks.sort(Comparator.comparing(TaskId::subtopologyId).thenComparing(TaskId::partition));</span>
+
+        // 3. assign any remaining unassigned tasks
+<span class="nc" id="L220">        final PriorityQueue&lt;ProcessState&gt; processByLoad = new PriorityQueue&lt;&gt;(Comparator.comparingDouble(ProcessState::load));</span>
+<span class="nc" id="L221">        processByLoad.addAll(localState.processIdToState.values());</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        for (final TaskId task: activeTasks) {</span>
+<span class="nc" id="L223">            final ProcessState processWithLeastLoad = processByLoad.poll();</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">            if (processWithLeastLoad == null) {</span>
+<span class="nc" id="L225">                throw new TaskAssignorException(String.format(&quot;No process available to assign active task %s.&quot;, task));</span>
+            }
+<span class="nc" id="L227">            final int newTaskCount = processWithLeastLoad.addTaskToLeastLoadedMember(task, true);</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">            if (newTaskCount != -1) {</span>
+<span class="nc" id="L229">                maybeUpdateActiveTasksPerMember(newTaskCount);</span>
+<span class="nc" id="L230">                maybeUpdateTotalTasksPerMember(newTaskCount);</span>
+            } else {
+<span class="nc" id="L232">                throw new TaskAssignorException(String.format(&quot;No member available to assign active task %s.&quot;, task));</span>
+            }
+<span class="nc" id="L234">            processByLoad.add(processWithLeastLoad); // Add it back to the queue after updating its state</span>
+<span class="nc" id="L235">        }</span>
+<span class="nc" id="L236">    }</span>
+
+    private void maybeUpdateActiveTasksPerMember(final int activeTasksNo) {
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        if (activeTasksNo == localState.activeTasksPerMember) {</span>
+<span class="nc" id="L240">            localState.totalMembersWithActiveTaskCapacity--;</span>
+<span class="nc" id="L241">            localState.totalActiveTasks -= activeTasksNo;</span>
+<span class="nc" id="L242">            localState.activeTasksPerMember = computeTasksPerMember(localState.totalActiveTasks, localState.totalMembersWithActiveTaskCapacity);</span>
+        }
+<span class="nc" id="L244">    }</span>
+
+    private void maybeUpdateTotalTasksPerMember(final int taskNo) {
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        if (taskNo == localState.totalTasksPerMember) {</span>
+<span class="nc" id="L248">            localState.totalMembersWithTaskCapacity--;</span>
+<span class="nc" id="L249">            localState.totalTasks -= taskNo;</span>
+<span class="nc" id="L250">            localState.totalTasksPerMember = computeTasksPerMember(localState.totalTasks, localState.totalMembersWithTaskCapacity);</span>
+        }
+<span class="nc" id="L252">    }</span>
+
+    private boolean assignStandbyToMemberWithLeastLoad(PriorityQueue&lt;ProcessState&gt; queue, TaskId taskId) {
+<span class="nc" id="L255">        final ProcessState processWithLeastLoad = queue.poll();</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">        if (processWithLeastLoad == null) {</span>
+<span class="nc" id="L257">            return false;</span>
+        }
+<span class="nc" id="L259">        boolean found = false;</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (!processWithLeastLoad.hasTask(taskId)) {</span>
+<span class="nc" id="L261">            final int newTaskCount = processWithLeastLoad.addTaskToLeastLoadedMember(taskId, false);</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">            if (newTaskCount != -1) {</span>
+<span class="nc" id="L263">                found = true;</span>
+<span class="nc" id="L264">                maybeUpdateTotalTasksPerMember(newTaskCount);</span>
+            }
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        } else if (!queue.isEmpty()) {</span>
+<span class="nc" id="L267">            found = assignStandbyToMemberWithLeastLoad(queue, taskId);</span>
+        }
+<span class="nc" id="L269">        queue.add(processWithLeastLoad); // Add it back to the queue after updating its state</span>
+<span class="nc" id="L270">        return found;</span>
+    }
+
+    /**
+     * Finds the previous member with the least load for a given task.
+     *
+     * @param members The list of previous members owning the task.
+     * @param taskId  The taskId, to check if the previous member already has the task. Can be null, if we assign it
+     *                for the first time (e.g., during active task assignment).
+     *
+     * @return Previous member with the least load that does not have the task, or null if no such member exists.
+     */
+    private Member findPrevMemberWithLeastLoad(final ArrayList&lt;Member&gt; members, final TaskId taskId) {
+<span class="nc bnc" id="L283" title="All 4 branches missed.">        if (members == null || members.isEmpty()) {</span>
+<span class="nc" id="L284">            return null;</span>
+        }
+
+<span class="nc" id="L287">        Member candidate = members.get(0);</span>
+<span class="nc" id="L288">        final ProcessState candidateProcessState = localState.processIdToState.get(candidate.processId);</span>
+<span class="nc" id="L289">        double candidateProcessLoad = candidateProcessState.load();</span>
+<span class="nc" id="L290">        double candidateMemberLoad = candidateProcessState.memberToTaskCounts().get(candidate.memberId);</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        for (int i = 1; i &lt; members.size(); i++) {</span>
+<span class="nc" id="L292">            final Member member = members.get(i);</span>
+<span class="nc" id="L293">            final ProcessState processState = localState.processIdToState.get(member.processId);</span>
+<span class="nc" id="L294">            final double newProcessLoad = processState.load();</span>
+<span class="nc bnc" id="L295" title="All 6 branches missed.">            if (newProcessLoad &lt; candidateProcessLoad &amp;&amp; (taskId == null || !processState.hasTask(taskId))) {</span>
+<span class="nc" id="L296">                final double newMemberLoad = processState.memberToTaskCounts().get(member.memberId);</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">                if (newMemberLoad &lt; candidateMemberLoad) {</span>
+<span class="nc" id="L298">                    candidateProcessLoad = newProcessLoad;</span>
+<span class="nc" id="L299">                    candidateMemberLoad = newMemberLoad;</span>
+<span class="nc" id="L300">                    candidate = member;</span>
+                }
+            }
+        }
+
+<span class="nc bnc" id="L305" title="All 4 branches missed.">        if (taskId == null || !candidateProcessState.hasTask(taskId)) {</span>
+<span class="nc" id="L306">            return candidate;</span>
+        }
+<span class="nc" id="L308">        return null;</span>
+    }
+
+    private boolean hasUnfulfilledActiveTaskQuota(final ProcessState process, final Member member) {
+<span class="nc bnc" id="L312" title="All 2 branches missed.">        return process.memberToTaskCounts().get(member.memberId) &lt; localState.activeTasksPerMember;</span>
+    }
+
+    private boolean hasUnfulfilledTaskQuota(final ProcessState process, final Member member) {
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        return process.memberToTaskCounts().get(member.memberId) &lt; localState.totalTasksPerMember;</span>
+    }
+
+    private void assignStandby(final LinkedList&lt;TaskId&gt; standbyTasks) {
+<span class="nc" id="L320">        final ArrayList&lt;StandbyToAssign&gt; toLeastLoaded = new ArrayList&lt;&gt;(standbyTasks.size() * localState.numStandbyReplicas);</span>
+        
+        // Assuming our current assignment is range-based, we want to sort by partition first.
+<span class="nc" id="L323">        standbyTasks.sort(Comparator.comparing(TaskId::partition).thenComparing(TaskId::subtopologyId).reversed());</span>
+
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        for (TaskId task : standbyTasks) {</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">            for (int i = 0; i &lt; localState.numStandbyReplicas; i++) {</span>
+
+                // prev active task
+<span class="nc" id="L329">                final Member prevActiveMember = localState.activeTaskToPrevMember.get(task);</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">                if (prevActiveMember != null) {</span>
+<span class="nc" id="L331">                    final ProcessState prevActiveMemberProcessState = localState.processIdToState.get(prevActiveMember.processId);</span>
+<span class="nc bnc" id="L332" title="All 4 branches missed.">                    if (!prevActiveMemberProcessState.hasTask(task) &amp;&amp; hasUnfulfilledTaskQuota(prevActiveMemberProcessState, prevActiveMember)) {</span>
+<span class="nc" id="L333">                        int newTaskCount = prevActiveMemberProcessState.addTask(prevActiveMember.memberId, task, false);</span>
+<span class="nc" id="L334">                        maybeUpdateTotalTasksPerMember(newTaskCount);</span>
+<span class="nc" id="L335">                        continue;</span>
+                    }
+                }
+
+                // prev standby tasks
+<span class="nc" id="L340">                final ArrayList&lt;Member&gt; prevStandbyMembers = localState.standbyTaskToPrevMember.get(task);</span>
+<span class="nc bnc" id="L341" title="All 4 branches missed.">                if (prevStandbyMembers != null &amp;&amp; !prevStandbyMembers.isEmpty()) {</span>
+<span class="nc" id="L342">                    final Member prevStandbyMember = findPrevMemberWithLeastLoad(prevStandbyMembers, task);</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                    if (prevStandbyMember != null) {</span>
+<span class="nc" id="L344">                        final ProcessState prevStandbyMemberProcessState = localState.processIdToState.get(prevStandbyMember.processId);</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">                        if (hasUnfulfilledTaskQuota(prevStandbyMemberProcessState, prevStandbyMember)) {</span>
+<span class="nc" id="L346">                            int newTaskCount = prevStandbyMemberProcessState.addTask(prevStandbyMember.memberId, task, false);</span>
+<span class="nc" id="L347">                            maybeUpdateTotalTasksPerMember(newTaskCount);</span>
+<span class="nc" id="L348">                            continue;</span>
+                        }
+                    }
+                }
+
+<span class="nc" id="L353">                toLeastLoaded.add(new StandbyToAssign(task, localState.numStandbyReplicas - i));</span>
+<span class="nc" id="L354">                break;</span>
+            }
+<span class="nc" id="L356">        }</span>
+
+        // To achieve a range-based assignment, sort by subtopology
+<span class="nc" id="L359">        toLeastLoaded.sort(Comparator.&lt;StandbyToAssign, String&gt;comparing(x -&gt; x.taskId.subtopologyId())</span>
+<span class="nc" id="L360">            .thenComparing(x -&gt; x.taskId.partition()).reversed());</span>
+
+<span class="nc" id="L362">        final PriorityQueue&lt;ProcessState&gt; processByLoad = new PriorityQueue&lt;&gt;(Comparator.comparingDouble(ProcessState::load));</span>
+<span class="nc" id="L363">        processByLoad.addAll(localState.processIdToState.values());</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">        for (final StandbyToAssign toAssign : toLeastLoaded) {</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">            for (int i = 0; i &lt; toAssign.remainingReplicas; i++) {</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">                if (!assignStandbyToMemberWithLeastLoad(processByLoad, toAssign.taskId)) {</span>
+<span class="nc" id="L367">                    log.warn(&quot;{} There is not enough available capacity. &quot; +</span>
+                            &quot;You should increase the number of threads and/or application instances to maintain the requested number of standby replicas.&quot;,
+<span class="nc" id="L369">                        errorMessage(localState.numStandbyReplicas, i, toAssign.taskId));</span>
+<span class="nc" id="L370">                    break;</span>
+                }
+            }
+<span class="nc" id="L373">        }</span>
+<span class="nc" id="L374">    }</span>
+
+    private String errorMessage(final int numStandbyReplicas, final int i, final TaskId task) {
+<span class="nc" id="L377">        return &quot;Unable to assign &quot; + (numStandbyReplicas - i) +</span>
+            &quot; of &quot; + numStandbyReplicas + &quot; standby tasks for task [&quot; + task + &quot;].&quot;;
+    }
+
+    private static int computeTasksPerMember(final int numberOfTasks, final int numberOfMembers) {
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        if (numberOfMembers == 0) {</span>
+<span class="nc" id="L383">            return 0;</span>
+        }
+<span class="nc" id="L385">        int tasksPerMember = numberOfTasks / numberOfMembers;</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">        if (numberOfTasks % numberOfMembers &gt; 0) {</span>
+<span class="nc" id="L387">            tasksPerMember++;</span>
+        }
+<span class="nc" id="L389">        return tasksPerMember;</span>
+    }
+
+    static class StandbyToAssign {
+        private final TaskId taskId;
+        private final int remainingReplicas;
+
+<span class="nc" id="L396">        public StandbyToAssign(final TaskId taskId, final int remainingReplicas) {</span>
+<span class="nc" id="L397">            this.taskId = taskId;</span>
+<span class="nc" id="L398">            this.remainingReplicas = remainingReplicas;</span>
+<span class="nc" id="L399">        }</span>
+    }
+
+    static class Member {
+        private final String processId;
+        private final String memberId;
+
+<span class="nc" id="L406">        public Member(final String processId, final String memberId) {</span>
+<span class="nc" id="L407">            this.processId = processId;</span>
+<span class="nc" id="L408">            this.memberId = memberId;</span>
+<span class="nc" id="L409">        }</span>
+    }
+
+    private static class LocalState {
+        // helper data structures:
+        Map&lt;TaskId, Member&gt; activeTaskToPrevMember;
+        Map&lt;TaskId, ArrayList&lt;Member&gt;&gt; standbyTaskToPrevMember;
+        Map&lt;String, ProcessState&gt; processIdToState;
+
+        int numStandbyReplicas;
+        int totalActiveTasks;
+        int totalTasks;
+        int totalMembersWithActiveTaskCapacity;
+        int totalMembersWithTaskCapacity;
+        int activeTasksPerMember;
+        int totalTasksPerMember;
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

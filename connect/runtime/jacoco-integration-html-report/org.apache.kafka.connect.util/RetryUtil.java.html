@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RetryUtil.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.util</a> &gt; <span class="el_source">RetryUtil.java</span></div><h1>RetryUtil.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.util;
+
+import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.errors.WakeupException;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.connect.errors.ConnectException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.Optional;
+import java.util.concurrent.Callable;
+import java.util.function.Supplier;
+
+<span class="nc" id="L32">public class RetryUtil {</span>
+<span class="fc" id="L33">    private static final Logger log = LoggerFactory.getLogger(RetryUtil.class);</span>
+
+    /**
+     * The method executes the callable at least once, optionally retrying the callable if
+     * {@link org.apache.kafka.connect.errors.RetriableException} is being thrown.  If timeout is exhausted,
+     * then the last exception is wrapped with a {@link org.apache.kafka.connect.errors.ConnectException} and thrown.
+     *
+     * &lt;p&gt;{@code description} supplies the message that indicates the purpose of the callable since the message will
+     * be used for logging.  For example, &quot;list offsets&quot;. If the supplier is null or the supplied string is
+     * null, {@code callable} will be used as the default string.
+     *
+     * &lt;p&gt;The task will be executed at least once. No retries will be performed 
+     * if {@code timeoutDuration} is 0 or negative, or if {@code timeoutDuration} is less than {@code retryBackoffMs}.
+     *
+     * &lt;p&gt;A {@code retryBackoffMs} that is negative or zero will result in no delays between retries.
+     *
+     * @param callable          the function to execute
+     * @param description       supplier that provides custom message for logging purpose
+     * @param timeoutDuration   timeout duration; must not be null
+     * @param retryBackoffMs    the number of milliseconds to delay upon receiving a
+     *                          {@link org.apache.kafka.connect.errors.RetriableException} before retrying again
+     * @throws ConnectException If the task exhausted all the retries
+     */
+    public static &lt;T&gt; T retryUntilTimeout(Callable&lt;T&gt; callable, Supplier&lt;String&gt; description, Duration timeoutDuration, long retryBackoffMs) throws Exception {
+<span class="fc" id="L57">        return retryUntilTimeout(callable, description, timeoutDuration, retryBackoffMs, Time.SYSTEM);</span>
+    }
+
+    // visible for testing
+    static &lt;T&gt; T retryUntilTimeout(Callable&lt;T&gt; callable, Supplier&lt;String&gt; description, Duration timeoutDuration, long retryBackoffMs, Time time) throws Exception {
+        // if null supplier or string is provided, the message will be default to &quot;callable&quot;
+<span class="fc" id="L63">        final String descriptionStr = Optional.ofNullable(description)</span>
+<span class="fc" id="L64">                .map(Supplier::get)</span>
+<span class="fc" id="L65">                .orElse(&quot;callable&quot;);</span>
+
+        // handling null duration
+<span class="fc" id="L68">        final long timeoutMs = Optional.ofNullable(timeoutDuration)</span>
+<span class="fc" id="L69">                .map(Duration::toMillis)</span>
+<span class="fc" id="L70">                .orElse(0L);</span>
+
+<span class="pc bpc" id="L72" title="1 of 2 branches missed.">        if (retryBackoffMs &lt; 0) {</span>
+<span class="nc" id="L73">            log.debug(&quot;Assuming no retry backoff since retryBackoffMs={} is negative&quot;, retryBackoffMs);</span>
+<span class="nc" id="L74">            retryBackoffMs = 0;</span>
+        }
+<span class="pc bpc" id="L76" title="2 of 4 branches missed.">        if (timeoutMs &lt;= 0 || retryBackoffMs &gt;= timeoutMs) {</span>
+<span class="nc" id="L77">            log.debug(&quot;Executing {} only once, since timeoutMs={} is not larger than retryBackoffMs={}&quot;,</span>
+<span class="nc" id="L78">                    descriptionStr, timeoutMs, retryBackoffMs);</span>
+<span class="nc" id="L79">            return callable.call();</span>
+        }
+
+<span class="fc" id="L82">        final long end = time.milliseconds() + timeoutMs;</span>
+<span class="fc" id="L83">        int attempt = 0;</span>
+        Throwable lastError;
+        do {
+<span class="fc" id="L86">            attempt++;</span>
+            try {
+<span class="fc" id="L88">                return callable.call();</span>
+<span class="nc" id="L89">            } catch (RetriableException | org.apache.kafka.connect.errors.RetriableException e) {</span>
+<span class="nc" id="L90">                log.warn(&quot;Attempt {} to {} resulted in RetriableException; retrying automatically. &quot; +</span>
+<span class="nc" id="L91">                        &quot;Reason: {}&quot;, attempt, descriptionStr, e.getMessage(), e);</span>
+<span class="nc" id="L92">                lastError = e;</span>
+<span class="nc" id="L93">            } catch (WakeupException e) {</span>
+<span class="nc" id="L94">                lastError = e;</span>
+<span class="nc" id="L95">            }</span>
+
+<span class="nc bnc" id="L97" title="All 2 branches missed.">            if (retryBackoffMs &gt; 0) {</span>
+<span class="nc" id="L98">                long millisRemaining = Math.max(0, end - time.milliseconds());</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">                if (millisRemaining &lt; retryBackoffMs) {</span>
+                    // exit when the time remaining is less than retryBackoffMs
+<span class="nc" id="L101">                    break;</span>
+                }
+<span class="nc" id="L103">                time.sleep(retryBackoffMs);</span>
+            }
+<span class="nc bnc" id="L105" title="All 2 branches missed.">        } while (time.milliseconds() &lt; end);</span>
+
+<span class="nc" id="L107">        throw new ConnectException(&quot;Fail to &quot; + descriptionStr + &quot; after &quot; + attempt + &quot; attempts.  Reason: &quot; + lastError.getMessage(), lastError);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

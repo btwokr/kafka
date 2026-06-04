@@ -1,0 +1,755 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaClusterTestKit.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.test</a> &gt; <span class="el_source">KafkaClusterTestKit.java</span></div><h1>KafkaClusterTestKit.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.common.test;
+
+import kafka.raft.KafkaRaftManager;
+import kafka.server.BrokerServer;
+import kafka.server.ControllerServer;
+import kafka.server.FaultHandlerFactory;
+import kafka.server.KafkaConfig;
+import kafka.server.KafkaRaftServer;
+import kafka.server.SharedServer;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.config.SaslConfigs;
+import org.apache.kafka.common.config.internals.BrokerSecurityConfigs;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.network.ListenerName;
+import org.apache.kafka.common.security.auth.SecurityProtocol;
+import org.apache.kafka.common.test.api.TestKitDefaults;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.common.utils.internals.ThreadUtils;
+import org.apache.kafka.controller.Controller;
+import org.apache.kafka.metadata.authorizer.StandardAuthorizer;
+import org.apache.kafka.metadata.properties.MetaPropertiesEnsemble;
+import org.apache.kafka.metadata.storage.Formatter;
+import org.apache.kafka.network.SocketServerConfigs;
+import org.apache.kafka.raft.DynamicVoters;
+import org.apache.kafka.raft.KRaftConfigs;
+import org.apache.kafka.raft.MetadataLogConfig;
+import org.apache.kafka.raft.QuorumConfig;
+import org.apache.kafka.server.common.ApiMessageAndVersion;
+import org.apache.kafka.server.config.ServerConfigs;
+import org.apache.kafka.server.fault.FaultHandler;
+import org.apache.kafka.storage.internals.log.CleanerConfig;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.AbstractMap.SimpleImmutableEntry;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.apache.kafka.server.config.ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG;
+import static org.apache.kafka.server.config.ServerLogConfigs.LOG_DIRS_CONFIG;
+
+
+public class KafkaClusterTestKit implements AutoCloseable {
+<span class="fc" id="L85">    private static final Logger log = LoggerFactory.getLogger(KafkaClusterTestKit.class);</span>
+
+<span class="fc" id="L87">    static class SimpleFaultHandlerFactory implements FaultHandlerFactory {</span>
+<span class="fc" id="L88">        private final MockFaultHandler fatalFaultHandler = new MockFaultHandler(&quot;fatalFaultHandler&quot;);</span>
+<span class="fc" id="L89">        private final MockFaultHandler nonFatalFaultHandler = new MockFaultHandler(&quot;nonFatalFaultHandler&quot;);</span>
+
+        MockFaultHandler fatalFaultHandler() {
+<span class="fc" id="L92">            return fatalFaultHandler;</span>
+        }
+
+        MockFaultHandler nonFatalFaultHandler() {
+<span class="fc" id="L96">            return nonFatalFaultHandler;</span>
+        }
+
+        @Override
+        public FaultHandler build(String name, boolean fatal, Runnable action) {
+<span class="fc bfc" id="L101" title="All 2 branches covered.">            if (fatal) {</span>
+<span class="fc" id="L102">                return fatalFaultHandler;</span>
+            } else {
+<span class="fc" id="L104">                return nonFatalFaultHandler;</span>
+            }
+        }
+    }
+
+    public static class Builder {
+        private final TestKitNodes nodes;
+<span class="fc" id="L111">        private final Map&lt;String, Object&gt; configProps = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L112">        private final SimpleFaultHandlerFactory faultHandlerFactory = new SimpleFaultHandlerFactory();</span>
+<span class="fc" id="L113">        private final PreboundSocketFactoryManager socketFactoryManager = new PreboundSocketFactoryManager();</span>
+        private final String brokerListenerName;
+        private final String controllerListenerName;
+        private final String brokerSecurityProtocol;
+        private final String controllerSecurityProtocol;
+        private boolean standalone;
+<span class="fc" id="L119">        private Optional&lt;Map&lt;Integer, Uuid&gt;&gt; initialVoterSet = Optional.empty();</span>
+        private boolean deleteOnClose;
+
+<span class="fc" id="L122">        public Builder(TestKitNodes nodes) {</span>
+<span class="fc" id="L123">            this.nodes = nodes;</span>
+<span class="fc" id="L124">            this.brokerListenerName = nodes.brokerListenerName().value();</span>
+<span class="fc" id="L125">            this.controllerListenerName = nodes.controllerListenerName().value();</span>
+<span class="fc" id="L126">            this.brokerSecurityProtocol = nodes.brokerListenerProtocol().name;</span>
+<span class="fc" id="L127">            this.controllerSecurityProtocol = nodes.controllerListenerProtocol().name;</span>
+<span class="fc" id="L128">            this.deleteOnClose = true;</span>
+<span class="fc" id="L129">        }</span>
+
+        public Builder setConfigProp(String key, Object value) {
+<span class="fc" id="L132">            this.configProps.put(key, value);</span>
+<span class="fc" id="L133">            return this;</span>
+        }
+
+        public Builder setStandalone(boolean standalone) {
+<span class="nc" id="L137">            this.standalone = standalone;</span>
+<span class="nc" id="L138">            return this;</span>
+        }
+
+        public Builder setInitialVoterSet(Map&lt;Integer, Uuid&gt; initialVoterSet) {
+<span class="nc" id="L142">            this.initialVoterSet = Optional.of(initialVoterSet);</span>
+<span class="nc" id="L143">            return this;</span>
+        }
+
+        private KafkaConfig createNodeConfig(TestKitNode node) throws IOException {
+<span class="fc" id="L147">            TestKitNode brokerNode = nodes.brokerNodes().get(node.id());</span>
+<span class="fc" id="L148">            TestKitNode controllerNode = nodes.controllerNodes().get(node.id());</span>
+
+<span class="fc" id="L150">            Map&lt;String, Object&gt; props = new HashMap&lt;&gt;(configProps);</span>
+<span class="fc" id="L151">            props.put(KRaftConfigs.SERVER_MAX_STARTUP_TIME_MS_CONFIG,</span>
+<span class="fc" id="L152">                    Long.toString(TimeUnit.MINUTES.toMillis(10)));</span>
+<span class="fc" id="L153">            props.put(KRaftConfigs.PROCESS_ROLES_CONFIG, roles(node.id()));</span>
+<span class="fc" id="L154">            props.put(KRaftConfigs.NODE_ID_CONFIG,</span>
+<span class="fc" id="L155">                    Integer.toString(node.id()));</span>
+            // In combined mode, always prefer the metadata log directory of the controller node.
+<span class="pc bpc" id="L157" title="1 of 2 branches missed.">            if (controllerNode != null) {</span>
+<span class="fc" id="L158">                props.put(MetadataLogConfig.METADATA_LOG_DIR_CONFIG,</span>
+<span class="fc" id="L159">                        controllerNode.metadataDirectory());</span>
+<span class="fc" id="L160">                setSecurityProtocolProps(props, controllerSecurityProtocol);</span>
+            } else {
+<span class="nc" id="L162">                props.put(MetadataLogConfig.METADATA_LOG_DIR_CONFIG,</span>
+<span class="nc" id="L163">                        node.metadataDirectory());</span>
+            }
+<span class="pc bpc" id="L165" title="1 of 2 branches missed.">            if (brokerNode != null) {</span>
+                // Set the log.dirs according to the broker node setting (if there is a broker node)
+<span class="fc" id="L167">                props.put(LOG_DIRS_CONFIG,</span>
+<span class="fc" id="L168">                        String.join(&quot;,&quot;, brokerNode.logDataDirectories()));</span>
+<span class="fc" id="L169">                setSecurityProtocolProps(props, brokerSecurityProtocol);</span>
+            } else {
+                // Set log.dirs equal to the metadata directory if there is just a controller.
+<span class="nc" id="L172">                props.put(LOG_DIRS_CONFIG,</span>
+<span class="nc" id="L173">                    controllerNode.metadataDirectory());</span>
+            }
+
+            // We allow configuring the listeners and related properties via Builder::setConfigProp,
+            // and they shouldn't be overridden here
+<span class="fc" id="L178">            props.putIfAbsent(SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG, String.format(&quot;%s:%s,%s:%s&quot;,</span>
+                    brokerListenerName, brokerSecurityProtocol, controllerListenerName, controllerSecurityProtocol));
+<span class="fc" id="L180">            props.putIfAbsent(SocketServerConfigs.LISTENERS_CONFIG, listeners(node.id()));</span>
+<span class="fc" id="L181">            props.putIfAbsent(INTER_BROKER_LISTENER_NAME_CONFIG, brokerListenerName);</span>
+<span class="fc" id="L182">            props.putIfAbsent(KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG, controllerListenerName);</span>
+
+<span class="pc bpc" id="L184" title="2 of 4 branches missed.">            if (!standalone &amp;&amp; initialVoterSet.isEmpty()) {</span>
+<span class="fc" id="L185">                StringBuilder quorumVoterStringBuilder = new StringBuilder();</span>
+<span class="fc" id="L186">                String prefix = &quot;&quot;;</span>
+<span class="fc bfc" id="L187" title="All 2 branches covered.">                for (int nodeId : nodes.controllerNodes().keySet()) {</span>
+<span class="fc" id="L188">                    quorumVoterStringBuilder.append(prefix).</span>
+<span class="fc" id="L189">                        append(nodeId).</span>
+<span class="fc" id="L190">                        append(&quot;@&quot;).</span>
+<span class="fc" id="L191">                        append(&quot;localhost&quot;).</span>
+<span class="fc" id="L192">                        append(&quot;:&quot;).</span>
+<span class="fc" id="L193">                        append(socketFactoryManager.getOrCreatePortForListener(nodeId, controllerListenerName));</span>
+<span class="fc" id="L194">                    prefix = &quot;,&quot;;</span>
+<span class="fc" id="L195">                }</span>
+<span class="fc" id="L196">                props.put(QuorumConfig.QUORUM_VOTERS_CONFIG, quorumVoterStringBuilder.toString());</span>
+<span class="fc" id="L197">            } else {</span>
+<span class="nc" id="L198">                StringBuilder bootstrapServersStringBuilder = new StringBuilder();</span>
+<span class="nc" id="L199">                String prefix = &quot;&quot;;</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">                for (int nodeId : nodes.controllerNodes().keySet()) {</span>
+<span class="nc" id="L201">                    bootstrapServersStringBuilder.append(prefix).</span>
+<span class="nc" id="L202">                        append(&quot;localhost&quot;).</span>
+<span class="nc" id="L203">                        append(&quot;:&quot;).</span>
+<span class="nc" id="L204">                        append(socketFactoryManager.getOrCreatePortForListener(nodeId, controllerListenerName));</span>
+<span class="nc" id="L205">                    prefix = &quot;,&quot;;</span>
+<span class="nc" id="L206">                }</span>
+<span class="nc" id="L207">                props.put(QuorumConfig.QUORUM_BOOTSTRAP_SERVERS_CONFIG, bootstrapServersStringBuilder.toString());</span>
+            }
+
+            // reduce log cleaner offset map memory usage
+<span class="fc" id="L211">            props.putIfAbsent(CleanerConfig.LOG_CLEANER_DEDUPE_BUFFER_SIZE_PROP, &quot;2097152&quot;);</span>
+
+            // do not include auto join config in broker nodes
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">            if (brokerNode != null) {</span>
+<span class="fc" id="L215">                props.remove(QuorumConfig.QUORUM_AUTO_JOIN_ENABLE_CONFIG);</span>
+            }
+
+            // Add associated broker node property overrides
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">            if (brokerNode != null) {</span>
+<span class="fc" id="L220">                props.putAll(brokerNode.propertyOverrides());</span>
+            }
+            // Add associated controller node property overrides
+<span class="pc bpc" id="L223" title="1 of 2 branches missed.">            if (controllerNode != null) {</span>
+<span class="fc" id="L224">                props.putAll(controllerNode.propertyOverrides());</span>
+            }
+<span class="fc" id="L226">            props.putIfAbsent(ServerConfigs.UNSTABLE_FEATURE_VERSIONS_ENABLE_CONFIG, &quot;true&quot;);</span>
+<span class="fc" id="L227">            props.putIfAbsent(ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG, &quot;true&quot;);</span>
+<span class="fc" id="L228">            return new KafkaConfig(props, false);</span>
+        }
+
+        private void setSecurityProtocolProps(Map&lt;String, Object&gt; props, String securityProtocol) {
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">            if (securityProtocol.equals(SecurityProtocol.SASL_PLAINTEXT.name)) {</span>
+<span class="nc" id="L233">                props.putIfAbsent(BrokerSecurityConfigs.SASL_ENABLED_MECHANISMS_CONFIG, &quot;PLAIN&quot;);</span>
+<span class="nc" id="L234">                props.putIfAbsent(BrokerSecurityConfigs.SASL_MECHANISM_INTER_BROKER_PROTOCOL_CONFIG, &quot;PLAIN&quot;);</span>
+<span class="nc" id="L235">                props.putIfAbsent(KRaftConfigs.SASL_MECHANISM_CONTROLLER_PROTOCOL_CONFIG, &quot;PLAIN&quot;);</span>
+<span class="nc" id="L236">                props.putIfAbsent(ServerConfigs.AUTHORIZER_CLASS_NAME_CONFIG, StandardAuthorizer.class.getName());</span>
+<span class="nc" id="L237">                props.putIfAbsent(StandardAuthorizer.ALLOW_EVERYONE_IF_NO_ACL_IS_FOUND_CONFIG, &quot;false&quot;);</span>
+<span class="nc" id="L238">                props.putIfAbsent(StandardAuthorizer.SUPER_USERS_CONFIG, &quot;User:&quot; + JaasUtils.KAFKA_PLAIN_ADMIN);</span>
+            }
+<span class="fc" id="L240">        }</span>
+
+        private Optional&lt;File&gt; maybeSetupJaasFile() throws Exception {
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">            if (brokerSecurityProtocol.equals(SecurityProtocol.SASL_PLAINTEXT.name)) {</span>
+<span class="nc" id="L244">                File file = JaasUtils.writeJaasContextsToFile(Set.of(</span>
+                    new JaasUtils.JaasSection(JaasUtils.KAFKA_SERVER_CONTEXT_NAME,
+<span class="nc" id="L246">                        List.of(</span>
+<span class="nc" id="L247">                            JaasModule.plainLoginModule(</span>
+                                JaasUtils.KAFKA_PLAIN_ADMIN, 
+                                JaasUtils.KAFKA_PLAIN_ADMIN_PASSWORD,
+                                true,
+<span class="nc" id="L251">                                Map.of(</span>
+                                    JaasUtils.KAFKA_PLAIN_USER1, JaasUtils.KAFKA_PLAIN_USER1_PASSWORD,
+                                    JaasUtils.KAFKA_PLAIN_ADMIN, JaasUtils.KAFKA_PLAIN_ADMIN_PASSWORD)
+                            )
+                        )
+                    )
+                ));
+<span class="nc" id="L258">                JaasUtils.refreshJavaLoginConfigParam(file);</span>
+<span class="nc" id="L259">                return Optional.of(file);</span>
+            }
+<span class="fc" id="L261">            return Optional.empty();</span>
+        }
+
+        public Builder setDeleteOnClose(boolean deleteOnClose) {
+<span class="nc" id="L265">            this.deleteOnClose = deleteOnClose;</span>
+<span class="nc" id="L266">            return this;</span>
+        }
+
+        public KafkaClusterTestKit build() throws Exception {
+<span class="fc" id="L270">            Map&lt;Integer, ControllerServer&gt; controllers = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L271">            Map&lt;Integer, BrokerServer&gt; brokers = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L272">            Map&lt;Integer, SharedServer&gt; jointServers = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L273">            File baseDirectory = null;</span>
+<span class="fc" id="L274">            Optional&lt;File&gt; jaasFile = maybeSetupJaasFile();</span>
+            try {
+<span class="fc" id="L276">                baseDirectory = new File(nodes.baseDirectory());</span>
+<span class="fc bfc" id="L277" title="All 2 branches covered.">                for (TestKitNode node : nodes.controllerNodes().values()) {</span>
+<span class="fc" id="L278">                    socketFactoryManager.getOrCreatePortForListener(node.id(), controllerListenerName);</span>
+<span class="fc" id="L279">                }</span>
+<span class="fc bfc" id="L280" title="All 2 branches covered.">                for (TestKitNode node : nodes.brokerNodes().values()) {</span>
+<span class="fc" id="L281">                    socketFactoryManager.getOrCreatePortForListener(node.id(), brokerListenerName);</span>
+<span class="fc" id="L282">                }</span>
+<span class="fc bfc" id="L283" title="All 2 branches covered.">                for (TestKitNode node : nodes.controllerNodes().values()) {</span>
+<span class="fc" id="L284">                    setupNodeDirectories(baseDirectory, node.metadataDirectory(), List.of());</span>
+<span class="fc" id="L285">                    KafkaConfig config = createNodeConfig(node);</span>
+<span class="fc" id="L286">                    SharedServer sharedServer = new SharedServer(</span>
+                        config,
+<span class="fc" id="L288">                        node.initialMetaPropertiesEnsemble(),</span>
+                        Time.SYSTEM,
+                        new Metrics(),
+<span class="fc" id="L291">                        CompletableFuture.completedFuture(QuorumConfig.parseVoterConnections(config.quorumConfig().voters())),</span>
+<span class="fc" id="L292">                        QuorumConfig.parseBootstrapServers(config.quorumConfig().bootstrapServers()),</span>
+                        faultHandlerFactory,
+<span class="fc" id="L294">                        socketFactoryManager.getOrCreateSocketFactory(node.id())</span>
+                    );
+<span class="fc" id="L296">                    ControllerServer controller = null;</span>
+                    try {
+<span class="fc" id="L298">                        controller = new ControllerServer(</span>
+                                sharedServer,
+<span class="fc" id="L300">                                KafkaRaftServer.configSchema(),</span>
+<span class="fc" id="L301">                                nodes.bootstrapMetadata());</span>
+<span class="nc" id="L302">                    } catch (Throwable e) {</span>
+<span class="nc" id="L303">                        log.error(&quot;Error creating controller {}&quot;, node.id(), e);</span>
+<span class="nc" id="L304">                        Utils.swallow(log, Level.WARN, &quot;sharedServer.stopForController error&quot;, sharedServer::stopForController);</span>
+<span class="nc" id="L305">                        throw e;</span>
+<span class="fc" id="L306">                    }</span>
+<span class="fc" id="L307">                    controllers.put(node.id(), controller);</span>
+<span class="fc" id="L308">                    jointServers.put(node.id(), sharedServer);</span>
+<span class="fc" id="L309">                }</span>
+<span class="fc bfc" id="L310" title="All 2 branches covered.">                for (TestKitNode node : nodes.brokerNodes().values()) {</span>
+<span class="fc" id="L311">                    SharedServer sharedServer = jointServers.get(node.id());</span>
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">                    if (sharedServer == null) {</span>
+<span class="nc" id="L313">                        KafkaConfig config = createNodeConfig(node);</span>
+<span class="nc" id="L314">                        sharedServer = new SharedServer(</span>
+                            config,
+<span class="nc" id="L316">                            node.initialMetaPropertiesEnsemble(),</span>
+                            Time.SYSTEM,
+                            new Metrics(),
+<span class="nc" id="L319">                            CompletableFuture.completedFuture(QuorumConfig.parseVoterConnections(config.quorumConfig().voters())),</span>
+<span class="nc" id="L320">                            QuorumConfig.parseBootstrapServers(config.quorumConfig().bootstrapServers()),</span>
+                            faultHandlerFactory,
+<span class="nc" id="L322">                            socketFactoryManager.getOrCreateSocketFactory(node.id())</span>
+                        );
+<span class="nc" id="L324">                        jointServers.put(node.id(), sharedServer);</span>
+                    }
+<span class="fc" id="L326">                    BrokerServer broker = null;</span>
+                    try {
+<span class="fc" id="L328">                        broker = new BrokerServer(sharedServer);</span>
+<span class="nc" id="L329">                    } catch (Throwable e) {</span>
+<span class="nc" id="L330">                        log.error(&quot;Error creating broker {}&quot;, node.id(), e);</span>
+<span class="nc" id="L331">                        Utils.swallow(log, Level.WARN, &quot;sharedServer.stopForBroker error&quot;, sharedServer::stopForBroker);</span>
+<span class="nc" id="L332">                        throw e;</span>
+<span class="fc" id="L333">                    }</span>
+<span class="fc" id="L334">                    brokers.put(node.id(), broker);</span>
+<span class="fc" id="L335">                }</span>
+<span class="nc" id="L336">            } catch (Exception e) {</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">                for (BrokerServer brokerServer : brokers.values()) {</span>
+<span class="nc" id="L338">                    brokerServer.shutdown();</span>
+<span class="nc" id="L339">                }</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">                for (ControllerServer controller : controllers.values()) {</span>
+<span class="nc" id="L341">                    controller.shutdown();</span>
+<span class="nc" id="L342">                }</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                if (baseDirectory != null) {</span>
+<span class="nc" id="L344">                    Utils.delete(baseDirectory);</span>
+                }
+<span class="nc" id="L346">                socketFactoryManager.close();</span>
+<span class="nc" id="L347">                throw e;</span>
+<span class="fc" id="L348">            }</span>
+<span class="fc" id="L349">            return new KafkaClusterTestKit(</span>
+                    nodes,
+                    controllers,
+                    brokers,
+                    baseDirectory,
+                    faultHandlerFactory,
+                    socketFactoryManager,
+                    jaasFile,
+                    standalone,
+                    initialVoterSet,
+                    deleteOnClose);
+        }
+
+        private String listeners(int node) {
+<span class="pc bpc" id="L363" title="1 of 2 branches missed.">            if (nodes.isCombined(node)) {</span>
+<span class="fc" id="L364">                return String.format(&quot;%s://localhost:0,%s://localhost:0&quot;, brokerListenerName, controllerListenerName);</span>
+            }
+<span class="nc bnc" id="L366" title="All 2 branches missed.">            if (nodes.controllerNodes().containsKey(node)) {</span>
+<span class="nc" id="L367">                return String.format(&quot;%s://localhost:0&quot;, controllerListenerName);</span>
+            }
+<span class="nc" id="L369">            return String.format(&quot;%s://localhost:0&quot;, brokerListenerName);</span>
+        }
+
+        private String roles(int node) {
+<span class="pc bpc" id="L373" title="1 of 2 branches missed.">            if (nodes.isCombined(node)) {</span>
+<span class="fc" id="L374">                return &quot;broker,controller&quot;;</span>
+            }
+<span class="nc bnc" id="L376" title="All 2 branches missed.">            if (nodes.controllerNodes().containsKey(node)) {</span>
+<span class="nc" id="L377">                return &quot;controller&quot;;</span>
+            }
+<span class="nc" id="L379">            return &quot;broker&quot;;</span>
+        }
+
+        private static void setupNodeDirectories(File baseDirectory,
+                                                 String metadataDirectory,
+                                                 Collection&lt;String&gt; logDataDirectories) throws Exception {
+<span class="fc" id="L385">            Files.createDirectories(new File(baseDirectory, &quot;local&quot;).toPath());</span>
+<span class="fc" id="L386">            Files.createDirectories(Paths.get(metadataDirectory));</span>
+<span class="pc bpc" id="L387" title="1 of 2 branches missed.">            for (String logDataDirectory : logDataDirectories) {</span>
+<span class="nc" id="L388">                Files.createDirectories(Paths.get(logDataDirectory));</span>
+<span class="nc" id="L389">            }</span>
+<span class="fc" id="L390">        }</span>
+    }
+
+    private static final String KAFKA_CLUSTER_THREAD_PREFIX = &quot;kafka-cluster-test-kit-&quot;;
+    private final ExecutorService executorService;
+<span class="fc" id="L395">    private final KafkaClusterThreadFactory threadFactory = new KafkaClusterThreadFactory(KAFKA_CLUSTER_THREAD_PREFIX);</span>
+    private final TestKitNodes nodes;
+    private final Map&lt;Integer, ControllerServer&gt; controllers;
+    private final Map&lt;Integer, BrokerServer&gt; brokers;
+    private final File baseDirectory;
+    private final SimpleFaultHandlerFactory faultHandlerFactory;
+    private final PreboundSocketFactoryManager socketFactoryManager;
+    private final String controllerListenerName;
+    private final Optional&lt;File&gt; jaasFile;
+    private final boolean standalone;
+    private final Optional&lt;Map&lt;Integer, Uuid&gt;&gt; initialVoterSet;
+    private final boolean deleteOnClose;
+
+    private KafkaClusterTestKit(
+        TestKitNodes nodes,
+        Map&lt;Integer, ControllerServer&gt; controllers,
+        Map&lt;Integer, BrokerServer&gt; brokers,
+        File baseDirectory,
+        SimpleFaultHandlerFactory faultHandlerFactory,
+        PreboundSocketFactoryManager socketFactoryManager,
+        Optional&lt;File&gt; jaasFile,
+        boolean standalone,
+        Optional&lt;Map&lt;Integer, Uuid&gt;&gt; initialVoterSet,
+        boolean deleteOnClose
+<span class="fc" id="L419">    ) {</span>
+        /*
+          Number of threads = Total number of brokers + Total number of controllers + Total number of Raft Managers
+                            = Total number of brokers + Total number of controllers * 2
+                              (Raft Manager per broker/controller)
+        */
+<span class="fc" id="L425">        int numOfExecutorThreads = (nodes.brokerNodes().size() + nodes.controllerNodes().size()) * 2;</span>
+<span class="fc" id="L426">        this.executorService = Executors.newFixedThreadPool(numOfExecutorThreads, threadFactory);</span>
+<span class="fc" id="L427">        this.nodes = nodes;</span>
+<span class="fc" id="L428">        this.controllers = controllers;</span>
+<span class="fc" id="L429">        this.brokers = brokers;</span>
+<span class="fc" id="L430">        this.baseDirectory = baseDirectory;</span>
+<span class="fc" id="L431">        this.faultHandlerFactory = faultHandlerFactory;</span>
+<span class="fc" id="L432">        this.socketFactoryManager = socketFactoryManager;</span>
+<span class="fc" id="L433">        this.controllerListenerName = nodes.controllerListenerName().value();</span>
+<span class="fc" id="L434">        this.jaasFile = jaasFile;</span>
+<span class="fc" id="L435">        this.standalone = standalone;</span>
+<span class="fc" id="L436">        this.initialVoterSet = initialVoterSet;</span>
+<span class="fc" id="L437">        this.deleteOnClose = deleteOnClose;</span>
+<span class="fc" id="L438">    }</span>
+
+    public void format() throws Exception {
+<span class="fc" id="L441">        List&lt;Future&lt;?&gt;&gt; futures = new ArrayList&lt;&gt;();</span>
+        try {
+<span class="fc bfc" id="L443" title="All 2 branches covered.">            for (ControllerServer controller : controllers.values()) {</span>
+<span class="fc" id="L444">                futures.add(executorService.submit(() -&gt; formatNode(controller.sharedServer().metaPropsEnsemble())));</span>
+<span class="fc" id="L445">            }</span>
+<span class="fc bfc" id="L446" title="All 2 branches covered.">            for (Entry&lt;Integer, BrokerServer&gt; entry : brokers.entrySet()) {</span>
+<span class="fc" id="L447">                BrokerServer broker = entry.getValue();</span>
+<span class="pc bpc" id="L448" title="1 of 2 branches missed.">                if (!nodes.isCombined(nodes().brokerNodes().get(entry.getKey()).id())) {</span>
+<span class="nc" id="L449">                    futures.add(executorService.submit(() -&gt; formatNode(broker.sharedServer().metaPropsEnsemble())));</span>
+                }
+<span class="fc" id="L451">            }</span>
+<span class="fc bfc" id="L452" title="All 2 branches covered.">            for (Future&lt;?&gt; future: futures) {</span>
+<span class="fc" id="L453">                future.get();</span>
+<span class="fc" id="L454">            }</span>
+<span class="nc" id="L455">        } catch (Exception e) {</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">            for (Future&lt;?&gt; future: futures) {</span>
+<span class="nc" id="L457">                future.cancel(true);</span>
+<span class="nc" id="L458">            }</span>
+<span class="nc" id="L459">            throw e;</span>
+<span class="fc" id="L460">        }</span>
+<span class="fc" id="L461">    }</span>
+
+    private void formatNode(
+        MetaPropertiesEnsemble ensemble
+    ) {
+        try {
+<span class="fc" id="L467">            final var nodeId = ensemble.nodeId().getAsInt();</span>
+<span class="fc" id="L468">            Formatter formatter = new Formatter();</span>
+<span class="fc" id="L469">            formatter.setNodeId(nodeId);</span>
+<span class="fc" id="L470">            formatter.setClusterId(ensemble.clusterId().get());</span>
+<span class="fc" id="L471">            formatter.setDirectories(ensemble.logDirProps().keySet());</span>
+<span class="pc bpc" id="L472" title="1 of 2 branches missed.">            if (formatter.directories().isEmpty()) {</span>
+<span class="nc" id="L473">                return;</span>
+            }
+<span class="fc" id="L475">            formatter.setReleaseVersion(nodes.bootstrapMetadata().metadataVersion());</span>
+<span class="fc" id="L476">            formatter.setUnstableFeatureVersionsEnabled(true);</span>
+<span class="fc" id="L477">            formatter.setIgnoreFormatted(false);</span>
+<span class="fc" id="L478">            formatter.setControllerListenerName(controllerListenerName);</span>
+<span class="fc" id="L479">            formatter.setMetadataLogDirectory(ensemble.metadataLogDir().get());</span>
+<span class="fc" id="L480">            StringBuilder dynamicVotersBuilder = new StringBuilder();</span>
+<span class="fc" id="L481">            String prefix = &quot;&quot;;</span>
+<span class="pc bpc" id="L482" title="1 of 2 branches missed.">            if (standalone) {</span>
+<span class="nc bnc" id="L483" title="All 2 branches missed.">                if (nodeId == TestKitDefaults.BROKER_ID_OFFSET + TestKitDefaults.CONTROLLER_ID_OFFSET) {</span>
+<span class="nc" id="L484">                    final var controllerNode = nodes.controllerNodes().get(nodeId);</span>
+<span class="nc" id="L485">                    dynamicVotersBuilder.append(</span>
+<span class="nc" id="L486">                        String.format(</span>
+                            &quot;%d@localhost:%d:%s&quot;,
+<span class="nc" id="L488">                            controllerNode.id(),</span>
+<span class="nc" id="L489">                            socketFactoryManager.</span>
+<span class="nc" id="L490">                                getOrCreatePortForListener(controllerNode.id(), controllerListenerName),</span>
+<span class="nc" id="L491">                            controllerNode.metadataDirectoryId()</span>
+                        )
+                    );
+<span class="nc" id="L494">                    formatter.setInitialControllers(DynamicVoters.parse(dynamicVotersBuilder.toString()));</span>
+                }
+                // when the nodeId != TestKitDefaults.CONTROLLER_ID_OFFSET, the node is formatting with
+                // the --no-initial-controllers flag
+<span class="nc" id="L498">                formatter.setHasDynamicQuorum(true);</span>
+<span class="pc bpc" id="L499" title="1 of 2 branches missed.">            } else if (initialVoterSet.isPresent()) {</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">                for (final var controllerNode : initialVoterSet.get().entrySet()) {</span>
+<span class="nc" id="L501">                    final var voterId = controllerNode.getKey();</span>
+<span class="nc" id="L502">                    final var voterDirectoryId = controllerNode.getValue();</span>
+<span class="nc" id="L503">                    dynamicVotersBuilder.append(prefix);</span>
+<span class="nc" id="L504">                    prefix = &quot;,&quot;;</span>
+<span class="nc" id="L505">                    dynamicVotersBuilder.append(</span>
+<span class="nc" id="L506">                        String.format(</span>
+                            &quot;%d@localhost:%d:%s&quot;,
+                            voterId,
+<span class="nc" id="L509">                            socketFactoryManager.</span>
+<span class="nc" id="L510">                                getOrCreatePortForListener(voterId, controllerListenerName),</span>
+                            voterDirectoryId
+                        )
+                    );
+<span class="nc" id="L514">                }</span>
+<span class="nc" id="L515">                formatter.setInitialControllers(DynamicVoters.parse(dynamicVotersBuilder.toString()));</span>
+<span class="nc" id="L516">                formatter.setHasDynamicQuorum(true);</span>
+            }
+<span class="fc" id="L518">            formatter.run();</span>
+<span class="nc" id="L519">        } catch (Exception e) {</span>
+<span class="nc" id="L520">            throw new RuntimeException(&quot;Failed to format node &quot; + ensemble.nodeId(), e);</span>
+<span class="fc" id="L521">        }</span>
+<span class="fc" id="L522">    }</span>
+
+    public void startup() throws ExecutionException, InterruptedException {
+<span class="fc" id="L525">        List&lt;Future&lt;?&gt;&gt; futures = new ArrayList&lt;&gt;();</span>
+        try {
+            // Note the startup order here is chosen to be consistent with
+            // `KafkaRaftServer`. See comments in that class for an explanation.
+<span class="fc bfc" id="L529" title="All 2 branches covered.">            for (ControllerServer controller : controllers.values()) {</span>
+<span class="fc" id="L530">                futures.add(executorService.submit(controller::startup));</span>
+<span class="fc" id="L531">            }</span>
+<span class="fc bfc" id="L532" title="All 2 branches covered.">            for (BrokerServer broker : brokers.values()) {</span>
+<span class="fc" id="L533">                futures.add(executorService.submit(broker::startup));</span>
+<span class="fc" id="L534">            }</span>
+<span class="fc bfc" id="L535" title="All 2 branches covered.">            for (Future&lt;?&gt; future: futures) {</span>
+<span class="fc" id="L536">                future.get();</span>
+<span class="fc" id="L537">            }</span>
+<span class="nc" id="L538">        } catch (Exception e) {</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">            for (Future&lt;?&gt; future: futures) {</span>
+<span class="nc" id="L540">                future.cancel(true);</span>
+<span class="nc" id="L541">            }</span>
+<span class="nc" id="L542">            throw e;</span>
+<span class="fc" id="L543">        }</span>
+<span class="fc" id="L544">    }</span>
+
+    /**
+     * Wait for a controller to mark all the brokers as ready (registered and unfenced).
+     * And also wait for the metadata cache up-to-date in each broker server.
+     */
+    public void waitForReadyBrokers() throws ExecutionException, InterruptedException {
+        // We can choose any controller, not just the active controller.
+        // If we choose a standby controller, we will wait slightly longer.
+<span class="fc" id="L553">        ControllerServer controllerServer = controllers.values().iterator().next();</span>
+<span class="fc" id="L554">        Controller controller = controllerServer.controller();</span>
+<span class="fc" id="L555">        controller.waitForReadyBrokers(brokers.size()).get();</span>
+
+        // make sure metadata cache in each broker server is up-to-date
+<span class="fc" id="L558">        TestUtils.waitForCondition(() -&gt;</span>
+<span class="fc" id="L559">                brokers.values().stream().map(BrokerServer::metadataCache)</span>
+<span class="fc" id="L560">                    .allMatch(cache -&gt; brokers.values().stream().map(b -&gt; b.config().brokerId()).allMatch(cache::hasAliveBroker)),</span>
+            &quot;Failed to wait for publisher to publish the metadata update to each broker.&quot;);
+<span class="fc" id="L562">    }</span>
+
+    public Admin admin() {
+<span class="nc" id="L565">        return admin(Map.of(), false);</span>
+    }
+
+    public Admin admin(Map&lt;String, Object&gt; configs) {
+<span class="nc" id="L569">        return admin(configs, false);</span>
+    }
+
+    public Admin admin(Map&lt;String, Object&gt; configs, boolean usingBootstrapControllers) {
+<span class="nc" id="L573">        Map&lt;String, Object&gt; props = new HashMap&lt;&gt;(configs);</span>
+<span class="nc" id="L574">        setBootstrapConfig(props, usingBootstrapControllers);</span>
+<span class="nc" id="L575">        setClientSaslConfig(props, usingBootstrapControllers);</span>
+<span class="nc" id="L576">        return Admin.create(props);</span>
+    }
+
+    private void setBootstrapConfig(Map&lt;String, Object&gt; props, boolean usingBootstrapControllers) {
+<span class="nc bnc" id="L580" title="All 2 branches missed.">        if (usingBootstrapControllers) {</span>
+<span class="nc" id="L581">            props.putIfAbsent(AdminClientConfig.BOOTSTRAP_CONTROLLERS_CONFIG, bootstrapControllers());</span>
+<span class="nc" id="L582">            props.remove(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG);</span>
+        } else {
+<span class="nc" id="L584">            props.putIfAbsent(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers());</span>
+<span class="nc" id="L585">            props.remove(AdminClientConfig.BOOTSTRAP_CONTROLLERS_CONFIG);</span>
+        }
+<span class="nc" id="L587">    }</span>
+
+    private void setClientSaslConfig(Map&lt;String, Object&gt; props, boolean usingBootstrapControllers) {
+<span class="nc bnc" id="L590" title="All 2 branches missed.">        SecurityProtocol protocol = usingBootstrapControllers ?</span>
+<span class="nc" id="L591">            nodes.controllerListenerProtocol() : nodes.brokerListenerProtocol();</span>
+
+<span class="nc" id="L593">        props.putIfAbsent(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG, protocol.name);</span>
+
+<span class="nc bnc" id="L595" title="All 2 branches missed.">        if (protocol == SecurityProtocol.SASL_PLAINTEXT) {</span>
+<span class="nc" id="L596">            props.putIfAbsent(SaslConfigs.SASL_MECHANISM, &quot;PLAIN&quot;);</span>
+<span class="nc" id="L597">            props.putIfAbsent(</span>
+                SaslConfigs.SASL_JAAS_CONFIG,
+<span class="nc" id="L599">                String.format(</span>
+                    &quot;org.apache.kafka.common.security.plain.PlainLoginModule required username=\&quot;%s\&quot; password=\&quot;%s\&quot;;&quot;,
+                    JaasUtils.KAFKA_PLAIN_ADMIN,
+                    JaasUtils.KAFKA_PLAIN_ADMIN_PASSWORD
+                )
+            );
+        }
+<span class="nc" id="L606">    }</span>
+
+    public String bootstrapServers() {
+<span class="fc" id="L609">        StringBuilder bld = new StringBuilder();</span>
+<span class="fc" id="L610">        String prefix = &quot;&quot;;</span>
+<span class="fc bfc" id="L611" title="All 2 branches covered.">        for (Entry&lt;Integer, BrokerServer&gt; entry : brokers.entrySet()) {</span>
+<span class="fc" id="L612">            int brokerId = entry.getKey();</span>
+<span class="fc" id="L613">            BrokerServer broker = entry.getValue();</span>
+<span class="fc" id="L614">            ListenerName listenerName = nodes.brokerListenerName();</span>
+            // The KafkaConfig#listeners method normalizes the listener name.
+            // The result from TestKitNodes#brokerListenerName method should be normalized as well,
+            // so that it matches the listener name in the KafkaConfig.
+<span class="fc" id="L618">            int port = broker.boundPort(ListenerName.normalised(listenerName.value()));</span>
+<span class="pc bpc" id="L619" title="1 of 2 branches missed.">            if (port &lt;= 0) {</span>
+<span class="nc" id="L620">                throw new RuntimeException(&quot;Broker &quot; + brokerId + &quot; does not yet &quot; +</span>
+                    &quot;have a bound port for &quot; + listenerName + &quot;.  Did you start &quot; +
+                    &quot;the cluster yet?&quot;);
+            }
+<span class="fc" id="L624">            bld.append(prefix).append(&quot;localhost:&quot;).append(port);</span>
+<span class="fc" id="L625">            prefix = &quot;,&quot;;</span>
+<span class="fc" id="L626">        }</span>
+<span class="fc" id="L627">        return bld.toString();</span>
+    }
+
+    public String bootstrapControllers() {
+<span class="nc" id="L631">        StringBuilder bld = new StringBuilder();</span>
+<span class="nc" id="L632">        String prefix = &quot;&quot;;</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">        for (Entry&lt;Integer, ControllerServer&gt; entry : controllers.entrySet()) {</span>
+<span class="nc" id="L634">            int id = entry.getKey();</span>
+<span class="nc" id="L635">            ControllerServer controller = entry.getValue();</span>
+<span class="nc" id="L636">            ListenerName listenerName = nodes.controllerListenerName();</span>
+            // Although the KafkaConfig#listeners method normalizes the listener name,
+            // the controller.listener.names configuration does not allow lowercase input,
+            // so there is no lowercase controller listener name, and we don't need to normalize it.
+<span class="nc" id="L640">            int port = controller.socketServer().boundPort(listenerName);</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">            if (port &lt;= 0) {</span>
+<span class="nc" id="L642">                throw new RuntimeException(&quot;Controller &quot; + id + &quot; does not yet &quot; +</span>
+                        &quot;have a bound port for &quot; + listenerName + &quot;.  Did you start &quot; +
+                        &quot;the cluster yet?&quot;);
+            }
+<span class="nc" id="L646">            bld.append(prefix).append(&quot;localhost:&quot;).append(port);</span>
+<span class="nc" id="L647">            prefix = &quot;,&quot;;</span>
+<span class="nc" id="L648">        }</span>
+<span class="nc" id="L649">        return bld.toString();</span>
+    }
+
+    public Map&lt;Integer, ControllerServer&gt; controllers() {
+<span class="nc" id="L653">        return controllers;</span>
+    }
+
+    public Controller waitForActiveController() throws InterruptedException {
+<span class="nc" id="L657">        AtomicReference&lt;Controller&gt; active = new AtomicReference&lt;&gt;(null);</span>
+<span class="nc" id="L658">        TestUtils.waitForCondition(() -&gt; {</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">            for (ControllerServer controllerServer : controllers.values()) {</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">                if (controllerServer.controller().isActive()) {</span>
+<span class="nc" id="L661">                    active.set(controllerServer.controller());</span>
+                }
+<span class="nc" id="L663">            }</span>
+<span class="nc bnc" id="L664" title="All 2 branches missed.">            return active.get() != null;</span>
+        }, 60_000, &quot;Controller not active&quot;);
+<span class="nc" id="L666">        return active.get();</span>
+    }
+
+    public Map&lt;Integer, BrokerServer&gt; brokers() {
+<span class="fc" id="L670">        return brokers;</span>
+    }
+
+    public Map&lt;Integer, KafkaRaftManager&lt;ApiMessageAndVersion&gt;&gt; raftManagers() {
+<span class="nc" id="L674">        Map&lt;Integer, KafkaRaftManager&lt;ApiMessageAndVersion&gt;&gt; results = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L675" title="All 2 branches missed.">        for (BrokerServer brokerServer : brokers().values()) {</span>
+<span class="nc" id="L676">            results.put(brokerServer.config().brokerId(), brokerServer.sharedServer().raftManager());</span>
+<span class="nc" id="L677">        }</span>
+<span class="nc bnc" id="L678" title="All 2 branches missed.">        for (ControllerServer controllerServer : controllers().values()) {</span>
+<span class="nc bnc" id="L679" title="All 2 branches missed.">            if (!results.containsKey(controllerServer.config().nodeId())) {</span>
+<span class="nc" id="L680">                results.put(controllerServer.config().nodeId(), controllerServer.sharedServer().raftManager());</span>
+            }
+<span class="nc" id="L682">        }</span>
+<span class="nc" id="L683">        return results;</span>
+    }
+
+    public TestKitNodes nodes() {
+<span class="fc" id="L687">        return nodes;</span>
+    }
+
+    public MockFaultHandler fatalFaultHandler() {
+<span class="nc" id="L691">        return faultHandlerFactory.fatalFaultHandler();</span>
+    }
+
+    public MockFaultHandler nonFatalFaultHandler() {
+<span class="fc" id="L695">        return faultHandlerFactory.nonFatalFaultHandler();</span>
+    }
+
+    @Override
+    public void close() throws Exception {
+<span class="fc" id="L700">        List&lt;Entry&lt;String, Future&lt;?&gt;&gt;&gt; futureEntries = new ArrayList&lt;&gt;();</span>
+        try {
+            // Note the shutdown order here is chosen to be consistent with
+            // `KafkaRaftServer`. See comments in that class for an explanation.
+<span class="fc bfc" id="L704" title="All 2 branches covered.">            for (Entry&lt;Integer, BrokerServer&gt; entry : brokers.entrySet()) {</span>
+<span class="fc" id="L705">                int brokerId = entry.getKey();</span>
+<span class="fc" id="L706">                BrokerServer broker = entry.getValue();</span>
+<span class="fc" id="L707">                futureEntries.add(new SimpleImmutableEntry&lt;&gt;(&quot;broker&quot; + brokerId,</span>
+<span class="fc" id="L708">                    executorService.submit((Runnable) broker::shutdown)));</span>
+<span class="fc" id="L709">            }</span>
+<span class="fc" id="L710">            waitForAllFutures(futureEntries);</span>
+<span class="fc" id="L711">            futureEntries.clear();</span>
+<span class="fc bfc" id="L712" title="All 2 branches covered.">            for (Entry&lt;Integer, ControllerServer&gt; entry : controllers.entrySet()) {</span>
+<span class="fc" id="L713">                int controllerId = entry.getKey();</span>
+<span class="fc" id="L714">                ControllerServer controller = entry.getValue();</span>
+<span class="fc" id="L715">                futureEntries.add(new SimpleImmutableEntry&lt;&gt;(&quot;controller&quot; + controllerId,</span>
+<span class="fc" id="L716">                    executorService.submit(controller::shutdown)));</span>
+<span class="fc" id="L717">            }</span>
+<span class="fc" id="L718">            waitForAllFutures(futureEntries);</span>
+<span class="fc" id="L719">            futureEntries.clear();</span>
+<span class="pc bpc" id="L720" title="1 of 2 branches missed.">            if (deleteOnClose) {</span>
+<span class="fc" id="L721">                Utils.delete(baseDirectory);</span>
+<span class="pc bpc" id="L722" title="1 of 2 branches missed.">                if (jaasFile.isPresent()) {</span>
+<span class="nc" id="L723">                    Utils.delete(jaasFile.get());</span>
+                }
+            }
+<span class="nc" id="L726">        } catch (Exception e) {</span>
+<span class="nc bnc" id="L727" title="All 2 branches missed.">            for (Entry&lt;String, Future&lt;?&gt;&gt; entry : futureEntries) {</span>
+<span class="nc" id="L728">                entry.getValue().cancel(true);</span>
+<span class="nc" id="L729">            }</span>
+<span class="nc" id="L730">            throw e;</span>
+        } finally {
+<span class="fc" id="L732">            ThreadUtils.shutdownExecutorServiceQuietly(executorService, 5, TimeUnit.MINUTES);</span>
+<span class="fc" id="L733">            socketFactoryManager.close();</span>
+        }
+<span class="fc" id="L735">        waitForAllThreads();</span>
+<span class="fc" id="L736">        faultHandlerFactory.fatalFaultHandler().maybeRethrowFirstException();</span>
+<span class="fc" id="L737">        faultHandlerFactory.nonFatalFaultHandler().maybeRethrowFirstException();</span>
+<span class="fc" id="L738">    }</span>
+
+    private void waitForAllFutures(List&lt;Entry&lt;String, Future&lt;?&gt;&gt;&gt; futureEntries)
+            throws Exception {
+<span class="fc bfc" id="L742" title="All 2 branches covered.">        for (Entry&lt;String, Future&lt;?&gt;&gt; entry : futureEntries) {</span>
+<span class="fc" id="L743">            log.debug(&quot;waiting for {} to shut down.&quot;, entry.getKey());</span>
+<span class="fc" id="L744">            entry.getValue().get();</span>
+<span class="fc" id="L745">            log.debug(&quot;{} successfully shut down.&quot;, entry.getKey());</span>
+<span class="fc" id="L746">        }</span>
+<span class="fc" id="L747">    }</span>
+
+    private void waitForAllThreads() throws InterruptedException {
+<span class="fc" id="L750">        TestUtils.waitForCondition(() -&gt; Thread.getAllStackTraces().keySet()</span>
+<span class="fc" id="L751">                    .stream().noneMatch(t -&gt; threadFactory.getThreadIds().contains(t.getId())),</span>
+                &quot;Failed to wait for all threads to shut down.&quot;);
+<span class="fc" id="L753">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

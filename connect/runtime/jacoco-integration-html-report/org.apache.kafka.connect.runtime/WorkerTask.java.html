@@ -1,0 +1,586 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>WorkerTask.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">WorkerTask.java</span></div><h1>WorkerTask.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.MetricNameTemplate;
+import org.apache.kafka.common.metrics.Gauge;
+import org.apache.kafka.common.metrics.PluginMetrics;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.internals.PluginMetricsImpl;
+import org.apache.kafka.common.metrics.stats.Avg;
+import org.apache.kafka.common.metrics.stats.Frequencies;
+import org.apache.kafka.common.metrics.stats.Max;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.runtime.AbstractStatus.State;
+import org.apache.kafka.connect.runtime.ConnectMetrics.MetricGroup;
+import org.apache.kafka.connect.runtime.errors.ErrorHandlingMetrics;
+import org.apache.kafka.connect.runtime.errors.ErrorReporter;
+import org.apache.kafka.connect.runtime.errors.RetryWithToleranceOperator;
+import org.apache.kafka.connect.runtime.isolation.LoaderSwap;
+import org.apache.kafka.connect.storage.StatusBackingStore;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+import org.apache.kafka.connect.util.LoggingContext;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+/**
+ * Handles processing for an individual task. This interface only provides the basic methods
+ * used by {@link Worker} to manage the tasks. Implementations combine a user-specified Task with
+ * Kafka to create a data flow.
+ * &lt;p&gt;
+ * Note on locking: since the task runs in its own thread, special care must be taken to ensure
+ * that state transitions are reported correctly, in particular since some state transitions are
+ * asynchronous (e.g. pause/resume). For example, changing the state to paused could cause a race
+ * if the task fails at the same time. To protect from these cases, we synchronize status updates
+ * using the WorkerTask's monitor.
+ * @param &lt;T&gt; The type of record initially entering the processing pipeline from the source or consumer
+ * @param &lt;R&gt; The type of record during transformations (must be an implementation of {@link ConnectRecord})
+ */
+abstract class WorkerTask&lt;T, R extends ConnectRecord&lt;R&gt;&gt; implements Runnable {
+<span class="fc" id="L66">    private static final Logger log = LoggerFactory.getLogger(WorkerTask.class);</span>
+    private static final String THREAD_NAME_PREFIX = &quot;task-thread-&quot;;
+
+    private final TaskStatus.Listener statusListener;
+    private final StatusBackingStore statusBackingStore;
+    protected final ConnectorTaskId id;
+    protected final ClassLoader loader;
+    protected final Time time;
+<span class="fc" id="L74">    private final CountDownLatch shutdownLatch = new CountDownLatch(1);</span>
+    private final TaskMetricsGroup taskMetricsGroup;
+    private volatile TargetState targetState;
+    private volatile boolean failed;
+    private volatile boolean stopping;   // indicates whether the Worker has asked the task to stop
+    private volatile boolean cancelled;  // indicates whether the Worker has cancelled the task (e.g. because of slow shutdown)
+    private final ErrorHandlingMetrics errorMetrics;
+    protected final RetryWithToleranceOperator&lt;T&gt; retryWithToleranceOperator;
+    protected final TransformationChain&lt;T, R&gt; transformationChain;
+    private final Supplier&lt;List&lt;ErrorReporter&lt;T&gt;&gt;&gt; errorReportersSupplier;
+    protected final Function&lt;ClassLoader, LoaderSwap&gt; pluginLoaderSwapper;
+    protected final PluginMetricsImpl pluginMetrics;
+
+    public WorkerTask(ConnectorTaskId id,
+                      TaskStatus.Listener statusListener,
+                      TargetState initialState,
+                      ClassLoader loader,
+                      ConnectMetrics connectMetrics,
+                      ErrorHandlingMetrics errorMetrics,
+                      RetryWithToleranceOperator&lt;T&gt; retryWithToleranceOperator,
+                      TransformationChain&lt;T, R&gt; transformationChain,
+                      Supplier&lt;List&lt;ErrorReporter&lt;T&gt;&gt;&gt; errorReportersSupplier,
+                      Time time,
+                      StatusBackingStore statusBackingStore,
+                      TaskPluginsMetadata pluginsMetadata,
+<span class="fc" id="L99">                      Function&lt;ClassLoader, LoaderSwap&gt; pluginLoaderSwapper) {</span>
+<span class="fc" id="L100">        this.id = id;</span>
+<span class="fc" id="L101">        this.taskMetricsGroup = new TaskMetricsGroup(this.id, connectMetrics, statusListener, pluginsMetadata);</span>
+<span class="fc" id="L102">        this.errorMetrics = errorMetrics;</span>
+<span class="fc" id="L103">        this.statusListener = taskMetricsGroup;</span>
+<span class="fc" id="L104">        this.loader = loader;</span>
+<span class="fc" id="L105">        this.targetState = initialState;</span>
+<span class="fc" id="L106">        this.failed = false;</span>
+<span class="fc" id="L107">        this.stopping = false;</span>
+<span class="fc" id="L108">        this.cancelled = false;</span>
+<span class="fc" id="L109">        this.taskMetricsGroup.recordState(this.targetState);</span>
+<span class="fc" id="L110">        this.retryWithToleranceOperator = retryWithToleranceOperator;</span>
+<span class="fc" id="L111">        this.transformationChain = transformationChain;</span>
+<span class="fc" id="L112">        this.errorReportersSupplier = errorReportersSupplier;</span>
+<span class="fc" id="L113">        this.time = time;</span>
+<span class="fc" id="L114">        this.statusBackingStore = statusBackingStore;</span>
+<span class="fc" id="L115">        this.pluginLoaderSwapper = pluginLoaderSwapper;</span>
+<span class="fc" id="L116">        this.pluginMetrics = connectMetrics.taskPluginMetrics(id);</span>
+<span class="fc" id="L117">    }</span>
+
+    public ConnectorTaskId id() {
+<span class="fc" id="L120">        return id;</span>
+    }
+
+    public ClassLoader loader() {
+<span class="fc" id="L124">        return loader;</span>
+    }
+
+    public PluginMetrics pluginMetrics() {
+<span class="nc" id="L128">        return pluginMetrics;</span>
+    }
+
+    /**
+     * Initialize the task for execution.
+     *
+     * @param taskConfig initial configuration
+     */
+    public abstract void initialize(TaskConfig taskConfig);
+
+
+    private void triggerStop() {
+<span class="fc" id="L140">        synchronized (this) {</span>
+<span class="fc" id="L141">            stopping = true;</span>
+
+            // wakeup any threads that are waiting for unpause
+<span class="fc" id="L144">            this.notifyAll();</span>
+<span class="fc" id="L145">        }</span>
+<span class="fc" id="L146">    }</span>
+
+    /**
+     * Stop this task from processing messages. This method does not block, it only triggers
+     * shutdown. Use {@link #awaitStop} to block until completion.
+     */
+    public void stop() {
+<span class="fc" id="L153">        triggerStop();</span>
+<span class="fc" id="L154">    }</span>
+
+    /**
+     * Cancel this task. This won't actually stop it, but it will prevent the state from being
+     * updated when it eventually does shutdown.
+     */
+    public void cancel() {
+<span class="fc" id="L161">        cancelled = true;</span>
+<span class="fc" id="L162">        retryWithToleranceOperator.triggerStop();</span>
+<span class="fc" id="L163">    }</span>
+
+    /**
+     * Wait for this task to finish stopping.
+     *
+     * @param timeoutMs time in milliseconds to await stop
+     * @return true if successful, false if the timeout was reached
+     */
+    public boolean awaitStop(long timeoutMs) {
+        try {
+<span class="fc" id="L173">            return shutdownLatch.await(timeoutMs, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L174">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L175">            return false;</span>
+        }
+    }
+
+    /**
+     * Remove all metrics published by this task.
+     */
+    public void removeMetrics() {
+        // Close quietly here so that we can be sure to close everything even if one attempt fails
+<span class="fc" id="L184">        Utils.closeQuietly(taskMetricsGroup::close, &quot;Task metrics group&quot;);</span>
+<span class="fc" id="L185">        Utils.closeQuietly(errorMetrics, &quot;Error handling metrics&quot;);</span>
+<span class="fc" id="L186">    }</span>
+
+    // Visible for testing
+    void doStart() {
+<span class="fc" id="L190">        retryWithToleranceOperator.reporters(errorReportersSupplier.get());</span>
+<span class="fc" id="L191">        initializeAndStart();</span>
+<span class="fc" id="L192">        statusListener.onStartup(id);</span>
+<span class="fc" id="L193">    }</span>
+
+    protected abstract void initializeAndStart();
+
+    protected abstract void execute();
+
+    protected abstract void close();
+
+    protected abstract String taskVersion();
+
+    protected boolean isFailed() {
+<span class="fc" id="L204">        return failed;</span>
+    }
+
+    protected boolean isStopping() {
+        // The target state should never be STOPPED, but if things go wrong and it somehow is,
+        // we handle that identically to a request to shut down the task
+<span class="fc bfc" id="L210" title="All 4 branches covered.">        return stopping || targetState == TargetState.STOPPED;</span>
+    }
+
+    protected boolean isCancelled() {
+<span class="fc" id="L214">        return cancelled;</span>
+    }
+
+    // Visible for testing
+    void doClose() {
+        try {
+<span class="fc" id="L220">            close();</span>
+<span class="nc" id="L221">        } catch (Throwable t) {</span>
+<span class="nc" id="L222">            log.error(&quot;{} Task threw an uncaught and unrecoverable exception during shutdown&quot;, this, t);</span>
+<span class="nc" id="L223">            throw t;</span>
+        } finally {
+<span class="fc" id="L225">            Utils.closeQuietly(transformationChain, &quot;transformation chain&quot;);</span>
+<span class="fc" id="L226">            Utils.closeQuietly(retryWithToleranceOperator, &quot;retry operator&quot;);</span>
+        }
+<span class="fc" id="L228">    }</span>
+
+    private void doRun() throws InterruptedException {
+        try {
+<span class="fc" id="L232">            synchronized (this) {</span>
+<span class="pc bpc" id="L233" title="1 of 2 branches missed.">                if (isStopping())</span>
+<span class="nc" id="L234">                    return;</span>
+
+<span class="pc bpc" id="L236" title="1 of 2 branches missed.">                if (targetState == TargetState.PAUSED) {</span>
+<span class="nc" id="L237">                    onPause();</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">                    if (!awaitUnpause()) return;</span>
+                }
+<span class="fc" id="L240">            }</span>
+
+<span class="fc" id="L242">            doStart();</span>
+<span class="fc" id="L243">            execute();</span>
+<span class="fc" id="L244">        } catch (Throwable t) {</span>
+<span class="fc" id="L245">            failed = true;</span>
+<span class="fc bfc" id="L246" title="All 2 branches covered.">            if (cancelled) {</span>
+<span class="fc" id="L247">                log.warn(&quot;{} After being scheduled for shutdown, the orphan task threw an uncaught exception. A newer instance of this task might be already running&quot;, this, t);</span>
+<span class="pc bpc" id="L248" title="1 of 2 branches missed.">            } else if (isStopping()) {</span>
+<span class="nc" id="L249">                log.warn(&quot;{} After being scheduled for shutdown, task threw an uncaught exception.&quot;, this, t);</span>
+            } else {
+<span class="fc" id="L251">                log.error(&quot;{} Task threw an uncaught and unrecoverable exception. Task is being killed and will not recover until manually restarted&quot;, this, t);</span>
+<span class="fc" id="L252">                throw t;</span>
+            }
+        } finally {
+<span class="fc" id="L255">            doClose();</span>
+        }
+<span class="fc" id="L257">    }</span>
+
+    private void onShutdown() {
+<span class="fc" id="L260">        synchronized (this) {</span>
+<span class="fc" id="L261">            triggerStop();</span>
+
+            // if we were cancelled, skip the status update since the task may have already been
+            // started somewhere else
+<span class="fc bfc" id="L265" title="All 2 branches covered.">            if (!cancelled)</span>
+<span class="fc" id="L266">                statusListener.onShutdown(id);</span>
+<span class="fc" id="L267">        }</span>
+<span class="fc" id="L268">    }</span>
+
+    protected void onFailure(Throwable t) {
+<span class="fc" id="L271">        synchronized (this) {</span>
+<span class="fc" id="L272">            triggerStop();</span>
+
+            // if we were cancelled, skip the status update since the task may have already been
+            // started somewhere else
+<span class="pc bpc" id="L276" title="1 of 2 branches missed.">            if (!cancelled)</span>
+<span class="fc" id="L277">                statusListener.onFailure(id, t);</span>
+<span class="fc" id="L278">        }</span>
+<span class="fc" id="L279">    }</span>
+
+    protected synchronized void onPause() {
+<span class="fc" id="L282">        statusListener.onPause(id);</span>
+<span class="fc" id="L283">    }</span>
+
+    protected synchronized void onResume() {
+<span class="fc" id="L286">        statusListener.onResume(id);</span>
+<span class="fc" id="L287">    }</span>
+
+    @Override
+    public void run() {
+        // Clear all MDC parameters, in case this thread is being reused
+<span class="fc" id="L292">        LoggingContext.clear();</span>
+
+<span class="fc" id="L294">        try (LoggingContext loggingContext = LoggingContext.forTask(id())) {</span>
+<span class="fc" id="L295">            String savedName = Thread.currentThread().getName();</span>
+            try {
+<span class="fc" id="L297">                Thread.currentThread().setName(THREAD_NAME_PREFIX + id);</span>
+<span class="fc" id="L298">                doRun();</span>
+<span class="fc" id="L299">                onShutdown();</span>
+<span class="fc" id="L300">            } catch (Throwable t) {</span>
+<span class="fc" id="L301">                onFailure(t);</span>
+
+<span class="pc bpc" id="L303" title="1 of 2 branches missed.">                if (t instanceof Error)</span>
+<span class="nc" id="L304">                    throw (Error) t;</span>
+            } finally {
+<span class="fc" id="L306">                Thread.currentThread().setName(savedName);</span>
+<span class="fc" id="L307">                shutdownLatch.countDown();</span>
+            }
+        }
+<span class="fc" id="L310">    }</span>
+
+    public boolean shouldPause() {
+<span class="fc bfc" id="L313" title="All 2 branches covered.">        return this.targetState == TargetState.PAUSED;</span>
+    }
+
+    /**
+     * Await task resumption.
+     *
+     * @return true if the task's target state is not paused, false if the task is shutdown before resumption
+     * @throws InterruptedException
+     */
+    protected boolean awaitUnpause() throws InterruptedException {
+<span class="fc" id="L323">        synchronized (this) {</span>
+<span class="fc bfc" id="L324" title="All 2 branches covered.">            while (targetState == TargetState.PAUSED) {</span>
+<span class="fc bfc" id="L325" title="All 2 branches covered.">                if (isStopping())</span>
+<span class="fc" id="L326">                    return false;</span>
+<span class="fc" id="L327">                this.wait();</span>
+            }
+<span class="fc" id="L329">            return true;</span>
+        }
+    }
+
+    public void transitionTo(TargetState state) {
+<span class="fc" id="L334">        synchronized (this) {</span>
+            // Ignore the state change if we are stopping.
+            // This has the consequence that, if we ever transition to the STOPPED target state (which
+            // should never happen since whole point of that state is that it comes with a complete
+            // shutdown of all the tasks for the connector), we will never be able to transition out of it.
+            // Since part of transitioning to the STOPPED state is that we shut down the task and all of
+            // its resources (Kafka clients, SMTs, etc.), this is a reasonable way to do things; otherwise,
+            // we'd have to re-instantiate all of those resources to be able to resume (or even just pause)
+            // the task .
+<span class="pc bpc" id="L343" title="1 of 2 branches missed.">            if (isStopping()) {</span>
+<span class="nc" id="L344">                log.debug(&quot;{} Ignoring request to transition stopped task {} to state {}&quot;, this, id, state);</span>
+<span class="nc" id="L345">                return;</span>
+            }
+
+<span class="pc bpc" id="L348" title="1 of 2 branches missed.">            if (targetState == TargetState.STOPPED)</span>
+<span class="nc" id="L349">                log.warn(&quot;{} Received unexpected request to transition task {} to state {}; will shut down in response&quot;, this, id, TargetState.STOPPED);</span>
+
+<span class="fc" id="L351">            this.targetState = state;</span>
+<span class="fc" id="L352">            this.notifyAll();</span>
+<span class="fc" id="L353">        }</span>
+<span class="fc" id="L354">    }</span>
+
+    /**
+     * Include this topic to the set of active topics for the connector that this worker task
+     * is running. This information is persisted in the status backing store used by this worker.
+     *
+     * @param topic the topic to mark as active for this connector
+     */
+    protected void recordActiveTopic(String topic) {
+<span class="fc bfc" id="L363" title="All 2 branches covered.">        if (statusBackingStore.getTopic(id.connector(), topic) != null) {</span>
+            // The topic is already recorded as active. No further action is required.
+<span class="fc" id="L365">            return;</span>
+        }
+<span class="fc" id="L367">        statusBackingStore.put(new TopicStatus(topic, id, time.milliseconds()));</span>
+<span class="fc" id="L368">    }</span>
+
+    /**
+     * Record that offsets have been committed.
+     *
+     * @param duration the length of time in milliseconds for the commit attempt to complete
+     */
+    protected void recordCommitSuccess(long duration) {
+<span class="fc" id="L376">        taskMetricsGroup.recordCommit(duration, true);</span>
+<span class="fc" id="L377">    }</span>
+
+    /**
+     * Record that offsets have been committed.
+     *
+     * @param duration the length of time in milliseconds for the commit attempt to complete
+     */
+    protected void recordCommitFailure(long duration) {
+<span class="nc" id="L385">        taskMetricsGroup.recordCommit(duration, false);</span>
+<span class="nc" id="L386">    }</span>
+
+    /**
+     * Record that a batch of records has been processed.
+     *
+     * @param size the number of records in the batch
+     */
+    protected void recordBatch(int size) {
+<span class="fc" id="L394">        taskMetricsGroup.recordBatch(size);</span>
+<span class="fc" id="L395">    }</span>
+
+    TaskMetricsGroup taskMetricsGroup() {
+<span class="nc" id="L398">        return taskMetricsGroup;</span>
+    }
+
+    static class TaskMetricsGroup implements TaskStatus.Listener {
+        private final TaskStatus.Listener delegateListener;
+        private final MetricGroup metricGroup;
+<span class="fc" id="L404">        private final List&lt;MetricGroup&gt; transformationGroups = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L405">        private final List&lt;MetricGroup&gt; predicateGroups = new ArrayList&lt;&gt;();</span>
+        private final Time time;
+        private final StateTracker taskStateTimer;
+        private final Sensor commitTime;
+        private final Sensor batchSize;
+        private final Sensor commitAttempts;
+        private final ConnectMetrics connectMetrics;
+        private final ConnectorTaskId id;
+
+        public TaskMetricsGroup(ConnectorTaskId id, ConnectMetrics connectMetrics, TaskStatus.Listener statusListener) {
+<span class="nc" id="L415">            this(id, connectMetrics, statusListener, null);</span>
+<span class="nc" id="L416">        }</span>
+
+<span class="fc" id="L418">        public TaskMetricsGroup(ConnectorTaskId id, ConnectMetrics connectMetrics, TaskStatus.Listener statusListener, TaskPluginsMetadata pluginsMetadata) {</span>
+<span class="fc" id="L419">            delegateListener = statusListener;</span>
+<span class="fc" id="L420">            this.connectMetrics = connectMetrics;</span>
+<span class="fc" id="L421">            this.id = id;</span>
+
+<span class="fc" id="L423">            time = connectMetrics.time();</span>
+<span class="fc" id="L424">            taskStateTimer = new StateTracker();</span>
+<span class="fc" id="L425">            ConnectMetricsRegistry registry = connectMetrics.registry();</span>
+<span class="fc" id="L426">            metricGroup = connectMetrics.group(registry.taskGroupName(),</span>
+<span class="fc" id="L427">                    registry.connectorTagName(), id.connector(),</span>
+<span class="fc" id="L428">                    registry.taskTagName(), Integer.toString(id.task()));</span>
+            // prevent collisions by removing any previously created metrics in this group.
+<span class="fc" id="L430">            metricGroup.close();</span>
+
+<span class="fc" id="L432">            metricGroup.addValueMetric(registry.taskStatus, now -&gt;</span>
+<span class="nc" id="L433">                taskStateTimer.currentState().toString().toLowerCase(Locale.getDefault())</span>
+            );
+
+<span class="fc" id="L436">            addRatioMetric(State.RUNNING, registry.taskRunningRatio);</span>
+<span class="fc" id="L437">            addRatioMetric(State.PAUSED, registry.taskPauseRatio);</span>
+
+<span class="fc" id="L439">            commitTime = metricGroup.sensor(&quot;commit-time&quot;);</span>
+<span class="fc" id="L440">            commitTime.add(metricGroup.metricName(registry.taskCommitTimeMax), new Max());</span>
+<span class="fc" id="L441">            commitTime.add(metricGroup.metricName(registry.taskCommitTimeAvg), new Avg());</span>
+
+<span class="fc" id="L443">            batchSize = metricGroup.sensor(&quot;batch-size&quot;);</span>
+<span class="fc" id="L444">            batchSize.add(metricGroup.metricName(registry.taskBatchSizeMax), new Max());</span>
+<span class="fc" id="L445">            batchSize.add(metricGroup.metricName(registry.taskBatchSizeAvg), new Avg());</span>
+
+<span class="fc" id="L447">            MetricName offsetCommitFailures = metricGroup.metricName(registry.taskCommitFailurePercentage);</span>
+<span class="fc" id="L448">            MetricName offsetCommitSucceeds = metricGroup.metricName(registry.taskCommitSuccessPercentage);</span>
+<span class="fc" id="L449">            Frequencies commitFrequencies = Frequencies.forBooleanValues(offsetCommitFailures, offsetCommitSucceeds);</span>
+<span class="fc" id="L450">            commitAttempts = metricGroup.sensor(&quot;offset-commit-completion&quot;);</span>
+<span class="fc" id="L451">            commitAttempts.add(commitFrequencies);</span>
+<span class="fc" id="L452">            addPluginInfoMetric(pluginsMetadata);</span>
+<span class="fc" id="L453">        }</span>
+
+        private void addRatioMetric(final State matchingState, MetricNameTemplate template) {
+<span class="fc" id="L456">            MetricName metricName = metricGroup.metricName(template);</span>
+<span class="fc" id="L457">            metricGroup.metrics().addMetricIfAbsent(metricName, null, (Gauge&lt;Double&gt;) (config, now) -&gt;</span>
+<span class="nc" id="L458">                    taskStateTimer.durationRatio(matchingState, now));</span>
+<span class="fc" id="L459">        }</span>
+
+        private void addPluginInfoMetric(TaskPluginsMetadata pluginsMetadata) {
+<span class="pc bpc" id="L462" title="1 of 2 branches missed.">            if (pluginsMetadata == null) {</span>
+<span class="nc" id="L463">                return;</span>
+            }
+<span class="fc" id="L465">            ConnectMetricsRegistry registry = connectMetrics.registry();</span>
+<span class="pc" id="L466">            metricGroup.addValueMetric(registry.taskConnectorClass, now -&gt; pluginsMetadata.connectorClass());</span>
+<span class="pc" id="L467">            metricGroup.addValueMetric(registry.taskConnectorClassVersion, now -&gt; pluginsMetadata.connectorVersion());</span>
+<span class="pc" id="L468">            metricGroup.addValueMetric(registry.taskConnectorType, now -&gt; pluginsMetadata.connectorType());</span>
+<span class="pc" id="L469">            metricGroup.addValueMetric(registry.taskClass, now -&gt; pluginsMetadata.taskClass());</span>
+<span class="pc" id="L470">            metricGroup.addValueMetric(registry.taskVersion, now -&gt; pluginsMetadata.taskVersion());</span>
+<span class="pc" id="L471">            metricGroup.addValueMetric(registry.taskKeyConverterClass, now -&gt; pluginsMetadata.keyConverterClass());</span>
+<span class="pc" id="L472">            metricGroup.addValueMetric(registry.taskKeyConverterVersion, now -&gt; pluginsMetadata.keyConverterVersion());</span>
+<span class="pc" id="L473">            metricGroup.addValueMetric(registry.taskValueConverterClass, now -&gt; pluginsMetadata.valueConverterClass());</span>
+<span class="pc" id="L474">            metricGroup.addValueMetric(registry.taskValueConverterVersion, now -&gt; pluginsMetadata.valueConverterVersion());</span>
+<span class="pc" id="L475">            metricGroup.addValueMetric(registry.taskHeaderConverterClass, now -&gt; pluginsMetadata.headerConverterClass());</span>
+<span class="pc" id="L476">            metricGroup.addValueMetric(registry.taskHeaderConverterVersion, now -&gt; pluginsMetadata.headerConverterVersion());</span>
+
+<span class="fc bfc" id="L478" title="All 2 branches covered.">            if (!pluginsMetadata.transformations().isEmpty()) {</span>
+<span class="fc bfc" id="L479" title="All 2 branches covered.">                for (TransformationStage.AliasedPluginInfo entry : pluginsMetadata.transformations()) {</span>
+<span class="fc" id="L480">                    MetricGroup transformationGroup = connectMetrics.group(registry.transformsGroupName(),</span>
+<span class="fc" id="L481">                            registry.connectorTagName(), id.connector(),</span>
+<span class="fc" id="L482">                            registry.taskTagName(), Integer.toString(id.task()),</span>
+<span class="fc" id="L483">                            registry.transformsTagName(), entry.alias());</span>
+<span class="pc" id="L484">                    transformationGroup.addValueMetric(registry.transformClass, now -&gt; entry.className());</span>
+<span class="pc" id="L485">                    transformationGroup.addValueMetric(registry.transformVersion, now -&gt; entry.version());</span>
+<span class="fc" id="L486">                    this.transformationGroups.add(transformationGroup);</span>
+<span class="fc" id="L487">                }</span>
+            }
+
+<span class="fc bfc" id="L490" title="All 2 branches covered.">            if (!pluginsMetadata.predicates().isEmpty()) {</span>
+<span class="fc bfc" id="L491" title="All 2 branches covered.">                for (TransformationStage.AliasedPluginInfo entry : pluginsMetadata.predicates()) {</span>
+<span class="fc" id="L492">                    MetricGroup predicateGroup = connectMetrics.group(registry.predicatesGroupName(),</span>
+<span class="fc" id="L493">                            registry.connectorTagName(), id.connector(),</span>
+<span class="fc" id="L494">                            registry.taskTagName(), Integer.toString(id.task()),</span>
+<span class="fc" id="L495">                            registry.predicateTagName(), entry.alias());</span>
+<span class="pc" id="L496">                    predicateGroup.addValueMetric(registry.predicateClass, now -&gt; entry.className());</span>
+<span class="pc" id="L497">                    predicateGroup.addValueMetric(registry.predicateVersion, now -&gt; entry.version());</span>
+<span class="fc" id="L498">                    this.predicateGroups.add(predicateGroup);</span>
+<span class="fc" id="L499">                }</span>
+            }
+<span class="fc" id="L501">        }</span>
+
+        void close() {
+<span class="fc" id="L504">            metricGroup.close();</span>
+<span class="fc" id="L505">            transformationGroups.forEach(MetricGroup::close);</span>
+<span class="fc" id="L506">            predicateGroups.forEach(MetricGroup::close);</span>
+<span class="fc" id="L507">        }</span>
+
+        void recordCommit(long duration, boolean success) {
+<span class="pc bpc" id="L510" title="1 of 2 branches missed.">            if (success) {</span>
+<span class="fc" id="L511">                commitTime.record(duration);</span>
+<span class="fc" id="L512">                commitAttempts.record(1.0d);</span>
+            } else {
+<span class="nc" id="L514">                commitAttempts.record(0.0d);</span>
+            }
+<span class="fc" id="L516">        }</span>
+
+        void recordBatch(int size) {
+<span class="fc" id="L519">            batchSize.record(size);</span>
+<span class="fc" id="L520">        }</span>
+
+        @Override
+        public void onStartup(ConnectorTaskId id) {
+<span class="fc" id="L524">            taskStateTimer.changeState(State.RUNNING, time.milliseconds());</span>
+<span class="fc" id="L525">            delegateListener.onStartup(id);</span>
+<span class="fc" id="L526">        }</span>
+
+        @Override
+        public void onFailure(ConnectorTaskId id, Throwable cause) {
+<span class="fc" id="L530">            taskStateTimer.changeState(State.FAILED, time.milliseconds());</span>
+<span class="fc" id="L531">            delegateListener.onFailure(id, cause);</span>
+<span class="fc" id="L532">        }</span>
+
+        @Override
+        public void onPause(ConnectorTaskId id) {
+<span class="fc" id="L536">            taskStateTimer.changeState(State.PAUSED, time.milliseconds());</span>
+<span class="fc" id="L537">            delegateListener.onPause(id);</span>
+<span class="fc" id="L538">        }</span>
+
+        @Override
+        public void onResume(ConnectorTaskId id) {
+<span class="fc" id="L542">            taskStateTimer.changeState(State.RUNNING, time.milliseconds());</span>
+<span class="fc" id="L543">            delegateListener.onResume(id);</span>
+<span class="fc" id="L544">        }</span>
+
+        @Override
+        public void onShutdown(ConnectorTaskId id) {
+<span class="fc" id="L548">            taskStateTimer.changeState(State.UNASSIGNED, time.milliseconds());</span>
+<span class="fc" id="L549">            delegateListener.onShutdown(id);</span>
+<span class="fc" id="L550">        }</span>
+
+        @Override
+        public void onDeletion(ConnectorTaskId id) {
+<span class="nc" id="L554">            taskStateTimer.changeState(State.DESTROYED, time.milliseconds());</span>
+<span class="nc" id="L555">            delegateListener.onDeletion(id);</span>
+<span class="nc" id="L556">        }</span>
+
+        @Override
+        public void onRestart(ConnectorTaskId id) {
+<span class="nc" id="L560">            taskStateTimer.changeState(State.RESTARTING, time.milliseconds());</span>
+<span class="nc" id="L561">            delegateListener.onRestart(id);</span>
+<span class="nc" id="L562">        }</span>
+
+        public void recordState(TargetState state) {
+<span class="pc bpc" id="L565" title="2 of 3 branches missed.">            switch (state) {</span>
+                case STARTED:
+<span class="fc" id="L567">                    taskStateTimer.changeState(State.RUNNING, time.milliseconds());</span>
+<span class="fc" id="L568">                    break;</span>
+                case PAUSED:
+<span class="nc" id="L570">                    taskStateTimer.changeState(State.PAUSED, time.milliseconds());</span>
+<span class="nc" id="L571">                    break;</span>
+                default:
+                    break;
+            }
+<span class="fc" id="L575">        }</span>
+
+        public State state() {
+<span class="nc" id="L578">            return taskStateTimer.currentState();</span>
+        }
+
+        protected MetricGroup metricGroup() {
+<span class="nc" id="L582">            return metricGroup;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,340 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractDualSchemaRocksDBSegmentedBytesStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">AbstractDualSchemaRocksDBSegmentedBytesStore.java</span></div><h1>AbstractDualSchemaRocksDBSegmentedBytesStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StateStoreContext;
+import org.apache.kafka.streams.processor.internals.InternalProcessorContext;
+import org.apache.kafka.streams.processor.internals.ProcessorContextUtils;
+import org.apache.kafka.streams.processor.internals.RecordBatchingStateRestoreCallback;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+import org.apache.kafka.streams.processor.internals.metrics.TaskMetrics;
+import org.apache.kafka.streams.query.Position;
+import org.apache.kafka.streams.state.KeyValueIterator;
+
+import org.rocksdb.RocksDBException;
+import org.rocksdb.WriteBatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import static org.apache.kafka.streams.StreamsConfig.InternalConfig.IQ_CONSISTENCY_OFFSET_VECTOR_ENABLED;
+import static org.apache.kafka.streams.processor.internals.ProcessorContextUtils.asInternalProcessorContext;
+
+public abstract class AbstractDualSchemaRocksDBSegmentedBytesStore&lt;S extends Segment&gt; implements SegmentedBytesStore {
+<span class="nc" id="L50">    private static final Logger LOG = LoggerFactory.getLogger(AbstractDualSchemaRocksDBSegmentedBytesStore.class);</span>
+
+    private final String name;
+    protected final AbstractSegments&lt;S&gt; segments;
+    protected final KeySchema baseKeySchema;
+    protected final Optional&lt;KeySchema&gt; indexKeySchema;
+    private final long retentionPeriod;
+
+    protected InternalProcessorContext&lt;?, ?&gt; internalProcessorContext;
+    private Sensor expiredRecordSensor;
+<span class="nc" id="L60">    protected long observedStreamTime = ConsumerRecord.NO_TIMESTAMP;</span>
+<span class="nc" id="L61">    protected boolean consistencyEnabled = false;</span>
+    protected Position position;
+    private volatile boolean open;
+
+    AbstractDualSchemaRocksDBSegmentedBytesStore(final String name,
+                                                 final KeySchema baseKeySchema,
+                                                 final Optional&lt;KeySchema&gt; indexKeySchema,
+                                                 final AbstractSegments&lt;S&gt; segments,
+<span class="nc" id="L69">                                                 final long retentionPeriod) {</span>
+<span class="nc" id="L70">        this.name = name;</span>
+<span class="nc" id="L71">        this.baseKeySchema = baseKeySchema;</span>
+<span class="nc" id="L72">        this.indexKeySchema = indexKeySchema;</span>
+<span class="nc" id="L73">        this.segments = segments;</span>
+<span class="nc" id="L74">        this.retentionPeriod = retentionPeriod;</span>
+<span class="nc" id="L75">    }</span>
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; all() {
+
+<span class="nc" id="L80">        final long actualFrom = getActualFrom(0, baseKeySchema instanceof PrefixedWindowKeySchemas.TimeFirstWindowKeySchema);</span>
+
+<span class="nc" id="L82">        final List&lt;S&gt; searchSpace = segments.allSegments(true);</span>
+<span class="nc" id="L83">        final Bytes from = baseKeySchema.lowerRange(null, actualFrom);</span>
+<span class="nc" id="L84">        final Bytes to = baseKeySchema.upperRange(null, Long.MAX_VALUE);</span>
+
+<span class="nc" id="L86">        return new SegmentIterator&lt;&gt;(</span>
+<span class="nc" id="L87">                searchSpace.iterator(),</span>
+<span class="nc" id="L88">                baseKeySchema.hasNextCondition(null, null, actualFrom, Long.MAX_VALUE, true),</span>
+                from,
+                to,
+                true);
+    }
+
+    @Override
+    public KeyValueIterator&lt;Bytes, byte[]&gt; backwardAll() {
+
+<span class="nc" id="L97">        final long actualFrom = getActualFrom(0, baseKeySchema instanceof PrefixedWindowKeySchemas.TimeFirstWindowKeySchema);</span>
+
+<span class="nc" id="L99">        final List&lt;S&gt; searchSpace = segments.allSegments(false);</span>
+<span class="nc" id="L100">        final Bytes from = baseKeySchema.lowerRange(null, actualFrom);</span>
+<span class="nc" id="L101">        final Bytes to = baseKeySchema.upperRange(null, Long.MAX_VALUE);</span>
+
+<span class="nc" id="L103">        return new SegmentIterator&lt;&gt;(</span>
+<span class="nc" id="L104">                searchSpace.iterator(),</span>
+<span class="nc" id="L105">                baseKeySchema.hasNextCondition(null, null, actualFrom, Long.MAX_VALUE, false),</span>
+                from,
+                to,
+                false);
+    }
+
+    @Override
+    public void remove(final Bytes rawBaseKey) {
+<span class="nc" id="L113">        final long timestamp = baseKeySchema.segmentTimestamp(rawBaseKey);</span>
+<span class="nc" id="L114">        observedStreamTime = Math.max(observedStreamTime, timestamp);</span>
+<span class="nc" id="L115">        final S segment = segments.segmentForTimestamp(timestamp);</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">        if (segment == null) {</span>
+<span class="nc" id="L117">            return;</span>
+        }
+<span class="nc" id="L119">        segment.delete(rawBaseKey);</span>
+
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (hasIndex()) {</span>
+<span class="nc" id="L122">            final KeyValue&lt;Bytes, byte[]&gt; kv = getIndexKeyValue(rawBaseKey, null);</span>
+<span class="nc" id="L123">            segment.delete(kv.key);</span>
+        }
+<span class="nc" id="L125">    }</span>
+
+    protected abstract KeyValue&lt;Bytes, byte[]&gt; getIndexKeyValue(final Bytes baseKey, final byte[] baseValue);
+
+    // isTimeFirstWindowSchema true implies ON_WINDOW_CLOSE semantics. There's an edge case
+    // when retentionPeriod = grace Period. If we add 1, then actualFrom &gt; to which would
+    // lead to no records being returned.
+    protected long getActualFrom(final long from, final boolean isTimeFirstWindowSchema) {
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        return isTimeFirstWindowSchema ? Math.max(from, observedStreamTime - retentionPeriod) :</span>
+<span class="nc" id="L134">                Math.max(from, observedStreamTime - retentionPeriod + 1);</span>
+
+    }
+
+    // For testing
+    void putIndex(final Bytes indexKey, final byte[] value) {
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (!hasIndex()) {</span>
+<span class="nc" id="L141">            throw new IllegalStateException(&quot;Index store doesn't exist&quot;);</span>
+        }
+
+<span class="nc" id="L144">        final long timestamp = indexKeySchema.get().segmentTimestamp(indexKey);</span>
+<span class="nc" id="L145">        final long segmentId = segments.segmentId(timestamp);</span>
+<span class="nc" id="L146">        final S segment = segments.getOrCreateSegmentIfLive(segmentId, internalProcessorContext, observedStreamTime);</span>
+
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (segment != null) {</span>
+<span class="nc" id="L149">            segment.put(indexKey, value);</span>
+        }
+<span class="nc" id="L151">    }</span>
+
+    byte[] getIndex(final Bytes indexKey) {
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if (!hasIndex()) {</span>
+<span class="nc" id="L155">            throw new IllegalStateException(&quot;Index store doesn't exist&quot;);</span>
+        }
+
+<span class="nc" id="L158">        final long timestamp = indexKeySchema.get().segmentTimestamp(indexKey);</span>
+<span class="nc" id="L159">        final long segmentId = segments.segmentId(timestamp);</span>
+<span class="nc" id="L160">        final S segment = segments.getOrCreateSegmentIfLive(segmentId, internalProcessorContext, observedStreamTime);</span>
+
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        if (segment != null) {</span>
+<span class="nc" id="L163">            return segment.get(indexKey);</span>
+        }
+<span class="nc" id="L165">        return null;</span>
+    }
+
+    void removeIndex(final Bytes indexKey) {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        if (!hasIndex()) {</span>
+<span class="nc" id="L170">            throw new IllegalStateException(&quot;Index store doesn't exist&quot;);</span>
+        }
+
+<span class="nc" id="L173">        final long timestamp = indexKeySchema.get().segmentTimestamp(indexKey);</span>
+<span class="nc" id="L174">        final long segmentId = segments.segmentId(timestamp);</span>
+<span class="nc" id="L175">        final S segment = segments.getOrCreateSegmentIfLive(segmentId, internalProcessorContext, observedStreamTime);</span>
+
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        if (segment != null) {</span>
+<span class="nc" id="L178">            segment.delete(indexKey);</span>
+        }
+<span class="nc" id="L180">    }</span>
+
+    @Override
+    public void put(final Bytes rawBaseKey,
+                    final byte[] value) {
+<span class="nc" id="L185">        final long timestamp = baseKeySchema.segmentTimestamp(rawBaseKey);</span>
+<span class="nc" id="L186">        observedStreamTime = Math.max(observedStreamTime, timestamp);</span>
+<span class="nc" id="L187">        final long segmentId = segments.segmentId(timestamp);</span>
+<span class="nc" id="L188">        final S segment = segments.getOrCreateSegmentIfLive(segmentId, internalProcessorContext, observedStreamTime);</span>
+
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (segment == null) {</span>
+<span class="nc" id="L191">            expiredRecordSensor.record(1.0d, internalProcessorContext.currentSystemTimeMs());</span>
+<span class="nc" id="L192">            LOG.warn(&quot;Skipping record for expired segment.&quot;);</span>
+        } else {
+<span class="nc" id="L194">            synchronized (position) {</span>
+<span class="nc" id="L195">                StoreQueryUtils.updatePosition(position, internalProcessorContext);</span>
+
+                // Put to index first so that if put to base failed, when we iterate index, we will
+                // find no base value. If put to base first but putting to index fails, when we iterate
+                // index, we can't find the key but if we iterate over base store, we can find the key
+                // which lead to inconsistency.
+<span class="nc bnc" id="L201" title="All 2 branches missed.">                if (hasIndex()) {</span>
+<span class="nc" id="L202">                    final KeyValue&lt;Bytes, byte[]&gt; indexKeyValue = getIndexKeyValue(rawBaseKey, value);</span>
+<span class="nc" id="L203">                    segment.put(indexKeyValue.key, indexKeyValue.value);</span>
+                }
+<span class="nc" id="L205">                segment.put(rawBaseKey, value);</span>
+<span class="nc" id="L206">            }</span>
+        }
+<span class="nc" id="L208">    }</span>
+
+    @Override
+    public byte[] get(final Bytes rawKey) {
+<span class="nc" id="L212">        final long timestampFromRawKey = baseKeySchema.segmentTimestamp(rawKey);</span>
+        // check if timestamp is expired
+
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        if (baseKeySchema instanceof PrefixedWindowKeySchemas.TimeFirstWindowKeySchema) {</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">            if (timestampFromRawKey &lt; observedStreamTime - retentionPeriod) {</span>
+<span class="nc" id="L217">                LOG.debug(&quot;Record with key {} is expired as timestamp from key ({}) &lt; actual stream time ({})&quot;,</span>
+<span class="nc" id="L218">                        rawKey.toString(), timestampFromRawKey, observedStreamTime - retentionPeriod);</span>
+<span class="nc" id="L219">                return null;</span>
+            }
+        } else {
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            if (timestampFromRawKey &lt; observedStreamTime - retentionPeriod + 1) {</span>
+<span class="nc" id="L223">                LOG.debug(&quot;Record with key {} is expired as timestamp from key ({}) &lt; actual stream time ({})&quot;,</span>
+<span class="nc" id="L224">                        rawKey.toString(), timestampFromRawKey, observedStreamTime - retentionPeriod + 1);</span>
+<span class="nc" id="L225">                return null;</span>
+            }
+        }
+
+<span class="nc" id="L229">        final S segment = segments.segmentForTimestamp(timestampFromRawKey);</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">        if (segment == null) {</span>
+<span class="nc" id="L231">            return null;</span>
+        }
+<span class="nc" id="L233">        return segment.get(rawKey);</span>
+    }
+
+    @Override
+    public String name() {
+<span class="nc" id="L238">        return name;</span>
+    }
+
+    @Override
+    public void init(final StateStoreContext stateStoreContext, final StateStore root) {
+<span class="nc" id="L243">        this.internalProcessorContext = asInternalProcessorContext(stateStoreContext);</span>
+
+<span class="nc" id="L245">        final StreamsMetricsImpl metrics = ProcessorContextUtils.metricsImpl(stateStoreContext);</span>
+<span class="nc" id="L246">        final String threadId = Thread.currentThread().getName();</span>
+<span class="nc" id="L247">        final String taskName = stateStoreContext.taskId().toString();</span>
+
+<span class="nc" id="L249">        expiredRecordSensor = TaskMetrics.droppedRecordsSensor(</span>
+            threadId,
+            taskName,
+            metrics
+        );
+
+<span class="nc" id="L255">        segments.openExisting(internalProcessorContext, observedStreamTime);</span>
+<span class="nc" id="L256">        this.position = segments.position;</span>
+<span class="nc" id="L257">        StoreQueryUtils.maybeMigrateExistingPositionFile(stateStoreContext.stateDir(), name(), this.position);</span>
+
+        // register and possibly restore the state from the logs
+<span class="nc" id="L260">        stateStoreContext.register(</span>
+            root,
+            (RecordBatchingStateRestoreCallback) this::restoreAllInternal,
+<span class="nc" id="L263">            segments::writePosition</span>
+        );
+
+<span class="nc" id="L266">        open = true;</span>
+
+<span class="nc" id="L268">        consistencyEnabled = StreamsConfig.InternalConfig.getBoolean(</span>
+<span class="nc" id="L269">            stateStoreContext.appConfigs(),</span>
+            IQ_CONSISTENCY_OFFSET_VECTOR_ENABLED,
+            false
+        );
+<span class="nc" id="L273">    }</span>
+
+    @Override
+    public void commit(final Map&lt;TopicPartition, Long&gt; changelogOffsets) {
+<span class="nc" id="L277">        segments.commit(changelogOffsets);</span>
+<span class="nc" id="L278">    }</span>
+
+    @SuppressWarnings(&quot;deprecation&quot;)
+    @Override
+    public boolean managesOffsets() {
+<span class="nc" id="L283">        return segments.managesOffsets();</span>
+    }
+
+    @Override
+    public Long committedOffset(final TopicPartition partition) {
+<span class="nc" id="L288">        return segments.committedOffset(partition);</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L293">        open = false;</span>
+<span class="nc" id="L294">        segments.close();</span>
+<span class="nc" id="L295">    }</span>
+
+    @Override
+    public boolean persistent() {
+<span class="nc" id="L299">        return true;</span>
+    }
+
+    @Override
+    public boolean isOpen() {
+<span class="nc" id="L304">        return open;</span>
+    }
+
+    // Visible for testing
+    List&lt;S&gt; getSegments() {
+<span class="nc" id="L309">        return segments.allSegments(false);</span>
+    }
+
+    // Visible for testing
+    void restoreAllInternal(final Collection&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; records) {
+<span class="nc" id="L314">        synchronized (position) {</span>
+            try {
+<span class="nc" id="L316">                final Map&lt;S, WriteBatch&gt; writeBatchMap = getWriteBatches(records);</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">                for (final Map.Entry&lt;S, WriteBatch&gt; entry : writeBatchMap.entrySet()) {</span>
+<span class="nc" id="L318">                    final S segment = entry.getKey();</span>
+<span class="nc" id="L319">                    final WriteBatch batch = entry.getValue();</span>
+<span class="nc" id="L320">                    segment.write(batch);</span>
+<span class="nc" id="L321">                    batch.close();</span>
+<span class="nc" id="L322">                }</span>
+<span class="nc" id="L323">            } catch (final RocksDBException e) {</span>
+<span class="nc" id="L324">                throw new ProcessorStateException(&quot;Error restoring batch to store &quot; + this.name, e);</span>
+<span class="nc" id="L325">            }</span>
+<span class="nc" id="L326">        }</span>
+<span class="nc" id="L327">    }</span>
+
+    abstract Map&lt;S, WriteBatch&gt; getWriteBatches(final Collection&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; records);
+
+    @Override
+    public Position getPosition() {
+<span class="nc" id="L333">        return position;</span>
+    }
+
+    public boolean hasIndex() {
+<span class="nc" id="L337">        return indexKeySchema.isPresent();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

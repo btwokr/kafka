@@ -1,0 +1,680 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MeteredTimestampedKeyValueStoreWithHeaders.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">MeteredTimestampedKeyValueStoreWithHeaders.java</span></div><h1>MeteredTimestampedKeyValueStoreWithHeaders.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.common.header.Headers;
+import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.common.serialization.Serializer;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.processor.internals.ProcessorRecordContext;
+import org.apache.kafka.streams.processor.internals.SerdeGetter;
+import org.apache.kafka.streams.query.KeyQuery;
+import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.Query;
+import org.apache.kafka.streams.query.QueryConfig;
+import org.apache.kafka.streams.query.QueryResult;
+import org.apache.kafka.streams.query.RangeQuery;
+import org.apache.kafka.streams.query.ResultOrder;
+import org.apache.kafka.streams.query.TimestampedKeyQuery;
+import org.apache.kafka.streams.query.TimestampedRangeQuery;
+import org.apache.kafka.streams.query.internals.InternalQueryResultUtil;
+import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.KeyValueStore;
+import org.apache.kafka.streams.state.TimestampedKeyValueStoreWithHeaders;
+import org.apache.kafka.streams.state.ValueAndTimestamp;
+import org.apache.kafka.streams.state.ValueTimestampHeaders;
+import org.apache.kafka.streams.state.internals.StoreQueryUtils.QueryHandler;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.Function;
+
+import static org.apache.kafka.common.utils.Utils.mkEntry;
+import static org.apache.kafka.common.utils.Utils.mkMap;
+import static org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl.maybeMeasureLatency;
+
+
+/**
+ * A Metered {@link TimestampedKeyValueStoreWithHeaders} wrapper that is used for recording operation metrics, and hence
+ * its inner KeyValueStore implementation does not need to provide its own metrics collecting functionality.
+ *
+ * &lt;p&gt; The inner {@link KeyValueStore} of this class is of type &amp;lt;Bytes, byte[]&amp;gt;,
+ * hence we use {@link Serde}s to convert from &amp;lt;K, ValueTimestampHeaders&amp;lt;V&amp;gt;&amp;gt; to &amp;lt;Bytes, byte[]&amp;gt;.
+ *
+ * @param &lt;K&gt; key type
+ * @param &lt;V&gt; value type (wrapped in {@link ValueTimestampHeaders})
+ */
+public class MeteredTimestampedKeyValueStoreWithHeaders&lt;K, V&gt;
+    extends MeteredKeyValueStore&lt;K, ValueTimestampHeaders&lt;V&gt;&gt;
+    implements TimestampedKeyValueStoreWithHeaders&lt;K, V&gt; {
+
+    MeteredTimestampedKeyValueStoreWithHeaders(
+        final KeyValueStore&lt;Bytes, byte[]&gt; inner,
+        final String metricScope,
+        final Time time,
+        final Serde&lt;K&gt; keySerde,
+        final Serde&lt;ValueTimestampHeaders&lt;V&gt;&gt; valueSerde
+    ) {
+<span class="nc" id="L79">        super(inner, metricScope, time, keySerde, valueSerde);</span>
+<span class="nc" id="L80">    }</span>
+
+<span class="nc" id="L82">    private final Map&lt;Class&lt;?&gt;, QueryHandler&lt;?&gt;&gt; queryHandlers =</span>
+<span class="nc" id="L83">        mkMap(</span>
+<span class="nc" id="L84">            mkEntry(</span>
+                KeyQuery.class,
+<span class="nc" id="L86">                (query, positionBound, config, store) -&gt; runKeyQuery(query, positionBound, config)</span>
+            ),
+<span class="nc" id="L88">            mkEntry(</span>
+                TimestampedKeyQuery.class,
+<span class="nc" id="L90">                (query, positionBound, config, store) -&gt; runTimestampedKeyQuery(query, positionBound, config)</span>
+            ),
+<span class="nc" id="L92">            mkEntry(</span>
+                RangeQuery.class,
+<span class="nc" id="L94">                (query, positionBound, config, store) -&gt; runRangeQuery(query, positionBound, config)</span>
+            ),
+<span class="nc" id="L96">            mkEntry(</span>
+                TimestampedRangeQuery.class,
+<span class="nc" id="L98">                (query, positionBound, config, store) -&gt; runTimestampedRangeQuery(query, positionBound, config)</span>
+            )
+        );
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    protected Serde&lt;ValueTimestampHeaders&lt;V&gt;&gt; prepareValueSerdeForStore(final Serde&lt;ValueTimestampHeaders&lt;V&gt;&gt; valueSerde,
+                                                                        final SerdeGetter getter) {
+<span class="nc bnc" id="L106" title="All 2 branches missed.">        if (valueSerde == null) {</span>
+<span class="nc" id="L107">            return new ValueTimestampHeadersSerde&lt;&gt;((Serde&lt;V&gt;) getter.valueSerde());</span>
+        } else {
+<span class="nc" id="L109">            return super.prepareValueSerdeForStore(valueSerde, getter);</span>
+        }
+    }
+
+    @Override
+    public ValueTimestampHeaders&lt;V&gt; get(final K key) {
+<span class="nc" id="L115">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+        try {
+<span class="nc" id="L117">            return maybeMeasureLatency(() -&gt; deserializeValue(wrapped().get(serializeKey(key, internalContext.headers()))), time, getSensor);</span>
+<span class="nc" id="L118">        } catch (final ProcessorStateException e) {</span>
+<span class="nc" id="L119">            final String message = String.format(e.getMessage(), key);</span>
+<span class="nc" id="L120">            throw new ProcessorStateException(message, e);</span>
+        }
+    }
+
+    @Override
+    public void put(final K key,
+                    final ValueTimestampHeaders&lt;V&gt; value) {
+<span class="nc" id="L127">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+        try {
+<span class="nc" id="L129">            maybeMeasureLatency(</span>
+                () -&gt; {
+<span class="nc bnc" id="L131" title="All 2 branches missed.">                    if (value == null) {</span>
+<span class="nc" id="L132">                        final ProcessorRecordContext currentContext = internalContext.recordContext();</span>
+
+                        // Create new headers object to isolate tombstone operation from input record
+<span class="nc" id="L135">                        final Headers tombstoneHeaders = new RecordHeaders(currentContext.headers());</span>
+
+                        // Create temporary context with new headers
+<span class="nc" id="L138">                        final ProcessorRecordContext temporaryContext = new ProcessorRecordContext(</span>
+<span class="nc" id="L139">                            currentContext.timestamp(),</span>
+<span class="nc" id="L140">                            currentContext.offset(),</span>
+<span class="nc" id="L141">                            currentContext.partition(),</span>
+<span class="nc" id="L142">                            currentContext.topic(),</span>
+                            tombstoneHeaders
+                        );
+
+                        try {
+<span class="nc" id="L147">                            internalContext.setRecordContext(temporaryContext);</span>
+<span class="nc" id="L148">                            wrapped().put(serializeKey(key, tombstoneHeaders), serializeValue(null));</span>
+                        } finally {
+                            // Restore original context
+<span class="nc" id="L151">                            internalContext.setRecordContext(currentContext);</span>
+                        }
+<span class="nc" id="L153">                    } else {</span>
+                        // it's ok to only pass headers into `serializeKey`, because for the value case passed-in headers are
+                        // getting ignored anyway, because the value (of type `ValueTimestampHeaders`) itself carries the headers
+<span class="nc" id="L156">                        final Headers headers = value.headers();</span>
+<span class="nc" id="L157">                        wrapped().put(serializeKey(key, headers), serializeValue(value));</span>
+                    }
+<span class="nc" id="L159">                },</span>
+                time,
+                putSensor
+            );
+<span class="nc" id="L163">            maybeRecordE2ELatency();</span>
+<span class="nc" id="L164">        } catch (final ProcessorStateException e) {</span>
+<span class="nc" id="L165">            final String message = String.format(e.getMessage(), key, value);</span>
+<span class="nc" id="L166">            throw new ProcessorStateException(message, e);</span>
+<span class="nc" id="L167">        }</span>
+<span class="nc" id="L168">    }</span>
+
+    @Override
+    public ValueTimestampHeaders&lt;V&gt; putIfAbsent(final K key,
+                                                final ValueTimestampHeaders&lt;V&gt; value) {
+<span class="nc" id="L173">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L174">        final ValueTimestampHeaders&lt;V&gt; currentValue = maybeMeasureLatency(</span>
+            () -&gt; {
+<span class="nc bnc" id="L176" title="All 2 branches missed.">                if (value == null) {</span>
+<span class="nc" id="L177">                    final ProcessorRecordContext currentContext = internalContext.recordContext();</span>
+
+                    // Create new headers object to isolate tombstone operation from input record
+<span class="nc" id="L180">                    final Headers tombstoneHeaders = new RecordHeaders(currentContext.headers());</span>
+
+                    // Create temporary context with new headers
+<span class="nc" id="L183">                    final ProcessorRecordContext temporaryContext = new ProcessorRecordContext(</span>
+<span class="nc" id="L184">                        currentContext.timestamp(),</span>
+<span class="nc" id="L185">                        currentContext.offset(),</span>
+<span class="nc" id="L186">                        currentContext.partition(),</span>
+<span class="nc" id="L187">                        currentContext.topic(),</span>
+                        tombstoneHeaders
+                    );
+
+                    try {
+<span class="nc" id="L192">                        internalContext.setRecordContext(temporaryContext);</span>
+<span class="nc" id="L193">                        return deserializeValue(wrapped().putIfAbsent(serializeKey(key, tombstoneHeaders), serializeValue(null)));</span>
+                    } finally {
+                        // Restore original context
+<span class="nc" id="L196">                        internalContext.setRecordContext(currentContext);</span>
+                    }
+                } else {
+                    // it's ok to only pass headers into `serializeKey`, because for the value case passed-in headers are
+                    // getting ignored anyway, because the value (of type `ValueTimestampHeaders`) itself carries the headers
+<span class="nc" id="L201">                    final Headers headers = value.headers();</span>
+                    // `rawOldValue` returned from `wrapped().putIfAbsent(...)` is type ValueTimestampHeader
+                    // -&gt; no need to pass in Headers into `deserializeValue()`
+<span class="nc" id="L204">                    return deserializeValue(wrapped().putIfAbsent(serializeKey(key, headers), serializeValue(value)));</span>
+                }
+            },
+            time,
+            putIfAbsentSensor
+        );
+<span class="nc" id="L210">        maybeRecordE2ELatency();</span>
+<span class="nc" id="L211">        return currentValue;</span>
+    }
+
+    @Override
+    public void putAll(final List&lt;KeyValue&lt;K, ValueTimestampHeaders&lt;V&gt;&gt;&gt; entries) {
+<span class="nc" id="L216">        entries.forEach(entry -&gt; Objects.requireNonNull(entry.key, &quot;key cannot be null&quot;));</span>
+
+<span class="nc bnc" id="L218" title="All 2 branches missed.">        final boolean hasNullValue = entries.stream().anyMatch(entry -&gt; entry.value == null);</span>
+
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        if (hasNullValue) {</span>
+<span class="nc" id="L221">            entries.forEach(entry -&gt; put(entry.key, entry.value));</span>
+        } else {
+<span class="nc" id="L223">            maybeMeasureLatency(() -&gt; wrapped().putAll(innerEntries(entries)), time, putAllSensor);</span>
+        }
+<span class="nc" id="L225">    }</span>
+
+    private List&lt;KeyValue&lt;Bytes, byte[]&gt;&gt; innerEntries(final List&lt;KeyValue&lt;K, ValueTimestampHeaders&lt;V&gt;&gt;&gt; from) {
+<span class="nc" id="L228">        final List&lt;KeyValue&lt;Bytes, byte[]&gt;&gt; byteEntries = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        for (final KeyValue&lt;K, ValueTimestampHeaders&lt;V&gt;&gt; entry : from) {</span>
+            // it's ok to only pass headers into `serializeKey`, because for the value case passed-in headers are
+            // getting ignored anyway, because the value (of type `ValueTimestampHeaders`) itself carries the headers
+<span class="nc bnc" id="L232" title="All 2 branches missed.">            final Headers headers = entry.value != null ? entry.value.headers() : internalContext.headers();</span>
+<span class="nc" id="L233">            byteEntries.add(KeyValue.pair(serializeKey(entry.key, headers), serializeValue(entry.value)));</span>
+<span class="nc" id="L234">        }</span>
+<span class="nc" id="L235">        return byteEntries;</span>
+    }
+
+    @Override
+    public ValueTimestampHeaders&lt;V&gt; delete(final K key) {
+<span class="nc" id="L240">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+        try {
+<span class="nc" id="L242">            return maybeMeasureLatency(</span>
+                () -&gt; {
+<span class="nc" id="L244">                    final ProcessorRecordContext currentContext = internalContext.recordContext();</span>
+
+                    // Create new headers object to isolate delete operation from input record
+<span class="nc" id="L247">                    final Headers tombstoneHeaders = new RecordHeaders(currentContext.headers());</span>
+
+                    // Create temporary context with new headers
+<span class="nc" id="L250">                    final ProcessorRecordContext temporaryContext = new ProcessorRecordContext(</span>
+<span class="nc" id="L251">                        currentContext.timestamp(),</span>
+<span class="nc" id="L252">                        currentContext.offset(),</span>
+<span class="nc" id="L253">                        currentContext.partition(),</span>
+<span class="nc" id="L254">                        currentContext.topic(),</span>
+                        tombstoneHeaders
+                    );
+
+                    try {
+<span class="nc" id="L259">                        internalContext.setRecordContext(temporaryContext);</span>
+<span class="nc" id="L260">                        final byte[] deletedValue = wrapped().delete(serializeKey(key, tombstoneHeaders));</span>
+<span class="nc" id="L261">                        return deserializeValue(deletedValue);</span>
+                    } finally {
+                        // Restore original context
+<span class="nc" id="L264">                        internalContext.setRecordContext(currentContext);</span>
+                    }
+                },
+                time,
+                deleteSensor
+            );
+<span class="nc" id="L270">        } catch (final ProcessorStateException e) {</span>
+<span class="nc" id="L271">            final String message = String.format(e.getMessage(), key);</span>
+<span class="nc" id="L272">            throw new ProcessorStateException(message, e);</span>
+        }
+    }
+
+    /**
+     * Executes a query against this store.
+     *
+     * &lt;p&gt;Note: Query results do NOT include headers, even though headers are
+     * preserved in the underlying store. This behavior provides compatibility
+     * with existing IQv2 APIs that operate on timestamped stores.
+     *
+     * @param query the query to execute
+     * @param positionBound the position bound
+     * @param config the query configuration
+     * @return the query result
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    public &lt;R&gt; QueryResult&lt;R&gt; query(
+        final Query&lt;R&gt; query,
+        final PositionBound positionBound,
+        final QueryConfig config
+    ) {
+<span class="nc" id="L295">        final long start = time.nanoseconds();</span>
+        final QueryResult&lt;R&gt; result;
+
+<span class="nc" id="L298">        final QueryHandler&lt;?&gt; handler = queryHandlers.get(query.getClass());</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        if (handler == null) {</span>
+<span class="nc" id="L300">            result = wrapped().query(query, positionBound, config);</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            if (config.isCollectExecutionInfo()) {</span>
+<span class="nc" id="L302">                result.addExecutionInfo(&quot;Handled in &quot; + getClass() + &quot; in &quot; + (time.nanoseconds() - start) + &quot;ns&quot;);</span>
+            }
+        } else {
+<span class="nc" id="L305">            result = ((QueryHandler&lt;R&gt;) handler).apply(</span>
+                query,
+                positionBound,
+                config,
+                this
+            );
+<span class="nc bnc" id="L311" title="All 2 branches missed.">            if (config.isCollectExecutionInfo()) {</span>
+<span class="nc" id="L312">                result.addExecutionInfo(&quot;Handled in &quot; + getClass() + &quot; with serdes &quot; + serdes + &quot; in &quot; + (time.nanoseconds() - start) + &quot;ns&quot;);</span>
+            }
+        }
+<span class="nc" id="L315">        return result;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;R&gt; QueryResult&lt;R&gt; runKeyQuery(
+        final Query&lt;R&gt; query,
+        final PositionBound positionBound,
+        final QueryConfig config
+    ) {
+        final QueryResult&lt;R&gt; result;
+<span class="nc" id="L325">        final KeyQuery&lt;K, V&gt; typedKeyQuery = (KeyQuery&lt;K, V&gt;) query;</span>
+
+<span class="nc" id="L327">        final KeyQuery&lt;Bytes, byte[]&gt; rawKeyQuery = KeyQuery.withKey(serializeKey(typedKeyQuery.getKey(), internalContext.headers()));</span>
+<span class="nc" id="L328">        final QueryResult&lt;byte[]&gt; rawResult = wrapped().query(rawKeyQuery, positionBound, config);</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">        if (rawResult.isSuccess()) {</span>
+            // value will be `rawValueTimestampHeader`; no need to pass headers explicitly
+<span class="nc" id="L331">            final Function&lt;byte[], ValueTimestampHeaders&lt;V&gt;&gt; deserializer = StoreQueryUtils.deserializeValue(serdes, wrapped());</span>
+<span class="nc" id="L332">            final ValueTimestampHeaders&lt;V&gt; valueTimestampHeaders = deserializer.apply(rawResult.getResult());</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">            final V plainValue = valueTimestampHeaders == null ? null : valueTimestampHeaders.value();</span>
+<span class="nc" id="L334">            final QueryResult&lt;V&gt; typedQueryResult =</span>
+<span class="nc" id="L335">                InternalQueryResultUtil.copyAndSubstituteDeserializedResult(rawResult, plainValue);</span>
+<span class="nc" id="L336">            result = (QueryResult&lt;R&gt;) typedQueryResult;</span>
+<span class="nc" id="L337">        } else {</span>
+            // the generic type doesn't matter, since failed queries have no result set.
+<span class="nc" id="L339">            result = (QueryResult&lt;R&gt;) rawResult;</span>
+        }
+<span class="nc" id="L341">        return result;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;R&gt; QueryResult&lt;R&gt; runTimestampedKeyQuery(
+        final Query&lt;R&gt; query,
+        final PositionBound positionBound,
+        final QueryConfig config
+    ) {
+        final QueryResult&lt;R&gt; result;
+<span class="nc" id="L351">        final TimestampedKeyQuery&lt;K, V&gt; typedKeyQuery = (TimestampedKeyQuery&lt;K, V&gt;) query;</span>
+
+<span class="nc" id="L353">        final KeyQuery&lt;Bytes, byte[]&gt; rawKeyQuery = KeyQuery.withKey(serializeKey(typedKeyQuery.key(), internalContext.headers()));</span>
+<span class="nc" id="L354">        final QueryResult&lt;byte[]&gt; rawResult = wrapped().query(rawKeyQuery, positionBound, config);</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">        if (rawResult.isSuccess()) {</span>
+            // value will be `rawValueTimestampHeader`; no need to pass headers explicitly
+<span class="nc" id="L357">            final Function&lt;byte[], ValueTimestampHeaders&lt;V&gt;&gt; deserializer = StoreQueryUtils.deserializeValue(serdes, wrapped());</span>
+<span class="nc" id="L358">            final ValueTimestampHeaders&lt;V&gt; valueTimestampHeaders = deserializer.apply(rawResult.getResult());</span>
+            // Convert ValueTimestampHeaders to ValueAndTimestamp for the result
+            final ValueAndTimestamp&lt;V&gt; valueAndTimestamp =
+<span class="nc bnc" id="L361" title="All 2 branches missed.">                valueTimestampHeaders == null</span>
+<span class="nc" id="L362">                    ? null</span>
+<span class="nc" id="L363">                    : ValueAndTimestamp.make(valueTimestampHeaders.value(), valueTimestampHeaders.timestamp());</span>
+<span class="nc" id="L364">            final QueryResult&lt;ValueAndTimestamp&lt;V&gt;&gt; typedQueryResult =</span>
+<span class="nc" id="L365">                InternalQueryResultUtil.copyAndSubstituteDeserializedResult(rawResult, valueAndTimestamp);</span>
+<span class="nc" id="L366">            result = (QueryResult&lt;R&gt;) typedQueryResult;</span>
+<span class="nc" id="L367">        } else {</span>
+            // the generic type doesn't matter, since failed queries have no result set.
+<span class="nc" id="L369">            result = (QueryResult&lt;R&gt;) rawResult;</span>
+        }
+<span class="nc" id="L371">        return result;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;R&gt; QueryResult&lt;R&gt; runRangeQuery(
+        final Query&lt;R&gt; query,
+        final PositionBound positionBound,
+        final QueryConfig config
+    ) {
+        final QueryResult&lt;R&gt; result;
+<span class="nc" id="L381">        final RangeQuery&lt;K, V&gt; typedQuery = (RangeQuery&lt;K, V&gt;) query;</span>
+
+        RangeQuery&lt;Bytes, byte[]&gt; rawRangeQuery;
+<span class="nc" id="L384">        final ResultOrder order = typedQuery.resultOrder();</span>
+<span class="nc" id="L385">        rawRangeQuery = RangeQuery.withRange(</span>
+<span class="nc" id="L386">            serializeKey(typedQuery.getLowerBound().orElse(null), internalContext.headers()),</span>
+<span class="nc" id="L387">            serializeKey(typedQuery.getUpperBound().orElse(null), internalContext.headers())</span>
+        );
+<span class="nc bnc" id="L389" title="All 2 branches missed.">        if (order.equals(ResultOrder.DESCENDING)) {</span>
+<span class="nc" id="L390">            rawRangeQuery = rawRangeQuery.withDescendingKeys();</span>
+        }
+<span class="nc bnc" id="L392" title="All 2 branches missed.">        if (order.equals(ResultOrder.ASCENDING)) {</span>
+<span class="nc" id="L393">            rawRangeQuery = rawRangeQuery.withAscendingKeys();</span>
+        }
+
+<span class="nc" id="L396">        final QueryResult&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; rawResult = wrapped().query(rawRangeQuery, positionBound, config);</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">        if (rawResult.isSuccess()) {</span>
+<span class="nc" id="L398">            final KeyValueIterator&lt;Bytes, byte[]&gt; iterator = rawResult.getResult();</span>
+<span class="nc" id="L399">            final KeyValueIterator&lt;K, V&gt; resultIterator = new MeteredTimestampedKeyValueStoreWithHeadersQueryIterator(</span>
+                iterator,
+                getSensor,
+                // value will be `rawValueTimestampHeader`; no need to pass headers explicitly
+<span class="nc" id="L403">                StoreQueryUtils.deserializeValue(serdes, wrapped()),</span>
+                true
+            );
+<span class="nc" id="L406">            final QueryResult&lt;KeyValueIterator&lt;K, V&gt;&gt; typedQueryResult =</span>
+<span class="nc" id="L407">                InternalQueryResultUtil.copyAndSubstituteDeserializedResult(</span>
+                    rawResult,
+                    resultIterator
+                );
+<span class="nc" id="L411">            result = (QueryResult&lt;R&gt;) typedQueryResult;</span>
+<span class="nc" id="L412">        } else {</span>
+            // the generic type doesn't matter, since failed queries have no result set.
+<span class="nc" id="L414">            result = (QueryResult&lt;R&gt;) rawResult;</span>
+        }
+<span class="nc" id="L416">        return result;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;R&gt; QueryResult&lt;R&gt; runTimestampedRangeQuery(
+        final Query&lt;R&gt; query,
+        final PositionBound positionBound,
+        final QueryConfig config
+    ) {
+        final QueryResult&lt;R&gt; result;
+<span class="nc" id="L426">        final TimestampedRangeQuery&lt;K, V&gt; typedQuery = (TimestampedRangeQuery&lt;K, V&gt;) query;</span>
+
+        RangeQuery&lt;Bytes, byte[]&gt; rawRangeQuery;
+<span class="nc" id="L429">        final ResultOrder order = typedQuery.resultOrder();</span>
+<span class="nc" id="L430">        rawRangeQuery = RangeQuery.withRange(</span>
+<span class="nc" id="L431">            serializeKey(typedQuery.lowerBound().orElse(null), internalContext.headers()),</span>
+<span class="nc" id="L432">            serializeKey(typedQuery.upperBound().orElse(null), internalContext.headers())</span>
+        );
+<span class="nc bnc" id="L434" title="All 2 branches missed.">        if (order.equals(ResultOrder.DESCENDING)) {</span>
+<span class="nc" id="L435">            rawRangeQuery = rawRangeQuery.withDescendingKeys();</span>
+        }
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        if (order.equals(ResultOrder.ASCENDING)) {</span>
+<span class="nc" id="L438">            rawRangeQuery = rawRangeQuery.withAscendingKeys();</span>
+        }
+
+<span class="nc" id="L441">        final QueryResult&lt;KeyValueIterator&lt;Bytes, byte[]&gt;&gt; rawResult = wrapped().query(rawRangeQuery, positionBound, config);</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">        if (rawResult.isSuccess()) {</span>
+<span class="nc" id="L443">            final KeyValueIterator&lt;Bytes, byte[]&gt; iterator = rawResult.getResult();</span>
+<span class="nc" id="L444">            final KeyValueIterator&lt;K, ValueAndTimestamp&lt;V&gt;&gt; resultIterator =</span>
+                (KeyValueIterator&lt;K, ValueAndTimestamp&lt;V&gt;&gt;) new MeteredTimestampedKeyValueStoreWithHeadersQueryIterator(
+                    iterator,
+                    getSensor,
+                    // value will be `rawValueTimestampHeader`; no need to pass headers explicitly
+<span class="nc" id="L449">                    StoreQueryUtils.deserializeValue(serdes, wrapped()),</span>
+                    false
+                );
+<span class="nc" id="L452">            final QueryResult&lt;KeyValueIterator&lt;K, ValueAndTimestamp&lt;V&gt;&gt;&gt; typedQueryResult =</span>
+<span class="nc" id="L453">                InternalQueryResultUtil.copyAndSubstituteDeserializedResult(</span>
+                    rawResult,
+                    resultIterator
+                );
+<span class="nc" id="L457">            result = (QueryResult&lt;R&gt;) typedQueryResult;</span>
+<span class="nc" id="L458">        } else {</span>
+            // the generic type doesn't matter, since failed queries have no result set.
+<span class="nc" id="L460">            result = (QueryResult&lt;R&gt;) rawResult;</span>
+        }
+<span class="nc" id="L462">        return result;</span>
+    }
+
+    @Override
+    public &lt;PS extends Serializer&lt;P&gt;, P&gt; KeyValueIterator&lt;K, ValueTimestampHeaders&lt;V&gt;&gt; prefixScan(final P prefix,
+                                                                                                  final PS prefixKeySerializer) {
+<span class="nc" id="L468">        Objects.requireNonNull(prefix, &quot;prefix cannot be null&quot;);</span>
+<span class="nc" id="L469">        Objects.requireNonNull(prefixKeySerializer, &quot;prefixKeySerializer cannot be null&quot;);</span>
+<span class="nc" id="L470">        return new MeteredTimestampedKeyValueStoreWithHeadersIterator(</span>
+<span class="nc" id="L471">            wrapped().prefixScan(prefix, prefixKeySerializer),</span>
+            prefixScanSensor
+        );
+    }
+
+    @Override
+    public KeyValueIterator&lt;K, ValueTimestampHeaders&lt;V&gt;&gt; range(final K from,
+                                                               final K to) {
+<span class="nc" id="L479">        return new MeteredTimestampedKeyValueStoreWithHeadersIterator(</span>
+<span class="nc" id="L480">            wrapped().range(</span>
+<span class="nc" id="L481">                serializeKey(from, internalContext.headers()),</span>
+<span class="nc" id="L482">                serializeKey(to, internalContext.headers())</span>
+            ),
+            rangeSensor
+        );
+    }
+
+    @Override
+    public KeyValueIterator&lt;K, ValueTimestampHeaders&lt;V&gt;&gt; reverseRange(final K from,
+                                                                      final K to) {
+<span class="nc" id="L491">        return new MeteredTimestampedKeyValueStoreWithHeadersIterator(</span>
+<span class="nc" id="L492">            wrapped().reverseRange(</span>
+<span class="nc" id="L493">                serializeKey(from, internalContext.headers()),</span>
+<span class="nc" id="L494">                serializeKey(to, internalContext.headers())</span>
+            ),
+            rangeSensor
+        );
+    }
+
+    @Override
+    public KeyValueIterator&lt;K, ValueTimestampHeaders&lt;V&gt;&gt; all() {
+<span class="nc" id="L502">        return new MeteredTimestampedKeyValueStoreWithHeadersIterator(</span>
+<span class="nc" id="L503">            wrapped().all(),</span>
+            allSensor
+        );
+    }
+
+    @Override
+    public KeyValueIterator&lt;K, ValueTimestampHeaders&lt;V&gt;&gt; reverseAll() {
+<span class="nc" id="L510">        return new MeteredTimestampedKeyValueStoreWithHeadersIterator(</span>
+<span class="nc" id="L511">            wrapped().reverseAll(),</span>
+            allSensor
+        );
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private class MeteredTimestampedKeyValueStoreWithHeadersQueryIterator implements KeyValueIterator&lt;K, V&gt;, MeteredIterator {
+
+        private final KeyValueIterator&lt;Bytes, byte[]&gt; iter;
+        private final Sensor sensor;
+        private final long startNs;
+        private final long startTimestampMs;
+        private final Function&lt;byte[], ValueTimestampHeaders&lt;V&gt;&gt; valueTimestampHeadersDeserializer;
+
+        private final boolean returnPlainValue;
+        private KeyValue&lt;K, V&gt; cachedNext;
+
+        private MeteredTimestampedKeyValueStoreWithHeadersQueryIterator(
+            final KeyValueIterator&lt;Bytes, byte[]&gt; iter,
+            final Sensor sensor,
+            final Function&lt;byte[], ValueTimestampHeaders&lt;V&gt;&gt; valueTimestampHeadersDeserializer,
+            final boolean returnPlainValue
+<span class="nc" id="L533">        ) {</span>
+<span class="nc" id="L534">            this.iter = iter;</span>
+<span class="nc" id="L535">            this.sensor = sensor;</span>
+<span class="nc" id="L536">            this.valueTimestampHeadersDeserializer = valueTimestampHeadersDeserializer;</span>
+<span class="nc" id="L537">            this.startNs = time.nanoseconds();</span>
+<span class="nc" id="L538">            this.startTimestampMs = time.milliseconds();</span>
+<span class="nc" id="L539">            this.returnPlainValue = returnPlainValue;</span>
+<span class="nc" id="L540">            openIterators.add(this);</span>
+<span class="nc" id="L541">        }</span>
+
+        @Override
+        public long startTimestamp() {
+<span class="nc" id="L545">            return startTimestampMs;</span>
+        }
+
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L550" title="All 4 branches missed.">            return cachedNext != null || iter.hasNext();</span>
+        }
+
+        @Override
+        public KeyValue&lt;K, V&gt; next() {
+<span class="nc bnc" id="L555" title="All 2 branches missed.">            if (cachedNext != null) {</span>
+<span class="nc" id="L556">                final KeyValue&lt;K, V&gt; result = cachedNext;</span>
+<span class="nc" id="L557">                cachedNext = null;</span>
+<span class="nc" id="L558">                return result;</span>
+            }
+
+<span class="nc" id="L561">            final KeyValue&lt;Bytes, byte[]&gt; keyValue = iter.next();</span>
+<span class="nc" id="L562">            final ValueTimestampHeaders&lt;V&gt; valueTimestampHeaders = valueTimestampHeadersDeserializer.apply(keyValue.value);</span>
+<span class="nc" id="L563">            final Headers headers = valueTimestampHeaders.headers();</span>
+
+<span class="nc bnc" id="L565" title="All 2 branches missed.">            if (returnPlainValue) {</span>
+<span class="nc" id="L566">                return KeyValue.pair(deserializeKey(keyValue.key.get(), headers), valueTimestampHeaders.value());</span>
+            } else {
+                // Return as ValueAndTimestamp
+<span class="nc" id="L569">                return KeyValue.pair(</span>
+<span class="nc" id="L570">                    deserializeKey(keyValue.key.get(), headers),</span>
+<span class="nc" id="L571">                    (V) ValueAndTimestamp.make(valueTimestampHeaders.value(), valueTimestampHeaders.timestamp())</span>
+                );
+            }
+        }
+
+        @Override
+        public void close() {
+            try {
+<span class="nc" id="L579">                iter.close();</span>
+            } finally {
+<span class="nc" id="L581">                final long duration = time.nanoseconds() - startNs;</span>
+<span class="nc" id="L582">                sensor.record(duration);</span>
+<span class="nc" id="L583">                iteratorDurationSensor.record(duration);</span>
+<span class="nc" id="L584">                openIterators.remove(this);</span>
+            }
+<span class="nc" id="L586">        }</span>
+
+        @Override
+        public K peekNextKey() {
+<span class="nc bnc" id="L590" title="All 2 branches missed.">            if (cachedNext == null) {</span>
+<span class="nc" id="L591">                cachedNext = next();</span>
+            }
+<span class="nc" id="L593">            return cachedNext.key;</span>
+        }
+    }
+
+    private class MeteredTimestampedKeyValueStoreWithHeadersIterator implements KeyValueIterator&lt;K, ValueTimestampHeaders&lt;V&gt;&gt;, MeteredIterator {
+        private final KeyValueIterator&lt;Bytes, byte[]&gt; iter;
+        private final Sensor sensor;
+        private final long startNs;
+        private final long startTimestampMs;
+        private KeyValue&lt;K, ValueTimestampHeaders&lt;V&gt;&gt; cachedNext;
+
+        private MeteredTimestampedKeyValueStoreWithHeadersIterator(
+            final KeyValueIterator&lt;Bytes, byte[]&gt; iter,
+            final Sensor sensor
+<span class="nc" id="L607">        ) {</span>
+<span class="nc" id="L608">            this.iter = iter;</span>
+<span class="nc" id="L609">            this.sensor = sensor;</span>
+<span class="nc" id="L610">            this.startNs = time.nanoseconds();</span>
+<span class="nc" id="L611">            this.startTimestampMs = time.milliseconds();</span>
+<span class="nc" id="L612">            numOpenIterators.increment();</span>
+<span class="nc" id="L613">            openIterators.add(this);</span>
+<span class="nc" id="L614">        }</span>
+
+        @Override
+        public long startTimestamp() {
+<span class="nc" id="L618">            return startTimestampMs;</span>
+        }
+
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L623" title="All 4 branches missed.">            return cachedNext != null || iter.hasNext();</span>
+        }
+
+        @Override
+        public KeyValue&lt;K, ValueTimestampHeaders&lt;V&gt;&gt; next() {
+<span class="nc bnc" id="L628" title="All 2 branches missed.">            if (cachedNext != null) {</span>
+<span class="nc" id="L629">                final KeyValue&lt;K, ValueTimestampHeaders&lt;V&gt;&gt; result = cachedNext;</span>
+<span class="nc" id="L630">                cachedNext = null;</span>
+<span class="nc" id="L631">                return result;</span>
+            }
+
+<span class="nc" id="L634">            final KeyValue&lt;Bytes, byte[]&gt; keyValue = iter.next();</span>
+<span class="nc" id="L635">            final ValueTimestampHeaders&lt;V&gt; valueTimestampHeaders = deserializeValue(keyValue.value);</span>
+<span class="nc" id="L636">            final K key = deserializeKey(keyValue.key.get(), valueTimestampHeaders.headers());</span>
+<span class="nc" id="L637">            return KeyValue.pair(key, valueTimestampHeaders);</span>
+        }
+
+        @Override
+        public void close() {
+            try {
+<span class="nc" id="L643">                iter.close();</span>
+            } finally {
+<span class="nc" id="L645">                final long duration = time.nanoseconds() - startNs;</span>
+<span class="nc" id="L646">                sensor.record(duration);</span>
+<span class="nc" id="L647">                iteratorDurationSensor.record(duration);</span>
+<span class="nc" id="L648">                numOpenIterators.decrement();</span>
+<span class="nc" id="L649">                openIterators.remove(this);</span>
+            }
+<span class="nc" id="L651">        }</span>
+
+        @Override
+        public K peekNextKey() {
+<span class="nc bnc" id="L655" title="All 2 branches missed.">            if (cachedNext == null) {</span>
+<span class="nc" id="L656">                cachedNext = next();</span>
+            }
+<span class="nc" id="L658">            return cachedNext.key;</span>
+        }
+    }
+
+    @Override
+    protected Bytes serializeKey(final K key) {
+<span class="nc" id="L664">        throw new UnsupportedOperationException(&quot;MeteredTimestampedKeyValueStoreWithHeaders required to pass in Headers when serializing a key.&quot;);</span>
+    }
+
+    private Bytes serializeKey(final K key, final Headers headers) {
+<span class="nc" id="L668">        return Bytes.wrap(serdes.rawKey(key, headers));</span>
+    }
+
+    @Override
+    protected K deserializeKey(final byte[] rawKey) {
+<span class="nc" id="L673">        throw new UnsupportedOperationException(&quot;MeteredTimestampedKeyValueStoreWithHeaders required to pass in Headers when deserializing a key.&quot;);</span>
+    }
+
+    private K deserializeKey(final byte[] rawKey, final Headers headers) {
+<span class="nc" id="L677">        return serdes.keyFrom(rawKey, headers);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

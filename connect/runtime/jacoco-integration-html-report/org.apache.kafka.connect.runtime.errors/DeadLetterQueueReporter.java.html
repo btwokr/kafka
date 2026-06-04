@@ -1,0 +1,217 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DeadLetterQueueReporter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.errors</a> &gt; <span class="el_source">DeadLetterQueueReporter.java</span></div><h1>DeadLetterQueueReporter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime.errors;
+
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.errors.TopicExistsException;
+import org.apache.kafka.common.header.Headers;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.runtime.SinkConnectorConfig;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+
+/**
+ * Write the original consumed record into a dead letter queue. The dead letter queue is a Kafka topic located
+ * on the same cluster used by the worker to maintain internal topics. Each connector is typically configured
+ * with its own Kafka topic dead letter queue. By default, the topic name is not set, and if the
+ * connector config doesn't specify one, this feature is disabled.
+ */
+public class DeadLetterQueueReporter implements ErrorReporter&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; {
+
+<span class="nc" id="L54">    private static final Logger log = LoggerFactory.getLogger(DeadLetterQueueReporter.class);</span>
+
+    private static final int DLQ_NUM_DESIRED_PARTITIONS = 1;
+
+    public static final String HEADER_PREFIX = &quot;__connect.errors.&quot;;
+    public static final String ERROR_HEADER_ORIG_TOPIC = HEADER_PREFIX + &quot;topic&quot;;
+    public static final String ERROR_HEADER_ORIG_PARTITION = HEADER_PREFIX + &quot;partition&quot;;
+    public static final String ERROR_HEADER_ORIG_OFFSET = HEADER_PREFIX + &quot;offset&quot;;
+    public static final String ERROR_HEADER_CONNECTOR_NAME = HEADER_PREFIX + &quot;connector.name&quot;;
+    public static final String ERROR_HEADER_TASK_ID = HEADER_PREFIX + &quot;task.id&quot;;
+    public static final String ERROR_HEADER_STAGE = HEADER_PREFIX + &quot;stage&quot;;
+    public static final String ERROR_HEADER_EXECUTING_CLASS = HEADER_PREFIX + &quot;class.name&quot;;
+    public static final String ERROR_HEADER_EXCEPTION = HEADER_PREFIX + &quot;exception.class.name&quot;;
+    public static final String ERROR_HEADER_EXCEPTION_MESSAGE = HEADER_PREFIX + &quot;exception.message&quot;;
+    public static final String ERROR_HEADER_EXCEPTION_STACK_TRACE = HEADER_PREFIX + &quot;exception.stacktrace&quot;;
+
+    private final SinkConnectorConfig connConfig;
+    private final ConnectorTaskId connectorTaskId;
+    private final ErrorHandlingMetrics errorHandlingMetrics;
+    private final String dlqTopicName;
+
+    private final KafkaProducer&lt;byte[], byte[]&gt; kafkaProducer;
+
+    public static DeadLetterQueueReporter createAndSetup(Map&lt;String, Object&gt; adminProps,
+                                                         ConnectorTaskId id,
+                                                         SinkConnectorConfig sinkConfig, Map&lt;String, Object&gt; producerProps,
+                                                         ErrorHandlingMetrics errorHandlingMetrics) {
+<span class="nc" id="L81">        String topic = sinkConfig.dlqTopicName();</span>
+
+<span class="nc" id="L83">        try (Admin admin = Admin.create(adminProps)) {</span>
+<span class="nc bnc" id="L84" title="All 2 branches missed.">            if (!admin.listTopics().names().get().contains(topic)) {</span>
+<span class="nc" id="L85">                log.error(&quot;Topic {} doesn't exist. Will attempt to create topic.&quot;, topic);</span>
+<span class="nc" id="L86">                NewTopic schemaTopicRequest = new NewTopic(topic, DLQ_NUM_DESIRED_PARTITIONS, sinkConfig.dlqTopicReplicationFactor());</span>
+<span class="nc" id="L87">                admin.createTopics(Set.of(schemaTopicRequest)).all().get();</span>
+            }
+<span class="nc" id="L89">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L90">            throw new ConnectException(&quot;Could not initialize dead letter queue with topic=&quot; + topic, e);</span>
+<span class="nc" id="L91">        } catch (ExecutionException e) {</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">            if (!(e.getCause() instanceof TopicExistsException)) {</span>
+<span class="nc" id="L93">                throw new ConnectException(&quot;Could not initialize dead letter queue with topic=&quot; + topic, e);</span>
+            }
+<span class="nc" id="L95">        }</span>
+
+<span class="nc" id="L97">        KafkaProducer&lt;byte[], byte[]&gt; dlqProducer = new KafkaProducer&lt;&gt;(producerProps);</span>
+<span class="nc" id="L98">        return new DeadLetterQueueReporter(dlqProducer, sinkConfig, id, errorHandlingMetrics);</span>
+    }
+
+    /**
+     * Initialize the dead letter queue reporter with a {@link KafkaProducer}.
+     *
+     * @param kafkaProducer a Kafka Producer to produce the original consumed records.
+     */
+    // Visible for testing
+    DeadLetterQueueReporter(KafkaProducer&lt;byte[], byte[]&gt; kafkaProducer, SinkConnectorConfig connConfig,
+<span class="nc" id="L108">                            ConnectorTaskId id, ErrorHandlingMetrics errorHandlingMetrics) {</span>
+<span class="nc" id="L109">        Objects.requireNonNull(kafkaProducer);</span>
+<span class="nc" id="L110">        Objects.requireNonNull(connConfig);</span>
+<span class="nc" id="L111">        Objects.requireNonNull(id);</span>
+<span class="nc" id="L112">        Objects.requireNonNull(errorHandlingMetrics);</span>
+
+<span class="nc" id="L114">        this.kafkaProducer = kafkaProducer;</span>
+<span class="nc" id="L115">        this.connConfig = connConfig;</span>
+<span class="nc" id="L116">        this.connectorTaskId = id;</span>
+<span class="nc" id="L117">        this.errorHandlingMetrics = errorHandlingMetrics;</span>
+<span class="nc" id="L118">        this.dlqTopicName = connConfig.dlqTopicName().trim();</span>
+<span class="nc" id="L119">    }</span>
+
+    /**
+     * Write the raw records into a Kafka topic and return the producer future.
+     *
+     * @param context processing context containing the raw record at {@link ProcessingContext#original()}.
+     * @return the future associated with the writing of this record; never null
+     */
+    public Future&lt;RecordMetadata&gt; report(ProcessingContext&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; context) {
+<span class="nc bnc" id="L128" title="All 2 branches missed.">        if (dlqTopicName.isEmpty()) {</span>
+<span class="nc" id="L129">            return CompletableFuture.completedFuture(null);</span>
+        }
+<span class="nc" id="L131">        errorHandlingMetrics.recordDeadLetterQueueProduceRequest();</span>
+
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        if (context.original() == null) {</span>
+<span class="nc" id="L134">            errorHandlingMetrics.recordDeadLetterQueueProduceFailed();</span>
+<span class="nc" id="L135">            return CompletableFuture.completedFuture(null);</span>
+        }
+<span class="nc" id="L137">        ConsumerRecord&lt;byte[], byte[]&gt; originalMessage = context.original();</span>
+
+        ProducerRecord&lt;byte[], byte[]&gt; producerRecord;
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (originalMessage.timestamp() == RecordBatch.NO_TIMESTAMP) {</span>
+<span class="nc" id="L141">            producerRecord = new ProducerRecord&lt;&gt;(dlqTopicName, null,</span>
+<span class="nc" id="L142">                    originalMessage.key(), originalMessage.value(), originalMessage.headers());</span>
+        } else {
+<span class="nc" id="L144">            producerRecord = new ProducerRecord&lt;&gt;(dlqTopicName, null, originalMessage.timestamp(),</span>
+<span class="nc" id="L145">                    originalMessage.key(), originalMessage.value(), originalMessage.headers());</span>
+        }
+
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (connConfig.isDlqContextHeadersEnabled()) {</span>
+<span class="nc" id="L149">            populateContextHeaders(producerRecord, context);</span>
+        }
+
+<span class="nc" id="L152">        return this.kafkaProducer.send(producerRecord, (metadata, exception) -&gt; {</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">            if (exception != null) {</span>
+<span class="nc" id="L154">                log.error(&quot;Could not produce message to dead letter queue. topic={}&quot;, dlqTopicName, exception);</span>
+<span class="nc" id="L155">                errorHandlingMetrics.recordDeadLetterQueueProduceFailed();</span>
+            }
+<span class="nc" id="L157">        });</span>
+    }
+
+    // Visible for testing
+    void populateContextHeaders(ProducerRecord&lt;byte[], byte[]&gt; producerRecord, ProcessingContext&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; context) {
+<span class="nc" id="L162">        Headers headers = producerRecord.headers();</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        if (context.original() != null) {</span>
+<span class="nc" id="L164">            headers.add(ERROR_HEADER_ORIG_TOPIC, toBytes(context.original().topic()));</span>
+<span class="nc" id="L165">            headers.add(ERROR_HEADER_ORIG_PARTITION, toBytes(context.original().partition()));</span>
+<span class="nc" id="L166">            headers.add(ERROR_HEADER_ORIG_OFFSET, toBytes(context.original().offset()));</span>
+        }
+
+<span class="nc" id="L169">        headers.add(ERROR_HEADER_CONNECTOR_NAME, toBytes(connectorTaskId.connector()));</span>
+<span class="nc" id="L170">        headers.add(ERROR_HEADER_TASK_ID, toBytes(String.valueOf(connectorTaskId.task())));</span>
+<span class="nc" id="L171">        headers.add(ERROR_HEADER_STAGE, toBytes(context.stage().name()));</span>
+<span class="nc" id="L172">        headers.add(ERROR_HEADER_EXECUTING_CLASS, toBytes(context.executingClass().getName()));</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (context.error() != null) {</span>
+<span class="nc" id="L174">            headers.add(ERROR_HEADER_EXCEPTION, toBytes(context.error().getClass().getName()));</span>
+<span class="nc" id="L175">            headers.add(ERROR_HEADER_EXCEPTION_MESSAGE, toBytes(context.error().getMessage()));</span>
+            byte[] trace;
+<span class="nc bnc" id="L177" title="All 2 branches missed.">            if ((trace = stacktrace(context.error())) != null) {</span>
+<span class="nc" id="L178">                headers.add(ERROR_HEADER_EXCEPTION_STACK_TRACE, trace);</span>
+            }
+        }
+<span class="nc" id="L181">    }</span>
+
+    private byte[] stacktrace(Throwable error) {
+<span class="nc" id="L184">        ByteArrayOutputStream bos = new ByteArrayOutputStream();</span>
+        try {
+<span class="nc" id="L186">            PrintStream stream = new PrintStream(bos, true, StandardCharsets.UTF_8);</span>
+<span class="nc" id="L187">            error.printStackTrace(stream);</span>
+<span class="nc" id="L188">            bos.close();</span>
+<span class="nc" id="L189">            return bos.toByteArray();</span>
+<span class="nc" id="L190">        } catch (IOException e) {</span>
+<span class="nc" id="L191">            log.error(&quot;Could not serialize stacktrace.&quot;, e);</span>
+        }
+<span class="nc" id="L193">        return null;</span>
+    }
+
+    private byte[] toBytes(int value) {
+<span class="nc" id="L197">        return toBytes(String.valueOf(value));</span>
+    }
+
+    private byte[] toBytes(long value) {
+<span class="nc" id="L201">        return toBytes(String.valueOf(value));</span>
+    }
+
+    private byte[] toBytes(String value) {
+<span class="nc bnc" id="L205" title="All 2 branches missed.">        if (value != null) {</span>
+<span class="nc" id="L206">            return value.getBytes(StandardCharsets.UTF_8);</span>
+        } else {
+<span class="nc" id="L208">            return null;</span>
+        }
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L214">        kafkaProducer.close();</span>
+<span class="nc" id="L215">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

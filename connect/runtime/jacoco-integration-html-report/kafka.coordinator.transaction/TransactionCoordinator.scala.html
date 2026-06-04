@@ -1,0 +1,1102 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TransactionCoordinator.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">kafka.coordinator.transaction</a> &gt; <span class="el_source">TransactionCoordinator.scala</span></div><h1>TransactionCoordinator.scala</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package kafka.coordinator.transaction
+
+import kafka.server.{KafkaConfig, ReplicaManager}
+import kafka.utils.Logging
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.internals.Topic
+import org.apache.kafka.common.message.AddPartitionsToTxnResponseData.AddPartitionsToTxnResult
+import org.apache.kafka.common.message.{DescribeTransactionsResponseData, ListTransactionsResponseData}
+import org.apache.kafka.common.metrics.Metrics
+import org.apache.kafka.common.protocol.Errors
+import org.apache.kafka.common.record.internal.RecordBatch
+import org.apache.kafka.common.requests.{AddPartitionsToTxnResponse, TransactionResult}
+import org.apache.kafka.common.utils.{LogContext, ProducerIdAndEpoch, Time}
+import org.apache.kafka.coordinator.transaction.{ProducerIdManager, TransactionLogConfig, TransactionMetadata, TransactionState, TransactionStateManagerConfig, TxnTransitMetadata}
+import org.apache.kafka.metadata.MetadataCache
+import org.apache.kafka.server.common.{RequestLocal, TransactionVersion}
+import org.apache.kafka.server.util.Scheduler
+
+import java.util
+import java.util.Properties
+import java.util.concurrent.atomic.AtomicBoolean
+import scala.jdk.OptionConverters._
+
+<span class="fc" id="L40">object TransactionCoordinator {</span>
+
+  def apply(config: KafkaConfig,
+            replicaManager: ReplicaManager,
+            scheduler: Scheduler,
+            createProducerIdGenerator: () =&gt; ProducerIdManager,
+            metrics: Metrics,
+            metadataCache: MetadataCache,
+            time: Time): TransactionCoordinator = {
+
+<span class="fc" id="L50">    val transactionLogConfig = new TransactionLogConfig(config)</span>
+<span class="fc" id="L51">    val transactionStateManagerConfig = new TransactionStateManagerConfig(config)</span>
+<span class="fc" id="L52">    val txnConfig = TransactionConfig(transactionStateManagerConfig.transactionalIdExpirationMs,</span>
+<span class="fc" id="L53">      transactionStateManagerConfig.transactionMaxTimeoutMs,</span>
+<span class="fc" id="L54">      transactionLogConfig.transactionTopicPartitions,</span>
+<span class="fc" id="L55">      transactionLogConfig.transactionTopicReplicationFactor,</span>
+<span class="fc" id="L56">      transactionLogConfig.transactionTopicSegmentBytes,</span>
+<span class="fc" id="L57">      transactionLogConfig.transactionLoadBufferSize,</span>
+<span class="fc" id="L58">      transactionLogConfig.transactionTopicMinISR,</span>
+<span class="fc" id="L59">      transactionStateManagerConfig.transactionAbortTimedOutTransactionCleanupIntervalMs,</span>
+<span class="fc" id="L60">      transactionStateManagerConfig.transactionRemoveExpiredTransactionalIdCleanupIntervalMs,</span>
+<span class="fc" id="L61">      transactionStateManagerConfig.transaction2PCEnabled,</span>
+<span class="fc" id="L62">      config.requestTimeoutMs)</span>
+
+<span class="fc" id="L64">    val txnStateManager = new TransactionStateManager(config.brokerId, scheduler, replicaManager, metadataCache, txnConfig,</span>
+<span class="fc" id="L65">      time, metrics)</span>
+
+<span class="fc" id="L67">    val logContext = new LogContext(s&quot;[TransactionCoordinator id=${config.brokerId}] &quot;)</span>
+<span class="fc" id="L68">    val txnMarkerChannelManager = TransactionMarkerChannelManager(config, metrics, metadataCache, txnStateManager,</span>
+<span class="fc" id="L69">      time, logContext)</span>
+
+<span class="fc" id="L71">    new TransactionCoordinator(txnConfig, scheduler, createProducerIdGenerator, txnStateManager, txnMarkerChannelManager,</span>
+<span class="fc" id="L72">      time, logContext)</span>
+  }
+
+  private def initTransactionError(error: Errors): InitProducerIdResult = {
+<span class="pc" id="L76">    InitProducerIdResult(RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH, error)</span>
+  }
+
+  private def initTransactionMetadata(txnMetadata: TxnTransitMetadata): InitProducerIdResult = {
+<span class="nc" id="L80">    InitProducerIdResult(txnMetadata.producerId, txnMetadata.producerEpoch, Errors.NONE)</span>
+  }
+}
+
+/**
+ * Transaction coordinator handles message transactions sent by producers and communicate with brokers
+ * to update ongoing transaction's status.
+ *
+ * Each Kafka server instantiates a transaction coordinator which is responsible for a set of
+ * producers. Producers with specific transactional ids are assigned to their corresponding coordinators;
+ * Producers with no specific transactional id may talk to a random broker as their coordinators.
+ */
+<span class="pc bpc" id="L92" title="1 of 4 branches missed.">class TransactionCoordinator(txnConfig: TransactionConfig,</span>
+<span class="fc" id="L93">                             scheduler: Scheduler,</span>
+                             createProducerIdManager: () =&gt; ProducerIdManager,
+<span class="fc" id="L95">                             txnManager: TransactionStateManager,</span>
+<span class="fc" id="L96">                             txnMarkerChannelManager: TransactionMarkerChannelManager,</span>
+<span class="fc" id="L97">                             time: Time,</span>
+<span class="fc" id="L98">                             logContext: LogContext) extends Logging {</span>
+<span class="fc" id="L99">  this.logIdent = logContext.logPrefix</span>
+
+  import TransactionCoordinator._
+
+  private type InitProducerIdCallback = InitProducerIdResult =&gt; Unit
+  private type AddPartitionsCallback = Errors =&gt; Unit
+  private type VerifyPartitionsCallback = AddPartitionsToTxnResult =&gt; Unit
+  private type EndTxnCallback = (Errors, Long, Short) =&gt; Unit
+  private type ApiResult[T] = Either[Errors, T]
+
+  /* Active flag of the coordinator */
+<span class="fc" id="L110">  private val isActive = new AtomicBoolean(false)</span>
+
+<span class="fc" id="L112">  val producerIdManager: ProducerIdManager = createProducerIdManager()</span>
+
+  def handleInitProducerId(transactionalId: String,
+                           transactionTimeoutMs: Int,
+                           enableTwoPCFlag: Boolean,
+                           keepPreparedTxn: Boolean,
+                           expectedProducerIdAndEpoch: Option[ProducerIdAndEpoch],
+                           responseCallback: InitProducerIdCallback,
+<span class="nc" id="L120">                           requestLocal: RequestLocal = RequestLocal.noCaching): Unit = {</span>
+
+<span class="pc bpc" id="L122" title="1 of 2 branches missed.">    if (transactionalId == null) {</span>
+      // if the transactional id is null, then always blindly accept the request
+      // and return a new producerId from the producerId manager
+      try {
+<span class="fc" id="L126">        responseCallback(InitProducerIdResult(producerIdManager.generateProducerId(), producerEpoch = 0, Errors.NONE))</span>
+      } catch {
+<span class="fc" id="L128">        case e: Exception =&gt; responseCallback(initTransactionError(Errors.forException(e)))</span>
+      }
+<span class="nc bnc" id="L130" title="All 2 branches missed.">    } else if (transactionalId.isEmpty) {</span>
+      // if transactional id is empty then return error as invalid request. This is
+      // to make TransactionCoordinator's behavior consistent with producer client
+<span class="nc" id="L133">      responseCallback(initTransactionError(Errors.INVALID_REQUEST))</span>
+<span class="nc bnc" id="L134" title="All 4 branches missed.">    } else if (enableTwoPCFlag &amp;&amp; !txnManager.isTransaction2pcEnabled()) {</span>
+      // if the request is to enable two-phase commit but the broker 2PC config is set to false,
+      // 2PC functionality is disabled, clients that attempt to use this functionality
+      // would receive an authorization failed error.
+<span class="nc" id="L138">      responseCallback(initTransactionError(Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED))</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">    } else if (keepPreparedTxn) {</span>
+      // if the request is to keep the prepared transaction, then return an
+      // unsupported version error since the feature hasn't been implemented yet.
+<span class="nc" id="L142">      responseCallback(initTransactionError(Errors.UNSUPPORTED_VERSION))</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">    } else if (!txnManager.validateTransactionTimeoutMs(enableTwoPCFlag, transactionTimeoutMs)) {</span>
+      // check transactionTimeoutMs is not larger than the broker configured maximum allowed value
+<span class="nc" id="L145">      responseCallback(initTransactionError(Errors.INVALID_TRANSACTION_TIMEOUT))</span>
+    } else {
+<span class="nc bnc" id="L147" title="All 2 branches missed.">      val resolvedTxnTimeoutMs = if (enableTwoPCFlag) Int.MaxValue else transactionTimeoutMs</span>
+<span class="nc" id="L148">      val coordinatorEpochAndMetadata = txnManager.getTransactionState(transactionalId).flatMap {</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">        case None =&gt;</span>
+          try {
+<span class="nc" id="L151">            val createdMetadata = new TransactionMetadata(transactionalId,</span>
+<span class="nc" id="L152">              producerIdManager.generateProducerId(),</span>
+<span class="nc" id="L153">              RecordBatch.NO_PRODUCER_ID,</span>
+<span class="nc" id="L154">              RecordBatch.NO_PRODUCER_ID,</span>
+<span class="nc" id="L155">              RecordBatch.NO_PRODUCER_EPOCH,</span>
+<span class="nc" id="L156">              RecordBatch.NO_PRODUCER_EPOCH,</span>
+<span class="nc" id="L157">              resolvedTxnTimeoutMs,</span>
+<span class="nc" id="L158">              TransactionState.EMPTY,</span>
+<span class="nc" id="L159">              util.Set.of(),</span>
+<span class="nc" id="L160">              -1,</span>
+<span class="nc" id="L161">              time.milliseconds(),</span>
+<span class="nc" id="L162">              TransactionVersion.TV_0)</span>
+<span class="nc" id="L163">            txnManager.putTransactionStateIfNotExists(createdMetadata)</span>
+          } catch {
+<span class="nc" id="L165">            case e: Exception =&gt; Left(Errors.forException(e))</span>
+          }
+
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        case Some(epochAndTxnMetadata) =&gt; Right(epochAndTxnMetadata)</span>
+      }
+
+      val result: ApiResult[(Int, TxnTransitMetadata)] = coordinatorEpochAndMetadata.flatMap {
+<span class="nc" id="L172">        existingEpochAndMetadata =&gt;</span>
+<span class="nc" id="L173">          val coordinatorEpoch = existingEpochAndMetadata.coordinatorEpoch</span>
+<span class="nc" id="L174">          val txnMetadata = existingEpochAndMetadata.transactionMetadata</span>
+
+<span class="nc" id="L176">          txnMetadata.inLock(() =&gt;</span>
+<span class="nc" id="L177">            prepareInitProducerIdTransit(transactionalId, resolvedTxnTimeoutMs, coordinatorEpoch, txnMetadata,</span>
+<span class="nc" id="L178">              expectedProducerIdAndEpoch)</span>
+          )
+      }
+
+<span class="nc" id="L182">      result match {</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        case Left(error) =&gt;</span>
+<span class="nc" id="L184">          responseCallback(initTransactionError(error))</span>
+
+<span class="nc bnc" id="L186" title="All 4 branches missed.">        case Right((coordinatorEpoch, newMetadata)) =&gt;</span>
+<span class="nc bnc" id="L187" title="All 6 branches missed.">          if (newMetadata.txnState == TransactionState.PREPARE_EPOCH_FENCE) {</span>
+            // abort the ongoing transaction and then return CONCURRENT_TRANSACTIONS to let client wait and retry
+            def sendRetriableErrorCallback(error: Errors, newProducerId: Long, newProducerEpoch: Short): Unit = {
+<span class="nc bnc" id="L190" title="All 36 branches missed.">              if (error != Errors.NONE) {</span>
+<span class="nc" id="L191">                responseCallback(initTransactionError(error))</span>
+              } else {
+<span class="nc" id="L193">                responseCallback(initTransactionError(Errors.CONCURRENT_TRANSACTIONS))</span>
+              }
+            }
+
+            endTransaction(transactionalId,
+<span class="nc" id="L198">              newMetadata.producerId,</span>
+<span class="nc" id="L199">              newMetadata.producerEpoch,</span>
+<span class="nc" id="L200">              TransactionResult.ABORT,</span>
+<span class="nc" id="L201">              isFromClient = false,</span>
+<span class="nc" id="L202">              clientTransactionVersion = txnManager.transactionVersionLevel(), // Since this is not from client, use server TV</span>
+<span class="nc" id="L203">              sendRetriableErrorCallback,</span>
+<span class="nc" id="L204">              requestLocal)</span>
+          } else {
+            def sendPidResponseCallback(error: Errors): Unit = {
+<span class="nc bnc" id="L207" title="All 6 branches missed.">              if (error == Errors.NONE) {</span>
+<span class="nc" id="L208">                info(s&quot;Initialized transactionalId $transactionalId with producerId ${newMetadata.producerId} and producer &quot; +</span>
+<span class="nc" id="L209">                  s&quot;epoch ${newMetadata.producerEpoch} on partition &quot; +</span>
+<span class="nc" id="L210">                  s&quot;${Topic.TRANSACTION_STATE_TOPIC_NAME}-${txnManager.partitionFor(transactionalId)}&quot;)</span>
+<span class="nc" id="L211">                responseCallback(initTransactionMetadata(newMetadata))</span>
+              } else {
+<span class="nc" id="L213">                info(s&quot;Returning $error error code to client for $transactionalId's InitProducerId request&quot;)</span>
+<span class="nc" id="L214">                responseCallback(initTransactionError(error))</span>
+              }
+            }
+
+<span class="nc" id="L218">            txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata,</span>
+<span class="nc" id="L219">              sendPidResponseCallback, requestLocal = requestLocal)</span>
+          }
+      }
+    }
+  }
+
+  private def prepareInitProducerIdTransit(transactionalId: String,
+                                           transactionTimeoutMs: Int,
+                                           coordinatorEpoch: Int,
+                                           txnMetadata: TransactionMetadata,
+                                           expectedProducerIdAndEpoch: Option[ProducerIdAndEpoch]): ApiResult[(Int, TxnTransitMetadata)] = {
+
+    def isValidProducerId(producerIdAndEpoch: ProducerIdAndEpoch): Boolean = {
+      // If a producer ID and epoch are provided by the request, fence the producer unless one of the following is true:
+      //   1. The producer epoch is equal to -1, which implies that the metadata was just created. This is the case of a
+      //      producer recovering from an UNKNOWN_PRODUCER_ID error, and it is safe to return the newly-generated
+      //      producer ID.
+      //   2. The expected producer ID matches the ID in current metadata (the epoch will be checked when we try to
+      //      increment it)
+      //   3. The expected producer ID matches the previous one and the expected epoch is exhausted, in which case this
+      //      could be a retry after a valid epoch bump that the producer never received the response for
+<span class="nc bnc" id="L240" title="All 2 branches missed.">      txnMetadata.producerEpoch == RecordBatch.NO_PRODUCER_EPOCH ||</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">        producerIdAndEpoch.producerId == txnMetadata.producerId ||</span>
+<span class="nc bnc" id="L242" title="All 4 branches missed.">        (producerIdAndEpoch.producerId == txnMetadata.prevProducerId &amp;&amp; TransactionMetadata.isEpochExhausted(producerIdAndEpoch.epoch))</span>
+    }
+
+<span class="nc bnc" id="L245" title="All 2 branches missed.">    if (txnMetadata.pendingTransitionInProgress) {</span>
+      // return a retriable exception to let the client backoff and retry
+<span class="nc" id="L247">      Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+    }
+<span class="nc bnc" id="L249" title="All 2 branches missed.">    else if (!expectedProducerIdAndEpoch.forall(isValidProducerId)) {</span>
+<span class="nc" id="L250">      Left(Errors.PRODUCER_FENCED)</span>
+    } else {
+      // caller should have synchronized on txnMetadata already
+<span class="nc" id="L253">      txnMetadata.state match {</span>
+<span class="nc bnc" id="L254" title="All 6 branches missed.">        case TransactionState.PREPARE_ABORT | TransactionState.PREPARE_COMMIT =&gt;</span>
+          // reply to client and let it backoff and retry
+<span class="nc" id="L256">          Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+
+<span class="nc bnc" id="L258" title="All 8 branches missed.">        case TransactionState.COMPLETE_ABORT | TransactionState.COMPLETE_COMMIT | TransactionState.EMPTY =&gt;</span>
+          val transitMetadataResult =
+            // If the epoch is exhausted and the expected epoch (if provided) matches it, generate a new producer ID
+            try {
+<span class="nc bnc" id="L262" title="All 2 branches missed.">              if (txnMetadata.isProducerEpochExhausted &amp;&amp;</span>
+<span class="nc bnc" id="L263" title="All 4 branches missed.">                  expectedProducerIdAndEpoch.forall(_.epoch == txnMetadata.producerEpoch))</span>
+<span class="nc" id="L264">                Right(txnMetadata.prepareProducerIdRotation(producerIdManager.generateProducerId(), transactionTimeoutMs, time.milliseconds(),</span>
+<span class="nc" id="L265">                  expectedProducerIdAndEpoch.isDefined))</span>
+              else
+<span class="nc" id="L267">                Right(txnMetadata.prepareIncrementProducerEpoch(transactionTimeoutMs, expectedProducerIdAndEpoch.map(e =&gt; Short.box(e.epoch)).toJava,</span>
+<span class="nc" id="L268">                  time.milliseconds()))</span>
+            } catch {
+<span class="nc" id="L270">              case e: Exception =&gt; Left(Errors.forException(e))</span>
+            }
+
+<span class="nc" id="L273">          transitMetadataResult match {</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            case Right(transitMetadata) =&gt; Right((coordinatorEpoch, transitMetadata))</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">            case Left(err) =&gt; Left(err)</span>
+          }
+
+<span class="nc bnc" id="L278" title="All 2 branches missed.">        case TransactionState.ONGOING =&gt;</span>
+          // indicate to abort the current ongoing txn first. Note that this epoch is never returned to the
+          // user. We will abort the ongoing transaction and return CONCURRENT_TRANSACTIONS to the client.
+          // This forces the client to retry, which will ensure that the epoch is bumped a second time. In
+          // particular, if fencing the current producer exhausts the available epochs for the current producerId,
+          // then when the client retries, we will generate a new producerId.
+<span class="nc" id="L284">          Right(coordinatorEpoch, txnMetadata.prepareFenceProducerEpoch())</span>
+
+<span class="nc bnc" id="L286" title="All 6 branches missed.">        case TransactionState.DEAD | TransactionState.PREPARE_EPOCH_FENCE =&gt;</span>
+<span class="nc" id="L287">          val errorMsg = s&quot;Found transactionalId $transactionalId with state ${txnMetadata.state}. &quot; +</span>
+            s&quot;This is illegal as we should never have transitioned to this state.&quot;
+<span class="nc" id="L289">          fatal(errorMsg)</span>
+<span class="nc" id="L290">          throw new IllegalStateException(errorMsg)</span>
+      }
+    }
+  }
+
+  def handleListTransactions(
+    filteredProducerIds: Set[Long],
+    filteredStates: Set[String],
+<span class="nc" id="L298">    filteredDuration: Long = -1L,</span>
+<span class="nc" id="L299">    filteredTransactionalIdPattern: String = null</span>
+  ): ListTransactionsResponseData = {
+<span class="nc bnc" id="L301" title="All 2 branches missed.">    if (!isActive.get()) {</span>
+<span class="nc" id="L302">      new ListTransactionsResponseData().setErrorCode(Errors.COORDINATOR_NOT_AVAILABLE.code)</span>
+    } else {
+<span class="nc" id="L304">      txnManager.listTransactionStates(filteredProducerIds, filteredStates, filteredDuration, filteredTransactionalIdPattern)</span>
+    }
+  }
+
+  def handleDescribeTransactions(
+    transactionalId: String
+  ): DescribeTransactionsResponseData.TransactionState = {
+<span class="nc bnc" id="L311" title="All 2 branches missed.">    if (transactionalId == null) {</span>
+<span class="nc" id="L312">      throw new IllegalArgumentException(&quot;Invalid null transactionalId&quot;)</span>
+    }
+
+<span class="nc" id="L315">    val transactionState = new DescribeTransactionsResponseData.TransactionState()</span>
+<span class="nc" id="L316">      .setTransactionalId(transactionalId)</span>
+
+<span class="nc bnc" id="L318" title="All 2 branches missed.">    if (!isActive.get()) {</span>
+<span class="nc" id="L319">      transactionState.setErrorCode(Errors.COORDINATOR_NOT_AVAILABLE.code)</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">    } else if (transactionalId.isEmpty) {</span>
+<span class="nc" id="L321">      transactionState.setErrorCode(Errors.INVALID_REQUEST.code)</span>
+    } else {
+<span class="nc" id="L323">      txnManager.getTransactionState(transactionalId) match {</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">        case Left(error) =&gt;</span>
+<span class="nc" id="L325">          transactionState.setErrorCode(error.code)</span>
+<span class="nc bnc" id="L326" title="All 4 branches missed.">        case Right(None) =&gt;</span>
+<span class="nc" id="L327">          transactionState.setErrorCode(Errors.TRANSACTIONAL_ID_NOT_FOUND.code)</span>
+<span class="nc bnc" id="L328" title="All 4 branches missed.">        case Right(Some(coordinatorEpochAndMetadata)) =&gt;</span>
+<span class="nc" id="L329">          val txnMetadata = coordinatorEpochAndMetadata.transactionMetadata</span>
+<span class="nc" id="L330">          txnMetadata.inLock(() =&gt; {</span>
+<span class="nc bnc" id="L331" title="All 6 branches missed.">            if (txnMetadata.state == TransactionState.DEAD) {</span>
+              // The transaction state is being expired, so ignore it
+<span class="nc" id="L333">              transactionState.setErrorCode(Errors.TRANSACTIONAL_ID_NOT_FOUND.code)</span>
+            } else {
+<span class="nc" id="L335">              txnMetadata.topicPartitions.forEach(topicPartition =&gt; {</span>
+<span class="nc" id="L336">                var topicData = transactionState.topics.find(topicPartition.topic)</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">                if (topicData == null) {</span>
+<span class="nc" id="L338">                  topicData = new DescribeTransactionsResponseData.TopicData()</span>
+<span class="nc" id="L339">                    .setTopic(topicPartition.topic)</span>
+<span class="nc" id="L340">                  transactionState.topics.add(topicData)</span>
+                }
+<span class="nc" id="L342">                topicData.partitions.add(topicPartition.partition)</span>
+              })
+
+<span class="nc" id="L345">              transactionState</span>
+<span class="nc" id="L346">                .setErrorCode(Errors.NONE.code)</span>
+<span class="nc" id="L347">                .setProducerId(txnMetadata.producerId)</span>
+<span class="nc" id="L348">                .setProducerEpoch(txnMetadata.producerEpoch)</span>
+<span class="nc" id="L349">                .setTransactionState(txnMetadata.state.stateName)</span>
+<span class="nc" id="L350">                .setTransactionTimeoutMs(txnMetadata.txnTimeoutMs)</span>
+<span class="nc" id="L351">                .setTransactionStartTimeMs(txnMetadata.txnStartTimestamp)</span>
+            }
+          })
+      }
+    }
+  }
+  
+  def handleVerifyPartitionsInTransaction(transactionalId: String,
+                                          producerId: Long,
+                                          producerEpoch: Short,
+                                          partitions: util.Set[TopicPartition],
+                                          responseCallback: VerifyPartitionsCallback): Unit = {
+<span class="nc bnc" id="L363" title="All 4 branches missed.">    if (transactionalId == null || transactionalId.isEmpty) {</span>
+<span class="nc" id="L364">      debug(s&quot;Returning ${Errors.INVALID_REQUEST} error code to client for $transactionalId's AddPartitions request for verification&quot;)</span>
+<span class="nc" id="L365">      val errors = new util.HashMap[TopicPartition, Errors]()</span>
+<span class="nc" id="L366">      partitions.forEach(partition =&gt; errors.put(partition, Errors.INVALID_REQUEST))</span>
+<span class="nc" id="L367">      responseCallback(AddPartitionsToTxnResponse.resultForTransaction(transactionalId, errors))</span>
+    } else {
+      val result: ApiResult[util.Map[TopicPartition, Errors]] =
+<span class="nc" id="L370">        txnManager.getTransactionState(transactionalId).flatMap {</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">          case None =&gt; Left(Errors.INVALID_PRODUCER_ID_MAPPING)</span>
+
+<span class="nc bnc" id="L373" title="All 2 branches missed.">          case Some(epochAndMetadata) =&gt;</span>
+<span class="nc" id="L374">            val txnMetadata = epochAndMetadata.transactionMetadata</span>
+
+            // Given the txnMetadata is valid, we check if the partitions are in the transaction.
+            // Pending state is not checked since there is a final validation on the append to the log.
+            // Partitions are added to metadata when the add partitions state is persisted, and removed when the end marker is persisted.
+<span class="nc" id="L379">            txnMetadata.inLock(() =&gt; {</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">              if (txnMetadata.producerId != producerId) {</span>
+<span class="nc" id="L381">                Left(Errors.INVALID_PRODUCER_ID_MAPPING)</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">              } else if (txnMetadata.producerEpoch != producerEpoch) {</span>
+<span class="nc" id="L383">                Left(Errors.PRODUCER_FENCED)</span>
+<span class="nc bnc" id="L384" title="All 12 branches missed.">              } else if (txnMetadata.state == TransactionState.PREPARE_COMMIT || txnMetadata.state == TransactionState.PREPARE_ABORT) {</span>
+<span class="nc" id="L385">                Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+              } else {
+<span class="nc" id="L387">                val errors = new util.HashMap[TopicPartition, Errors]()</span>
+<span class="nc" id="L388">                partitions.forEach(part =&gt; {</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">                  if (txnMetadata.topicPartitions.contains(part))</span>
+<span class="nc" id="L390">                    errors.put(part, Errors.NONE)</span>
+                  else
+<span class="nc" id="L392">                    errors.put(part, Errors.TRANSACTION_ABORTABLE)</span>
+                })
+<span class="nc" id="L394">                Right(errors)</span>
+              }
+            })
+        }
+
+<span class="nc" id="L399">      result match {</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        case Left(err) =&gt;</span>
+<span class="nc" id="L401">          debug(s&quot;Returning $err error code to client for $transactionalId's AddPartitions request for verification&quot;)</span>
+<span class="nc" id="L402">          val errors = new util.HashMap[TopicPartition, Errors]()</span>
+<span class="nc" id="L403">          partitions.forEach(partition =&gt; errors.put(partition, err))</span>
+<span class="nc" id="L404">          responseCallback(AddPartitionsToTxnResponse.resultForTransaction(transactionalId, errors))</span>
+          
+<span class="nc bnc" id="L406" title="All 2 branches missed.">        case Right(errors) =&gt;</span>
+<span class="nc" id="L407">          responseCallback(AddPartitionsToTxnResponse.resultForTransaction(transactionalId, errors))</span>
+      }
+    }
+    
+  }
+
+  def handleAddPartitionsToTransaction(transactionalId: String,
+                                       producerId: Long,
+                                       producerEpoch: Short,
+                                       partitions: util.Set[TopicPartition],
+                                       responseCallback: AddPartitionsCallback,
+                                       clientTransactionVersion: TransactionVersion,
+<span class="nc" id="L419">                                       requestLocal: RequestLocal = RequestLocal.noCaching): Unit = {</span>
+<span class="nc bnc" id="L420" title="All 4 branches missed.">    if (transactionalId == null || transactionalId.isEmpty) {</span>
+<span class="nc" id="L421">      debug(s&quot;Returning ${Errors.INVALID_REQUEST} error code to client for $transactionalId's AddPartitions request&quot;)</span>
+<span class="nc" id="L422">      responseCallback(Errors.INVALID_REQUEST)</span>
+    } else {
+      // try to update the transaction metadata and append the updated metadata to txn log;
+      // if there is no such metadata treat it as invalid producerId mapping error.
+<span class="nc" id="L426">      val result: ApiResult[(Int, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).flatMap {</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">        case None =&gt; Left(Errors.INVALID_PRODUCER_ID_MAPPING)</span>
+
+<span class="nc bnc" id="L429" title="All 2 branches missed.">        case Some(epochAndMetadata) =&gt;</span>
+<span class="nc" id="L430">          val coordinatorEpoch = epochAndMetadata.coordinatorEpoch</span>
+<span class="nc" id="L431">          val txnMetadata = epochAndMetadata.transactionMetadata</span>
+
+          // generate the new transaction metadata with added partitions
+<span class="nc" id="L434">          txnMetadata.inLock(() =&gt; {</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">            if (txnMetadata.pendingTransitionInProgress) {</span>
+              // return a retriable exception to let the client backoff and retry
+              // This check is performed first so that the pending transition can complete before subsequent checks.
+              // With TV2, we may be transitioning over a producer epoch overflow, and the producer may be using the
+              // new producer ID that is still only in pending state.
+<span class="nc" id="L440">              Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">            } else if (txnMetadata.producerId != producerId) {</span>
+<span class="nc" id="L442">              Left(Errors.INVALID_PRODUCER_ID_MAPPING)</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">            } else if (txnMetadata.producerEpoch != producerEpoch) {</span>
+<span class="nc" id="L444">              Left(Errors.PRODUCER_FENCED)</span>
+<span class="nc bnc" id="L445" title="All 12 branches missed.">            } else if (txnMetadata.state == TransactionState.PREPARE_COMMIT || txnMetadata.state == TransactionState.PREPARE_ABORT) {</span>
+<span class="nc" id="L446">              Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+<span class="nc bnc" id="L447" title="All 8 branches missed.">            } else if (txnMetadata.state == TransactionState.ONGOING &amp;&amp; txnMetadata.topicPartitions.containsAll(partitions)) {</span>
+              // this is an optimization: if the partitions are already in the metadata reply OK immediately
+<span class="nc" id="L449">              Left(Errors.NONE)</span>
+            } else {
+<span class="nc" id="L451">              Right(coordinatorEpoch, txnMetadata.prepareAddPartitions(partitions, time.milliseconds(), clientTransactionVersion))</span>
+            }
+          })
+      }
+
+<span class="nc" id="L456">      result match {</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        case Left(err) =&gt;</span>
+<span class="nc" id="L458">          debug(s&quot;Returning $err error code to client for $transactionalId's AddPartitions request&quot;)</span>
+<span class="nc" id="L459">          responseCallback(err)</span>
+
+<span class="nc bnc" id="L461" title="All 4 branches missed.">        case Right((coordinatorEpoch, newMetadata)) =&gt;</span>
+<span class="nc" id="L462">          txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata,</span>
+<span class="nc" id="L463">            responseCallback, requestLocal = requestLocal)</span>
+      }
+    }
+  }
+
+  /**
+   * Load state from the given partition and begin handling requests for groups which map to this partition.
+   *
+   * @param txnTopicPartitionId The partition that we are now leading
+   * @param coordinatorEpoch The partition coordinator (or leader) epoch from the received LeaderAndIsr request
+   */
+  def onElection(txnTopicPartitionId: Int, coordinatorEpoch: Int): Unit = {
+<span class="nc" id="L475">    info(s&quot;Elected as the txn coordinator for partition $txnTopicPartitionId at epoch $coordinatorEpoch&quot;)</span>
+    // The operations performed during immigration must be resilient to any previous errors we saw or partial state we
+    // left off during the unloading phase. Ensure we remove all associated state for this partition before we continue
+    // loading it.
+<span class="nc" id="L479">    txnMarkerChannelManager.removeMarkersForTxnTopicPartition(txnTopicPartitionId)</span>
+
+    // Now load the partition.
+<span class="nc" id="L482">    txnManager.loadTransactionsForTxnTopicPartition(txnTopicPartitionId, coordinatorEpoch,</span>
+<span class="nc" id="L483">      txnMarkerChannelManager.addTxnMarkersToSend)</span>
+  }
+
+  /**
+   * Clear coordinator caches for the given partition after giving up leadership.
+   *
+   * @param txnTopicPartitionId The partition that we are no longer leading
+   * @param coordinatorEpoch The partition coordinator (or leader) epoch, which may be absent if we
+   *                         are resigning after receiving a StopReplica request from the controller
+   */
+  def onResignation(txnTopicPartitionId: Int, coordinatorEpoch: Option[Int]): Unit = {
+<span class="nc" id="L494">    info(s&quot;Resigned as the txn coordinator for partition $txnTopicPartitionId at epoch $coordinatorEpoch&quot;)</span>
+<span class="nc" id="L495">    coordinatorEpoch match {</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">      case Some(epoch) =&gt;</span>
+<span class="nc" id="L497">        txnManager.removeTransactionsForTxnTopicPartition(txnTopicPartitionId, epoch)</span>
+<span class="nc bnc" id="L498" title="All 2 branches missed.">      case None =&gt;</span>
+<span class="nc" id="L499">        txnManager.removeTransactionsForTxnTopicPartition(txnTopicPartitionId)</span>
+    }
+<span class="nc" id="L501">    txnMarkerChannelManager.removeMarkersForTxnTopicPartition(txnTopicPartitionId)</span>
+  }
+
+  private def logInvalidStateTransitionAndReturnError(transactionalId: String,
+                                                      transactionState: TransactionState,
+                                                      transactionResult: TransactionResult) = {
+<span class="nc" id="L507">    warn(s&quot;TransactionalId: $transactionalId's state is $transactionState, but received transaction &quot; +</span>
+<span class="nc" id="L508">      s&quot;marker result to send: $transactionResult&quot;)</span>
+<span class="nc" id="L509">    Left(Errors.INVALID_TXN_STATE)</span>
+  }
+
+  def handleEndTransaction(transactionalId: String,
+                           producerId: Long,
+                           producerEpoch: Short,
+                           txnMarkerResult: TransactionResult,
+                           clientTransactionVersion: TransactionVersion,
+                           responseCallback: EndTxnCallback,
+<span class="nc" id="L518">                           requestLocal: RequestLocal = RequestLocal.noCaching): Unit = {</span>
+    endTransaction(transactionalId,
+      producerId,
+      producerEpoch,
+      txnMarkerResult,
+<span class="nc" id="L523">      isFromClient = true,</span>
+      clientTransactionVersion,
+      responseCallback,
+<span class="nc" id="L526">      requestLocal)</span>
+  }
+
+  /**
+   * Handling the endTxn request under the Transaction Version 1.
+   *
+   * @param transactionalId     The transaction ID from the endTxn request
+   * @param producerId          The producer ID from the endTxn request
+   * @param producerEpoch       The producer epoch from the endTxn request
+   * @param txnMarkerResult     To commit or abort the transaction
+   * @param isFromClient        Is the request from client
+   * @param responseCallback    The response callback
+   * @param requestLocal        The request local object
+   */
+  private def endTransactionWithTV1(transactionalId: String,
+                             producerId: Long,
+                             producerEpoch: Short,
+                             txnMarkerResult: TransactionResult,
+                             isFromClient: Boolean,
+                             responseCallback: EndTxnCallback,
+                             requestLocal: RequestLocal): Unit = {
+<span class="nc" id="L547">    var isEpochFence = false</span>
+<span class="nc bnc" id="L548" title="All 14 branches missed.">    if (transactionalId == null || transactionalId.isEmpty)</span>
+<span class="nc" id="L549">      responseCallback(Errors.INVALID_REQUEST, RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH)</span>
+    else {
+<span class="nc" id="L551">      val preAppendResult: ApiResult[(Int, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).flatMap {</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">        case None =&gt;</span>
+<span class="nc" id="L553">          Left(Errors.INVALID_PRODUCER_ID_MAPPING)</span>
+
+<span class="nc bnc" id="L555" title="All 2 branches missed.">        case Some(epochAndTxnMetadata) =&gt;</span>
+<span class="nc" id="L556">          val txnMetadata = epochAndTxnMetadata.transactionMetadata</span>
+<span class="nc" id="L557">          val coordinatorEpoch = epochAndTxnMetadata.coordinatorEpoch</span>
+
+<span class="nc" id="L559">          txnMetadata.inLock(() =&gt; {</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">            if (txnMetadata.producerId != producerId)</span>
+<span class="nc" id="L561">              Left(Errors.INVALID_PRODUCER_ID_MAPPING)</span>
+            // Strict equality is enforced on the client side requests, as they shouldn't bump the producer epoch.
+<span class="nc bnc" id="L563" title="All 6 branches missed.">            else if ((isFromClient &amp;&amp; producerEpoch != txnMetadata.producerEpoch) || producerEpoch &lt; txnMetadata.producerEpoch)</span>
+<span class="nc" id="L564">              Left(Errors.PRODUCER_FENCED)</span>
+<span class="nc bnc" id="L565" title="All 8 branches missed.">            else if (txnMetadata.pendingTransitionInProgress &amp;&amp; txnMetadata.pendingState.get != TransactionState.PREPARE_EPOCH_FENCE)</span>
+<span class="nc" id="L566">              Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+<span class="nc" id="L567">            else txnMetadata.state match {</span>
+<span class="nc bnc" id="L568" title="All 2 branches missed.">              case TransactionState.ONGOING =&gt;</span>
+<span class="nc bnc" id="L569" title="All 6 branches missed.">                val nextState = if (txnMarkerResult == TransactionResult.COMMIT)</span>
+<span class="nc" id="L570">                  TransactionState.PREPARE_COMMIT</span>
+                else
+<span class="nc" id="L572">                  TransactionState.PREPARE_ABORT</span>
+
+<span class="nc bnc" id="L574" title="All 14 branches missed.">                if (nextState == TransactionState.PREPARE_ABORT &amp;&amp; txnMetadata.pendingState.filter(s =&gt; s == TransactionState.PREPARE_EPOCH_FENCE).isPresent) {</span>
+                  // We should clear the pending state to make way for the transition to PrepareAbort and also bump
+                  // the epoch in the transaction metadata we are about to append.
+<span class="nc" id="L577">                  isEpochFence = true</span>
+<span class="nc" id="L578">                  txnMetadata.pendingState(util.Optional.empty())</span>
+<span class="nc" id="L579">                  txnMetadata.setProducerEpoch(producerEpoch)</span>
+<span class="nc" id="L580">                  txnMetadata.setLastProducerEpoch(RecordBatch.NO_PRODUCER_EPOCH)</span>
+                }
+
+<span class="nc" id="L583">                Right(coordinatorEpoch, txnMetadata.prepareAbortOrCommit(nextState, TransactionVersion.fromFeatureLevel(0), RecordBatch.NO_PRODUCER_ID, time.milliseconds(), false))</span>
+<span class="nc bnc" id="L584" title="All 2 branches missed.">              case TransactionState.COMPLETE_COMMIT =&gt;</span>
+<span class="nc bnc" id="L585" title="All 6 branches missed.">                if (txnMarkerResult == TransactionResult.COMMIT)</span>
+<span class="nc" id="L586">                  Left(Errors.NONE)</span>
+                else
+<span class="nc" id="L588">                  logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">              case TransactionState.COMPLETE_ABORT =&gt;</span>
+<span class="nc bnc" id="L590" title="All 6 branches missed.">                if (txnMarkerResult == TransactionResult.ABORT)</span>
+<span class="nc" id="L591">                  Left(Errors.NONE)</span>
+                else
+<span class="nc" id="L593">                  logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">              case TransactionState.PREPARE_COMMIT =&gt;</span>
+<span class="nc bnc" id="L595" title="All 6 branches missed.">                if (txnMarkerResult == TransactionResult.COMMIT)</span>
+<span class="nc" id="L596">                  Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+                else
+<span class="nc" id="L598">                  logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">              case TransactionState.PREPARE_ABORT =&gt;</span>
+<span class="nc bnc" id="L600" title="All 6 branches missed.">                if (txnMarkerResult == TransactionResult.ABORT)</span>
+<span class="nc" id="L601">                  Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+                else
+<span class="nc" id="L603">                  logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+<span class="nc bnc" id="L604" title="All 2 branches missed.">              case TransactionState.EMPTY =&gt;</span>
+<span class="nc" id="L605">                logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+<span class="nc bnc" id="L606" title="All 6 branches missed.">              case TransactionState.DEAD | TransactionState.PREPARE_EPOCH_FENCE =&gt;</span>
+<span class="nc" id="L607">                val errorMsg = s&quot;Found transactionalId $transactionalId with state ${txnMetadata.state}. &quot; +</span>
+                  s&quot;This is illegal as we should never have transitioned to this state.&quot;
+<span class="nc" id="L609">                fatal(errorMsg)</span>
+<span class="nc" id="L610">                throw new IllegalStateException(errorMsg)</span>
+            }
+          })
+      }
+
+<span class="nc" id="L615">      preAppendResult match {</span>
+<span class="nc bnc" id="L616" title="All 8 branches missed.">        case Left(err) =&gt;</span>
+<span class="nc" id="L617">          debug(s&quot;Aborting append of $txnMarkerResult to transaction log with coordinator and returning $err error to client for $transactionalId's EndTransaction request&quot;)</span>
+<span class="nc" id="L618">          responseCallback(err, RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH)</span>
+
+<span class="nc bnc" id="L620" title="All 16 branches missed.">        case Right((coordinatorEpoch, newMetadata)) =&gt;</span>
+          def sendTxnMarkersCallback(error: Errors): Unit = {
+<span class="nc bnc" id="L622" title="All 6 branches missed.">            if (error == Errors.NONE) {</span>
+<span class="nc" id="L623">              val preSendResult: ApiResult[(TransactionMetadata, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).flatMap {</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">                case None =&gt;</span>
+<span class="nc" id="L625">                  val errorMsg = s&quot;The coordinator still owns the transaction partition for $transactionalId, but there is &quot; +</span>
+                    s&quot;no metadata in the cache; this is not expected&quot;
+<span class="nc" id="L627">                  fatal(errorMsg)</span>
+<span class="nc" id="L628">                  throw new IllegalStateException(errorMsg)</span>
+
+<span class="nc bnc" id="L630" title="All 2 branches missed.">                case Some(epochAndMetadata) =&gt;</span>
+<span class="nc bnc" id="L631" title="All 2 branches missed.">                  if (epochAndMetadata.coordinatorEpoch == coordinatorEpoch) {</span>
+<span class="nc" id="L632">                    val txnMetadata = epochAndMetadata.transactionMetadata</span>
+<span class="nc" id="L633">                    txnMetadata.inLock(() =&gt; {</span>
+<span class="nc bnc" id="L634" title="All 2 branches missed.">                      if (txnMetadata.producerId != producerId)</span>
+<span class="nc" id="L635">                        Left(Errors.INVALID_PRODUCER_ID_MAPPING)</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">                      else if (txnMetadata.producerEpoch != producerEpoch)</span>
+<span class="nc" id="L637">                        Left(Errors.PRODUCER_FENCED)</span>
+<span class="nc bnc" id="L638" title="All 2 branches missed.">                      else if (txnMetadata.pendingTransitionInProgress)</span>
+<span class="nc" id="L639">                        Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+<span class="nc" id="L640">                      else txnMetadata.state match {</span>
+<span class="nc bnc" id="L641" title="All 10 branches missed.">                        case TransactionState.EMPTY| TransactionState.ONGOING | TransactionState.COMPLETE_COMMIT | TransactionState.COMPLETE_ABORT =&gt;</span>
+<span class="nc" id="L642">                          logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+<span class="nc bnc" id="L643" title="All 2 branches missed.">                        case TransactionState.PREPARE_COMMIT =&gt;</span>
+<span class="nc bnc" id="L644" title="All 6 branches missed.">                          if (txnMarkerResult != TransactionResult.COMMIT)</span>
+<span class="nc" id="L645">                            logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+                          else
+<span class="nc" id="L647">                            Right(txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">                        case TransactionState.PREPARE_ABORT =&gt;</span>
+<span class="nc bnc" id="L649" title="All 6 branches missed.">                          if (txnMarkerResult != TransactionResult.ABORT)</span>
+<span class="nc" id="L650">                            logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+                          else
+<span class="nc" id="L652">                            Right(txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))</span>
+<span class="nc bnc" id="L653" title="All 6 branches missed.">                        case TransactionState.DEAD | TransactionState.PREPARE_EPOCH_FENCE =&gt;</span>
+<span class="nc" id="L654">                          val errorMsg = s&quot;Found transactionalId $transactionalId with state ${txnMetadata.state}. &quot; +</span>
+                            s&quot;This is illegal as we should never have transitioned to this state.&quot;
+<span class="nc" id="L656">                          fatal(errorMsg)</span>
+<span class="nc" id="L657">                          throw new IllegalStateException(errorMsg)</span>
+                      }
+                    })
+                  } else {
+<span class="nc" id="L661">                    debug(s&quot;The transaction coordinator epoch has changed to ${epochAndMetadata.coordinatorEpoch} after $txnMarkerResult was &quot; +</span>
+<span class="nc" id="L662">                      s&quot;successfully appended to the log for $transactionalId with old epoch $coordinatorEpoch&quot;)</span>
+<span class="nc" id="L663">                    Left(Errors.NOT_COORDINATOR)</span>
+                  }
+              }
+
+<span class="nc" id="L667">              preSendResult match {</span>
+<span class="nc bnc" id="L668" title="All 2 branches missed.">                case Left(err) =&gt;</span>
+<span class="nc" id="L669">                  info(s&quot;Aborting sending of transaction markers after appended $txnMarkerResult to transaction log and returning $err error to client for $transactionalId's EndTransaction request&quot;)</span>
+<span class="nc" id="L670">                  responseCallback(err, RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH)</span>
+
+<span class="nc bnc" id="L672" title="All 4 branches missed.">                case Right((txnMetadata, newPreSendMetadata)) =&gt;</span>
+                  // we can respond to the client immediately and continue to write the txn markers if
+                  // the log append was successful
+<span class="nc" id="L675">                  responseCallback(Errors.NONE, RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH)</span>
+
+<span class="nc" id="L677">                  txnMarkerChannelManager.addTxnMarkersToSend(coordinatorEpoch, txnMarkerResult, txnMetadata, newPreSendMetadata)</span>
+              }
+            } else {
+<span class="nc" id="L680">              info(s&quot;Aborting sending of transaction markers and returning $error error to client for $transactionalId's EndTransaction request of $txnMarkerResult, &quot; +</span>
+<span class="nc" id="L681">                s&quot;since appending $newMetadata to transaction log with coordinator epoch $coordinatorEpoch failed&quot;)</span>
+
+<span class="nc bnc" id="L683" title="All 2 branches missed.">              if (isEpochFence) {</span>
+<span class="nc" id="L684">                txnManager.getTransactionState(transactionalId).foreach {</span>
+<span class="nc bnc" id="L685" title="All 2 branches missed.">                  case None =&gt;</span>
+<span class="nc" id="L686">                    warn(s&quot;The coordinator still owns the transaction partition for $transactionalId, but there is &quot; +</span>
+                      s&quot;no metadata in the cache; this is not expected&quot;)
+
+<span class="nc bnc" id="L689" title="All 2 branches missed.">                  case Some(epochAndMetadata) =&gt;</span>
+<span class="nc bnc" id="L690" title="All 2 branches missed.">                    if (epochAndMetadata.coordinatorEpoch == coordinatorEpoch) {</span>
+                      // This was attempted epoch fence that failed, so mark this state on the metadata
+<span class="nc" id="L692">                      epochAndMetadata.transactionMetadata.hasFailedEpochFence(true)</span>
+<span class="nc" id="L693">                      warn(s&quot;The coordinator failed to write an epoch fence transition for producer $transactionalId to the transaction log &quot; +</span>
+<span class="nc" id="L694">                        s&quot;with error $error. The epoch was increased to ${newMetadata.producerEpoch} but not returned to the client&quot;)</span>
+                    }
+                }
+              }
+
+<span class="nc" id="L699">              responseCallback(error, RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH)</span>
+            }
+          }
+
+<span class="nc" id="L703">          txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata,</span>
+<span class="nc" id="L704">            sendTxnMarkersCallback, requestLocal = requestLocal)</span>
+      }
+    }
+  }
+
+
+  /*
+    Here is the table to demonstrate the state transition for Empty, CompleteAbort, CompleteCommit in Transaction V2.
+    Note:
+    PF = PRODUCER_FENCED
+    ITS = INVALID_TXN_STATE
+    NONE = No error and no epoch bump
+    EB = No error and epoch bump
+
+    Retry =&gt; producerEpoch = txnState.ProducerEpoch - 1
+    Current =&gt; producerEpoch = txnState.ProducerEpoch
+
+    ------------------------------------------------------
+    With transaction V1, Retry is not allowed, PRODUCER_FENCED will be returned if the epoch does not match.
+    Empty does not accept Abort and Commit.
+    CompleteAbort only accepts Abort.
+    CompleteCommit only accepts Commit.
+    For all invalid cases, INVALID_TXN_STATE is returned.
+
+    ------------------------------------------------------
+    With transaction V2.
+    +----------------+-----------------+-----------------+
+    |                | Abort           | Commit          |
+    +----------------+-------+---------+-------+---------+
+    |                | Retry | Current | Retry | Current |
+    +----------------+-------+---------+-------+---------+
+    | Empty          | PF    | EB      | PF    | ITS     |
+    +----------------+-------+---------+-------+---------+
+    | CompleteAbort  | NONE  | EB      | ITS   | ITS     |
+    +----------------+-------+---------+-------+---------+
+    | CompleteCommit | ITS   | EB      | NONE  | ITS     |
+    +----------------+-------+---------+-------+---------+
+   */
+
+  /**
+   * Handling the endTxn request above the Transaction Version 2.
+   *
+   * @param transactionalId           The transaction ID from the endTxn request
+   * @param producerId                The producer ID from the endTxn request
+   * @param producerEpoch             The producer epoch from the endTxn request
+   * @param txnMarkerResult           To commit or abort the transaction
+   * @param isFromClient              Is the request from client
+   * @param clientTransactionVersion  The transaction version for the endTxn request
+   * @param responseCallback          The response callback
+   * @param requestLocal              The request local object
+   */
+  private def endTransaction(transactionalId: String,
+                             producerId: Long,
+                             producerEpoch: Short,
+                             txnMarkerResult: TransactionResult,
+                             isFromClient: Boolean,
+                             clientTransactionVersion: TransactionVersion,
+                             responseCallback: EndTxnCallback,
+                             requestLocal: RequestLocal): Unit = {
+<span class="nc bnc" id="L763" title="All 6 branches missed.">    if (!clientTransactionVersion.supportsEpochBump()) {</span>
+      endTransactionWithTV1(transactionalId, producerId, producerEpoch, txnMarkerResult, isFromClient, responseCallback, requestLocal)
+      return
+    }
+<span class="nc" id="L767">    var isEpochFence = false</span>
+<span class="nc bnc" id="L768" title="All 10 branches missed.">    if (transactionalId == null || transactionalId.isEmpty)</span>
+<span class="nc" id="L769">      responseCallback(Errors.INVALID_REQUEST, RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH)</span>
+    else {
+<span class="nc" id="L771">      var producerIdCopy = RecordBatch.NO_PRODUCER_ID</span>
+<span class="nc" id="L772">      var producerEpochCopy = RecordBatch.NO_PRODUCER_EPOCH</span>
+<span class="nc" id="L773">      val preAppendResult: ApiResult[(Int, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).flatMap {</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">        case None =&gt;</span>
+<span class="nc" id="L775">          Left(Errors.INVALID_PRODUCER_ID_MAPPING)</span>
+
+<span class="nc bnc" id="L777" title="All 2 branches missed.">        case Some(epochAndTxnMetadata) =&gt;</span>
+<span class="nc" id="L778">          val txnMetadata = epochAndTxnMetadata.transactionMetadata</span>
+<span class="nc" id="L779">          val coordinatorEpoch = epochAndTxnMetadata.coordinatorEpoch</span>
+
+<span class="nc" id="L781">          txnMetadata.inLock(() =&gt; {</span>
+<span class="nc" id="L782">            producerIdCopy = txnMetadata.producerId</span>
+<span class="nc" id="L783">            producerEpochCopy = txnMetadata.producerEpoch</span>
+            // PrepareEpochFence has slightly different epoch bumping logic so don't include it here.
+            // Note that, it can only happen when the current state is Ongoing.
+<span class="nc bnc" id="L786" title="All 6 branches missed.">            isEpochFence = txnMetadata.pendingState.filter(s =&gt; s == TransactionState.PREPARE_EPOCH_FENCE).isPresent</span>
+            // True if the client retried a request that had overflowed the epoch, and a new producer ID is stored in the txnMetadata
+<span class="nc bnc" id="L788" title="All 4 branches missed.">            val retryOnOverflow = !isEpochFence &amp;&amp; txnMetadata.prevProducerId == producerId &amp;&amp;</span>
+<span class="nc bnc" id="L789" title="All 4 branches missed.">              producerEpoch == Short.MaxValue - 1 &amp;&amp; txnMetadata.producerEpoch == 0</span>
+            // True if the client retried an endTxn request, and the bumped producer epoch is stored in the txnMetadata.
+<span class="nc bnc" id="L791" title="All 4 branches missed.">            val retryOnEpochBump = !isEpochFence &amp;&amp; txnMetadata.producerEpoch == producerEpoch + 1</span>
+
+            val isValidEpoch = {
+<span class="nc bnc" id="L794" title="All 2 branches missed.">              if (!isEpochFence) {</span>
+                // With transactions V2, state + same epoch is not sufficient to determine if a retry transition is valid. If the epoch is the
+                // same it actually indicates the next endTransaction call. Instead, we want to check the epoch matches with the epoch in the retry conditions.
+                // Return producer fenced even in the cases where the epoch is higher and could indicate an invalid state transition.
+                // Use the following criteria to determine if a v2 retry is valid:
+<span class="nc" id="L799">                txnMetadata.state match {</span>
+<span class="nc bnc" id="L800" title="All 10 branches missed.">                  case TransactionState.ONGOING | TransactionState.EMPTY | TransactionState.DEAD | TransactionState.PREPARE_EPOCH_FENCE =&gt;</span>
+<span class="nc bnc" id="L801" title="All 2 branches missed.">                    producerEpoch == txnMetadata.producerEpoch</span>
+<span class="nc bnc" id="L802" title="All 6 branches missed.">                  case TransactionState.PREPARE_COMMIT | TransactionState.PREPARE_ABORT =&gt;</span>
+<span class="nc" id="L803">                    retryOnEpochBump</span>
+<span class="nc bnc" id="L804" title="All 6 branches missed.">                  case TransactionState.COMPLETE_COMMIT | TransactionState.COMPLETE_ABORT =&gt;</span>
+<span class="nc bnc" id="L805" title="All 6 branches missed.">                    retryOnEpochBump || retryOnOverflow || producerEpoch == txnMetadata.producerEpoch</span>
+                }
+              } else {
+                // If the epoch is going to be fenced, it bumps the epoch differently with TV2.
+<span class="nc bnc" id="L809" title="All 6 branches missed.">                (!isFromClient || producerEpoch == txnMetadata.producerEpoch) &amp;&amp; producerEpoch &gt;= txnMetadata.producerEpoch</span>
+              }
+            }
+
+<span class="nc bnc" id="L813" title="All 4 branches missed.">            val isRetry = retryOnEpochBump || retryOnOverflow</span>
+
+            def generateTxnTransitMetadataForTxnCompletion(nextState: TransactionState, noPartitionAdded: Boolean): ApiResult[(Int, TxnTransitMetadata)] = {
+              // EndTxn completion on TV2 bumps epoch, so rotate producer ID whenever the current epoch is exhausted.
+              // This must also apply to the epoch-fence path.
+              val nextProducerIdOrErrors =
+<span class="nc bnc" id="L819" title="All 10 branches missed.">                if (txnMetadata.isProducerEpochExhausted) {</span>
+                  try {
+<span class="nc" id="L821">                    Right(producerIdManager.generateProducerId())</span>
+                  } catch {
+<span class="nc" id="L823">                    case e: Exception =&gt; Left(Errors.forException(e))</span>
+                  }
+                } else {
+<span class="nc" id="L826">                  Right(RecordBatch.NO_PRODUCER_ID)</span>
+                }
+
+<span class="nc bnc" id="L829" title="All 40 branches missed.">              if (nextState == TransactionState.PREPARE_ABORT &amp;&amp; isEpochFence) {</span>
+                // We should clear the pending state to make way for the transition to PrepareAbort
+<span class="nc" id="L831">                txnMetadata.pendingState(util.Optional.empty())</span>
+                // For TV2+, don't manually set the epoch - let prepareAbortOrCommit handle it naturally.
+              }
+
+<span class="nc" id="L835">              nextProducerIdOrErrors.flatMap {</span>
+<span class="nc" id="L836">                nextProducerId =&gt;</span>
+<span class="nc" id="L837">                  Right(coordinatorEpoch, txnMetadata.prepareAbortOrCommit(nextState, clientTransactionVersion, nextProducerId.asInstanceOf[Long], time.milliseconds(), noPartitionAdded))</span>
+              }
+            }
+
+<span class="nc bnc" id="L841" title="All 8 branches missed.">            if (txnMetadata.pendingTransitionInProgress &amp;&amp; txnMetadata.pendingState.get != TransactionState.PREPARE_EPOCH_FENCE) {</span>
+              // This check is performed first so that the pending transition can complete before the next checks.
+              // With TV2, we may be transitioning over a producer epoch overflow, and the producer may be using the
+              // new producer ID that is still only in pending state.
+<span class="nc" id="L845">              Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+<span class="nc bnc" id="L846" title="All 4 branches missed.">            } else if (txnMetadata.producerId != producerId &amp;&amp; !retryOnOverflow)</span>
+<span class="nc" id="L847">              Left(Errors.INVALID_PRODUCER_ID_MAPPING)</span>
+<span class="nc bnc" id="L848" title="All 2 branches missed.">            else if (!isValidEpoch)</span>
+<span class="nc" id="L849">              Left(Errors.PRODUCER_FENCED)</span>
+<span class="nc" id="L850">            else txnMetadata.state match {</span>
+<span class="nc bnc" id="L851" title="All 2 branches missed.">              case TransactionState.ONGOING =&gt;</span>
+<span class="nc bnc" id="L852" title="All 6 branches missed.">                val nextState = if (txnMarkerResult == TransactionResult.COMMIT)</span>
+<span class="nc" id="L853">                  TransactionState.PREPARE_COMMIT</span>
+                else
+<span class="nc" id="L855">                  TransactionState.PREPARE_ABORT</span>
+
+<span class="nc" id="L857">                generateTxnTransitMetadataForTxnCompletion(nextState, false)</span>
+<span class="nc bnc" id="L858" title="All 2 branches missed.">              case TransactionState.COMPLETE_COMMIT =&gt;</span>
+<span class="nc bnc" id="L859" title="All 6 branches missed.">                if (txnMarkerResult == TransactionResult.COMMIT) {</span>
+<span class="nc bnc" id="L860" title="All 2 branches missed.">                  if (isRetry)</span>
+<span class="nc" id="L861">                    Left(Errors.NONE)</span>
+                  else
+<span class="nc" id="L863">                    logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+                } else {
+                  // Abort.
+<span class="nc bnc" id="L866" title="All 2 branches missed.">                  if (isRetry)</span>
+<span class="nc" id="L867">                    logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+                  else
+<span class="nc" id="L869">                    generateTxnTransitMetadataForTxnCompletion(TransactionState.PREPARE_ABORT, true)</span>
+                }
+<span class="nc bnc" id="L871" title="All 2 branches missed.">              case TransactionState.COMPLETE_ABORT =&gt;</span>
+<span class="nc bnc" id="L872" title="All 6 branches missed.">                if (txnMarkerResult == TransactionResult.ABORT) {</span>
+<span class="nc bnc" id="L873" title="All 2 branches missed.">                  if (isRetry)</span>
+<span class="nc" id="L874">                    Left(Errors.NONE)</span>
+                  else
+<span class="nc" id="L876">                    generateTxnTransitMetadataForTxnCompletion(TransactionState.PREPARE_ABORT, true)</span>
+                } else {
+                  // Commit.
+<span class="nc" id="L879">                  logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+                }
+<span class="nc bnc" id="L881" title="All 2 branches missed.">              case TransactionState.PREPARE_COMMIT =&gt;</span>
+<span class="nc bnc" id="L882" title="All 6 branches missed.">                if (txnMarkerResult == TransactionResult.COMMIT)</span>
+<span class="nc" id="L883">                  Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+                else
+<span class="nc" id="L885">                  logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+<span class="nc bnc" id="L886" title="All 2 branches missed.">              case TransactionState.PREPARE_ABORT =&gt;</span>
+<span class="nc bnc" id="L887" title="All 6 branches missed.">                if (txnMarkerResult == TransactionResult.ABORT)</span>
+<span class="nc" id="L888">                  Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+                else
+<span class="nc" id="L890">                  logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+<span class="nc bnc" id="L891" title="All 2 branches missed.">              case TransactionState.EMPTY =&gt;</span>
+<span class="nc bnc" id="L892" title="All 6 branches missed.">                if (txnMarkerResult == TransactionResult.ABORT) {</span>
+<span class="nc" id="L893">                  generateTxnTransitMetadataForTxnCompletion(TransactionState.PREPARE_ABORT, true)</span>
+                } else {
+<span class="nc" id="L895">                  logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+                }
+<span class="nc bnc" id="L897" title="All 6 branches missed.">              case TransactionState.DEAD | TransactionState.PREPARE_EPOCH_FENCE =&gt;</span>
+<span class="nc" id="L898">                val errorMsg = s&quot;Found transactionalId $transactionalId with state ${txnMetadata.state}. &quot; +</span>
+                  s&quot;This is illegal as we should never have transitioned to this state.&quot;
+<span class="nc" id="L900">                fatal(errorMsg)</span>
+<span class="nc" id="L901">                throw new IllegalStateException(errorMsg)</span>
+
+            }
+          })
+      }
+
+<span class="nc" id="L907">      preAppendResult match {</span>
+<span class="nc bnc" id="L908" title="All 6 branches missed.">        case Left(err) =&gt;</span>
+<span class="nc bnc" id="L909" title="All 18 branches missed.">          if (err == Errors.NONE) {</span>
+<span class="nc" id="L910">            responseCallback(err, producerIdCopy, producerEpochCopy)</span>
+          } else {
+<span class="nc" id="L912">            debug(s&quot;Aborting append of $txnMarkerResult to transaction log with coordinator and returning $err error to client for $transactionalId's EndTransaction request&quot;)</span>
+<span class="nc" id="L913">            responseCallback(err, RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH)</span>
+          }
+
+<span class="nc bnc" id="L916" title="All 12 branches missed.">        case Right((coordinatorEpoch, newMetadata)) =&gt;</span>
+          def sendTxnMarkersCallback(error: Errors): Unit = {
+<span class="nc bnc" id="L918" title="All 6 branches missed.">            if (error == Errors.NONE) {</span>
+<span class="nc" id="L919">              val preSendResult: ApiResult[(TransactionMetadata, TxnTransitMetadata)] = txnManager.getTransactionState(transactionalId).flatMap {</span>
+<span class="nc bnc" id="L920" title="All 2 branches missed.">                case None =&gt;</span>
+<span class="nc" id="L921">                  val errorMsg = s&quot;The coordinator still owns the transaction partition for $transactionalId, but there is &quot; +</span>
+                    s&quot;no metadata in the cache; this is not expected&quot;
+<span class="nc" id="L923">                  fatal(errorMsg)</span>
+<span class="nc" id="L924">                  throw new IllegalStateException(errorMsg)</span>
+
+<span class="nc bnc" id="L926" title="All 2 branches missed.">                case Some(epochAndMetadata) =&gt;</span>
+<span class="nc bnc" id="L927" title="All 2 branches missed.">                  if (epochAndMetadata.coordinatorEpoch == coordinatorEpoch) {</span>
+<span class="nc" id="L928">                    val txnMetadata = epochAndMetadata.transactionMetadata</span>
+<span class="nc" id="L929">                    txnMetadata.inLock(() =&gt; {</span>
+<span class="nc bnc" id="L930" title="All 2 branches missed.">                      if (txnMetadata.producerId != producerId)</span>
+<span class="nc" id="L931">                        Left(Errors.INVALID_PRODUCER_ID_MAPPING)</span>
+<span class="nc bnc" id="L932" title="All 4 branches missed.">                      else if (txnMetadata.producerEpoch != producerEpoch &amp;&amp; txnMetadata.producerEpoch != producerEpoch + 1)</span>
+<span class="nc" id="L933">                        Left(Errors.PRODUCER_FENCED)</span>
+<span class="nc bnc" id="L934" title="All 2 branches missed.">                      else if (txnMetadata.pendingTransitionInProgress)</span>
+<span class="nc" id="L935">                        Left(Errors.CONCURRENT_TRANSACTIONS)</span>
+<span class="nc" id="L936">                      else txnMetadata.state match {</span>
+<span class="nc bnc" id="L937" title="All 10 branches missed.">                        case TransactionState.EMPTY | TransactionState.ONGOING | TransactionState.COMPLETE_COMMIT | TransactionState.COMPLETE_ABORT =&gt;</span>
+<span class="nc" id="L938">                          logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+<span class="nc bnc" id="L939" title="All 2 branches missed.">                        case TransactionState.PREPARE_COMMIT =&gt;</span>
+<span class="nc bnc" id="L940" title="All 6 branches missed.">                          if (txnMarkerResult != TransactionResult.COMMIT)</span>
+<span class="nc" id="L941">                            logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+                          else
+<span class="nc" id="L943">                            Right(txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))</span>
+<span class="nc bnc" id="L944" title="All 2 branches missed.">                        case TransactionState.PREPARE_ABORT =&gt;</span>
+<span class="nc bnc" id="L945" title="All 6 branches missed.">                          if (txnMarkerResult != TransactionResult.ABORT)</span>
+<span class="nc" id="L946">                            logInvalidStateTransitionAndReturnError(transactionalId, txnMetadata.state, txnMarkerResult)</span>
+                          else
+<span class="nc" id="L948">                            Right(txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))</span>
+<span class="nc bnc" id="L949" title="All 6 branches missed.">                        case TransactionState.DEAD | TransactionState.PREPARE_EPOCH_FENCE =&gt;</span>
+<span class="nc" id="L950">                          val errorMsg = s&quot;Found transactionalId $transactionalId with state ${txnMetadata.state}. &quot; +</span>
+                            s&quot;This is illegal as we should never have transitioned to this state.&quot;
+<span class="nc" id="L952">                          fatal(errorMsg)</span>
+<span class="nc" id="L953">                          throw new IllegalStateException(errorMsg)</span>
+
+                      }
+                    })
+                  } else {
+<span class="nc" id="L958">                    debug(s&quot;The transaction coordinator epoch has changed to ${epochAndMetadata.coordinatorEpoch} after $txnMarkerResult was &quot; +</span>
+<span class="nc" id="L959">                      s&quot;successfully appended to the log for $transactionalId with old epoch $coordinatorEpoch&quot;)</span>
+<span class="nc" id="L960">                    Left(Errors.NOT_COORDINATOR)</span>
+                  }
+              }
+
+<span class="nc" id="L964">              preSendResult match {</span>
+<span class="nc bnc" id="L965" title="All 2 branches missed.">                case Left(err) =&gt;</span>
+<span class="nc" id="L966">                  info(s&quot;Aborting sending of transaction markers after appended $txnMarkerResult to transaction log and returning $err error to client for $transactionalId's EndTransaction request&quot;)</span>
+<span class="nc" id="L967">                  responseCallback(err, RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH)</span>
+
+<span class="nc bnc" id="L969" title="All 4 branches missed.">                case Right((txnMetadata, newPreSendMetadata)) =&gt;</span>
+                  // we can respond to the client immediately and continue to write the txn markers if
+                  // the log append was successful
+<span class="nc" id="L972">                  responseCallback(Errors.NONE, newPreSendMetadata.producerId, newPreSendMetadata.producerEpoch)</span>
+
+<span class="nc" id="L974">                  txnMarkerChannelManager.addTxnMarkersToSend(coordinatorEpoch, txnMarkerResult, txnMetadata, newPreSendMetadata)</span>
+              }
+            } else {
+<span class="nc" id="L977">              info(s&quot;Aborting sending of transaction markers and returning $error error to client for $transactionalId's EndTransaction request of $txnMarkerResult, &quot; +</span>
+<span class="nc" id="L978">                s&quot;since appending $newMetadata to transaction log with coordinator epoch $coordinatorEpoch failed&quot;)</span>
+
+<span class="nc bnc" id="L980" title="All 2 branches missed.">              if (isEpochFence) {</span>
+<span class="nc" id="L981">                txnManager.getTransactionState(transactionalId).foreach {</span>
+<span class="nc bnc" id="L982" title="All 2 branches missed.">                  case None =&gt;</span>
+<span class="nc" id="L983">                    warn(s&quot;The coordinator still owns the transaction partition for $transactionalId, but there is &quot; +</span>
+                      s&quot;no metadata in the cache; this is not expected&quot;)
+
+<span class="nc bnc" id="L986" title="All 2 branches missed.">                  case Some(epochAndMetadata) =&gt;</span>
+<span class="nc bnc" id="L987" title="All 2 branches missed.">                    if (epochAndMetadata.coordinatorEpoch == coordinatorEpoch) {</span>
+                      // For TV2, we allow re-bumping the epoch on retry, since we don't complete the epoch bump.
+                      // Therefore, we don't set hasFailedEpochFence = true.
+<span class="nc" id="L990">                      warn(s&quot;The coordinator failed to write an epoch fence transition for producer $transactionalId to the transaction log &quot; +</span>
+<span class="nc" id="L991">                        s&quot;with error $error&quot;)</span>
+                    }
+                }
+              }
+
+<span class="nc" id="L996">              responseCallback(error, RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH)</span>
+            }
+          }
+
+<span class="nc" id="L1000">          txnManager.appendTransactionToLog(transactionalId, coordinatorEpoch, newMetadata,</span>
+<span class="nc" id="L1001">            sendTxnMarkersCallback, requestLocal = requestLocal)</span>
+      }
+    }
+  }
+
+<span class="nc" id="L1006">  def transactionTopicConfigs: Properties = txnManager.transactionTopicConfigs</span>
+
+<span class="nc" id="L1008">  def partitionFor(transactionalId: String): Int = txnManager.partitionFor(transactionalId)</span>
+
+  // Package-private for testing
+<span class="nc" id="L1011">  private[kafka] def transactionManager: TransactionStateManager = txnManager</span>
+
+  private def onEndTransactionComplete(txnIdAndPidEpoch: TransactionalIdAndProducerIdEpoch)(error: Errors, newProducerId: Long, newProducerEpoch: Short): Unit = {
+    error match {
+<span class="nc bnc" id="L1015" title="All 2 branches missed.">      case Errors.NONE =&gt;</span>
+<span class="nc" id="L1016">        info(&quot;Completed rollback of ongoing transaction for transactionalId &quot; +</span>
+<span class="nc" id="L1017">          s&quot;${txnIdAndPidEpoch.transactionalId} due to timeout&quot;)</span>
+
+<span class="nc bnc" id="L1019" title="All 4 branches missed.">      case error@(Errors.INVALID_PRODUCER_ID_MAPPING |</span>
+<span class="nc bnc" id="L1020" title="All 2 branches missed.">                  Errors.PRODUCER_FENCED |</span>
+<span class="nc bnc" id="L1021" title="All 2 branches missed.">                  Errors.CONCURRENT_TRANSACTIONS) =&gt;</span>
+<span class="nc" id="L1022">        debug(s&quot;Rollback of ongoing transaction for transactionalId ${txnIdAndPidEpoch.transactionalId} &quot; +</span>
+<span class="nc" id="L1023">          s&quot;has been cancelled due to error $error&quot;)</span>
+
+      case error =&gt;
+<span class="nc" id="L1026">        warn(s&quot;Rollback of ongoing transaction for transactionalId ${txnIdAndPidEpoch.transactionalId} &quot; +</span>
+<span class="nc" id="L1027">          s&quot;failed due to error $error&quot;)</span>
+    }
+  }
+
+  private[transaction] def abortTimedOutTransactions(onComplete: TransactionalIdAndProducerIdEpoch =&gt; EndTxnCallback): Unit = {
+
+<span class="pc" id="L1033">    txnManager.timedOutTransactions().foreach { txnIdAndPidEpoch =&gt;</span>
+<span class="nc" id="L1034">      txnManager.getTransactionState(txnIdAndPidEpoch.transactionalId).foreach {</span>
+<span class="nc bnc" id="L1035" title="All 2 branches missed.">        case None =&gt;</span>
+<span class="nc" id="L1036">          error(s&quot;Could not find transaction metadata when trying to timeout transaction for $txnIdAndPidEpoch&quot;)</span>
+
+<span class="nc bnc" id="L1038" title="All 2 branches missed.">        case Some(epochAndTxnMetadata) =&gt;</span>
+<span class="nc" id="L1039">          val txnMetadata = epochAndTxnMetadata.transactionMetadata</span>
+<span class="nc" id="L1040">          val transitMetadataOpt = txnMetadata.inLock(() =&gt; {</span>
+<span class="nc bnc" id="L1041" title="All 2 branches missed.">            if (txnMetadata.producerId != txnIdAndPidEpoch.producerId) {</span>
+<span class="nc" id="L1042">              error(s&quot;Found incorrect producerId when expiring transactionalId: ${txnIdAndPidEpoch.transactionalId}. &quot; +</span>
+<span class="nc" id="L1043">                s&quot;Expected producerId: ${txnIdAndPidEpoch.producerId}. Found producerId: &quot; +</span>
+<span class="nc" id="L1044">                s&quot;${txnMetadata.producerId}&quot;)</span>
+<span class="nc" id="L1045">              None</span>
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">            } else if (txnMetadata.pendingTransitionInProgress) {</span>
+<span class="nc" id="L1047">              debug(s&quot;Skipping abort of timed out transaction $txnIdAndPidEpoch since there is a &quot; +</span>
+                &quot;pending state transition&quot;)
+<span class="nc" id="L1049">              None</span>
+            } else {
+<span class="nc" id="L1051">              Some(txnMetadata.prepareFenceProducerEpoch())</span>
+            }
+          })
+
+<span class="nc" id="L1055">          transitMetadataOpt.foreach { txnTransitMetadata =&gt;</span>
+<span class="nc" id="L1056">            endTransaction(txnMetadata.transactionalId,</span>
+<span class="nc" id="L1057">              txnTransitMetadata.producerId,</span>
+<span class="nc" id="L1058">              txnTransitMetadata.producerEpoch,</span>
+<span class="nc" id="L1059">              TransactionResult.ABORT,</span>
+<span class="nc" id="L1060">              isFromClient = false,</span>
+<span class="nc" id="L1061">              clientTransactionVersion = txnManager.transactionVersionLevel(), // Since this is not from client, use server TV</span>
+<span class="nc" id="L1062">              onComplete(txnIdAndPidEpoch),</span>
+<span class="nc" id="L1063">              RequestLocal.noCaching)</span>
+          }
+      }
+    }
+  }
+
+  /**
+   * Startup logic executed at the same time when the server starts up.
+   */
+<span class="fc" id="L1072">  def startup(retrieveTransactionTopicPartitionCount: () =&gt; Int, enableTransactionalIdExpiration: Boolean = true): Unit = {</span>
+<span class="pc" id="L1073">    info(&quot;Starting up.&quot;)</span>
+<span class="fc" id="L1074">    scheduler.startup()</span>
+<span class="fc" id="L1075">    scheduler.schedule(&quot;transaction-abort&quot;,</span>
+<span class="pc" id="L1076">      () =&gt; abortTimedOutTransactions(onEndTransactionComplete),</span>
+<span class="fc" id="L1077">      txnConfig.abortTimedOutTransactionsIntervalMs,</span>
+<span class="fc" id="L1078">      txnConfig.abortTimedOutTransactionsIntervalMs</span>
+    )
+<span class="fc" id="L1080">    txnManager.startup(retrieveTransactionTopicPartitionCount, enableTransactionalIdExpiration)</span>
+<span class="fc" id="L1081">    txnMarkerChannelManager.start()</span>
+<span class="fc" id="L1082">    isActive.set(true)</span>
+
+<span class="pc" id="L1084">    info(&quot;Startup complete.&quot;)</span>
+  }
+
+  /**
+   * Shutdown logic executed at the same time when server shuts down.
+   * Ordering of actions should be reversed from the startup process.
+   */
+  def shutdown(): Unit = {
+<span class="pc" id="L1092">    info(&quot;Shutting down.&quot;)</span>
+<span class="fc" id="L1093">    isActive.set(false)</span>
+<span class="fc" id="L1094">    scheduler.shutdown()</span>
+<span class="fc" id="L1095">    txnManager.shutdown()</span>
+<span class="fc" id="L1096">    txnMarkerChannelManager.shutdown()</span>
+<span class="pc" id="L1097">    info(&quot;Shutdown complete.&quot;)</span>
+  }
+}
+
+<span class="pc bnc" id="L1101" title="All 28 branches missed.">case class InitProducerIdResult(producerId: Long, producerEpoch: Short, error: Errors)</span>
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

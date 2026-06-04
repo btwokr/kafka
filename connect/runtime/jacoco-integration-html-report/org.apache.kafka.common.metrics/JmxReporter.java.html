@@ -1,0 +1,339 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>JmxReporter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.metrics</a> &gt; <span class="el_source">JmxReporter.java</span></div><h1>JmxReporter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.metrics;
+
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.utils.internals.Sanitizer;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.lang.management.ManagementFactory;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
+
+import javax.management.Attribute;
+import javax.management.AttributeList;
+import javax.management.AttributeNotFoundException;
+import javax.management.DynamicMBean;
+import javax.management.JMException;
+import javax.management.MBeanAttributeInfo;
+import javax.management.MBeanInfo;
+import javax.management.MBeanServer;
+import javax.management.MalformedObjectNameException;
+import javax.management.ObjectName;
+
+/**
+ * Register metrics in JMX as dynamic mbeans based on the metric names
+ */
+public class JmxReporter implements MetricsReporter {
+
+    public static final String METRICS_CONFIG_PREFIX = &quot;metrics.jmx.&quot;;
+
+    public static final String EXCLUDE_CONFIG = METRICS_CONFIG_PREFIX + &quot;exclude&quot;;
+
+    public static final String INCLUDE_CONFIG = METRICS_CONFIG_PREFIX + &quot;include&quot;;
+
+
+<span class="fc" id="L60">    public static final Set&lt;String&gt; RECONFIGURABLE_CONFIGS = Set.of(INCLUDE_CONFIG,</span>
+                                                                         EXCLUDE_CONFIG);
+
+    public static final String DEFAULT_INCLUDE = &quot;.*&quot;;
+    public static final String DEFAULT_EXCLUDE = &quot;&quot;;
+
+<span class="fc" id="L66">    private static final Logger log = LoggerFactory.getLogger(JmxReporter.class);</span>
+<span class="fc" id="L67">    private static final Object LOCK = new Object();</span>
+    private String prefix;
+<span class="fc" id="L69">    private final Map&lt;String, KafkaMbean&gt; mbeans = new HashMap&lt;&gt;();</span>
+<span class="pc" id="L70">    private Predicate&lt;String&gt; mbeanPredicate = s -&gt; true;</span>
+
+<span class="fc" id="L72">    public JmxReporter() {</span>
+<span class="fc" id="L73">        this.prefix = &quot;&quot;;</span>
+<span class="fc" id="L74">    }</span>
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs) {
+<span class="fc" id="L78">        reconfigure(configs);</span>
+<span class="fc" id="L79">    }</span>
+
+    @Override
+    public Set&lt;String&gt; reconfigurableConfigs() {
+<span class="fc" id="L83">        return RECONFIGURABLE_CONFIGS;</span>
+    }
+
+    @Override
+    public void validateReconfiguration(Map&lt;String, ?&gt; configs) throws ConfigException {
+<span class="nc" id="L88">        compilePredicate(configs);</span>
+<span class="nc" id="L89">    }</span>
+
+    @Override
+    public void reconfigure(Map&lt;String, ?&gt; configs) {
+<span class="fc" id="L93">        synchronized (LOCK) {</span>
+<span class="fc" id="L94">            this.mbeanPredicate = JmxReporter.compilePredicate(configs);</span>
+
+<span class="fc" id="L96">            mbeans.forEach((name, mbean) -&gt; {</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">                if (mbeanPredicate.test(name)) {</span>
+<span class="nc" id="L98">                    reregister(mbean);</span>
+                } else {
+<span class="nc" id="L100">                    unregister(mbean);</span>
+                }
+<span class="nc" id="L102">            });</span>
+<span class="fc" id="L103">        }</span>
+<span class="fc" id="L104">    }</span>
+
+    @Override
+    public void init(List&lt;KafkaMetric&gt; metrics) {
+<span class="fc" id="L108">        synchronized (LOCK) {</span>
+<span class="fc bfc" id="L109" title="All 2 branches covered.">            for (KafkaMetric metric : metrics)</span>
+<span class="fc" id="L110">                addAttribute(metric);</span>
+
+<span class="fc" id="L112">            mbeans.forEach((name, mbean) -&gt; {</span>
+<span class="pc bpc" id="L113" title="1 of 2 branches missed.">                if (mbeanPredicate.test(name)) {</span>
+<span class="fc" id="L114">                    reregister(mbean);</span>
+                }
+<span class="fc" id="L116">            });</span>
+<span class="fc" id="L117">        }</span>
+<span class="fc" id="L118">    }</span>
+
+    public boolean containsMbean(String mbeanName) {
+<span class="nc" id="L121">        return mbeans.containsKey(mbeanName);</span>
+    }
+
+    @Override
+    public void metricChange(KafkaMetric metric) {
+<span class="fc" id="L126">        synchronized (LOCK) {</span>
+<span class="fc" id="L127">            String mbeanName = addAttribute(metric);</span>
+<span class="pc bpc" id="L128" title="2 of 4 branches missed.">            if (mbeanName != null &amp;&amp; mbeanPredicate.test(mbeanName)) {</span>
+<span class="fc" id="L129">                reregister(mbeans.get(mbeanName));</span>
+            }
+<span class="fc" id="L131">        }</span>
+<span class="fc" id="L132">    }</span>
+
+    @Override
+    public void metricRemoval(KafkaMetric metric) {
+<span class="fc" id="L136">        synchronized (LOCK) {</span>
+<span class="fc" id="L137">            MetricName metricName = metric.metricName();</span>
+<span class="fc" id="L138">            String mBeanName = getMBeanName(prefix, metricName);</span>
+<span class="fc" id="L139">            KafkaMbean mbean = removeAttribute(metric, mBeanName);</span>
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">            if (mbean != null) {</span>
+<span class="fc bfc" id="L141" title="All 2 branches covered.">                if (mbean.metrics.isEmpty()) {</span>
+<span class="fc" id="L142">                    unregister(mbean);</span>
+<span class="fc" id="L143">                    mbeans.remove(mBeanName);</span>
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">                } else if (mbeanPredicate.test(mBeanName))</span>
+<span class="fc" id="L145">                    reregister(mbean);</span>
+            }
+<span class="fc" id="L147">        }</span>
+<span class="fc" id="L148">    }</span>
+
+    private KafkaMbean removeAttribute(KafkaMetric metric, String mBeanName) {
+<span class="fc" id="L151">        MetricName metricName = metric.metricName();</span>
+<span class="fc" id="L152">        KafkaMbean mbean = this.mbeans.get(mBeanName);</span>
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">        if (mbean != null)</span>
+<span class="fc" id="L154">            mbean.removeAttribute(metricName.name());</span>
+<span class="fc" id="L155">        return mbean;</span>
+    }
+
+    private String addAttribute(KafkaMetric metric) {
+        try {
+<span class="fc" id="L160">            MetricName metricName = metric.metricName();</span>
+<span class="fc" id="L161">            String mBeanName = getMBeanName(prefix, metricName);</span>
+<span class="fc bfc" id="L162" title="All 2 branches covered.">            if (!this.mbeans.containsKey(mBeanName))</span>
+<span class="fc" id="L163">                mbeans.put(mBeanName, new KafkaMbean(mBeanName));</span>
+<span class="fc" id="L164">            KafkaMbean mbean = this.mbeans.get(mBeanName);</span>
+<span class="fc" id="L165">            mbean.setAttribute(metricName.name(), metric);</span>
+<span class="fc" id="L166">            return mBeanName;</span>
+<span class="nc" id="L167">        } catch (JMException e) {</span>
+<span class="nc" id="L168">            throw new KafkaException(&quot;Error creating mbean attribute for metricName :&quot; + metric.metricName(), e);</span>
+        }
+    }
+
+    /**
+     * @param metricName
+     * @return standard JMX MBean name in the following format domainName:type=metricType,key1=val1,key2=val2
+     */
+    static String getMBeanName(String prefix, MetricName metricName) {
+<span class="fc" id="L177">        StringBuilder mBeanName = new StringBuilder();</span>
+<span class="fc" id="L178">        mBeanName.append(prefix);</span>
+<span class="fc" id="L179">        mBeanName.append(&quot;:type=&quot;);</span>
+<span class="fc" id="L180">        mBeanName.append(metricName.group());</span>
+<span class="fc bfc" id="L181" title="All 2 branches covered.">        for (Map.Entry&lt;String, String&gt; entry : metricName.tags().entrySet()) {</span>
+<span class="pc bpc" id="L182" title="2 of 4 branches missed.">            if (entry.getKey().isEmpty() || entry.getValue().isEmpty())</span>
+<span class="nc" id="L183">                continue;</span>
+<span class="fc" id="L184">            mBeanName.append(&quot;,&quot;);</span>
+<span class="fc" id="L185">            mBeanName.append(entry.getKey());</span>
+<span class="fc" id="L186">            mBeanName.append(&quot;=&quot;);</span>
+<span class="fc" id="L187">            mBeanName.append(Sanitizer.jmxSanitize(entry.getValue()));</span>
+<span class="fc" id="L188">        }</span>
+<span class="fc" id="L189">        return mBeanName.toString();</span>
+    }
+
+    public void close() {
+<span class="fc" id="L193">        synchronized (LOCK) {</span>
+<span class="fc bfc" id="L194" title="All 2 branches covered.">            for (KafkaMbean mbean : this.mbeans.values())</span>
+<span class="fc" id="L195">                unregister(mbean);</span>
+<span class="fc" id="L196">        }</span>
+<span class="fc" id="L197">    }</span>
+
+    private void unregister(KafkaMbean mbean) {
+<span class="fc" id="L200">        MBeanServer server = ManagementFactory.getPlatformMBeanServer();</span>
+        try {
+<span class="fc bfc" id="L202" title="All 2 branches covered.">            if (server.isRegistered(mbean.name()))</span>
+<span class="fc" id="L203">                server.unregisterMBean(mbean.name());</span>
+<span class="nc" id="L204">        } catch (JMException e) {</span>
+<span class="nc" id="L205">            throw new KafkaException(&quot;Error unregistering mbean&quot;, e);</span>
+<span class="fc" id="L206">        }</span>
+<span class="fc" id="L207">    }</span>
+
+    private void reregister(KafkaMbean mbean) {
+<span class="fc" id="L210">        unregister(mbean);</span>
+        try {
+<span class="fc" id="L212">            ManagementFactory.getPlatformMBeanServer().registerMBean(mbean, mbean.name());</span>
+<span class="nc" id="L213">        } catch (JMException e) {</span>
+<span class="nc" id="L214">            throw new KafkaException(&quot;Error registering mbean &quot; + mbean.name(), e);</span>
+<span class="fc" id="L215">        }</span>
+<span class="fc" id="L216">    }</span>
+
+    private static class KafkaMbean implements DynamicMBean {
+        private final ObjectName objectName;
+        private final Map&lt;String, KafkaMetric&gt; metrics;
+
+<span class="fc" id="L222">        KafkaMbean(String mbeanName) throws MalformedObjectNameException {</span>
+<span class="fc" id="L223">            this.metrics = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L224">            this.objectName = new ObjectName(mbeanName);</span>
+<span class="fc" id="L225">        }</span>
+
+        public ObjectName name() {
+<span class="fc" id="L228">            return objectName;</span>
+        }
+
+        void setAttribute(String name, KafkaMetric metric) {
+<span class="fc" id="L232">            this.metrics.put(name, metric);</span>
+<span class="fc" id="L233">        }</span>
+
+        @Override
+        public Object getAttribute(String name) throws AttributeNotFoundException {
+<span class="nc bnc" id="L237" title="All 2 branches missed.">            if (this.metrics.containsKey(name))</span>
+<span class="nc" id="L238">                return this.metrics.get(name).metricValue();</span>
+            else
+<span class="nc" id="L240">                throw new AttributeNotFoundException(&quot;Could not find attribute &quot; + name);</span>
+        }
+
+        @Override
+        public AttributeList getAttributes(String[] names) {
+<span class="nc" id="L245">            AttributeList list = new AttributeList();</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">            for (String name : names) {</span>
+                try {
+<span class="nc" id="L248">                    list.add(new Attribute(name, getAttribute(name)));</span>
+<span class="nc" id="L249">                } catch (Exception e) {</span>
+<span class="nc" id="L250">                    log.warn(&quot;Error getting JMX attribute '{}'&quot;, name, e);</span>
+<span class="nc" id="L251">                }</span>
+            }
+<span class="nc" id="L253">            return list;</span>
+        }
+
+        KafkaMetric removeAttribute(String name) {
+<span class="fc" id="L257">            return this.metrics.remove(name);</span>
+        }
+
+        @Override
+        public MBeanInfo getMBeanInfo() {
+<span class="fc" id="L262">            MBeanAttributeInfo[] attrs = new MBeanAttributeInfo[metrics.size()];</span>
+<span class="fc" id="L263">            int i = 0;</span>
+<span class="fc bfc" id="L264" title="All 2 branches covered.">            for (Map.Entry&lt;String, KafkaMetric&gt; entry : this.metrics.entrySet()) {</span>
+<span class="fc" id="L265">                String attribute = entry.getKey();</span>
+<span class="fc" id="L266">                KafkaMetric metric = entry.getValue();</span>
+<span class="fc" id="L267">                attrs[i] = new MBeanAttributeInfo(attribute,</span>
+<span class="fc" id="L268">                                                  double.class.getName(),</span>
+<span class="fc" id="L269">                                                  metric.metricName().description(),</span>
+                                                  true,
+                                                  false,
+                                                  false);
+<span class="fc" id="L273">                i += 1;</span>
+<span class="fc" id="L274">            }</span>
+<span class="fc" id="L275">            return new MBeanInfo(this.getClass().getName(), &quot;&quot;, attrs, null, null, null);</span>
+        }
+
+        @Override
+        public Object invoke(String name, Object[] params, String[] sig) {
+<span class="nc" id="L280">            throw new UnsupportedOperationException(&quot;Set not allowed.&quot;);</span>
+        }
+
+        @Override
+        public void setAttribute(Attribute attribute) {
+<span class="nc" id="L285">            throw new UnsupportedOperationException(&quot;Set not allowed.&quot;);</span>
+        }
+
+        @Override
+        public AttributeList setAttributes(AttributeList list) {
+<span class="nc" id="L290">            throw new UnsupportedOperationException(&quot;Set not allowed.&quot;);</span>
+        }
+
+    }
+
+    public static Predicate&lt;String&gt; compilePredicate(Map&lt;String, ?&gt; configs) {
+<span class="fc" id="L296">        String include = (String) configs.get(INCLUDE_CONFIG);</span>
+<span class="fc" id="L297">        String exclude = (String) configs.get(EXCLUDE_CONFIG);</span>
+
+<span class="pc bpc" id="L299" title="1 of 2 branches missed.">        if (include == null) {</span>
+<span class="fc" id="L300">            include = DEFAULT_INCLUDE;</span>
+        }
+
+<span class="pc bpc" id="L303" title="1 of 2 branches missed.">        if (exclude == null) {</span>
+<span class="fc" id="L304">            exclude = DEFAULT_EXCLUDE;</span>
+        }
+
+        try {
+<span class="fc" id="L308">            Pattern includePattern = Pattern.compile(include);</span>
+<span class="fc" id="L309">            Pattern excludePattern = Pattern.compile(exclude);</span>
+
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">            return s -&gt; includePattern.matcher(s).matches()</span>
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">                        &amp;&amp; !excludePattern.matcher(s).matches();</span>
+<span class="nc" id="L313">        } catch (PatternSyntaxException e) {</span>
+<span class="nc" id="L314">            throw new ConfigException(&quot;JMX filter for configuration&quot; + METRICS_CONFIG_PREFIX</span>
+                                      + &quot;.(include/exclude) is not a valid regular expression&quot;);
+        }
+    }
+
+    @Override
+    public void contextChange(MetricsContext metricsContext) {
+<span class="fc" id="L321">        String namespace = metricsContext.contextLabels().get(MetricsContext.NAMESPACE);</span>
+<span class="fc" id="L322">        Objects.requireNonNull(namespace);</span>
+<span class="fc" id="L323">        synchronized (LOCK) {</span>
+<span class="pc bpc" id="L324" title="1 of 2 branches missed.">            if (!mbeans.isEmpty()) {</span>
+<span class="nc" id="L325">                throw new IllegalStateException(&quot;JMX MetricsContext can only be updated before JMX metrics are created&quot;);</span>
+            }
+
+            // prevent prefix from getting reset back to empty for backwards compatibility
+            // with the deprecated JmxReporter(String prefix) constructor, in case contextChange gets called
+            // via one of the Metrics() constructor with a default empty MetricsContext()
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">            if (namespace.isEmpty()) {</span>
+<span class="nc" id="L332">                return;</span>
+            }
+
+<span class="fc" id="L335">            prefix = namespace;</span>
+<span class="fc" id="L336">        }</span>
+<span class="fc" id="L337">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

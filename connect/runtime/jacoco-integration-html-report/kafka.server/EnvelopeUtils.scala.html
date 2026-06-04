@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>EnvelopeUtils.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">kafka.server</a> &gt; <span class="el_source">EnvelopeUtils.scala</span></div><h1>EnvelopeUtils.scala</h1><pre class="source lang-java linenums">/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package kafka.server
+
+import java.net.{InetAddress, UnknownHostException}
+import java.nio.ByteBuffer
+import kafka.network.RequestChannel
+import org.apache.kafka.common.errors.{InvalidRequestException, PrincipalDeserializationException, UnsupportedVersionException}
+import org.apache.kafka.common.network.ClientInformation
+import org.apache.kafka.common.requests.{EnvelopeRequest, RequestContext, RequestHeader}
+import org.apache.kafka.common.security.auth.KafkaPrincipal
+import org.apache.kafka.network.metrics.RequestChannelMetrics
+
+import scala.jdk.OptionConverters.RichOptional
+
+
+<span class="fc" id="L32">object EnvelopeUtils {</span>
+  def handleEnvelopeRequest(
+    request: RequestChannel.Request,
+    requestChannelMetrics: RequestChannelMetrics,
+    handler: RequestChannel.Request =&gt; Unit
+  ): Unit = {
+<span class="fc" id="L38">    val envelope = request.body[EnvelopeRequest]</span>
+<span class="fc" id="L39">    val forwardedPrincipal = parseForwardedPrincipal(request.context, envelope.requestPrincipal)</span>
+<span class="fc" id="L40">    val forwardedClientAddress = parseForwardedClientAddress(envelope.clientAddress)</span>
+
+<span class="fc" id="L42">    val forwardedRequestBuffer = envelope.requestData.duplicate()</span>
+<span class="fc" id="L43">    val forwardedRequestHeader = parseForwardedRequestHeader(forwardedRequestBuffer)</span>
+
+<span class="fc" id="L45">    val forwardedApi = forwardedRequestHeader.apiKey</span>
+<span class="pc bpc" id="L46" title="1 of 2 branches missed.">    if (!forwardedApi.forwardable) {</span>
+<span class="nc" id="L47">      throw new InvalidRequestException(s&quot;API $forwardedApi is not enabled or is not eligible for forwarding&quot;)</span>
+    }
+
+<span class="fc" id="L50">    val forwardedContext = new RequestContext(</span>
+<span class="fc" id="L51">      forwardedRequestHeader,</span>
+<span class="fc" id="L52">      request.context.connectionId,</span>
+<span class="fc" id="L53">      forwardedClientAddress,</span>
+<span class="fc" id="L54">      forwardedPrincipal,</span>
+<span class="fc" id="L55">      request.context.listenerName,</span>
+<span class="fc" id="L56">      request.context.securityProtocol,</span>
+<span class="fc" id="L57">      ClientInformation.EMPTY,</span>
+<span class="fc" id="L58">      request.context.fromPrivilegedListener</span>
+    )
+
+<span class="fc" id="L61">    val forwardedRequest = parseForwardedRequest(</span>
+<span class="fc" id="L62">      request,</span>
+<span class="fc" id="L63">      forwardedContext,</span>
+<span class="fc" id="L64">      forwardedRequestBuffer,</span>
+<span class="fc" id="L65">      requestChannelMetrics</span>
+    )
+<span class="fc" id="L67">    handler(forwardedRequest)</span>
+  }
+
+  private def parseForwardedClientAddress(
+    address: Array[Byte]
+  ): InetAddress = {
+    try {
+<span class="pc" id="L74">      InetAddress.getByAddress(address)</span>
+    } catch {
+      case e: UnknownHostException =&gt;
+<span class="nc" id="L77">        throw new InvalidRequestException(&quot;Failed to parse client address from envelope&quot;, e)</span>
+    }
+  }
+
+  private def parseForwardedRequest(
+    envelope: RequestChannel.Request,
+    forwardedContext: RequestContext,
+    buffer: ByteBuffer,
+    requestChannelMetrics: RequestChannelMetrics
+  ): RequestChannel.Request = {
+    try {
+<span class="fc" id="L88">      val forwardedRequest = new RequestChannel.Request(</span>
+<span class="fc" id="L89">        processor = envelope.processor,</span>
+<span class="fc" id="L90">        context = forwardedContext,</span>
+<span class="fc" id="L91">        startTimeNanos = envelope.startTimeNanos,</span>
+<span class="fc" id="L92">        envelope.memoryPool,</span>
+<span class="fc" id="L93">        buffer,</span>
+<span class="fc" id="L94">        requestChannelMetrics,</span>
+<span class="fc" id="L95">        Some(envelope)</span>
+      )
+      // set the dequeue time of forwardedRequest as the value of envelope request
+<span class="fc" id="L98">      forwardedRequest.requestDequeueTimeNanos = envelope.requestDequeueTimeNanos</span>
+<span class="pc" id="L99">      forwardedRequest</span>
+    } catch {
+      case e: InvalidRequestException =&gt;
+        // We use UNSUPPORTED_VERSION if the embedded request cannot be parsed.
+        // The purpose is to disambiguate structural errors in the envelope request
+        // itself, such as an invalid client address.
+<span class="nc" id="L105">        throw new UnsupportedVersionException(s&quot;Failed to parse forwarded request &quot; +</span>
+<span class="nc" id="L106">          s&quot;with header ${forwardedContext.header}&quot;, e)</span>
+    }
+  }
+
+  private def parseForwardedRequestHeader(
+    buffer: ByteBuffer
+  ): RequestHeader = {
+    try {
+<span class="pc" id="L114">      RequestHeader.parse(buffer)</span>
+    } catch {
+      case e: InvalidRequestException =&gt;
+        // We use UNSUPPORTED_VERSION if the embedded request cannot be parsed.
+        // The purpose is to disambiguate structural errors in the envelope request
+        // itself, such as an invalid client address.
+<span class="nc" id="L120">        throw new UnsupportedVersionException(&quot;Failed to parse request header from envelope&quot;, e)</span>
+    }
+  }
+
+  private def parseForwardedPrincipal(
+    envelopeContext: RequestContext,
+    principalBytes: Array[Byte]
+  ): KafkaPrincipal = {
+<span class="pc" id="L128">    envelopeContext.principalSerde.toScala match {</span>
+<span class="pc bpc" id="L129" title="1 of 2 branches missed.">      case Some(serde) =&gt;</span>
+        try {
+<span class="pc" id="L131">          serde.deserialize(principalBytes)</span>
+        } catch {
+          case e: Exception =&gt;
+<span class="nc" id="L134">            throw new PrincipalDeserializationException(&quot;Failed to deserialize client principal from envelope&quot;, e)</span>
+        }
+
+<span class="nc bnc" id="L137" title="All 2 branches missed.">      case None =&gt;</span>
+<span class="nc" id="L138">        throw new PrincipalDeserializationException(&quot;Could not deserialize principal since &quot; +</span>
+          &quot;no `KafkaPrincipalSerde` has been defined&quot;)
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

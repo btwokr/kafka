@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PluginClassLoader.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.isolation</a> &gt; <span class="el_source">PluginClassLoader.java</span></div><h1>PluginClassLoader.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime.isolation;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.Objects;
+
+/**
+ * A custom classloader dedicated to loading Connect plugin classes in classloading isolation.
+ * &lt;p&gt;
+ * Under the current scheme for classloading isolation in Connect, a plugin classloader loads the
+ * classes that it finds in its urls. For classes that are either not found or are not supposed to
+ * be loaded in isolation, this plugin classloader delegates their loading to its parent. This makes
+ * this classloader a child-first classloader.
+ * &lt;p&gt;
+ * This class is thread-safe and parallel capable.
+ */
+public class PluginClassLoader extends URLClassLoader {
+<span class="nc" id="L42">    private static final Logger log = LoggerFactory.getLogger(PluginClassLoader.class);</span>
+    private final URL pluginLocation;
+
+    static {
+<span class="nc" id="L46">        ClassLoader.registerAsParallelCapable();</span>
+<span class="nc" id="L47">    }</span>
+
+    /**
+     * Constructor that accepts a specific classloader as parent.
+     *
+     * @param pluginLocation the top-level location of the plugin to be loaded in isolation by this
+     * classloader.
+     * @param urls the list of urls from which to load classes and resources for this plugin.
+     * @param parent the parent classloader to be used for delegation for classes that were
+     * not found or should not be loaded in isolation by this classloader.
+     */
+    public PluginClassLoader(URL pluginLocation, URL[] urls, ClassLoader parent) {
+<span class="nc" id="L59">        super(urls, parent);</span>
+<span class="nc" id="L60">        this.pluginLocation = Objects.requireNonNull(pluginLocation, &quot;Plugin location must be non-null&quot;);</span>
+<span class="nc" id="L61">    }</span>
+
+    /**
+     * Returns the top-level location of the classes and dependencies required by the plugin that
+     * is loaded by this classloader.
+     *
+     * @return the plugin location.
+     */
+    public String location() {
+<span class="nc" id="L70">        return pluginLocation.toString();</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L75">        return &quot;PluginClassLoader{pluginLocation=&quot; + pluginLocation + &quot;}&quot;;</span>
+    }
+
+    @Override
+    public URL getResource(String name) {
+<span class="nc" id="L80">        Objects.requireNonNull(name);</span>
+
+<span class="nc" id="L82">        URL url = findResource(name);</span>
+<span class="nc bnc" id="L83" title="All 2 branches missed.">        if (url == null) {</span>
+<span class="nc" id="L84">            url = super.getResource(name);</span>
+        }
+<span class="nc" id="L86">        return url;</span>
+    }
+
+    @Override
+    public Enumeration&lt;URL&gt; getResources(String name) throws IOException {
+<span class="nc" id="L91">        Objects.requireNonNull(name);</span>
+<span class="nc" id="L92">        List&lt;URL&gt; resources = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">        for (Enumeration&lt;URL&gt; foundLocally = findResources(name); foundLocally.hasMoreElements();) {</span>
+<span class="nc" id="L94">            URL url = foundLocally.nextElement();</span>
+<span class="nc bnc" id="L95" title="All 2 branches missed.">            if (url != null)</span>
+<span class="nc" id="L96">                resources.add(url);</span>
+<span class="nc" id="L97">        }</span>
+        // Explicitly call the parent implementation instead of super to avoid double-listing the local resources
+<span class="nc bnc" id="L99" title="All 2 branches missed.">        for (Enumeration&lt;URL&gt; foundByParent = getParent().getResources(name); foundByParent.hasMoreElements();) {</span>
+<span class="nc" id="L100">            URL url = foundByParent.nextElement();</span>
+<span class="nc bnc" id="L101" title="All 2 branches missed.">            if (url != null)</span>
+<span class="nc" id="L102">                resources.add(url);</span>
+<span class="nc" id="L103">        }</span>
+<span class="nc" id="L104">        return Collections.enumeration(resources);</span>
+    }
+
+    // This method needs to be thread-safe because it is supposed to be called by multiple
+    // Connect tasks. While findClass is thread-safe, defineClass called within loadClass of the
+    // base method is not. More on multithreaded classloaders in:
+    // https://docs.oracle.com/javase/7/docs/technotes/guides/lang/cl-mt.html
+    @Override
+    protected Class&lt;?&gt; loadClass(String name, boolean resolve) throws ClassNotFoundException {
+<span class="nc" id="L113">        synchronized (getClassLoadingLock(name)) {</span>
+<span class="nc" id="L114">            Class&lt;?&gt; klass = findLoadedClass(name);</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">            if (klass == null) {</span>
+                try {
+<span class="nc bnc" id="L117" title="All 2 branches missed.">                    if (PluginUtils.shouldLoadInIsolation(name)) {</span>
+<span class="nc" id="L118">                        klass = findClass(name);</span>
+                    }
+<span class="nc" id="L120">                } catch (ClassNotFoundException e) {</span>
+                    // Not found in loader's path. Search in parents.
+<span class="nc" id="L122">                    log.trace(&quot;Class '{}' not found. Delegating to parent&quot;, name);</span>
+<span class="nc" id="L123">                }</span>
+            }
+<span class="nc bnc" id="L125" title="All 2 branches missed.">            if (klass == null) {</span>
+<span class="nc" id="L126">                klass = super.loadClass(name, false);</span>
+            }
+<span class="nc bnc" id="L128" title="All 2 branches missed.">            if (resolve) {</span>
+<span class="nc" id="L129">                resolveClass(klass);</span>
+            }
+<span class="nc" id="L131">            return klass;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,466 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DualColumnFamilyAccessor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">DualColumnFamilyAccessor.java</span></div><h1>DualColumnFamilyAccessor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.common.utils.internals.AbstractIterator;
+import org.apache.kafka.common.utils.internals.ByteUtils;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.state.internals.RocksDBStore.DBAccessor;
+
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ReadOptions;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.RocksIterator;
+import org.rocksdb.WriteBatchInterface;
+
+import java.util.Comparator;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
+
+import static org.apache.kafka.streams.state.internals.RocksDBStore.incrementWithoutOverflow;
+
+/**
+ * A generic implementation of {@link RocksDBStore.ColumnFamilyAccessor} that supports dual-column-family
+ * upgrade scenarios. This class manages two column families:
+ * &lt;ul&gt;
+ *   &lt;li&gt;oldColumnFamily: contains legacy data in the old format&lt;/li&gt;
+ *   &lt;li&gt;newColumnFamily: contains data in the new format&lt;/li&gt;
+ * &lt;/ul&gt;
+ *
+ * When reading, it first checks the new column family, then falls back to the old column family
+ * and converts values on-the-fly using the provided conversion function.
+ */
+class DualColumnFamilyAccessor extends AbstractColumnFamilyAccessor {
+
+    private final ColumnFamilyHandle oldColumnFamily;
+    private final ColumnFamilyHandle newColumnFamily;
+    private final Function&lt;byte[], byte[]&gt; valueConverter;
+    private final RocksDBStore store;
+
+    /**
+     * Constructs a DualColumnFamilyAccessor.
+     *
+     * @param offsetColumnFamily the column family for the managed offsets
+     * @param oldColumnFamily the column family containing legacy data
+     * @param newColumnFamily the column family for new format data
+     * @param valueConverter  function to convert old format values to new format
+     * @param store           the RocksDBStore instance (for accessing position, context, and name)
+     */
+    DualColumnFamilyAccessor(final ColumnFamilyHandle offsetColumnFamily,
+                             final ColumnFamilyHandle oldColumnFamily,
+                             final ColumnFamilyHandle newColumnFamily,
+                             final Function&lt;byte[], byte[]&gt; valueConverter,
+                             final RocksDBStore store,
+                             final AtomicBoolean storeOpen) {
+<span class="nc" id="L74">        super(offsetColumnFamily, storeOpen);</span>
+<span class="nc" id="L75">        this.oldColumnFamily = oldColumnFamily;</span>
+<span class="nc" id="L76">        this.newColumnFamily = newColumnFamily;</span>
+<span class="nc" id="L77">        this.valueConverter = valueConverter;</span>
+<span class="nc" id="L78">        this.store = store;</span>
+<span class="nc" id="L79">    }</span>
+
+    @Override
+    public void put(final DBAccessor accessor,
+                    final byte[] key,
+                    final byte[] value) {
+<span class="nc" id="L85">        synchronized (store.position) {</span>
+<span class="nc bnc" id="L86" title="All 2 branches missed.">            if (value == null) {</span>
+                try {
+<span class="nc" id="L88">                    accessor.delete(oldColumnFamily, key);</span>
+<span class="nc" id="L89">                } catch (final RocksDBException e) {</span>
+<span class="nc" id="L90">                    throw new ProcessorStateException(&quot;Error while removing key from store &quot; + store.name(), e);</span>
+<span class="nc" id="L91">                }</span>
+                try {
+<span class="nc" id="L93">                    accessor.delete(newColumnFamily, key);</span>
+<span class="nc" id="L94">                } catch (final RocksDBException e) {</span>
+<span class="nc" id="L95">                    throw new ProcessorStateException(&quot;Error while removing key from store &quot; + store.name(), e);</span>
+<span class="nc" id="L96">                }</span>
+            } else {
+                try {
+<span class="nc" id="L99">                    accessor.delete(oldColumnFamily, key);</span>
+<span class="nc" id="L100">                } catch (final RocksDBException e) {</span>
+<span class="nc" id="L101">                    throw new ProcessorStateException(&quot;Error while removing key from store &quot; + store.name(), e);</span>
+<span class="nc" id="L102">                }</span>
+                try {
+<span class="nc" id="L104">                    accessor.put(newColumnFamily, key, value);</span>
+<span class="nc" id="L105">                    StoreQueryUtils.updatePosition(store.position, store.context);</span>
+<span class="nc" id="L106">                } catch (final RocksDBException e) {</span>
+<span class="nc" id="L107">                    throw new ProcessorStateException(&quot;Error while putting key/value into store &quot; + store.name(), e);</span>
+<span class="nc" id="L108">                }</span>
+            }
+<span class="nc" id="L110">        }</span>
+<span class="nc" id="L111">    }</span>
+
+    @Override
+    public void prepareBatch(final List&lt;KeyValue&lt;Bytes, byte[]&gt;&gt; entries,
+                             final WriteBatchInterface batch) throws RocksDBException {
+<span class="nc bnc" id="L116" title="All 2 branches missed.">        for (final KeyValue&lt;Bytes, byte[]&gt; entry : entries) {</span>
+<span class="nc" id="L117">            Objects.requireNonNull(entry.key, &quot;key cannot be null&quot;);</span>
+<span class="nc" id="L118">            addToBatch(entry.key.get(), entry.value, batch);</span>
+<span class="nc" id="L119">        }</span>
+<span class="nc" id="L120">    }</span>
+
+    @Override
+    public byte[] get(final DBAccessor accessor, final byte[] key)
+        throws RocksDBException {
+<span class="nc" id="L125">        return get(accessor, key, Optional.empty());</span>
+    }
+
+    @Override
+    public byte[] get(final DBAccessor accessor, final byte[] key,
+                      final ReadOptions readOptions)
+        throws RocksDBException {
+<span class="nc" id="L132">        return get(accessor, key, Optional.of(readOptions));</span>
+    }
+
+    private byte[] get(final DBAccessor accessor, final byte[] key,
+                       final Optional&lt;ReadOptions&gt; readOptions)
+        throws RocksDBException {
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        final byte[] valueInNewFormat = readOptions.isPresent()</span>
+<span class="nc" id="L139">                ? accessor.get(newColumnFamily, readOptions.get(), key)</span>
+<span class="nc" id="L140">                : accessor.get(newColumnFamily, key);</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        if (valueInNewFormat != null) {</span>
+<span class="nc" id="L142">            return valueInNewFormat;</span>
+        }
+
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        final byte[] valueInOldFormat = readOptions.isPresent()</span>
+<span class="nc" id="L146">                ? accessor.get(oldColumnFamily, readOptions.get(), key)</span>
+<span class="nc" id="L147">                : accessor.get(oldColumnFamily, key);</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (valueInOldFormat != null) {</span>
+<span class="nc" id="L149">            final byte[] convertedValue = valueConverter.apply(valueInOldFormat);</span>
+            // This does only work because the changelog topic contains correct data already.
+            // For other format changes, we cannot take this short cut and can only migrate data
+            // from old to new store on put().
+<span class="nc" id="L153">            put(accessor, key, convertedValue);</span>
+<span class="nc" id="L154">            return convertedValue;</span>
+        }
+
+<span class="nc" id="L157">        return null;</span>
+    }
+
+    @Override
+    public byte[] getOnly(final DBAccessor accessor, final byte[] key) throws RocksDBException {
+<span class="nc" id="L162">        final byte[] valueInNewFormat = accessor.get(newColumnFamily, key);</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        if (valueInNewFormat != null) {</span>
+<span class="nc" id="L164">            return valueInNewFormat;</span>
+        }
+
+<span class="nc" id="L167">        final byte[] valueInOldFormat = accessor.get(oldColumnFamily, key);</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        if (valueInOldFormat != null) {</span>
+<span class="nc" id="L169">            return valueConverter.apply(valueInOldFormat);</span>
+        }
+
+<span class="nc" id="L172">        return null;</span>
+    }
+
+    @Override
+    public ManagedKeyValueIterator&lt;Bytes, byte[]&gt; range(final DBAccessor accessor,
+                                                        final Bytes from,
+                                                        final Bytes to,
+                                                        final boolean forward) {
+<span class="nc" id="L180">        return new RocksDBDualCFRangeIterator(</span>
+<span class="nc" id="L181">            store.name(),</span>
+<span class="nc" id="L182">            accessor.newIterator(newColumnFamily),</span>
+<span class="nc" id="L183">            accessor.newIterator(oldColumnFamily),</span>
+            from,
+            to,
+            forward,
+            true,
+            valueConverter);
+    }
+
+    @Override
+    public void deleteRange(final DBAccessor accessor, final byte[] from, final byte[] to) {
+        try {
+<span class="nc" id="L194">            accessor.deleteRange(oldColumnFamily, from, to);</span>
+<span class="nc" id="L195">        } catch (final RocksDBException e) {</span>
+<span class="nc" id="L196">            throw new ProcessorStateException(&quot;Error while removing key from store &quot; + store.name(), e);</span>
+<span class="nc" id="L197">        }</span>
+        try {
+<span class="nc" id="L199">            accessor.deleteRange(newColumnFamily, from, to);</span>
+<span class="nc" id="L200">        } catch (final RocksDBException e) {</span>
+<span class="nc" id="L201">            throw new ProcessorStateException(&quot;Error while removing key from store &quot; + store.name(), e);</span>
+<span class="nc" id="L202">        }</span>
+<span class="nc" id="L203">    }</span>
+
+    @Override
+    public ManagedKeyValueIterator&lt;Bytes, byte[]&gt; all(final DBAccessor accessor,
+                                                      final boolean forward) {
+<span class="nc" id="L208">        final RocksIterator innerIterNew = accessor.newIterator(newColumnFamily);</span>
+<span class="nc" id="L209">        final RocksIterator innerIterOld = accessor.newIterator(oldColumnFamily);</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        if (forward) {</span>
+<span class="nc" id="L211">            innerIterNew.seekToFirst();</span>
+<span class="nc" id="L212">            innerIterOld.seekToFirst();</span>
+        } else {
+<span class="nc" id="L214">            innerIterNew.seekToLast();</span>
+<span class="nc" id="L215">            innerIterOld.seekToLast();</span>
+        }
+<span class="nc" id="L217">        return new RocksDBDualCFIterator(store.name(), innerIterNew, innerIterOld, forward, valueConverter);</span>
+    }
+
+    @Override
+    public ManagedKeyValueIterator&lt;Bytes, byte[]&gt; prefixScan(final DBAccessor accessor,
+                                                             final Bytes prefix) {
+<span class="nc" id="L223">        final Bytes to = incrementWithoutOverflow(prefix);</span>
+<span class="nc" id="L224">        return new RocksDBDualCFRangeIterator(</span>
+<span class="nc" id="L225">            store.name(),</span>
+<span class="nc" id="L226">            accessor.newIterator(newColumnFamily),</span>
+<span class="nc" id="L227">            accessor.newIterator(oldColumnFamily),</span>
+            prefix,
+            to,
+            true,
+            false,
+            valueConverter
+        );
+    }
+
+    @Override
+    public long approximateNumEntries(final DBAccessor accessor)
+        throws RocksDBException {
+<span class="nc" id="L239">        return accessor.approximateNumEntries(oldColumnFamily)</span>
+<span class="nc" id="L240">                + accessor.approximateNumEntries(newColumnFamily);</span>
+    }
+
+    @Override
+    public void addToBatch(final byte[] key,
+                           final byte[] value,
+                           final WriteBatchInterface batch) throws RocksDBException {
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        if (value == null) {</span>
+<span class="nc" id="L248">            batch.delete(oldColumnFamily, key);</span>
+<span class="nc" id="L249">            batch.delete(newColumnFamily, key);</span>
+        } else {
+<span class="nc" id="L251">            batch.delete(oldColumnFamily, key);</span>
+<span class="nc" id="L252">            batch.put(newColumnFamily, key, value);</span>
+        }
+<span class="nc" id="L254">    }</span>
+
+    @Override
+    public void close(final DBAccessor accessor) throws RocksDBException {
+<span class="nc" id="L258">        super.close(accessor);</span>
+<span class="nc" id="L259">        oldColumnFamily.close();</span>
+<span class="nc" id="L260">        newColumnFamily.close();</span>
+<span class="nc" id="L261">    }</span>
+
+    private static class RocksDBDualCFIterator
+        extends AbstractIterator&lt;KeyValue&lt;Bytes, byte[]&gt;&gt;
+        implements ManagedKeyValueIterator&lt;Bytes, byte[]&gt; {
+
+        // RocksDB's JNI interface does not expose getters/setters that allow the
+        // comparator to be pluggable, and the default is lexicographic, so it's
+        // safe to just force lexicographic comparator here for now.
+<span class="nc" id="L270">        private final Comparator&lt;byte[]&gt; comparator = ByteUtils.BYTES_LEXICO_COMPARATOR;</span>
+
+        private final String storeName;
+        private final RocksIterator iterNewFormat;
+        private final RocksIterator iterOldFormat;
+        private final boolean forward;
+        private final Function&lt;byte[], byte[]&gt; valueConverter;
+
+<span class="nc" id="L278">        private volatile boolean open = true;</span>
+
+        private byte[] nextNewFormat;
+        private byte[] nextOldFormat;
+        private KeyValue&lt;Bytes, byte[]&gt; next;
+<span class="nc" id="L283">        private Runnable closeCallback = null;</span>
+
+        RocksDBDualCFIterator(final String storeName,
+                              final RocksIterator iterNewFormat,
+                              final RocksIterator iterOldFormat,
+                              final boolean forward,
+<span class="nc" id="L289">                              final Function&lt;byte[], byte[]&gt; valueConverter) {</span>
+<span class="nc" id="L290">            this.iterNewFormat = iterNewFormat;</span>
+<span class="nc" id="L291">            this.iterOldFormat = iterOldFormat;</span>
+<span class="nc" id="L292">            this.storeName = storeName;</span>
+<span class="nc" id="L293">            this.forward = forward;</span>
+<span class="nc" id="L294">            this.valueConverter = valueConverter;</span>
+<span class="nc" id="L295">        }</span>
+
+        @Override
+        public synchronized boolean hasNext() {
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            if (!open) {</span>
+<span class="nc" id="L300">                throw new org.apache.kafka.streams.errors.InvalidStateStoreException(</span>
+<span class="nc" id="L301">                        String.format(&quot;RocksDB iterator for store %s has closed&quot;, storeName));</span>
+            }
+<span class="nc" id="L303">            return super.hasNext();</span>
+        }
+
+        @Override
+        public synchronized KeyValue&lt;Bytes, byte[]&gt; next() {
+<span class="nc" id="L308">            return super.next();</span>
+        }
+
+        @Override
+        protected KeyValue&lt;Bytes, byte[]&gt; makeNext() {
+<span class="nc bnc" id="L313" title="All 4 branches missed.">            if (nextOldFormat == null &amp;&amp; iterOldFormat.isValid()) {</span>
+<span class="nc" id="L314">                nextOldFormat = iterOldFormat.key();</span>
+            }
+
+<span class="nc bnc" id="L317" title="All 4 branches missed.">            if (nextNewFormat == null &amp;&amp; iterNewFormat.isValid()) {</span>
+<span class="nc" id="L318">                nextNewFormat = iterNewFormat.key();</span>
+            }
+
+<span class="nc bnc" id="L321" title="All 4 branches missed.">            if (nextOldFormat == null &amp;&amp; !iterOldFormat.isValid()) {</span>
+<span class="nc bnc" id="L322" title="All 4 branches missed.">                if (nextNewFormat == null &amp;&amp; !iterNewFormat.isValid()) {</span>
+<span class="nc" id="L323">                    return allDone();</span>
+                } else {
+<span class="nc" id="L325">                    next = KeyValue.pair(new Bytes(nextNewFormat), iterNewFormat.value());</span>
+<span class="nc" id="L326">                    nextNewFormat = null;</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">                    if (forward) {</span>
+<span class="nc" id="L328">                        iterNewFormat.next();</span>
+                    } else {
+<span class="nc" id="L330">                        iterNewFormat.prev();</span>
+                    }
+                }
+            } else {
+<span class="nc bnc" id="L334" title="All 2 branches missed.">                if (nextNewFormat == null) {</span>
+<span class="nc" id="L335">                    next = KeyValue.pair(new Bytes(nextOldFormat), valueConverter.apply(iterOldFormat.value()));</span>
+<span class="nc" id="L336">                    nextOldFormat = null;</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">                    if (forward) {</span>
+<span class="nc" id="L338">                        iterOldFormat.next();</span>
+                    } else {
+<span class="nc" id="L340">                        iterOldFormat.prev();</span>
+                    }
+                } else {
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                    if (forward) {</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">                        if (comparator.compare(nextOldFormat, nextNewFormat) &lt;= 0) {</span>
+<span class="nc" id="L345">                            next = KeyValue.pair(new Bytes(nextOldFormat), valueConverter.apply(iterOldFormat.value()));</span>
+<span class="nc" id="L346">                            nextOldFormat = null;</span>
+<span class="nc" id="L347">                            iterOldFormat.next();</span>
+                        } else {
+<span class="nc" id="L349">                            next = KeyValue.pair(new Bytes(nextNewFormat), iterNewFormat.value());</span>
+<span class="nc" id="L350">                            nextNewFormat = null;</span>
+<span class="nc" id="L351">                            iterNewFormat.next();</span>
+                        }
+                    } else {
+<span class="nc bnc" id="L354" title="All 2 branches missed.">                        if (comparator.compare(nextOldFormat, nextNewFormat) &gt;= 0) {</span>
+<span class="nc" id="L355">                            next = KeyValue.pair(new Bytes(nextOldFormat), valueConverter.apply(iterOldFormat.value()));</span>
+<span class="nc" id="L356">                            nextOldFormat = null;</span>
+<span class="nc" id="L357">                            iterOldFormat.prev();</span>
+                        } else {
+<span class="nc" id="L359">                            next = KeyValue.pair(new Bytes(nextNewFormat), iterNewFormat.value());</span>
+<span class="nc" id="L360">                            nextNewFormat = null;</span>
+<span class="nc" id="L361">                            iterNewFormat.prev();</span>
+                        }
+                    }
+                }
+            }
+<span class="nc" id="L366">            return next;</span>
+        }
+
+        @Override
+        public synchronized void close() {
+<span class="nc bnc" id="L371" title="All 2 branches missed.">            if (closeCallback == null) {</span>
+<span class="nc" id="L372">                throw new IllegalStateException(</span>
+                        &quot;RocksDBDualCFIterator expects close callback to be set immediately upon creation&quot;);
+            }
+<span class="nc" id="L375">            closeCallback.run();</span>
+
+<span class="nc" id="L377">            iterOldFormat.close();</span>
+<span class="nc" id="L378">            iterNewFormat.close();</span>
+<span class="nc" id="L379">            open = false;</span>
+<span class="nc" id="L380">        }</span>
+
+        @Override
+        public Bytes peekNextKey() {
+<span class="nc bnc" id="L384" title="All 2 branches missed.">            if (!hasNext()) {</span>
+<span class="nc" id="L385">                throw new java.util.NoSuchElementException();</span>
+            }
+<span class="nc" id="L387">            return next.key;</span>
+        }
+
+        @Override
+        public void onClose(final Runnable closeCallback) {
+<span class="nc" id="L392">            this.closeCallback = closeCallback;</span>
+<span class="nc" id="L393">        }</span>
+    }
+
+    private static class RocksDBDualCFRangeIterator extends RocksDBDualCFIterator {
+    // RocksDB's JNI interface does not expose getters/setters that allow the
+    // comparator to be pluggable, and the default is lexicographic, so it's
+    // safe to just force lexicographic comparator here for now.
+<span class="nc" id="L400">        private final Comparator&lt;byte[]&gt; comparator = ByteUtils.BYTES_LEXICO_COMPARATOR;</span>
+        private final byte[] rawLastKey;
+        private final boolean forward;
+        private final boolean toInclusive;
+
+        RocksDBDualCFRangeIterator(final String storeName,
+                                   final RocksIterator iterNewFormat,
+                                   final RocksIterator iterOldFormat,
+                                   final Bytes from,
+                                   final Bytes to,
+                                   final boolean forward,
+                                   final boolean toInclusive,
+                                   final Function&lt;byte[], byte[]&gt; valueConverter) {
+<span class="nc" id="L413">            super(storeName, iterNewFormat, iterOldFormat, forward, valueConverter);</span>
+<span class="nc" id="L414">            this.forward = forward;</span>
+<span class="nc" id="L415">            this.toInclusive = toInclusive;</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">            if (forward) {</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">                if (from == null) {</span>
+<span class="nc" id="L418">                    iterNewFormat.seekToFirst();</span>
+<span class="nc" id="L419">                    iterOldFormat.seekToFirst();</span>
+                } else {
+<span class="nc" id="L421">                    iterNewFormat.seek(from.get());</span>
+<span class="nc" id="L422">                    iterOldFormat.seek(from.get());</span>
+                }
+<span class="nc bnc" id="L424" title="All 2 branches missed.">                rawLastKey = to == null ? null : to.get();</span>
+            } else {
+<span class="nc bnc" id="L426" title="All 2 branches missed.">                if (to == null) {</span>
+<span class="nc" id="L427">                    iterNewFormat.seekToLast();</span>
+<span class="nc" id="L428">                    iterOldFormat.seekToLast();</span>
+                } else {
+<span class="nc" id="L430">                    iterNewFormat.seekForPrev(to.get());</span>
+<span class="nc" id="L431">                    iterOldFormat.seekForPrev(to.get());</span>
+                }
+<span class="nc bnc" id="L433" title="All 2 branches missed.">                rawLastKey = from == null ? null : from.get();</span>
+            }
+<span class="nc" id="L435">        }</span>
+
+        @Override
+        protected KeyValue&lt;Bytes, byte[]&gt; makeNext() {
+<span class="nc" id="L439">            final KeyValue&lt;Bytes, byte[]&gt; next = super.makeNext();</span>
+
+<span class="nc bnc" id="L441" title="All 2 branches missed.">            if (next == null) {</span>
+<span class="nc" id="L442">                return allDone();</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">            } else if (rawLastKey == null) {</span>
+                // null means range endpoint is open
+<span class="nc" id="L445">                return next;</span>
+            } else {
+<span class="nc bnc" id="L447" title="All 2 branches missed.">                if (forward) {</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">                    if (comparator.compare(next.key.get(), rawLastKey) &lt; 0) {</span>
+<span class="nc" id="L449">                        return next;</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">                    } else if (comparator.compare(next.key.get(), rawLastKey) == 0) {</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">                        return toInclusive ? next : allDone();</span>
+                    } else {
+<span class="nc" id="L453">                        return allDone();</span>
+                    }
+                } else {
+<span class="nc bnc" id="L456" title="All 2 branches missed.">                    if (comparator.compare(next.key.get(), rawLastKey) &gt;= 0) {</span>
+<span class="nc" id="L457">                        return next;</span>
+                    } else {
+<span class="nc" id="L459">                        return allDone();</span>
+                    }
+                }
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaNetworkChannel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.raft</a> &gt; <span class="el_source">KafkaNetworkChannel.java</span></div><h1>KafkaNetworkChannel.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.raft;
+
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.clients.KafkaClient;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.message.AddRaftVoterRequestData;
+import org.apache.kafka.common.message.ApiVersionsRequestData;
+import org.apache.kafka.common.message.BeginQuorumEpochRequestData;
+import org.apache.kafka.common.message.EndQuorumEpochRequestData;
+import org.apache.kafka.common.message.FetchRequestData;
+import org.apache.kafka.common.message.FetchSnapshotRequestData;
+import org.apache.kafka.common.message.RemoveRaftVoterRequestData;
+import org.apache.kafka.common.message.UpdateRaftVoterRequestData;
+import org.apache.kafka.common.message.VoteRequestData;
+import org.apache.kafka.common.network.ListenerName;
+import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.ApiMessage;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.AbstractRequest;
+import org.apache.kafka.common.requests.AddRaftVoterRequest;
+import org.apache.kafka.common.requests.ApiVersionsRequest;
+import org.apache.kafka.common.requests.BeginQuorumEpochRequest;
+import org.apache.kafka.common.requests.EndQuorumEpochRequest;
+import org.apache.kafka.common.requests.FetchRequest;
+import org.apache.kafka.common.requests.FetchSnapshotRequest;
+import org.apache.kafka.common.requests.RemoveRaftVoterRequest;
+import org.apache.kafka.common.requests.UpdateRaftVoterRequest;
+import org.apache.kafka.common.requests.VoteRequest;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.server.util.InterBrokerSendThread;
+import org.apache.kafka.server.util.RequestAndCompletionHandler;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class KafkaNetworkChannel implements NetworkChannel {
+
+    static class SendThread extends InterBrokerSendThread {
+
+<span class="fc" id="L63">        private final Queue&lt;RequestAndCompletionHandler&gt; queue = new ConcurrentLinkedQueue&lt;&gt;();</span>
+
+        public SendThread(String name, KafkaClient networkClient, int requestTimeoutMs, Time time, boolean isInterruptible) {
+<span class="fc" id="L66">            super(name, networkClient, requestTimeoutMs, time, isInterruptible);</span>
+<span class="fc" id="L67">        }</span>
+
+        @Override
+        public Collection&lt;RequestAndCompletionHandler&gt; generateRequests() {
+<span class="fc" id="L71">            List&lt;RequestAndCompletionHandler&gt; list =  new ArrayList&lt;&gt;();</span>
+            while (true) {
+<span class="fc" id="L73">                RequestAndCompletionHandler request = queue.poll();</span>
+<span class="pc bpc" id="L74" title="1 of 2 branches missed.">                if (request == null) {</span>
+<span class="fc" id="L75">                    return list;</span>
+                } else {
+<span class="nc" id="L77">                    list.add(request);</span>
+                }
+<span class="nc" id="L79">            }</span>
+        }
+
+        public void sendRequest(RequestAndCompletionHandler request) {
+<span class="nc" id="L83">            queue.add(request);</span>
+<span class="nc" id="L84">            wakeup();</span>
+<span class="nc" id="L85">        }</span>
+    }
+
+<span class="fc" id="L88">    private static final Logger log = LoggerFactory.getLogger(KafkaNetworkChannel.class);</span>
+
+    private final SendThread requestThread;
+
+<span class="fc" id="L92">    private final AtomicInteger correlationIdCounter = new AtomicInteger(0);</span>
+
+    private final ListenerName listenerName;
+
+    public KafkaNetworkChannel(
+        Time time,
+        ListenerName listenerName,
+        KafkaClient client,
+        int requestTimeoutMs,
+        String threadNamePrefix
+<span class="fc" id="L102">    ) {</span>
+<span class="fc" id="L103">        this.listenerName = listenerName;</span>
+<span class="fc" id="L104">        this.requestThread = new SendThread(</span>
+            threadNamePrefix + &quot;-outbound-request-thread&quot;,
+            client,
+            requestTimeoutMs,
+            time,
+            false
+        );
+<span class="fc" id="L111">    }</span>
+
+    @Override
+    public int newCorrelationId() {
+<span class="nc" id="L115">        return correlationIdCounter.getAndIncrement();</span>
+    }
+
+    @Override
+    public void send(RaftRequest.Outbound request) {
+<span class="nc" id="L120">        Node node = request.destination();</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (node != null) {</span>
+<span class="nc" id="L122">            requestThread.sendRequest(new RequestAndCompletionHandler(</span>
+<span class="nc" id="L123">                request.createdTimeMs(),</span>
+                node,
+<span class="nc" id="L125">                buildRequest(request.data()),</span>
+<span class="nc" id="L126">                response -&gt; sendOnComplete(request, response)</span>
+            ));
+        } else
+<span class="nc" id="L129">            sendCompleteFuture(request, errorResponse(request.data(), Errors.BROKER_NOT_AVAILABLE));</span>
+<span class="nc" id="L130">    }</span>
+
+    private void sendCompleteFuture(RaftRequest.Outbound request, ApiMessage message) {
+<span class="nc" id="L133">        RaftResponse.Inbound response = new RaftResponse.Inbound(</span>
+<span class="nc" id="L134">                request.correlationId(),</span>
+                message,
+<span class="nc" id="L136">                request.destination()</span>
+        );
+<span class="nc" id="L138">        request.completion.complete(response);</span>
+<span class="nc" id="L139">    }</span>
+
+    private void sendOnComplete(RaftRequest.Outbound request, ClientResponse clientResponse) {
+        ApiMessage response;
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        if (clientResponse.versionMismatch() != null) {</span>
+<span class="nc" id="L144">            log.error(&quot;Request {} failed due to unsupported version error&quot;, request, clientResponse.versionMismatch());</span>
+<span class="nc" id="L145">            response = errorResponse(request.data(), Errors.UNSUPPORTED_VERSION);</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        } else if (clientResponse.authenticationException() != null) {</span>
+            // For now, we treat authentication errors as retriable. We use the
+            // `NETWORK_EXCEPTION` error code for lack of a good alternative.
+            // Note that `NodeToControllerChannelManager` will still log the
+            // authentication errors so that users have a chance to fix the problem.
+<span class="nc" id="L151">            log.error(&quot;Request {} failed due to authentication error&quot;, request, clientResponse.authenticationException());</span>
+<span class="nc" id="L152">            response = errorResponse(request.data(), Errors.NETWORK_EXCEPTION);</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        } else if (clientResponse.wasDisconnected()) {</span>
+<span class="nc" id="L154">            response = errorResponse(request.data(), Errors.BROKER_NOT_AVAILABLE);</span>
+        } else {
+<span class="nc" id="L156">            response = clientResponse.responseBody().data();</span>
+        }
+<span class="nc" id="L158">        sendCompleteFuture(request, response);</span>
+<span class="nc" id="L159">    }</span>
+
+    private ApiMessage errorResponse(ApiMessage request, Errors error) {
+<span class="nc" id="L162">        ApiKeys apiKey = ApiKeys.forId(request.apiKey());</span>
+<span class="nc" id="L163">        return RaftUtil.errorResponse(apiKey, error);</span>
+    }
+
+    @Override
+    public ListenerName listenerName() {
+<span class="fc" id="L168">        return listenerName;</span>
+    }
+
+    public void start() {
+<span class="fc" id="L172">        requestThread.start();</span>
+<span class="fc" id="L173">    }</span>
+
+    @Override
+    public void close() throws InterruptedException {
+<span class="fc" id="L177">        requestThread.shutdown();</span>
+<span class="fc" id="L178">    }</span>
+
+    // Visible for testing
+    public void pollOnce() {
+<span class="nc" id="L182">        requestThread.doWork();</span>
+<span class="nc" id="L183">    }</span>
+
+    static AbstractRequest.Builder&lt;? extends AbstractRequest&gt; buildRequest(ApiMessage requestData) {
+<span class="nc bnc" id="L186" title="All 2 branches missed.">        if (requestData instanceof VoteRequestData)</span>
+<span class="nc" id="L187">            return new VoteRequest.Builder((VoteRequestData) requestData);</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        else if (requestData instanceof BeginQuorumEpochRequestData)</span>
+<span class="nc" id="L189">            return new BeginQuorumEpochRequest.Builder((BeginQuorumEpochRequestData) requestData);</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        else if (requestData instanceof EndQuorumEpochRequestData)</span>
+<span class="nc" id="L191">            return new EndQuorumEpochRequest.Builder((EndQuorumEpochRequestData) requestData);</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">        else if (requestData instanceof FetchRequestData)</span>
+<span class="nc" id="L193">            return new FetchRequest.SimpleBuilder((FetchRequestData) requestData);</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        else if (requestData instanceof FetchSnapshotRequestData)</span>
+<span class="nc" id="L195">            return new FetchSnapshotRequest.Builder((FetchSnapshotRequestData) requestData);</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        else if (requestData instanceof UpdateRaftVoterRequestData)</span>
+<span class="nc" id="L197">            return new UpdateRaftVoterRequest.Builder((UpdateRaftVoterRequestData) requestData);</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        else if (requestData instanceof AddRaftVoterRequestData)</span>
+<span class="nc" id="L199">            return new AddRaftVoterRequest.Builder((AddRaftVoterRequestData) requestData);</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        else if (requestData instanceof RemoveRaftVoterRequestData)</span>
+<span class="nc" id="L201">            return new RemoveRaftVoterRequest.Builder((RemoveRaftVoterRequestData) requestData);</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        else if (requestData instanceof ApiVersionsRequestData)</span>
+<span class="nc" id="L203">            return new ApiVersionsRequest.Builder((ApiVersionsRequestData) requestData,</span>
+<span class="nc" id="L204">                ApiKeys.API_VERSIONS.oldestVersion(),</span>
+<span class="nc" id="L205">                ApiKeys.API_VERSIONS.latestVersion());</span>
+        else
+<span class="nc" id="L207">            throw new IllegalArgumentException(&quot;Unexpected type for requestData: &quot; + requestData);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

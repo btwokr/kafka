@@ -1,0 +1,408 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConnectProtocol.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.distributed</a> &gt; <span class="el_source">ConnectProtocol.java</span></div><h1>ConnectProtocol.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime.distributed;
+
+import org.apache.kafka.common.protocol.types.ArrayOf;
+import org.apache.kafka.common.protocol.types.Field;
+import org.apache.kafka.common.protocol.types.Schema;
+import org.apache.kafka.common.protocol.types.SchemaException;
+import org.apache.kafka.common.protocol.types.Struct;
+import org.apache.kafka.common.protocol.types.Type;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+
+import static org.apache.kafka.common.message.JoinGroupRequestData.JoinGroupRequestProtocol;
+import static org.apache.kafka.common.message.JoinGroupRequestData.JoinGroupRequestProtocolCollection;
+import static org.apache.kafka.connect.runtime.distributed.ConnectProtocolCompatibility.EAGER;
+
+/**
+ * This class implements the protocol for Kafka Connect workers in a group. It includes the format of worker state used when
+ * joining the group and distributing assignments, and the format of assignments of connectors and tasks to workers.
+ */
+<span class="nc" id="L45">public class ConnectProtocol {</span>
+    public static final String VERSION_KEY_NAME = &quot;version&quot;;
+    public static final String URL_KEY_NAME = &quot;url&quot;;
+    public static final String CONFIG_OFFSET_KEY_NAME = &quot;config-offset&quot;;
+    public static final String CONNECTOR_KEY_NAME = &quot;connector&quot;;
+    public static final String LEADER_KEY_NAME = &quot;leader&quot;;
+    public static final String LEADER_URL_KEY_NAME = &quot;leader-url&quot;;
+    public static final String ERROR_KEY_NAME = &quot;error&quot;;
+    public static final String TASKS_KEY_NAME = &quot;tasks&quot;;
+    public static final String ASSIGNMENT_KEY_NAME = &quot;assignment&quot;;
+    public static final int CONNECTOR_TASK = -1;
+
+    public static final short CONNECT_PROTOCOL_V0 = 0;
+<span class="fc" id="L58">    public static final Schema CONNECT_PROTOCOL_HEADER_SCHEMA = new Schema(</span>
+            new Field(VERSION_KEY_NAME, Type.INT16));
+
+    /**
+     * Connect Protocol Header V0:
+     * &lt;pre&gt;
+     *   Version            =&gt; Int16
+     * &lt;/pre&gt;
+     */
+<span class="fc" id="L67">    private static final Struct CONNECT_PROTOCOL_HEADER_V0 = new Struct(CONNECT_PROTOCOL_HEADER_SCHEMA)</span>
+<span class="fc" id="L68">            .set(VERSION_KEY_NAME, CONNECT_PROTOCOL_V0);</span>
+
+    /**
+     * Config State V0:
+     * &lt;pre&gt;
+     *   Url                =&gt; [String]
+     *   ConfigOffset       =&gt; Int64
+     * &lt;/pre&gt;
+     */
+<span class="fc" id="L77">    public static final Schema CONFIG_STATE_V0 = new Schema(</span>
+            new Field(URL_KEY_NAME, Type.STRING),
+            new Field(CONFIG_OFFSET_KEY_NAME, Type.INT64));
+
+    /**
+     * Connector Assignment V0:
+     * &lt;pre&gt;
+     *   Connector          =&gt; [String]
+     *   Tasks              =&gt; [Int32]
+     * &lt;/pre&gt;
+     *
+     * &lt;p&gt;Assignments for each worker are a set of connectors and tasks. These are categorized by
+     * connector ID. A sentinel task ID (CONNECTOR_TASK) is used to indicate the connector itself
+     * (i.e. that the assignment includes responsibility for running the Connector instance in
+     * addition to any tasks it generates).&lt;/p&gt;
+     */
+<span class="fc" id="L93">    public static final Schema CONNECTOR_ASSIGNMENT_V0 = new Schema(</span>
+            new Field(CONNECTOR_KEY_NAME, Type.STRING),
+            new Field(TASKS_KEY_NAME, new ArrayOf(Type.INT32)));
+
+    /**
+     * Assignment V0:
+     * &lt;pre&gt;
+     *   Error              =&gt; Int16
+     *   Leader             =&gt; [String]
+     *   LeaderUrl          =&gt; [String]
+     *   ConfigOffset       =&gt; Int64
+     *   Assignment         =&gt; [Connector Assignment]
+     * &lt;/pre&gt;
+     */
+<span class="fc" id="L107">    public static final Schema ASSIGNMENT_V0 = new Schema(</span>
+            new Field(ERROR_KEY_NAME, Type.INT16),
+            new Field(LEADER_KEY_NAME, Type.STRING),
+            new Field(LEADER_URL_KEY_NAME, Type.STRING),
+            new Field(CONFIG_OFFSET_KEY_NAME, Type.INT64),
+            new Field(ASSIGNMENT_KEY_NAME, new ArrayOf(CONNECTOR_ASSIGNMENT_V0)));
+
+    /**
+     * The fields are serialized in sequence as follows:
+     * Subscription V0:
+     * &lt;pre&gt;
+     *   Version            =&gt; Int16
+     *   Url                =&gt; [String]
+     *   ConfigOffset       =&gt; Int64
+     * &lt;/pre&gt;
+     *
+     * @param workerState the current state of the worker metadata
+     * @return the serialized state of the worker metadata
+     */
+    public static ByteBuffer serializeMetadata(WorkerState workerState) {
+<span class="fc" id="L127">        Struct struct = new Struct(CONFIG_STATE_V0);</span>
+<span class="fc" id="L128">        struct.set(URL_KEY_NAME, workerState.url());</span>
+<span class="fc" id="L129">        struct.set(CONFIG_OFFSET_KEY_NAME, workerState.offset());</span>
+<span class="fc" id="L130">        ByteBuffer buffer = ByteBuffer.allocate(CONNECT_PROTOCOL_HEADER_V0.sizeOf() + CONFIG_STATE_V0.sizeOf(struct));</span>
+<span class="fc" id="L131">        CONNECT_PROTOCOL_HEADER_V0.writeTo(buffer);</span>
+<span class="fc" id="L132">        CONFIG_STATE_V0.write(buffer, struct);</span>
+<span class="fc" id="L133">        buffer.flip();</span>
+<span class="fc" id="L134">        return buffer;</span>
+    }
+
+    /**
+     * Returns the collection of Connect protocols that are supported by this version along
+     * with their serialized metadata. The protocols are ordered by preference.
+     *
+     * @param workerState the current state of the worker metadata
+     * @return the collection of Connect protocol metadata
+     */
+    public static JoinGroupRequestProtocolCollection metadataRequest(WorkerState workerState) {
+<span class="nc" id="L145">        return new JoinGroupRequestProtocolCollection(Set.of(</span>
+                new JoinGroupRequestProtocol()
+<span class="nc" id="L147">                        .setName(EAGER.protocol())</span>
+<span class="nc" id="L148">                        .setMetadata(ConnectProtocol.serializeMetadata(workerState).array()))</span>
+                );
+    }
+
+    /**
+     * Given a byte buffer that contains protocol metadata return the deserialized form of the
+     * metadata.
+     *
+     * @param buffer A buffer containing the protocols metadata
+     * @return the deserialized metadata
+     * @throws SchemaException on incompatible Connect protocol version
+     */
+    public static WorkerState deserializeMetadata(ByteBuffer buffer) {
+<span class="nc" id="L161">        Struct header = CONNECT_PROTOCOL_HEADER_SCHEMA.read(buffer);</span>
+<span class="nc" id="L162">        Short version = header.getShort(VERSION_KEY_NAME);</span>
+<span class="nc" id="L163">        checkVersionCompatibility(version);</span>
+<span class="nc" id="L164">        Struct struct = CONFIG_STATE_V0.read(buffer);</span>
+<span class="nc" id="L165">        long configOffset = struct.getLong(CONFIG_OFFSET_KEY_NAME);</span>
+<span class="nc" id="L166">        String url = struct.getString(URL_KEY_NAME);</span>
+<span class="nc" id="L167">        return new WorkerState(url, configOffset);</span>
+    }
+
+    /**
+     * The fields are serialized in sequence as follows:
+     * Complete Assignment V0:
+     * &lt;pre&gt;
+     *   Version            =&gt; Int16
+     *   Error              =&gt; Int16
+     *   Leader             =&gt; [String]
+     *   LeaderUrl          =&gt; [String]
+     *   ConfigOffset       =&gt; Int64
+     *   Assignment         =&gt; [Connector Assignment]
+     * &lt;/pre&gt;
+     */
+    public static ByteBuffer serializeAssignment(Assignment assignment) {
+<span class="nc" id="L183">        Struct struct = new Struct(ASSIGNMENT_V0);</span>
+<span class="nc" id="L184">        struct.set(ERROR_KEY_NAME, assignment.error());</span>
+<span class="nc" id="L185">        struct.set(LEADER_KEY_NAME, assignment.leader());</span>
+<span class="nc" id="L186">        struct.set(LEADER_URL_KEY_NAME, assignment.leaderUrl());</span>
+<span class="nc" id="L187">        struct.set(CONFIG_OFFSET_KEY_NAME, assignment.offset());</span>
+<span class="nc" id="L188">        List&lt;Struct&gt; taskAssignments = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">        for (Map.Entry&lt;String, Collection&lt;Integer&gt;&gt; connectorEntry : assignment.asMap().entrySet()) {</span>
+<span class="nc" id="L190">            Struct taskAssignment = new Struct(CONNECTOR_ASSIGNMENT_V0);</span>
+<span class="nc" id="L191">            taskAssignment.set(CONNECTOR_KEY_NAME, connectorEntry.getKey());</span>
+<span class="nc" id="L192">            Collection&lt;Integer&gt; tasks = connectorEntry.getValue();</span>
+<span class="nc" id="L193">            taskAssignment.set(TASKS_KEY_NAME, tasks.toArray());</span>
+<span class="nc" id="L194">            taskAssignments.add(taskAssignment);</span>
+<span class="nc" id="L195">        }</span>
+<span class="nc" id="L196">        struct.set(ASSIGNMENT_KEY_NAME, taskAssignments.toArray());</span>
+
+<span class="nc" id="L198">        ByteBuffer buffer = ByteBuffer.allocate(CONNECT_PROTOCOL_HEADER_V0.sizeOf() + ASSIGNMENT_V0.sizeOf(struct));</span>
+<span class="nc" id="L199">        CONNECT_PROTOCOL_HEADER_V0.writeTo(buffer);</span>
+<span class="nc" id="L200">        ASSIGNMENT_V0.write(buffer, struct);</span>
+<span class="nc" id="L201">        buffer.flip();</span>
+<span class="nc" id="L202">        return buffer;</span>
+    }
+
+    /**
+     * Given a byte buffer that contains an assignment as defined by this protocol, return the
+     * deserialized form of the assignment.
+     *
+     * @param buffer the buffer containing a serialized assignment
+     * @return the deserialized assignment
+     * @throws SchemaException on incompatible Connect protocol version
+     */
+    public static Assignment deserializeAssignment(ByteBuffer buffer) {
+<span class="nc" id="L214">        Struct header = CONNECT_PROTOCOL_HEADER_SCHEMA.read(buffer);</span>
+<span class="nc" id="L215">        Short version = header.getShort(VERSION_KEY_NAME);</span>
+<span class="nc" id="L216">        checkVersionCompatibility(version);</span>
+<span class="nc" id="L217">        Struct struct = ASSIGNMENT_V0.read(buffer);</span>
+<span class="nc" id="L218">        short error = struct.getShort(ERROR_KEY_NAME);</span>
+<span class="nc" id="L219">        String leader = struct.getString(LEADER_KEY_NAME);</span>
+<span class="nc" id="L220">        String leaderUrl = struct.getString(LEADER_URL_KEY_NAME);</span>
+<span class="nc" id="L221">        long offset = struct.getLong(CONFIG_OFFSET_KEY_NAME);</span>
+<span class="nc" id="L222">        List&lt;String&gt; connectorIds = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L223">        List&lt;ConnectorTaskId&gt; taskIds = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        for (Object structObj : struct.getArray(ASSIGNMENT_KEY_NAME)) {</span>
+<span class="nc" id="L225">            Struct assignment = (Struct) structObj;</span>
+<span class="nc" id="L226">            String connector = assignment.getString(CONNECTOR_KEY_NAME);</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">            for (Object taskIdObj : assignment.getArray(TASKS_KEY_NAME)) {</span>
+<span class="nc" id="L228">                Integer taskId = (Integer) taskIdObj;</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">                if (taskId == CONNECTOR_TASK)</span>
+<span class="nc" id="L230">                    connectorIds.add(connector);</span>
+                else
+<span class="nc" id="L232">                    taskIds.add(new ConnectorTaskId(connector, taskId));</span>
+            }
+        }
+<span class="nc" id="L235">        return new Assignment(error, leader, leaderUrl, offset, connectorIds, taskIds);</span>
+    }
+
+    /**
+     * A class that captures the deserialized form of a worker's metadata.
+     */
+    public static class WorkerState {
+        private final String url;
+        private final long offset;
+
+<span class="fc" id="L245">        public WorkerState(String url, long offset) {</span>
+<span class="fc" id="L246">            this.url = url;</span>
+<span class="fc" id="L247">            this.offset = offset;</span>
+<span class="fc" id="L248">        }</span>
+
+        public String url() {
+<span class="fc" id="L251">            return url;</span>
+        }
+
+        /**
+         * The most up-to-date (maximum) configuration offset known to this worker.
+         *
+         * @return the configuration offset
+         */
+        public long offset() {
+<span class="fc" id="L260">            return offset;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L265">            return &quot;WorkerState{&quot; +</span>
+                    &quot;url='&quot; + url + '\'' +
+                    &quot;, offset=&quot; + offset +
+                    '}';
+        }
+    }
+
+    /**
+     * The basic assignment of connectors and tasks introduced with V0 version of the Connect protocol.
+     */
+    public static class Assignment {
+        public static final short NO_ERROR = 0;
+        // Configuration offsets mismatched in a way that the leader could not resolve. Workers should read to the end
+        // of the config log and try to re-join
+        public static final short CONFIG_MISMATCH = 1;
+
+        private final short error;
+        private final String leader;
+        private final String leaderUrl;
+        private final long offset;
+        private final Collection&lt;String&gt; connectorIds;
+        private final Collection&lt;ConnectorTaskId&gt; taskIds;
+
+        /**
+         * Create an assignment indicating responsibility for the given connector instances and task Ids.
+         *
+         * @param error error code for this assignment; {@link ConnectProtocol.Assignment#NO_ERROR}
+         *              indicates no error during assignment
+         * @param leader Connect group's leader Id; may be null only on the empty assignment
+         * @param leaderUrl Connect group's leader URL; may be null only on the empty assignment
+         * @param configOffset the most up-to-date configuration offset according to this assignment
+         * @param connectorIds list of connectors that the worker should instantiate and run; may not be null
+         * @param taskIds list of task IDs that the worker should instantiate and run; may not be null
+         */
+        public Assignment(short error, String leader, String leaderUrl, long configOffset,
+<span class="fc" id="L300">                          Collection&lt;String&gt; connectorIds, Collection&lt;ConnectorTaskId&gt; taskIds) {</span>
+<span class="fc" id="L301">            this.error = error;</span>
+<span class="fc" id="L302">            this.leader = leader;</span>
+<span class="fc" id="L303">            this.leaderUrl = leaderUrl;</span>
+<span class="fc" id="L304">            this.offset = configOffset;</span>
+<span class="fc" id="L305">            this.connectorIds = Objects.requireNonNull(connectorIds,</span>
+                    &quot;Assigned connector IDs may be empty but not null&quot;);
+<span class="fc" id="L307">            this.taskIds = Objects.requireNonNull(taskIds,</span>
+                    &quot;Assigned task IDs may be empty but not null&quot;);
+<span class="fc" id="L309">        }</span>
+
+        /**
+         * Return the error code of this assignment; 0 signals successful assignment ({@link ConnectProtocol.Assignment#NO_ERROR}).
+         *
+         * @return the error code of the assignment
+         */
+        public short error() {
+<span class="fc" id="L317">            return error;</span>
+        }
+
+        /**
+         * Return the ID of the leader Connect worker in this assignment.
+         *
+         * @return the ID of the leader
+         */
+        public String leader() {
+<span class="fc" id="L326">            return leader;</span>
+        }
+
+        /**
+         * Return the URL to which the leader accepts requests from other members of the group.
+         *
+         * @return the leader URL
+         */
+        public String leaderUrl() {
+<span class="fc" id="L335">            return leaderUrl;</span>
+        }
+
+        /**
+         * Check if this assignment failed.
+         *
+         * @return true if this assignment failed; false otherwise
+         */
+        public boolean failed() {
+<span class="pc bpc" id="L344" title="1 of 2 branches missed.">            return error != NO_ERROR;</span>
+        }
+
+        /**
+         * Return the most up-to-date offset in the configuration topic according to this assignment
+         *
+         * @return the up-to-date configuration topic offset
+         */
+        public long offset() {
+<span class="fc" id="L353">            return offset;</span>
+        }
+
+        /**
+         * The connectors included in this assignment.
+         *
+         * @return the connectors
+         */
+        public Collection&lt;String&gt; connectors() {
+<span class="fc" id="L362">            return connectorIds;</span>
+        }
+
+        /**
+         * The tasks included in this assignment.
+         *
+         * @return the tasks
+         */
+        public Collection&lt;ConnectorTaskId&gt; tasks() {
+<span class="fc" id="L371">            return taskIds;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L376">            return &quot;Assignment{&quot; +</span>
+                    &quot;error=&quot; + error +
+                    &quot;, leader='&quot; + leader + '\'' +
+                    &quot;, leaderUrl='&quot; + leaderUrl + '\'' +
+                    &quot;, offset=&quot; + offset +
+                    &quot;, connectorIds=&quot; + connectorIds +
+                    &quot;, taskIds=&quot; + taskIds +
+                    '}';
+        }
+
+        protected Map&lt;String, Collection&lt;Integer&gt;&gt; asMap() {
+            // Using LinkedHashMap preserves the ordering, which is helpful for tests and debugging
+<span class="fc" id="L388">            Map&lt;String, Collection&lt;Integer&gt;&gt; taskMap = new LinkedHashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L389" title="All 2 branches covered.">            for (String connectorId : new HashSet&lt;&gt;(connectorIds)) {</span>
+<span class="fc" id="L390">                taskMap.computeIfAbsent(connectorId, key -&gt; new ArrayList&lt;&gt;()).add(CONNECTOR_TASK);</span>
+<span class="fc" id="L391">            }</span>
+<span class="fc bfc" id="L392" title="All 2 branches covered.">            for (ConnectorTaskId taskId : taskIds) {</span>
+<span class="fc" id="L393">                String connectorId = taskId.connector();</span>
+<span class="fc" id="L394">                taskMap.computeIfAbsent(connectorId, key -&gt; new ArrayList&lt;&gt;()).add(taskId.task());</span>
+<span class="fc" id="L395">            }</span>
+<span class="fc" id="L396">            return taskMap;</span>
+        }
+    }
+
+    private static void checkVersionCompatibility(short version) {
+        // check for invalid versions
+<span class="nc bnc" id="L402" title="All 2 branches missed.">        if (version &lt; CONNECT_PROTOCOL_V0)</span>
+<span class="nc" id="L403">            throw new SchemaException(&quot;Unsupported subscription version: &quot; + version);</span>
+
+        // otherwise, assume versions can be parsed as V0
+<span class="nc" id="L406">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

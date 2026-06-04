@@ -1,0 +1,736 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractConfig.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.config</a> &gt; <span class="el_source">AbstractConfig.java</span></div><h1>AbstractConfig.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.common.config;
+
+import org.apache.kafka.common.Configurable;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.config.provider.ConfigProvider;
+import org.apache.kafka.common.config.types.Password;
+import org.apache.kafka.common.utils.Utils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+/**
+ * A convenient base class for configurations to extend.
+ * &lt;p&gt;
+ * This class holds both the original configuration that was provided as well as the parsed
+ */
+public class AbstractConfig {
+
+<span class="fc" id="L48">    private static final Logger log = LoggerFactory.getLogger(AbstractConfig.class);</span>
+
+    /**
+     * Configs for which values have been requested, used to detect unused configs.
+     * This set must be concurrent modifiable and iterable. It will be modified
+     * when directly accessed or as a result of RecordingMap access.
+     */
+<span class="fc" id="L55">    private final Set&lt;String&gt; used = ConcurrentHashMap.newKeySet();</span>
+
+    /* the original values passed in by the user */
+    private final Map&lt;String, ?&gt; originals;
+
+    /* the parsed values */
+    private final Map&lt;String, Object&gt; values;
+
+    private final ConfigDef definition;
+
+    public static final String AUTOMATIC_CONFIG_PROVIDERS_PROPERTY = &quot;org.apache.kafka.automatic.config.providers&quot;;
+
+    public static final String CONFIG_PROVIDERS_CONFIG = &quot;config.providers&quot;;
+    public static final String CONFIG_PROVIDERS_DOC = 
+            &quot;Comma-separated alias names for classes implementing the &lt;code&gt;ConfigProvider&lt;/code&gt; interface. &quot; +
+            &quot;This enables loading configuration data (such as passwords, API keys, and other credentials) from external &quot; +
+            &quot;sources. For example, see &lt;a href=\&quot;https://kafka.apache.org/documentation/#config_providers\&quot;&gt;Configuration Providers&lt;/a&gt;.&quot;;
+
+    private static final String CONFIG_PROVIDERS_PARAM = &quot;.param.&quot;;
+
+    /**
+     * Construct a configuration with a ConfigDef and the configuration properties, which can include properties
+     * for zero or more {@link ConfigProvider} that will be used to resolve variables in configuration property
+     * values.
+     * &lt;p&gt;
+     * The originals is a name-value pair configuration properties and optional config provider configs. The
+     * value of the configuration can be a variable as defined below or the actual value. This constructor will
+     * first instantiate the ConfigProviders using the config provider configs, then it will find all the
+     * variables in the values of the originals configurations, attempt to resolve the variables using the named
+     * ConfigProviders, and then parse and validate the configurations.
+     * &lt;p&gt;
+     * ConfigProvider configs can be passed either as configs in the originals map or in the separate
+     * configProviderProps map. If config providers properties are passed in the configProviderProps any config
+     * provider properties in originals map will be ignored. If ConfigProvider properties are not provided, the
+     * constructor will skip the variable substitution step and will simply validate and parse the supplied
+     * configuration.
+     * &lt;p&gt;
+     * The &quot;{@code config.providers}&quot; configuration property and all configuration properties that begin with the
+     * &quot;{@code config.providers.}&quot; prefix are reserved. The &quot;{@code config.providers}&quot; configuration property
+     * specifies the names of the config providers, and properties that begin with the &quot;{@code config.providers..}&quot;
+     * prefix correspond to the properties for that named provider. For example, the &quot;{@code config.providers..class}&quot;
+     * property specifies the name of the {@link ConfigProvider} implementation class that should be used for
+     * the provider.
+     * &lt;p&gt;
+     * The keys for ConfigProvider configs in both originals and configProviderProps will start with the above
+     * mentioned &quot;{@code config.providers.}&quot; prefix.
+     * &lt;p&gt;
+     * Variables have the form &quot;${providerName:[path:]key}&quot;, where &quot;providerName&quot; is the name of a ConfigProvider,
+     * &quot;path&quot; is an optional string, and &quot;key&quot; is a required string. This variable is resolved by passing the &quot;key&quot;
+     * and optional &quot;path&quot; to a ConfigProvider with the specified name, and the result from the ConfigProvider is
+     * then used in place of the variable. Variables that cannot be resolved by the AbstractConfig constructor will
+     * be left unchanged in the configuration.
+     *
+     * @param definition          the definition of the configurations; may not be null
+     * @param originals           the configuration properties plus any optional config provider properties;
+     * @param configProviderProps the map of properties of config providers which will be instantiated by
+     *                            the constructor to resolve any variables in {@code originals}; may be null or empty
+     * @param doLog               whether the configurations should be logged
+     */
+    @SuppressWarnings({&quot;this-escape&quot;})
+<span class="fc" id="L115">    public AbstractConfig(ConfigDef definition, Map&lt;?, ?&gt; originals, Map&lt;String, ?&gt; configProviderProps, boolean doLog) {</span>
+<span class="fc" id="L116">        Map&lt;String, Object&gt; originalMap = preProcessParsedConfig(Collections.unmodifiableMap(Utils.castToStringObjectMap(originals)));</span>
+<span class="fc" id="L117">        this.originals = resolveConfigVariables(configProviderProps, originalMap);</span>
+<span class="fc" id="L118">        this.values = definition.parse(this.originals);</span>
+<span class="fc" id="L119">        Map&lt;String, Object&gt; configUpdates = postProcessParsedConfig(Collections.unmodifiableMap(this.values));</span>
+<span class="fc" id="L120">        this.values.putAll(configUpdates);</span>
+<span class="fc" id="L121">        definition.parse(this.values);</span>
+<span class="fc" id="L122">        this.definition = definition;</span>
+<span class="fc bfc" id="L123" title="All 2 branches covered.">        if (doLog)</span>
+<span class="fc" id="L124">            logAll();</span>
+<span class="fc" id="L125">    }</span>
+
+    /**
+     * Construct a configuration with a ConfigDef and the configuration properties,
+     * which can include properties for zero or more {@link ConfigProvider}
+     * that will be used to resolve variables in configuration property values.
+     *
+     * @param definition the definition of the configurations; may not be null
+     * @param originals  the configuration properties plus any optional config provider properties; may not be null
+     */
+    public AbstractConfig(ConfigDef definition, Map&lt;?, ?&gt; originals) {
+<span class="fc" id="L136">        this(definition, originals, Map.of(), true);</span>
+<span class="fc" id="L137">    }</span>
+
+    /**
+     * Construct a configuration with a ConfigDef and the configuration properties,
+     * which can include properties for zero or more {@link ConfigProvider}
+     * that will be used to resolve variables in configuration property values.
+     *
+     * @param definition the definition of the configurations; may not be null
+     * @param originals  the configuration properties plus any optional config provider properties; may not be null
+     * @param doLog      whether the configurations should be logged
+     */
+    public AbstractConfig(ConfigDef definition, Map&lt;?, ?&gt; originals, boolean doLog) {
+<span class="fc" id="L149">        this(definition, originals, Map.of(), doLog);</span>
+<span class="fc" id="L150">    }</span>
+
+    /**
+     * Called directly after user configs got parsed (and thus default values is not set).
+     * This allows to check user's config.
+     *
+     * @param parsedValues unmodifiable map of current configuration
+     * @return a map of updates that should be applied to the configuration (will be validated to prevent bad updates)
+     */
+    protected Map&lt;String, Object&gt; preProcessParsedConfig(Map&lt;String, Object&gt; parsedValues) {
+<span class="fc" id="L160">        return parsedValues;</span>
+    }
+
+    /**
+     * Called directly after user configs got parsed (and thus default values got set).
+     * This allows to change default values for &quot;secondary defaults&quot; if required.
+     *
+     * @param parsedValues unmodifiable map of current configuration
+     * @return a map of updates that should be applied to the configuration (will be validated to prevent bad updates)
+     */
+    protected Map&lt;String, Object&gt; postProcessParsedConfig(Map&lt;String, Object&gt; parsedValues) {
+<span class="fc" id="L171">        return Map.of();</span>
+    }
+
+    protected Object get(String key) {
+<span class="pc bpc" id="L175" title="1 of 2 branches missed.">        if (!values.containsKey(key))</span>
+<span class="nc" id="L176">            throw new ConfigException(String.format(&quot;Unknown configuration '%s'&quot;, key));</span>
+<span class="fc" id="L177">        used.add(key);</span>
+<span class="fc" id="L178">        return values.get(key);</span>
+    }
+
+    public void ignore(String key) {
+<span class="fc" id="L182">        used.add(key);</span>
+<span class="fc" id="L183">    }</span>
+
+    public Short getShort(String key) {
+<span class="fc" id="L186">        return (Short) get(key);</span>
+    }
+
+    public Integer getInt(String key) {
+<span class="fc" id="L190">        return (Integer) get(key);</span>
+    }
+
+    public Long getLong(String key) {
+<span class="fc" id="L194">        return (Long) get(key);</span>
+    }
+
+    public Double getDouble(String key) {
+<span class="fc" id="L198">        return (Double) get(key);</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public List&lt;String&gt; getList(String key) {
+<span class="fc" id="L203">        return (List&lt;String&gt;) get(key);</span>
+    }
+
+    public Boolean getBoolean(String key) {
+<span class="fc" id="L207">        return (Boolean) get(key);</span>
+    }
+
+    public String getString(String key) {
+<span class="fc" id="L211">        final String res = (String) get(key);</span>
+<span class="fc bfc" id="L212" title="All 2 branches covered.">        return res == null ? res : res.trim();</span>
+    }
+
+    public ConfigDef.Type typeOf(String key) {
+<span class="nc" id="L216">        ConfigDef.ConfigKey configKey = definition.configKeys().get(key);</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">        if (configKey == null)</span>
+<span class="nc" id="L218">            return null;</span>
+<span class="nc" id="L219">        return configKey.type;</span>
+    }
+
+    public String documentationOf(String key) {
+<span class="nc" id="L223">        ConfigDef.ConfigKey configKey = definition.configKeys().get(key);</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        if (configKey == null)</span>
+<span class="nc" id="L225">            return null;</span>
+<span class="nc" id="L226">        return configKey.documentation;</span>
+    }
+
+    public Password getPassword(String key) {
+<span class="fc" id="L230">        return (Password) get(key);</span>
+    }
+
+    public Class&lt;?&gt; getClass(String key) {
+<span class="fc" id="L234">        return (Class&lt;?&gt;) get(key);</span>
+    }
+
+    public Set&lt;String&gt; unused() {
+<span class="fc" id="L238">        Set&lt;String&gt; keys = new HashSet&lt;&gt;(originals.keySet());</span>
+<span class="fc" id="L239">        keys.removeAll(used);</span>
+<span class="fc" id="L240">        return keys;</span>
+    }
+
+    public Map&lt;String, Object&gt; originals() {
+<span class="fc" id="L244">        Map&lt;String, Object&gt; copy = new RecordingMap&lt;&gt;();</span>
+<span class="fc" id="L245">        copy.putAll(originals);</span>
+<span class="fc" id="L246">        return copy;</span>
+    }
+
+    public Map&lt;String, Object&gt; originals(Map&lt;String, Object&gt; configOverrides) {
+<span class="fc" id="L250">        Map&lt;String, Object&gt; copy = new RecordingMap&lt;&gt;();</span>
+<span class="fc" id="L251">        copy.putAll(originals);</span>
+<span class="fc" id="L252">        copy.putAll(configOverrides);</span>
+<span class="fc" id="L253">        return copy;</span>
+    }
+
+    /**
+     * Get all the original settings, ensuring that all values are of type String.
+     *
+     * @return the original settings
+     * @throws ClassCastException if any of the values are not strings
+     */
+    public Map&lt;String, String&gt; originalsStrings() {
+<span class="fc" id="L263">        Map&lt;String, String&gt; copy = new RecordingMap&lt;&gt;();</span>
+<span class="fc bfc" id="L264" title="All 2 branches covered.">        for (Map.Entry&lt;String, ?&gt; entry : originals.entrySet()) {</span>
+<span class="pc bpc" id="L265" title="1 of 2 branches missed.">            if (!(entry.getValue() instanceof String))</span>
+<span class="nc" id="L266">                throw new ClassCastException(&quot;Non-string value found in original settings for key &quot; + entry.getKey() +</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">                        &quot;: &quot; + (entry.getValue() == null ? null : entry.getValue().getClass().getName()));</span>
+<span class="fc" id="L268">            copy.put(entry.getKey(), (String) entry.getValue());</span>
+<span class="fc" id="L269">        }</span>
+<span class="fc" id="L270">        return copy;</span>
+    }
+
+    /**
+     * Gets all original settings with the given prefix, stripping the prefix before adding it to the output.
+     *
+     * @param prefix the prefix to use as a filter
+     * @return a Map containing the settings with the prefix
+     */
+    public Map&lt;String, Object&gt; originalsWithPrefix(String prefix) {
+<span class="fc" id="L280">        return originalsWithPrefix(prefix, true);</span>
+    }
+
+    /**
+     * Gets all original settings with the given prefix.
+     *
+     * @param prefix the prefix to use as a filter
+     * @param strip  strip the prefix before adding to the output if set true
+     * @return a Map containing the settings with the prefix
+     */
+    public Map&lt;String, Object&gt; originalsWithPrefix(String prefix, boolean strip) {
+<span class="fc" id="L291">        Map&lt;String, Object&gt; result = new RecordingMap&lt;&gt;(prefix, false);</span>
+<span class="fc" id="L292">        result.putAll(Utils.entriesWithPrefix(originals, prefix, strip));</span>
+<span class="fc" id="L293">        return result;</span>
+    }
+
+    /**
+     * Put all keys that do not start with {@code prefix} and their parsed values in the result map and then
+     * put all the remaining keys with the prefix stripped and their parsed values in the result map.
+     * &lt;p&gt;
+     * This is useful if one wants to allow prefixed configs to override default ones.
+     * &lt;p&gt;
+     * Two forms of prefixes are supported:
+     * &lt;ul&gt;
+     *     &lt;li&gt;listener.name.{listenerName}.some.prop: If the provided prefix is `listener.name.{listenerName}.`,
+     *         the key `some.prop` with the value parsed using the definition of `some.prop` is returned.&lt;/li&gt;
+     *     &lt;li&gt;listener.name.{listenerName}.{mechanism}.some.prop: If the provided prefix is `listener.name.{listenerName}.`,
+     *         the key `{mechanism}.some.prop` with the value parsed using the definition of `some.prop` is returned.
+     *          This is used to provide per-mechanism configs for a broker listener (e.g sasl.jaas.config)&lt;/li&gt;
+     * &lt;/ul&gt;
+     * &lt;/p&gt;
+     */
+    public Map&lt;String, Object&gt; valuesWithPrefixOverride(String prefix) {
+<span class="fc" id="L313">        Map&lt;String, Object&gt; result = new RecordingMap&lt;&gt;(values(), prefix, true);</span>
+<span class="fc bfc" id="L314" title="All 2 branches covered.">        for (Map.Entry&lt;String, ?&gt; entry : originals.entrySet()) {</span>
+<span class="pc bpc" id="L315" title="3 of 4 branches missed.">            if (entry.getKey().startsWith(prefix) &amp;&amp; entry.getKey().length() &gt; prefix.length()) {</span>
+<span class="nc" id="L316">                String keyWithNoPrefix = entry.getKey().substring(prefix.length());</span>
+<span class="nc" id="L317">                ConfigDef.ConfigKey configKey = definition.configKeys().get(keyWithNoPrefix);</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">                if (configKey != null)</span>
+<span class="nc" id="L319">                    result.put(keyWithNoPrefix, definition.parseValue(configKey, entry.getValue(), true));</span>
+                else {
+<span class="nc" id="L321">                    String keyWithNoSecondaryPrefix = keyWithNoPrefix.substring(keyWithNoPrefix.indexOf('.') + 1);</span>
+<span class="nc" id="L322">                    configKey = definition.configKeys().get(keyWithNoSecondaryPrefix);</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">                    if (configKey != null)</span>
+<span class="nc" id="L324">                        result.put(keyWithNoPrefix, definition.parseValue(configKey, entry.getValue(), true));</span>
+                }
+            }
+<span class="fc" id="L327">        }</span>
+<span class="fc" id="L328">        return result;</span>
+    }
+
+    /**
+     * If at least one key with {@code prefix} exists, all prefixed values will be parsed and put into map.
+     * If no value with {@code prefix} exists all unprefixed values will be returned.
+     * &lt;p&gt;
+     * This is useful if one wants to allow prefixed configs to override default ones, but wants to use either
+     * only prefixed configs or only regular configs, but not mix them.
+     */
+    public Map&lt;String, Object&gt; valuesWithPrefixAllOrNothing(String prefix) {
+<span class="fc" id="L339">        Map&lt;String, Object&gt; withPrefix = originalsWithPrefix(prefix, true);</span>
+
+<span class="pc bpc" id="L341" title="1 of 2 branches missed.">        if (withPrefix.isEmpty()) {</span>
+<span class="fc" id="L342">            return new RecordingMap&lt;&gt;(values(), &quot;&quot;, true);</span>
+        } else {
+<span class="nc" id="L344">            Map&lt;String, Object&gt; result = new RecordingMap&lt;&gt;(prefix, true);</span>
+
+<span class="nc bnc" id="L346" title="All 2 branches missed.">            for (Map.Entry&lt;String, ?&gt; entry : withPrefix.entrySet()) {</span>
+<span class="nc" id="L347">                ConfigDef.ConfigKey configKey = definition.configKeys().get(entry.getKey());</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">                if (configKey != null)</span>
+<span class="nc" id="L349">                    result.put(entry.getKey(), definition.parseValue(configKey, entry.getValue(), true));</span>
+<span class="nc" id="L350">            }</span>
+
+<span class="nc" id="L352">            return result;</span>
+        }
+    }
+
+    public Map&lt;String, ?&gt; values() {
+<span class="fc" id="L357">        return new RecordingMap&lt;&gt;(values);</span>
+    }
+
+    public Map&lt;String, ?&gt; nonInternalValues() {
+<span class="fc" id="L361">        Map&lt;String, Object&gt; nonInternalConfigs = new RecordingMap&lt;&gt;();</span>
+<span class="fc" id="L362">        values.forEach((key, value) -&gt; {</span>
+<span class="fc" id="L363">            ConfigDef.ConfigKey configKey = definition.configKeys().get(key);</span>
+<span class="pc bpc" id="L364" title="1 of 4 branches missed.">            if (configKey == null || !configKey.internalConfig) {</span>
+<span class="fc" id="L365">                nonInternalConfigs.put(key, value);</span>
+            }
+<span class="fc" id="L367">        });</span>
+<span class="fc" id="L368">        return nonInternalConfigs;</span>
+    }
+
+    private void logAll() {
+<span class="fc" id="L372">        StringBuilder b = new StringBuilder();</span>
+<span class="fc" id="L373">        b.append(getClass().getSimpleName());</span>
+<span class="fc" id="L374">        b.append(&quot; values: &quot;);</span>
+<span class="fc" id="L375">        b.append(Utils.NL);</span>
+
+<span class="fc bfc" id="L377" title="All 2 branches covered.">        for (Map.Entry&lt;String, Object&gt; entry : new TreeMap&lt;&gt;(this.values).entrySet()) {</span>
+<span class="fc" id="L378">            b.append('\t');</span>
+<span class="fc" id="L379">            b.append(entry.getKey());</span>
+<span class="fc" id="L380">            b.append(&quot; = &quot;);</span>
+<span class="fc" id="L381">            b.append(entry.getValue());</span>
+<span class="fc" id="L382">            b.append(Utils.NL);</span>
+<span class="fc" id="L383">        }</span>
+<span class="fc" id="L384">        log.info(b.toString());</span>
+<span class="fc" id="L385">    }</span>
+
+    /**
+     * Info level log for any unused configurations
+     */
+    public void logUnused() {
+<span class="fc" id="L391">        Set&lt;String&gt; unusedKeys = unused();</span>
+<span class="fc bfc" id="L392" title="All 2 branches covered.">        if (!unusedKeys.isEmpty()) {</span>
+<span class="fc" id="L393">            log.info(&quot;These configurations '{}' were supplied but are not used yet.&quot;, unusedKeys);</span>
+        }
+<span class="fc" id="L395">    }</span>
+
+    private &lt;T&gt; T getConfiguredInstance(Object klass, Class&lt;T&gt; t, Map&lt;String, Object&gt; configPairs) {
+<span class="fc bfc" id="L398" title="All 2 branches covered.">        if (klass == null)</span>
+<span class="fc" id="L399">            return null;</span>
+        Object o;
+
+<span class="fc bfc" id="L402" title="All 2 branches covered.">        if (klass instanceof String) {</span>
+            try {
+<span class="fc" id="L404">                o = Utils.newInstance((String) klass, t);</span>
+<span class="nc" id="L405">            } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L406">                throw new KafkaException(&quot;Class &quot; + klass + &quot; cannot be found&quot;, e);</span>
+<span class="fc" id="L407">            }</span>
+<span class="pc bpc" id="L408" title="1 of 2 branches missed.">        } else if (klass instanceof Class&lt;?&gt;) {</span>
+<span class="fc" id="L409">            o = Utils.newInstance((Class&lt;?&gt;) klass);</span>
+        } else
+<span class="nc" id="L411">            throw new KafkaException(&quot;Unexpected element of type &quot; + klass.getClass().getName() + &quot;, expected String or Class&quot;);</span>
+        try {
+<span class="pc bpc" id="L413" title="1 of 2 branches missed.">            if (!t.isInstance(o))</span>
+<span class="nc" id="L414">                throw new KafkaException(klass + &quot; is not an instance of &quot; + t.getName());</span>
+<span class="fc bfc" id="L415" title="All 2 branches covered.">            if (o instanceof Configurable)</span>
+<span class="fc" id="L416">                ((Configurable) o).configure(configPairs);</span>
+<span class="nc" id="L417">        } catch (Exception e) {</span>
+<span class="nc" id="L418">            maybeClose(o, &quot;AutoCloseable object constructed and configured during failed call to getConfiguredInstance&quot;);</span>
+<span class="nc" id="L419">            throw e;</span>
+<span class="fc" id="L420">        }</span>
+<span class="fc" id="L421">        return t.cast(o);</span>
+    }
+
+    /**
+     * Get a configured instance of the give class specified by the given configuration key. If the object implements
+     * Configurable configure it using the configuration.
+     *
+     * @param key The configuration key for the class
+     * @param t   The interface the class should implement
+     * @return A configured instance of the class
+     */
+    public &lt;T&gt; T getConfiguredInstance(String key, Class&lt;T&gt; t) {
+<span class="fc" id="L433">        return getConfiguredInstance(key, t, Map.of());</span>
+    }
+
+    /**
+     * Get a configured instance of the give class specified by the given configuration key. If the object implements
+     * Configurable configure it using the configuration.
+     *
+     * @param key             The configuration key for the class
+     * @param t               The interface the class should implement
+     * @param configOverrides override origin configs
+     * @return A configured instance of the class
+     */
+    public &lt;T&gt; T getConfiguredInstance(String key, Class&lt;T&gt; t, Map&lt;String, Object&gt; configOverrides) {
+<span class="fc" id="L446">        Class&lt;?&gt; c = getClass(key);</span>
+
+<span class="fc" id="L448">        return getConfiguredInstance(c, t, originals(configOverrides));</span>
+    }
+
+    /**
+     * Get a list of configured instances of the given class specified by the given configuration key. The configuration
+     * may specify either null or an empty string to indicate no configured instances. In both cases, this method
+     * returns an empty list to indicate no configured instances.
+     *
+     * @param key The configuration key for the class
+     * @param t   The interface the class should implement
+     * @return The list of configured instances
+     */
+    public &lt;T&gt; List&lt;T&gt; getConfiguredInstances(String key, Class&lt;T&gt; t) {
+<span class="nc" id="L461">        return getConfiguredInstances(key, t, Map.of());</span>
+    }
+
+    /**
+     * Get a list of configured instances of the given class specified by the given configuration key. The configuration
+     * may specify either null or an empty string to indicate no configured instances. In both cases, this method
+     * returns an empty list to indicate no configured instances.
+     *
+     * @param key             The configuration key for the class
+     * @param t               The interface the class should implement
+     * @param configOverrides Configuration overrides to use.
+     * @return The list of configured instances
+     */
+    public &lt;T&gt; List&lt;T&gt; getConfiguredInstances(String key, Class&lt;T&gt; t, Map&lt;String, Object&gt; configOverrides) {
+<span class="fc" id="L475">        return getConfiguredInstances(getList(key), t, configOverrides);</span>
+    }
+
+    /**
+     * Get a list of configured instances of the given class specified by the given configuration key. The configuration
+     * may specify either null or an empty string to indicate no configured instances. In both cases, this method
+     * returns an empty list to indicate no configured instances.
+     *
+     * @param classNames      The list of class names of the instances to create
+     * @param t               The interface the class should implement
+     * @param configOverrides Configuration overrides to use.
+     * @return The list of configured instances
+     */
+    public &lt;T&gt; List&lt;T&gt; getConfiguredInstances(List&lt;String&gt; classNames, Class&lt;T&gt; t, Map&lt;String, Object&gt; configOverrides) {
+<span class="fc" id="L489">        List&lt;T&gt; objects = new ArrayList&lt;&gt;();</span>
+<span class="pc bpc" id="L490" title="1 of 2 branches missed.">        if (classNames == null)</span>
+<span class="nc" id="L491">            return objects;</span>
+<span class="fc" id="L492">        Map&lt;String, Object&gt; configPairs = originals();</span>
+<span class="fc" id="L493">        configPairs.putAll(configOverrides);</span>
+
+        try {
+<span class="fc bfc" id="L496" title="All 2 branches covered.">            for (Object klass : classNames) {</span>
+<span class="fc" id="L497">                Object o = getConfiguredInstance(klass, t, configPairs);</span>
+<span class="fc" id="L498">                objects.add(t.cast(o));</span>
+<span class="fc" id="L499">            }</span>
+<span class="nc" id="L500">        } catch (Exception e) {</span>
+<span class="nc bnc" id="L501" title="All 2 branches missed.">            for (Object object : objects) {</span>
+<span class="nc" id="L502">                maybeClose(object, &quot;AutoCloseable object constructed and configured during failed call to getConfiguredInstances&quot;);</span>
+<span class="nc" id="L503">            }</span>
+<span class="nc" id="L504">            throw e;</span>
+<span class="fc" id="L505">        }</span>
+<span class="fc" id="L506">        return objects;</span>
+    }
+
+    private static void maybeClose(Object object, String name) {
+<span class="nc bnc" id="L510" title="All 2 branches missed.">        if (object instanceof AutoCloseable) {</span>
+<span class="nc" id="L511">            Utils.closeQuietly((AutoCloseable) object, name);</span>
+        }
+<span class="nc" id="L513">    }</span>
+
+    private Map&lt;String, String&gt; extractPotentialVariables(Map&lt;?, ?&gt; configMap) {
+        // Variables are tuples of the form &quot;${providerName:[path:]key}&quot;. From the configMap we extract the subset of configs with string
+        // values as potential variables.
+<span class="fc" id="L518">        Map&lt;String, String&gt; configMapAsString = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L519" title="All 2 branches covered.">        for (Map.Entry&lt;?, ?&gt; entry : configMap.entrySet()) {</span>
+<span class="fc bfc" id="L520" title="All 2 branches covered.">            if (entry.getValue() instanceof String)</span>
+<span class="fc" id="L521">                configMapAsString.put((String) entry.getKey(), (String) entry.getValue());</span>
+<span class="fc" id="L522">        }</span>
+
+<span class="fc" id="L524">        return configMapAsString;</span>
+    }
+
+    /**
+     * Instantiates given list of config providers and fetches the actual values of config variables from the config providers.
+     * returns a map of config key and resolved values.
+     *
+     * @param configProviderProps The map of config provider configs
+     * @param originals           The map of raw configs.
+     * @return map of resolved config variable.
+     */
+    private Map&lt;String, ?&gt; resolveConfigVariables(Map&lt;String, ?&gt; configProviderProps, Map&lt;String, Object&gt; originals) {
+        Map&lt;String, String&gt; providerConfigString;
+        Map&lt;String, ?&gt; configProperties;
+        Predicate&lt;String&gt; classNameFilter;
+<span class="fc" id="L539">        Map&lt;String, Object&gt; resolvedOriginals = new HashMap&lt;&gt;();</span>
+        // As variable configs are strings, parse the originals and obtain the potential variable configs.
+<span class="fc" id="L541">        Map&lt;String, String&gt; indirectVariables = extractPotentialVariables(originals);</span>
+
+<span class="fc" id="L543">        resolvedOriginals.putAll(originals);</span>
+<span class="pc bpc" id="L544" title="1 of 4 branches missed.">        if (configProviderProps == null || configProviderProps.isEmpty()) {</span>
+<span class="fc" id="L545">            providerConfigString = indirectVariables;</span>
+<span class="fc" id="L546">            configProperties = originals;</span>
+<span class="fc" id="L547">            classNameFilter = automaticConfigProvidersFilter();</span>
+        } else {
+<span class="fc" id="L549">            providerConfigString = extractPotentialVariables(configProviderProps);</span>
+<span class="fc" id="L550">            configProperties = configProviderProps;</span>
+<span class="fc" id="L551">            classNameFilter = ignored -&gt; true;</span>
+        }
+<span class="fc" id="L553">        Map&lt;String, ConfigProvider&gt; providers = instantiateConfigProviders(providerConfigString, configProperties, classNameFilter);</span>
+
+<span class="fc bfc" id="L555" title="All 2 branches covered.">        if (!providers.isEmpty()) {</span>
+<span class="fc" id="L556">            ConfigTransformer configTransformer = new ConfigTransformer(providers);</span>
+<span class="fc" id="L557">            ConfigTransformerResult result = configTransformer.transform(indirectVariables);</span>
+<span class="pc bpc" id="L558" title="1 of 2 branches missed.">            if (!result.data().isEmpty()) {</span>
+<span class="fc" id="L559">                resolvedOriginals.putAll(result.data());</span>
+            }
+        }
+<span class="fc" id="L562">        providers.values().forEach(x -&gt; Utils.closeQuietly(x, &quot;config provider&quot;));</span>
+
+<span class="fc" id="L564">        return new ResolvingMap&lt;&gt;(resolvedOriginals, originals);</span>
+    }
+
+    private Predicate&lt;String&gt; automaticConfigProvidersFilter() {
+<span class="fc" id="L568">        String systemProperty = System.getProperty(AUTOMATIC_CONFIG_PROVIDERS_PROPERTY);</span>
+<span class="pc bpc" id="L569" title="1 of 2 branches missed.">        if (systemProperty == null) {</span>
+<span class="pc" id="L570">            return ignored -&gt; true;</span>
+        } else {
+<span class="nc" id="L572">            return Arrays.stream(systemProperty.split(&quot;,&quot;))</span>
+<span class="nc" id="L573">                    .map(String::trim)</span>
+<span class="nc" id="L574">                    .collect(Collectors.toSet())::contains;</span>
+        }
+    }
+
+    private Map&lt;String, Object&gt; configProviderProperties(String configProviderPrefix, Map&lt;String, ?&gt; providerConfigProperties) {
+<span class="fc" id="L579">        Map&lt;String, Object&gt; result = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L580" title="All 2 branches covered.">        for (Map.Entry&lt;String, ?&gt; entry : providerConfigProperties.entrySet()) {</span>
+<span class="fc" id="L581">            String key = entry.getKey();</span>
+<span class="pc bpc" id="L582" title="3 of 4 branches missed.">            if (key.startsWith(configProviderPrefix) &amp;&amp; key.length() &gt; configProviderPrefix.length()) {</span>
+<span class="nc" id="L583">                result.put(key.substring(configProviderPrefix.length()), entry.getValue());</span>
+            }
+<span class="fc" id="L585">        }</span>
+<span class="fc" id="L586">        return result;</span>
+    }
+
+    /**
+     * Instantiates and configures the ConfigProviders. The config providers configs are defined as follows:
+     * config.providers : A comma-separated list of names for providers.
+     * config.providers.{name}.class : The Java class name for a provider.
+     * config.providers.{name}.param.{param-name} : A parameter to be passed to the above Java class on initialization.
+     * returns a map of config provider name and its instance.
+     *
+     * @param indirectConfigs          The map of potential variable configs
+     * @param providerConfigProperties The map of config provider configs
+     * @param classNameFilter          Filter for config provider class names
+     * @return map of config provider name and its instance.
+     */
+    private Map&lt;String, ConfigProvider&gt; instantiateConfigProviders(
+            Map&lt;String, String&gt; indirectConfigs,
+            Map&lt;String, ?&gt; providerConfigProperties,
+            Predicate&lt;String&gt; classNameFilter
+    ) {
+<span class="fc" id="L606">        final String configProviders = indirectConfigs.get(CONFIG_PROVIDERS_CONFIG);</span>
+
+<span class="pc bpc" id="L608" title="1 of 4 branches missed.">        if (configProviders == null || configProviders.isEmpty()) {</span>
+<span class="fc" id="L609">            return Map.of();</span>
+        }
+
+<span class="fc" id="L612">        Map&lt;String, String&gt; providerMap = new HashMap&lt;&gt;();</span>
+
+<span class="fc bfc" id="L614" title="All 2 branches covered.">        for (String provider : configProviders.split(&quot;,&quot;)) {</span>
+<span class="fc" id="L615">            String providerClass = providerClassProperty(provider);</span>
+<span class="pc bpc" id="L616" title="1 of 2 branches missed.">            if (indirectConfigs.containsKey(providerClass)) {</span>
+<span class="fc" id="L617">                String providerClassName = indirectConfigs.get(providerClass);</span>
+<span class="pc bpc" id="L618" title="1 of 2 branches missed.">                if (classNameFilter.test(providerClassName)) {</span>
+<span class="fc" id="L619">                    providerMap.put(provider, providerClassName);</span>
+                } else {
+<span class="nc" id="L621">                    throw new ConfigException(providerClassName + &quot; is not allowed. Update System property '&quot;</span>
+                            + AUTOMATIC_CONFIG_PROVIDERS_PROPERTY + &quot;' to allow &quot; + providerClassName);
+                }
+            }
+        }
+        // Instantiate Config Providers
+<span class="fc" id="L627">        Map&lt;String, ConfigProvider&gt; configProviderInstances = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L628" title="All 2 branches covered.">        for (Map.Entry&lt;String, String&gt; entry : providerMap.entrySet()) {</span>
+            try {
+<span class="fc" id="L630">                String prefix = CONFIG_PROVIDERS_CONFIG + &quot;.&quot; + entry.getKey() + CONFIG_PROVIDERS_PARAM;</span>
+<span class="fc" id="L631">                Map&lt;String, ?&gt; configProperties = configProviderProperties(prefix, providerConfigProperties);</span>
+<span class="fc" id="L632">                ConfigProvider provider = Utils.newInstance(entry.getValue(), ConfigProvider.class);</span>
+<span class="fc" id="L633">                provider.configure(configProperties);</span>
+<span class="fc" id="L634">                configProviderInstances.put(entry.getKey(), provider);</span>
+<span class="nc" id="L635">            } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L636">                log.error(&quot;Could not load config provider class {}&quot;, entry.getValue(), e);</span>
+<span class="nc" id="L637">                throw new ConfigException(providerClassProperty(entry.getKey()), entry.getValue(), &quot;Could not load config provider class or one of its dependencies&quot;);</span>
+<span class="fc" id="L638">            }</span>
+<span class="fc" id="L639">        }</span>
+
+<span class="fc" id="L641">        return configProviderInstances;</span>
+    }
+
+    private static String providerClassProperty(String providerName) {
+<span class="fc" id="L645">        return String.format(&quot;%s.%s.class&quot;, CONFIG_PROVIDERS_CONFIG, providerName);</span>
+    }
+
+    @Override
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L650" title="All 2 branches missed.">        if (this == o) return true;</span>
+<span class="nc bnc" id="L651" title="All 4 branches missed.">        if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="nc" id="L653">        AbstractConfig that = (AbstractConfig) o;</span>
+
+<span class="nc" id="L655">        return originals.equals(that.originals);</span>
+    }
+
+    @Override
+    public int hashCode() {
+<span class="nc" id="L660">        return originals.hashCode();</span>
+    }
+
+    /**
+     * Marks keys retrieved via `get` as used. This is needed because `Configurable.configure` takes a `Map` instead
+     * of an `AbstractConfig` and we can't change that without breaking public API like `Partitioner`.
+     */
+    private class RecordingMap&lt;V&gt; extends HashMap&lt;String, V&gt; {
+
+        private final String prefix;
+        private final boolean withIgnoreFallback;
+
+        RecordingMap() {
+<span class="fc" id="L673">            this(&quot;&quot;, false);</span>
+<span class="fc" id="L674">        }</span>
+
+<span class="fc" id="L676">        RecordingMap(String prefix, boolean withIgnoreFallback) {</span>
+<span class="fc" id="L677">            this.prefix = prefix;</span>
+<span class="fc" id="L678">            this.withIgnoreFallback = withIgnoreFallback;</span>
+<span class="fc" id="L679">        }</span>
+
+        RecordingMap(Map&lt;String, ? extends V&gt; m) {
+<span class="fc" id="L682">            this(m, &quot;&quot;, false);</span>
+<span class="fc" id="L683">        }</span>
+
+<span class="fc" id="L685">        RecordingMap(Map&lt;String, ? extends V&gt; m, String prefix, boolean withIgnoreFallback) {</span>
+<span class="fc" id="L686">            super(m);</span>
+<span class="fc" id="L687">            this.prefix = prefix;</span>
+<span class="fc" id="L688">            this.withIgnoreFallback = withIgnoreFallback;</span>
+<span class="fc" id="L689">        }</span>
+
+        @Override
+        public V get(Object key) {
+<span class="pc bpc" id="L693" title="1 of 2 branches missed.">            if (key instanceof String) {</span>
+<span class="fc" id="L694">                String stringKey = (String) key;</span>
+                String keyWithPrefix;
+<span class="fc bfc" id="L696" title="All 2 branches covered.">                if (prefix.isEmpty()) {</span>
+<span class="fc" id="L697">                    keyWithPrefix = stringKey;</span>
+                } else {
+<span class="fc" id="L699">                    keyWithPrefix = prefix + stringKey;</span>
+                }
+<span class="fc" id="L701">                ignore(keyWithPrefix);</span>
+<span class="fc bfc" id="L702" title="All 2 branches covered.">                if (withIgnoreFallback)</span>
+<span class="fc" id="L703">                    ignore(stringKey);</span>
+            }
+<span class="fc" id="L705">            return super.get(key);</span>
+        }
+    }
+
+    /**
+     * ResolvingMap keeps a track of the original map instance and the resolved configs.
+     * The originals are tracked in a separate nested map and may be a `RecordingMap`; thus
+     * any access to a value for a key needs to be recorded on the originals map.
+     * The resolved configs are kept in the inherited map and are therefore mutable, though any
+     * mutations are not applied to the originals.
+     */
+    private static class ResolvingMap&lt;V&gt; extends HashMap&lt;String, V&gt; {
+
+        private final Map&lt;String, ?&gt; originals;
+
+        ResolvingMap(Map&lt;String, ? extends V&gt; resolved, Map&lt;String, ?&gt; originals) {
+<span class="fc" id="L721">            super(resolved);</span>
+<span class="fc" id="L722">            this.originals = Collections.unmodifiableMap(originals);</span>
+<span class="fc" id="L723">        }</span>
+
+        @Override
+        public V get(Object key) {
+<span class="pc bpc" id="L727" title="1 of 4 branches missed.">            if (key instanceof String &amp;&amp; originals.containsKey(key)) {</span>
+                // Intentionally ignore the result; call just to mark the original entry as used
+<span class="fc" id="L729">                originals.get(key);</span>
+            }
+            // But always use the resolved entry
+<span class="fc" id="L732">            return super.get(key);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

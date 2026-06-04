@@ -1,0 +1,414 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AutoTopicCreationManager.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">kafka.server</a> &gt; <span class="el_source">AutoTopicCreationManager.scala</span></div><h1>AutoTopicCreationManager.scala</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package kafka.server
+
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
+import java.util.{Collections, Properties}
+import kafka.coordinator.transaction.TransactionCoordinator
+import kafka.utils.Logging
+import org.apache.kafka.common.errors.{AuthenticationException, InvalidTopicException, TimeoutException, UnsupportedVersionException}
+import org.apache.kafka.common.internals.Topic
+import org.apache.kafka.common.internals.Topic.{GROUP_METADATA_TOPIC_NAME, SHARE_GROUP_STATE_TOPIC_NAME, TRANSACTION_STATE_TOPIC_NAME}
+import org.apache.kafka.common.message.CreateTopicsRequestData
+import org.apache.kafka.common.message.CreateTopicsRequestData.{CreatableTopic, CreatableTopicConfig, CreatableTopicConfigCollection}
+import org.apache.kafka.common.message.MetadataResponseData.MetadataResponseTopic
+import org.apache.kafka.common.protocol.Errors
+import org.apache.kafka.common.requests.{CreateTopicsRequest, CreateTopicsResponse, RequestContext}
+import org.apache.kafka.coordinator.group.GroupCoordinator
+import org.apache.kafka.coordinator.share.ShareCoordinator
+import org.apache.kafka.coordinator.transaction.TransactionLogConfig
+import org.apache.kafka.server.config.{ReplicationConfigs, ServerLogConfigs}
+import org.apache.kafka.server.quota.ControllerMutationQuota
+import org.apache.kafka.common.utils.Time
+import org.apache.kafka.server.TopicCreator
+
+import scala.collection.{Map, Seq, Set, mutable}
+import scala.jdk.CollectionConverters._
+
+<span class="nc" id="L44">trait AutoTopicCreationManager {</span>
+
+  def createTopics(
+    topicNames: Set[String],
+    controllerMutationQuota: ControllerMutationQuota,
+    metadataRequestContext: Option[RequestContext]
+  ): Seq[MetadataResponseTopic]
+
+  def createStreamsInternalTopics(
+    topics: Map[String, CreatableTopic],
+    requestContext: RequestContext,
+    timeoutMs: Long
+  ): Unit
+
+  def getStreamsInternalTopicCreationErrors(
+    topicNames: Set[String],
+    currentTimeMs: Long
+  ): Map[String, String]
+
+  def close(): Unit = {}
+
+}
+
+/**
+ * Thread-safe cache that stores topic creation errors with per-entry expiration.
+ * - Expiration: maintained by a min-heap (priority queue) on expiration time
+ * - Capacity: enforced by evicting entries with earliest expiration time (not LRU)
+ * - Updates: old entries remain in queue but are ignored via reference equality check
+ */
+<span class="fc" id="L73">private[server] class ExpiringErrorCache(maxSize: Int, time: Time) {</span>
+
+<span class="nc bnc" id="L75" title="All 42 branches missed.">  private case class Entry(topicName: String, errorMessage: String, expirationTimeMs: Long)</span>
+
+<span class="fc" id="L77">  private val byTopic = new ConcurrentHashMap[String, Entry]()</span>
+<span class="pc" id="L78">  private val expiryQueue = new java.util.PriorityQueue[Entry](11, new java.util.Comparator[Entry] {</span>
+<span class="nc" id="L79">    override def compare(a: Entry, b: Entry): Int = java.lang.Long.compare(a.expirationTimeMs, b.expirationTimeMs)</span>
+  })
+<span class="fc" id="L81">  private val lock = new ReentrantLock()</span>
+
+  def put(topicName: String, errorMessage: String, ttlMs: Long): Unit = {
+<span class="nc" id="L84">    lock.lock()</span>
+    try {
+<span class="nc" id="L86">      val currentTimeMs = time.milliseconds()</span>
+<span class="nc" id="L87">      val expirationTimeMs = currentTimeMs + ttlMs</span>
+<span class="nc" id="L88">      val entry = Entry(topicName, errorMessage, expirationTimeMs)</span>
+<span class="nc" id="L89">      byTopic.put(topicName, entry)</span>
+<span class="nc" id="L90">      expiryQueue.add(entry)</span>
+
+      // Clean up expired entries and enforce capacity
+<span class="nc bnc" id="L93" title="All 2 branches missed.">      while (!expiryQueue.isEmpty &amp;&amp; </span>
+<span class="nc bnc" id="L94" title="All 4 branches missed.">             (expiryQueue.peek().expirationTimeMs &lt;= currentTimeMs || byTopic.size() &gt; maxSize)) {</span>
+<span class="nc" id="L95">        val evicted = expiryQueue.poll()</span>
+<span class="nc" id="L96">        val current = byTopic.get(evicted.topicName)</span>
+<span class="nc bnc" id="L97" title="All 4 branches missed.">        if (current != null &amp;&amp; (current eq evicted)) {</span>
+<span class="nc" id="L98">          byTopic.remove(evicted.topicName)</span>
+        }
+      }
+    } finally {
+<span class="nc" id="L102">      lock.unlock()</span>
+    }
+  }
+
+  def hasError(topicName: String, currentTimeMs: Long): Boolean = {
+<span class="nc" id="L107">    val entry = byTopic.get(topicName)</span>
+<span class="nc bnc" id="L108" title="All 4 branches missed.">    entry != null &amp;&amp; entry.expirationTimeMs &gt; currentTimeMs</span>
+  }
+
+  def getErrorsForTopics(topicNames: Set[String], currentTimeMs: Long): Map[String, String] = {
+<span class="nc" id="L112">    val result = mutable.Map.empty[String, String]</span>
+<span class="nc" id="L113">    topicNames.foreach { topicName =&gt;</span>
+<span class="nc" id="L114">      val entry = byTopic.get(topicName)</span>
+<span class="nc bnc" id="L115" title="All 4 branches missed.">      if (entry != null &amp;&amp; entry.expirationTimeMs &gt; currentTimeMs) {</span>
+<span class="nc" id="L116">        result.put(topicName, entry.errorMessage)</span>
+      }
+    }
+<span class="nc" id="L119">    result.toMap</span>
+  }
+
+  private[server] def clear(): Unit = {
+<span class="fc" id="L123">    lock.lock()</span>
+    try {
+<span class="fc" id="L125">      byTopic.clear()</span>
+<span class="fc" id="L126">      expiryQueue.clear()</span>
+    } finally {
+<span class="fc" id="L128">      lock.unlock()</span>
+    }
+  }
+}
+
+
+<span class="pc bpc" id="L134" title="1 of 4 branches missed.">class DefaultAutoTopicCreationManager(</span>
+<span class="fc" id="L135">  config: KafkaConfig,</span>
+<span class="fc" id="L136">  groupCoordinator: GroupCoordinator,</span>
+<span class="fc" id="L137">  txnCoordinator: TransactionCoordinator,</span>
+<span class="fc" id="L138">  shareCoordinator: ShareCoordinator,</span>
+<span class="fc" id="L139">  time: Time,</span>
+<span class="fc" id="L140">  topicCreator: TopicCreator,</span>
+<span class="pc" id="L141">  topicErrorCacheCapacity: Int = 1000</span>
+<span class="fc" id="L142">) extends AutoTopicCreationManager with Logging {</span>
+
+<span class="fc" id="L144">  private val inflightTopics = Collections.newSetFromMap(new ConcurrentHashMap[String, java.lang.Boolean]())</span>
+
+  // Hardcoded default capacity; can be overridden in tests via constructor param
+<span class="fc" id="L147">  private val topicCreationErrorCache = new ExpiringErrorCache(topicErrorCacheCapacity, time)</span>
+
+  /**
+   * Initiate auto topic creation for the given topics.
+   *
+   * @param topics the topics to create
+   * @param controllerMutationQuota the controller mutation quota for topic creation
+   * @param metadataRequestContext defined when creating topics on behalf of the client. The goal here is to preserve
+   *                               original client principal for auditing, thus needing to wrap a plain CreateTopicsRequest
+   *                               inside Envelope to send to the controller when forwarding is enabled.
+   * @return auto created topic metadata responses
+   */
+  override def createTopics(
+    topics: Set[String],
+    controllerMutationQuota: ControllerMutationQuota,
+    metadataRequestContext: Option[RequestContext]
+  ): Seq[MetadataResponseTopic] = {
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">    val (creatableTopics, uncreatableTopicResponses) = filterCreatableTopics(topics)</span>
+
+<span class="pc bpc" id="L166" title="1 of 2 branches missed.">    val creatableTopicResponses = if (creatableTopics.isEmpty) {</span>
+<span class="nc" id="L167">      Seq.empty</span>
+    } else {
+<span class="fc" id="L169">      sendCreateTopicRequest(creatableTopics, metadataRequestContext)</span>
+    }
+
+<span class="fc" id="L172">    uncreatableTopicResponses ++ creatableTopicResponses</span>
+  }
+
+  override def createStreamsInternalTopics(
+    topics: Map[String, CreatableTopic],
+    requestContext: RequestContext,
+    timeoutMs: Long
+  ): Unit = {
+<span class="nc bnc" id="L180" title="All 2 branches missed.">    if (topics.isEmpty) {</span>
+<span class="nc" id="L181">      return</span>
+    }
+
+<span class="nc" id="L184">    val currentTimeMs = time.milliseconds()</span>
+
+    // Filter out topics that are:
+    // 1. Already in error cache (back-off period)
+    // 2. Already in-flight (concurrent request)
+<span class="nc bnc" id="L189" title="All 2 branches missed.">    val topicsToCreate = topics.filter { case (topicName, _) =&gt;</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">      !topicCreationErrorCache.hasError(topicName, currentTimeMs) &amp;&amp;</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">      inflightTopics.add(topicName)</span>
+    }
+
+<span class="nc bnc" id="L194" title="All 2 branches missed.">    if (topicsToCreate.nonEmpty) {</span>
+<span class="nc" id="L195">      sendCreateTopicRequestWithErrorCaching(topicsToCreate, requestContext, timeoutMs)</span>
+    }
+  }
+
+  override def getStreamsInternalTopicCreationErrors(
+    topicNames: Set[String],
+    currentTimeMs: Long
+  ): Map[String, String] = {
+<span class="nc" id="L203">    topicCreationErrorCache.getErrorsForTopics(topicNames, currentTimeMs)</span>
+  }
+
+  private def sendCreateTopicRequest(
+    creatableTopics: Map[String, CreatableTopic],
+    requestContext: Option[RequestContext]
+  ): Seq[MetadataResponseTopic] = {
+<span class="fc" id="L210">    val createTopicsRequest: CreateTopicsRequest.Builder = makeCreateTopicsRequestBuilder(creatableTopics)</span>
+
+<span class="nc" id="L212">    val responseFuture = requestContext match {</span>
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">      case Some(context) =&gt; topicCreator.createTopicWithPrincipal(context, createTopicsRequest)</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">      case None =&gt; topicCreator.createTopicWithoutPrincipal(createTopicsRequest)</span>
+    }
+
+    responseFuture.whenComplete {
+<span class="fc" id="L218">      (response, throwable) =&gt;</span>
+<span class="fc" id="L219">        clearInflightRequests(creatableTopics)</span>
+        // Log any errors from the topic creation attempt
+<span class="pc bpc" id="L221" title="1 of 2 branches missed.">        if (throwable != null) {</span>
+<span class="nc" id="L222">          logError(creatableTopics, throwable)</span>
+<span class="pc bpc" id="L223" title="1 of 2 branches missed.">        } else if (response != null) {</span>
+<span class="fc" id="L224">          response.data().topics().forEach(topicResult =&gt; {</span>
+<span class="fc" id="L225">            val error = Errors.forCode(topicResult.errorCode)</span>
+<span class="pc bpc" id="L226" title="4 of 6 branches missed.">            if (error != Errors.NONE) {</span>
+<span class="pc" id="L227">              warn(s&quot;Auto topic creation failed for ${topicResult.name} with error '${error.name}': ${topicResult.errorMessage}&quot;)</span>
+            }
+          })
+        } else {
+<span class="nc" id="L231">          warn(&quot;CreateTopicsResponse future completed with null response and no exception&quot;)</span>
+        }
+    }
+
+<span class="fc" id="L235">    val creatableTopicResponses = creatableTopics.keySet.toSeq.map { topic =&gt;</span>
+<span class="fc" id="L236">      new MetadataResponseTopic()</span>
+<span class="fc" id="L237">        .setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)</span>
+<span class="fc" id="L238">        .setName(topic)</span>
+<span class="fc" id="L239">        .setIsInternal(Topic.isInternal(topic))</span>
+    }
+
+<span class="pc" id="L242">    info(s&quot;Sent auto-creation request for ${creatableTopics.keys} to the active controller.&quot;)</span>
+<span class="fc" id="L243">    creatableTopicResponses</span>
+  }
+
+  private def clearInflightRequests(creatableTopics: Map[String, CreatableTopic]): Unit = {
+<span class="fc" id="L247">    creatableTopics.keySet.foreach(inflightTopics.remove)</span>
+<span class="pc" id="L248">    debug(s&quot;Cleared inflight topic creation state for $creatableTopics&quot;)</span>
+  }
+
+  private def creatableTopic(topic: String): CreatableTopic = {
+<span class="pc bpc" id="L252" title="4 of 6 branches missed.">    topic match {</span>
+<span class="pc bpc" id="L253" title="1 of 2 branches missed.">      case GROUP_METADATA_TOPIC_NAME =&gt;</span>
+<span class="fc" id="L254">        new CreatableTopic()</span>
+<span class="fc" id="L255">          .setName(topic)</span>
+<span class="fc" id="L256">          .setNumPartitions(config.groupCoordinatorConfig.offsetsTopicPartitions)</span>
+<span class="fc" id="L257">          .setReplicationFactor(config.groupCoordinatorConfig.offsetsTopicReplicationFactor)</span>
+<span class="fc" id="L258">          .setConfigs(convertToTopicConfigCollections(groupCoordinator.groupMetadataTopicConfigs))</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">      case TRANSACTION_STATE_TOPIC_NAME =&gt;</span>
+<span class="nc" id="L260">        val transactionLogConfig = new TransactionLogConfig(config)</span>
+<span class="nc" id="L261">        new CreatableTopic()</span>
+<span class="nc" id="L262">          .setName(topic)</span>
+<span class="nc" id="L263">          .setNumPartitions(transactionLogConfig.transactionTopicPartitions)</span>
+<span class="nc" id="L264">          .setReplicationFactor(transactionLogConfig.transactionTopicReplicationFactor)</span>
+<span class="nc" id="L265">          .setConfigs(convertToTopicConfigCollections(</span>
+<span class="nc" id="L266">            txnCoordinator.transactionTopicConfigs))</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">      case SHARE_GROUP_STATE_TOPIC_NAME =&gt;</span>
+<span class="nc" id="L268">        new CreatableTopic()</span>
+<span class="nc" id="L269">          .setName(topic)</span>
+<span class="nc" id="L270">          .setNumPartitions(config.shareCoordinatorConfig.shareCoordinatorStateTopicNumPartitions())</span>
+<span class="nc" id="L271">          .setReplicationFactor(config.shareCoordinatorConfig.shareCoordinatorStateTopicReplicationFactor())</span>
+<span class="nc" id="L272">          .setConfigs(convertToTopicConfigCollections(shareCoordinator.shareGroupStateTopicConfigs()))</span>
+      case topicName =&gt;
+        val numPartitions: java.lang.Integer =
+<span class="nc bnc" id="L275" title="All 2 branches missed.">          if (config.originals.containsKey(ServerLogConfigs.NUM_PARTITIONS_CONFIG)) config.numPartitions</span>
+<span class="nc" id="L276">          else CreateTopicsRequest.NO_NUM_PARTITIONS</span>
+        val replicationFactor: java.lang.Short =
+<span class="nc bnc" id="L278" title="All 2 branches missed.">          if (config.originals.containsKey(ReplicationConfigs.DEFAULT_REPLICATION_FACTOR_CONFIG)) config.defaultReplicationFactor.toShort</span>
+<span class="nc" id="L279">          else CreateTopicsRequest.NO_REPLICATION_FACTOR</span>
+
+<span class="nc" id="L281">        new CreatableTopic()</span>
+<span class="nc" id="L282">          .setName(topicName)</span>
+<span class="nc" id="L283">          .setNumPartitions(numPartitions)</span>
+<span class="nc" id="L284">          .setReplicationFactor(replicationFactor)</span>
+    }
+  }
+
+  private def convertToTopicConfigCollections(config: Properties): CreatableTopicConfigCollection = {
+<span class="fc" id="L289">    val topicConfigs = new CreatableTopicConfigCollection()</span>
+<span class="fc" id="L290">    config.forEach {</span>
+      case (name, value) =&gt;
+<span class="fc" id="L292">        topicConfigs.add(new CreatableTopicConfig()</span>
+<span class="fc" id="L293">          .setName(name.toString)</span>
+<span class="fc" id="L294">          .setValue(value.toString))</span>
+    }
+<span class="fc" id="L296">    topicConfigs</span>
+  }
+
+  private def isValidTopicName(topic: String): Boolean = {
+    try {
+<span class="fc" id="L301">      Topic.validate(topic)</span>
+<span class="pc" id="L302">      true</span>
+    } catch {
+      case _: InvalidTopicException =&gt;
+<span class="nc" id="L305">        false</span>
+    }
+  }
+
+  private def filterCreatableTopics(
+    topics: Set[String]
+  ): (Map[String, CreatableTopic], Seq[MetadataResponseTopic]) = {
+
+<span class="fc" id="L313">    val creatableTopics = mutable.Map.empty[String, CreatableTopic]</span>
+<span class="fc" id="L314">    val uncreatableTopics = mutable.Buffer.empty[MetadataResponseTopic]</span>
+
+<span class="fc" id="L316">    topics.foreach { topic =&gt;</span>
+      // Attempt basic topic validation before sending any requests to the controller.
+<span class="pc bpc" id="L318" title="1 of 2 branches missed.">      val validationError: Option[Errors] = if (!isValidTopicName(topic)) {</span>
+<span class="nc" id="L319">        Some(Errors.INVALID_TOPIC_EXCEPTION)</span>
+<span class="pc bpc" id="L320" title="1 of 2 branches missed.">      } else if (!inflightTopics.add(topic)) {</span>
+<span class="nc" id="L321">        Some(Errors.UNKNOWN_TOPIC_OR_PARTITION)</span>
+      } else {
+<span class="fc" id="L323">        None</span>
+      }
+
+<span class="nc" id="L326">      validationError match {</span>
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">        case Some(error) =&gt;</span>
+<span class="nc" id="L328">          uncreatableTopics += new MetadataResponseTopic()</span>
+<span class="nc" id="L329">            .setErrorCode(error.code)</span>
+<span class="nc" id="L330">            .setName(topic)</span>
+<span class="nc" id="L331">            .setIsInternal(Topic.isInternal(topic))</span>
+<span class="pc bpc" id="L332" title="1 of 2 branches missed.">        case None =&gt;</span>
+<span class="fc" id="L333">          creatableTopics.put(topic, creatableTopic(topic))</span>
+      }
+    }
+
+<span class="fc" id="L337">    (creatableTopics, uncreatableTopics)</span>
+  }
+
+  private def sendCreateTopicRequestWithErrorCaching(
+    creatableTopics: Map[String, CreatableTopic],
+    requestContext: RequestContext,
+    timeoutMs: Long
+  ): Unit = {
+<span class="nc" id="L345">    val createTopicsRequest: CreateTopicsRequest.Builder = makeCreateTopicsRequestBuilder(creatableTopics)</span>
+
+<span class="nc" id="L347">    val createTopicsResponseFuture = topicCreator.createTopicWithPrincipal(requestContext, createTopicsRequest)</span>
+
+<span class="nc" id="L349">    createTopicsResponseFuture.whenComplete {</span>
+<span class="nc" id="L350">      (response, throwable) =&gt;</span>
+<span class="nc" id="L351">        clearInflightRequests(creatableTopics)</span>
+        // Log any errors from the topic creation attempt
+<span class="nc bnc" id="L353" title="All 2 branches missed.">        if (throwable != null) {</span>
+<span class="nc" id="L354">          logError(creatableTopics, throwable)</span>
+<span class="nc" id="L355">          val errorMessage = Option(throwable.getMessage).getOrElse(throwable.toString)</span>
+<span class="nc" id="L356">          cacheTopicCreationErrors(creatableTopics.keys.toSet, errorMessage, timeoutMs)</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        } else if (response != null) {</span>
+<span class="nc" id="L358">          debug(s&quot;Auto topic creation completed for ${creatableTopics.keys} with response $response.&quot;)</span>
+<span class="nc" id="L359">          cacheTopicCreationErrorsFromResponse(response, timeoutMs)</span>
+        } else {
+<span class="nc" id="L361">          val ex = new IllegalStateException(&quot;CreateTopicsResponse future completed with null response and no exception&quot;)</span>
+<span class="nc" id="L362">          error(s&quot;Auto topic creation failed for ${creatableTopics.keys} due to unexpected future completion state&quot;, ex)</span>
+<span class="nc" id="L363">          cacheTopicCreationErrors(creatableTopics.keys.toSet, ex.getMessage, timeoutMs)</span>
+        }
+    }
+  }
+
+  private def logError(creatableTopics: Map[String, CreatableTopic], throwable: Throwable): Unit = {
+    throwable match {
+<span class="nc bnc" id="L370" title="All 2 branches missed.">      case _: TimeoutException =&gt;</span>
+<span class="nc" id="L371">        debug(s&quot;Auto topic creation timed out for ${creatableTopics.keys}.&quot;)</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">      case _: AuthenticationException =&gt;</span>
+<span class="nc" id="L373">        warn(s&quot;Auto topic creation failed for ${creatableTopics.keys} with authentication exception&quot;)</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">      case _: UnsupportedVersionException =&gt;</span>
+<span class="nc" id="L375">        warn(s&quot;Auto topic creation failed for ${creatableTopics.keys} with invalid version exception&quot;)</span>
+      case other =&gt;
+<span class="nc" id="L377">        warn(s&quot;Auto topic creation failed for ${creatableTopics.keys} with exception&quot;, other)</span>
+    }
+  }
+
+  private def makeCreateTopicsRequestBuilder(creatableTopics: Map[String, CreatableTopic]): CreateTopicsRequest.Builder = {
+<span class="fc" id="L382">    val topicsToCreate = new CreateTopicsRequestData.CreatableTopicCollection(creatableTopics.size)</span>
+<span class="fc" id="L383">    topicsToCreate.addAll(creatableTopics.values.asJavaCollection)</span>
+
+<span class="fc" id="L385">    new CreateTopicsRequest.Builder(</span>
+<span class="fc" id="L386">      new CreateTopicsRequestData()</span>
+<span class="fc" id="L387">        .setTimeoutMs(config.requestTimeoutMs)</span>
+<span class="fc" id="L388">        .setTopics(topicsToCreate)</span>
+    )
+  }
+
+  private def cacheTopicCreationErrors(topicNames: Set[String], errorMessage: String, ttlMs: Long): Unit = {
+<span class="nc" id="L393">    topicNames.foreach { topicName =&gt;</span>
+<span class="nc" id="L394">      topicCreationErrorCache.put(topicName, errorMessage, ttlMs)</span>
+    }
+  }
+
+  private def cacheTopicCreationErrorsFromResponse(response: CreateTopicsResponse, ttlMs: Long): Unit = {
+<span class="nc" id="L399">    response.data().topics().forEach { topicResult =&gt;</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">      if (topicResult.errorCode() != Errors.NONE.code()) {</span>
+<span class="nc" id="L401">        val errorMessage = Option(topicResult.errorMessage())</span>
+<span class="nc" id="L402">          .filter(_.nonEmpty)</span>
+<span class="nc" id="L403">          .getOrElse(Errors.forCode(topicResult.errorCode()).message())</span>
+<span class="nc" id="L404">        topicCreationErrorCache.put(topicResult.name(), errorMessage, ttlMs)</span>
+<span class="nc" id="L405">        debug(s&quot;Cached topic creation error for ${topicResult.name()}: $errorMessage&quot;)</span>
+      }
+    }
+  }
+
+  override def close(): Unit = {
+<span class="fc" id="L411">    topicCreationErrorCache.clear()</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

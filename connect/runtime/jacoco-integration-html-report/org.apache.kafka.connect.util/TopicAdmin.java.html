@@ -1,0 +1,770 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TopicAdmin.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.util</a> &gt; <span class="el_source">TopicAdmin.java</span></div><h1>TopicAdmin.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.util;
+
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.Config;
+import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.clients.admin.CreateTopicsOptions;
+import org.apache.kafka.clients.admin.DescribeConfigsOptions;
+import org.apache.kafka.clients.admin.DescribeTopicsOptions;
+import org.apache.kafka.clients.admin.ListOffsetsOptions;
+import org.apache.kafka.clients.admin.ListOffsetsResult;
+import org.apache.kafka.clients.admin.ListOffsetsResult.ListOffsetsResultInfo;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.admin.TopicDescription;
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.config.ConfigResource;
+import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.errors.AuthorizationException;
+import org.apache.kafka.common.errors.ClusterAuthorizationException;
+import org.apache.kafka.common.errors.InvalidConfigurationException;
+import org.apache.kafka.common.errors.InvalidReplicationFactorException;
+import org.apache.kafka.common.errors.LeaderNotAvailableException;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.TopicAuthorizationException;
+import org.apache.kafka.common.errors.TopicExistsException;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.errors.RetriableException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+/**
+ * Utility to simplify creating and managing topics via the {@link Admin}.
+ */
+public class TopicAdmin implements AutoCloseable {
+
+<span class="fc" id="L75">    public static final TopicCreationResponse EMPTY_CREATION = new TopicCreationResponse(Set.of(), Set.of());</span>
+<span class="fc" id="L76">    private static final List&lt;Class&lt;? extends Exception&gt;&gt; CAUSES_TO_RETRY_TOPIC_CREATION = List.of(</span>
+            InvalidReplicationFactorException.class,
+            TimeoutException.class);
+
+    public static class TopicCreationResponse {
+
+        private final Set&lt;String&gt; created;
+        private final Set&lt;String&gt; existing;
+
+<span class="fc" id="L85">        public TopicCreationResponse(Set&lt;String&gt; createdTopicNames, Set&lt;String&gt; existingTopicNames) {</span>
+<span class="fc" id="L86">            this.created = Set.copyOf(createdTopicNames);</span>
+<span class="fc" id="L87">            this.existing = Set.copyOf(existingTopicNames);</span>
+<span class="fc" id="L88">        }</span>
+
+        public Set&lt;String&gt; createdTopics() {
+<span class="fc" id="L91">            return created;</span>
+        }
+
+        public boolean isCreated(String topicName) {
+<span class="fc" id="L95">            return created.contains(topicName);</span>
+        }
+
+        public boolean isExisting(String topicName) {
+<span class="fc" id="L99">            return existing.contains(topicName);</span>
+        }
+
+        public boolean isCreatedOrExisting(String topicName) {
+<span class="nc bnc" id="L103" title="All 4 branches missed.">            return isCreated(topicName) || isExisting(topicName);</span>
+        }
+
+        public int createdTopicsCount() {
+<span class="nc" id="L107">            return created.size();</span>
+        }
+
+        public int existingTopicsCount() {
+<span class="nc" id="L111">            return existing.size();</span>
+        }
+
+        public int createdOrExistingTopicsCount() {
+<span class="nc" id="L115">            return createdTopicsCount() + existingTopicsCount();</span>
+        }
+
+        public boolean isEmpty() {
+<span class="nc bnc" id="L119" title="All 2 branches missed.">            return createdOrExistingTopicsCount() == 0;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L124">            return &quot;TopicCreationResponse{&quot; + &quot;created=&quot; + created + &quot;, existing=&quot; + existing + '}';</span>
+        }
+    }
+
+    public static final int NO_PARTITIONS = -1;
+    public static final short NO_REPLICATION_FACTOR = -1;
+
+    private static final String CLEANUP_POLICY_CONFIG = TopicConfig.CLEANUP_POLICY_CONFIG;
+    private static final String CLEANUP_POLICY_COMPACT = TopicConfig.CLEANUP_POLICY_COMPACT;
+
+    /**
+     * A builder of {@link NewTopic} instances.
+     */
+    public static class NewTopicBuilder {
+        private final String name;
+<span class="fc" id="L139">        private int numPartitions = NO_PARTITIONS;</span>
+<span class="fc" id="L140">        private short replicationFactor = NO_REPLICATION_FACTOR;</span>
+<span class="fc" id="L141">        private final Map&lt;String, String&gt; configs = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L143">        NewTopicBuilder(String name) {</span>
+<span class="fc" id="L144">            this.name = name;</span>
+<span class="fc" id="L145">        }</span>
+
+        /**
+         * Specify the desired number of partitions for the topic.
+         *
+         * @param numPartitions the desired number of partitions; must be positive, or -1 to
+         *                      signify using the broker's default
+         * @return this builder to allow methods to be chained; never null
+         */
+        public NewTopicBuilder partitions(int numPartitions) {
+<span class="fc" id="L155">            this.numPartitions = numPartitions;</span>
+<span class="fc" id="L156">            return this;</span>
+        }
+
+        /**
+         * Specify the topic's number of partition should be the broker configuration for
+         * {@code num.partitions}.
+         *
+         * @return this builder to allow methods to be chained; never null
+         */
+        public NewTopicBuilder defaultPartitions() {
+<span class="nc" id="L166">            this.numPartitions = NO_PARTITIONS;</span>
+<span class="nc" id="L167">            return this;</span>
+        }
+
+        /**
+         * Specify the desired replication factor for the topic.
+         *
+         * @param replicationFactor the desired replication factor; must be positive, or -1 to
+         *                          signify using the broker's default
+         * @return this builder to allow methods to be chained; never null
+         */
+        public NewTopicBuilder replicationFactor(short replicationFactor) {
+<span class="fc" id="L178">            this.replicationFactor = replicationFactor;</span>
+<span class="fc" id="L179">            return this;</span>
+        }
+
+        /**
+         * Specify the replication factor for the topic should be the broker configurations for
+         * {@code default.replication.factor}.
+         *
+         * @return this builder to allow methods to be chained; never null
+         */
+        public NewTopicBuilder defaultReplicationFactor() {
+<span class="nc" id="L189">            this.replicationFactor = NO_REPLICATION_FACTOR;</span>
+<span class="nc" id="L190">            return this;</span>
+        }
+
+        /**
+         * Specify that the topic should be compacted.
+         *
+         * @return this builder to allow methods to be chained; never null
+         */
+        public NewTopicBuilder compacted() {
+<span class="fc" id="L199">            this.configs.put(CLEANUP_POLICY_CONFIG, CLEANUP_POLICY_COMPACT);</span>
+<span class="fc" id="L200">            return this;</span>
+        }
+
+        /**
+         * Specify the configuration properties for the topic, overwriting any previously-set properties.
+         *
+         * @param configs the desired topic configuration properties, or null if all existing properties should be cleared
+         * @return this builder to allow methods to be chained; never null
+         */
+        public NewTopicBuilder config(Map&lt;String, Object&gt; configs) {
+<span class="pc bpc" id="L210" title="1 of 2 branches missed.">            if (configs != null) {</span>
+<span class="fc bfc" id="L211" title="All 2 branches covered.">                for (Map.Entry&lt;String, Object&gt; entry : configs.entrySet()) {</span>
+<span class="fc" id="L212">                    Object value = entry.getValue();</span>
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">                    this.configs.put(entry.getKey(), value != null ? value.toString() : null);</span>
+<span class="fc" id="L214">                }</span>
+            } else {
+<span class="nc" id="L216">                this.configs.clear();</span>
+            }
+<span class="fc" id="L218">            return this;</span>
+        }
+
+        /**
+         * Build the {@link NewTopic} representation.
+         *
+         * @return the topic description; never null
+         */
+        public NewTopic build() {
+<span class="fc" id="L227">            return new NewTopic(</span>
+                    name,
+<span class="fc" id="L229">                    Optional.of(numPartitions),</span>
+<span class="fc" id="L230">                    Optional.of(replicationFactor)</span>
+<span class="fc" id="L231">            ).configs(configs);</span>
+        }
+    }
+
+    /**
+     * Obtain a {@link NewTopicBuilder builder} to define a {@link NewTopic}.
+     *
+     * @param topicName the name of the topic
+     * @return the {@link NewTopic} description of the topic; never null
+     */
+    public static NewTopicBuilder defineTopic(String topicName) {
+<span class="fc" id="L242">        return new NewTopicBuilder(topicName);</span>
+    }
+
+<span class="fc" id="L245">    private static final Logger log = LoggerFactory.getLogger(TopicAdmin.class);</span>
+    private final String bootstrapServers;
+    private final Admin admin;
+    private final boolean logCreation;
+
+    /**
+     * Create a new topic admin component with the given configuration.
+     * &lt;p&gt;
+     * Note that this will create an underlying {@link Admin} instance which must be freed when this
+     * topic admin is no longer needed by calling {@link #close()} or {@link #close(Duration)}.
+     *
+     * @param adminConfig the configuration for the {@link Admin}
+     */
+    public TopicAdmin(Map&lt;String, Object&gt; adminConfig) {
+<span class="fc" id="L259">        this(adminConfig, Admin.create(adminConfig));</span>
+<span class="fc" id="L260">    }</span>
+
+    public TopicAdmin(Map&lt;String, Object&gt; adminConfig, Admin adminClient) {
+<span class="fc" id="L263">        this(bootstrapServers(adminConfig), adminClient, true);</span>
+<span class="fc" id="L264">    }</span>
+
+    // visible for testing
+    TopicAdmin(Admin adminClient) {
+<span class="nc" id="L268">        this(null, adminClient, true);</span>
+<span class="nc" id="L269">    }</span>
+
+    // visible for testing
+<span class="fc" id="L272">    TopicAdmin(String bootstrapServers, Admin adminClient, boolean logCreation) {</span>
+<span class="fc" id="L273">        this.admin = adminClient;</span>
+<span class="pc bpc" id="L274" title="1 of 2 branches missed.">        this.bootstrapServers = bootstrapServers != null ? bootstrapServers : &quot;&lt;unknown&gt;&quot;;</span>
+<span class="fc" id="L275">        this.logCreation = logCreation;</span>
+<span class="fc" id="L276">    }</span>
+
+    private static String bootstrapServers(Map&lt;String, Object&gt; adminConfig) {
+<span class="fc" id="L279">        Object result = adminConfig.get(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG);</span>
+<span class="pc bpc" id="L280" title="1 of 2 branches missed.">        return result != null ? result.toString() : null;</span>
+    }
+
+   /**
+     * Attempt to create the topic described by the given definition, returning true if the topic was created or false
+     * if the topic already existed.
+     *
+     * @param topic the specification of the topic
+     * @return true if the topic was created or false if the topic already existed.
+     * @throws ConnectException            if an error occurs, the operation takes too long, or the thread is interrupted while
+     *                                     attempting to perform this operation
+     * @throws UnsupportedVersionException if the broker does not support the necessary APIs to perform this request
+     */
+    public boolean createTopic(NewTopic topic) {
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        if (topic == null) return false;</span>
+<span class="nc" id="L295">        Set&lt;String&gt; newTopicNames = createTopics(topic);</span>
+<span class="nc" id="L296">        return newTopicNames.contains(topic.name());</span>
+    }
+
+    /**
+     * Attempt to create the topics described by the given definitions, returning all of the names of those topics that
+     * were created by this request. Any existing topics with the same name are unchanged, and the names of such topics
+     * are excluded from the result.
+     * &lt;p&gt;
+     * If multiple topic definitions have the same topic name, the last one with that name will be used.
+     * &lt;p&gt;
+     * Apache Kafka added support for creating topics in 0.10.1.0, so this method works as expected with that and later versions.
+     * With brokers older than 0.10.1.0, this method is unable to create topics and always returns an empty set.
+     *
+     * @param topics the specifications of the topics
+     * @return the names of the topics that were created by this operation; never null but possibly empty
+     * @throws ConnectException            if an error occurs, the operation takes too long, or the thread is interrupted while
+     *                                     attempting to perform this operation
+     */
+    public Set&lt;String&gt; createTopics(NewTopic... topics) {
+<span class="fc" id="L315">        return createOrFindTopics(topics).createdTopics();</span>
+    }
+
+    /**
+     * Implements a retry logic around creating topic(s) in case it'd fail due to
+     * specific type of exceptions, see {@link TopicAdmin#retryableTopicCreationException(ConnectException)}
+     *
+     * @param topicDescription the specifications of the topic
+     * @param timeoutMs        Timeout in milliseconds
+     * @param backOffMs        Time for delay after initial failed attempt in milliseconds
+     * @param time             {@link Time} instance
+     * @return the names of the topics that were created by this operation; never null but possibly empty,
+     * the same as {@link TopicAdmin#createTopics(NewTopic...)}
+     */
+    public Set&lt;String&gt; createTopicsWithRetry(NewTopic topicDescription, long timeoutMs, long backOffMs, Time time) {
+<span class="fc" id="L330">        Timer timer = time.timer(timeoutMs);</span>
+        do {
+            try {
+<span class="fc" id="L333">                return createTopics(topicDescription);</span>
+<span class="nc" id="L334">            } catch (ConnectException e) {</span>
+<span class="nc bnc" id="L335" title="All 4 branches missed.">                if (timer.notExpired() &amp;&amp; retryableTopicCreationException(e)) {</span>
+<span class="nc" id="L336">                    log.info(&quot;'{}' topic creation failed due to '{}', retrying, {}ms remaining&quot;,</span>
+<span class="nc" id="L337">                            topicDescription.name(), e.getMessage(), timer.remainingMs());</span>
+                } else {
+<span class="nc" id="L339">                    throw e;</span>
+                }
+            }
+<span class="nc" id="L342">            timer.sleep(backOffMs);</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">        } while (timer.notExpired());</span>
+<span class="nc" id="L344">        throw new TimeoutException(&quot;Timeout expired while trying to create topic(s)&quot;);</span>
+    }
+
+    private boolean retryableTopicCreationException(ConnectException e) {
+        // createTopics wraps the exception into ConnectException
+        // to retry the creation, it should be an ExecutionException from future get which was caused by InvalidReplicationFactorException
+        // or can be a TimeoutException
+<span class="nc" id="L351">        Throwable cause = e.getCause();</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">        while (cause != null) {</span>
+<span class="nc" id="L353">            final Throwable finalCause = cause;</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">            if (CAUSES_TO_RETRY_TOPIC_CREATION.stream().anyMatch(exceptionClass -&gt; exceptionClass.isInstance(finalCause))) {</span>
+<span class="nc" id="L355">                return true;</span>
+            }
+<span class="nc" id="L357">            cause = cause.getCause();</span>
+<span class="nc" id="L358">        }</span>
+<span class="nc" id="L359">        return false;</span>
+    }
+
+    /**
+     * Attempt to find or create the topic described by the given definition, returning true if the topic was created or had
+     * already existed, or false if the topic did not exist and could not be created.
+     *
+     * @param topic the specification of the topic
+     * @return true if the topic was created or existed, or false if the topic could not already existed.
+     * @throws ConnectException            if an error occurs, the operation takes too long, or the thread is interrupted while
+     *                                     attempting to perform this operation
+     * @throws UnsupportedVersionException if the broker does not support the necessary APIs to perform this request
+     */
+    public boolean createOrFindTopic(NewTopic topic) {
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        if (topic == null) return false;</span>
+<span class="nc" id="L374">        return createOrFindTopics(topic).isCreatedOrExisting(topic.name());</span>
+    }
+
+    /**
+     * Attempt to create the topics described by the given definitions, returning all of the names of those topics that
+     * were created by this request. Any existing topics with the same name are unchanged, and the names of such topics
+     * are excluded from the result.
+     * &lt;p&gt;
+     * If multiple topic definitions have the same topic name, the last one with that name will be used.
+     * &lt;p&gt;
+     * Apache Kafka added support for creating topics in 0.10.1.0, so this method works as expected with that and later versions.
+     * With brokers older than 0.10.1.0, this method is unable to create topics and always returns an empty set.
+     *
+     * @param topics the specifications of the topics
+     * @return the {@link TopicCreationResponse} with the names of the newly created and existing topics;
+     *         never null but possibly empty
+     * @throws ConnectException if an error occurs, the operation takes too long, or the thread is interrupted while
+     *                          attempting to perform this operation
+     */
+    public TopicCreationResponse createOrFindTopics(NewTopic... topics) {
+<span class="fc" id="L394">        Map&lt;String, NewTopic&gt; topicsByName = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L395" title="1 of 2 branches missed.">        if (topics != null) {</span>
+<span class="fc bfc" id="L396" title="All 2 branches covered.">            for (NewTopic topic : topics) {</span>
+<span class="pc bpc" id="L397" title="1 of 2 branches missed.">                if (topic != null) topicsByName.put(topic.name(), topic);</span>
+            }
+        }
+<span class="pc bpc" id="L400" title="1 of 2 branches missed.">        if (topicsByName.isEmpty()) return EMPTY_CREATION;</span>
+<span class="fc" id="L401">        String topicNameList = String.join(&quot;', '&quot;, topicsByName.keySet());</span>
+
+        // Attempt to create any missing topics
+<span class="fc" id="L404">        CreateTopicsOptions args = new CreateTopicsOptions().validateOnly(false);</span>
+<span class="fc" id="L405">        Map&lt;String, KafkaFuture&lt;Void&gt;&gt; newResults = admin.createTopics(topicsByName.values(), args).values();</span>
+
+        // Iterate over each future so that we can handle individual failures like when some topics already exist
+<span class="fc" id="L408">        Set&lt;String&gt; newlyCreatedTopicNames = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L409">        Set&lt;String&gt; existingTopicNames = new HashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L410" title="All 2 branches covered.">        for (Map.Entry&lt;String, KafkaFuture&lt;Void&gt;&gt; entry : newResults.entrySet()) {</span>
+<span class="fc" id="L411">            String topic = entry.getKey();</span>
+            try {
+<span class="fc" id="L413">                entry.getValue().get();</span>
+<span class="pc bpc" id="L414" title="1 of 2 branches missed.">                if (logCreation) {</span>
+<span class="fc" id="L415">                    log.info(&quot;Created topic {} on brokers at {}&quot;, topicsByName.get(topic), bootstrapServers);</span>
+                }
+<span class="fc" id="L417">                newlyCreatedTopicNames.add(topic);</span>
+<span class="fc" id="L418">            } catch (ExecutionException e) {</span>
+<span class="fc" id="L419">                Throwable cause = e.getCause();</span>
+<span class="pc bpc" id="L420" title="1 of 2 branches missed.">                if (cause instanceof TopicExistsException) {</span>
+<span class="fc" id="L421">                    log.debug(&quot;Found existing topic '{}' on the brokers at {}&quot;, topic, bootstrapServers);</span>
+<span class="fc" id="L422">                    existingTopicNames.add(topic);</span>
+<span class="fc" id="L423">                    continue;</span>
+                }
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                if (cause instanceof UnsupportedVersionException) {</span>
+<span class="nc" id="L426">                    log.debug(&quot;Unable to create topic(s) '{}' since the brokers at {} do not support the CreateTopics API.&quot; +</span>
+                            &quot; Falling back to assume topic(s) exist or will be auto-created by the broker.&quot;,
+                            topicNameList, bootstrapServers);
+<span class="nc" id="L429">                    return EMPTY_CREATION;</span>
+                }
+<span class="nc bnc" id="L431" title="All 2 branches missed.">                if (cause instanceof ClusterAuthorizationException) {</span>
+<span class="nc" id="L432">                    log.debug(&quot;Not authorized to create topic(s) '{}' upon the brokers {}.&quot; +</span>
+                            &quot; Falling back to assume topic(s) exist or will be auto-created by the broker.&quot;,
+                            topicNameList, bootstrapServers);
+<span class="nc" id="L435">                    return EMPTY_CREATION;</span>
+                }
+<span class="nc bnc" id="L437" title="All 2 branches missed.">                if (cause instanceof TopicAuthorizationException) {</span>
+<span class="nc" id="L438">                    log.debug(&quot;Not authorized to create topic(s) '{}' upon the brokers {}.&quot; +</span>
+                                    &quot; Falling back to assume topic(s) exist or will be auto-created by the broker.&quot;,
+                            topicNameList, bootstrapServers);
+<span class="nc" id="L441">                    return EMPTY_CREATION;</span>
+                }
+<span class="nc bnc" id="L443" title="All 2 branches missed.">                if (cause instanceof InvalidConfigurationException) {</span>
+<span class="nc" id="L444">                    throw new ConnectException(&quot;Unable to create topic(s) '&quot; + topicNameList + &quot;': &quot; + cause.getMessage(),</span>
+                            cause);
+                }
+<span class="nc bnc" id="L447" title="All 2 branches missed.">                if (cause instanceof TimeoutException) {</span>
+                    // Timed out waiting for the operation to complete
+<span class="nc" id="L449">                    throw new ConnectException(&quot;Timed out while checking for or creating topic(s) '&quot; + topicNameList + &quot;'.&quot; +</span>
+                            &quot; This could indicate a connectivity issue, unavailable topic partitions, or if&quot; +
+                            &quot; this is your first use of the topic it may have taken too long to create.&quot;, cause);
+                }
+<span class="nc" id="L453">                throw new ConnectException(&quot;Error while attempting to create/find topic(s) '&quot; + topicNameList + &quot;'&quot;, e);</span>
+<span class="nc" id="L454">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L455">                Thread.interrupted();</span>
+<span class="nc" id="L456">                throw new ConnectException(&quot;Interrupted while attempting to create/find topic(s) '&quot; + topicNameList + &quot;'&quot;, e);</span>
+<span class="fc" id="L457">            }</span>
+<span class="fc" id="L458">        }</span>
+<span class="fc" id="L459">        return new TopicCreationResponse(newlyCreatedTopicNames, existingTopicNames);</span>
+    }
+
+    /**
+     * Attempt to fetch the descriptions of the given topics
+     * Apache Kafka added support for describing topics in 0.10.0.0, so this method works as expected with that and later versions.
+     * With brokers older than 0.10.0.0, this method is unable to describe topics and always returns an empty set.
+     *
+     * @param topics the topics to describe
+     * @return a map of topic names to topic descriptions of the topics that were requested; never null but possibly empty
+     * @throws RetriableException if a retriable error occurs, the operation takes too long, or the
+     * thread is interrupted while attempting to perform this operation
+     * @throws ConnectException if a non retriable error occurs
+     */
+    public Map&lt;String, TopicDescription&gt; describeTopics(String... topics) {
+<span class="pc bpc" id="L474" title="1 of 2 branches missed.">        if (topics == null) {</span>
+<span class="nc" id="L475">            return Map.of();</span>
+        }
+<span class="fc" id="L477">        String topicNameList = String.join(&quot;, &quot;, topics);</span>
+
+<span class="fc" id="L479">        Map&lt;String, KafkaFuture&lt;TopicDescription&gt;&gt; newResults =</span>
+<span class="fc" id="L480">                admin.describeTopics(List.of(topics), new DescribeTopicsOptions()).topicNameValues();</span>
+
+        // Iterate over each future so that we can handle individual failures like when some topics don't exist
+<span class="fc" id="L483">        Map&lt;String, TopicDescription&gt; existingTopics = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L484">        newResults.forEach((topic, desc) -&gt; {</span>
+            try {
+<span class="fc" id="L486">                existingTopics.put(topic, desc.get());</span>
+<span class="fc" id="L487">            } catch (ExecutionException e) {</span>
+<span class="fc" id="L488">                Throwable cause = e.getCause();</span>
+<span class="pc bpc" id="L489" title="1 of 2 branches missed.">                if (cause instanceof UnknownTopicOrPartitionException) {</span>
+<span class="fc" id="L490">                    log.debug(&quot;Topic '{}' does not exist on the brokers at {}&quot;, topic, bootstrapServers);</span>
+<span class="fc" id="L491">                    return;</span>
+                }
+<span class="nc bnc" id="L493" title="All 4 branches missed.">                if (cause instanceof ClusterAuthorizationException || cause instanceof TopicAuthorizationException) {</span>
+<span class="nc" id="L494">                    String msg = String.format(&quot;Not authorized to describe topic(s) '%s' on the brokers %s&quot;,</span>
+                            topicNameList, bootstrapServers);
+<span class="nc" id="L496">                    throw new ConnectException(msg, cause);</span>
+                }
+<span class="nc bnc" id="L498" title="All 2 branches missed.">                if (cause instanceof UnsupportedVersionException) {</span>
+<span class="nc" id="L499">                    String msg = String.format(&quot;Unable to describe topic(s) '%s' since the brokers &quot;</span>
+                                    + &quot;at %s do not support the DescribeTopics API.&quot;,
+                            topicNameList, bootstrapServers);
+<span class="nc" id="L502">                    throw new ConnectException(msg, cause);</span>
+                }
+<span class="nc bnc" id="L504" title="All 2 branches missed.">                if (cause instanceof TimeoutException) {</span>
+                    // Timed out waiting for the operation to complete
+<span class="nc" id="L506">                    throw new RetriableException(&quot;Timed out while describing topics '&quot; + topicNameList + &quot;'&quot;, cause);</span>
+                }
+<span class="nc" id="L508">                throw new ConnectException(&quot;Error while attempting to describe topics '&quot; + topicNameList + &quot;'&quot;, e);</span>
+<span class="nc" id="L509">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L510">                Thread.interrupted();</span>
+<span class="nc" id="L511">                throw new RetriableException(&quot;Interrupted while attempting to describe topics '&quot; + topicNameList + &quot;'&quot;, e);</span>
+<span class="fc" id="L512">            }</span>
+<span class="fc" id="L513">        });</span>
+<span class="fc" id="L514">        return existingTopics;</span>
+    }
+
+    /**
+     * Verify the named topic uses only compaction for the cleanup policy.
+     *
+     * @param topic             the name of the topic
+     * @param workerTopicConfig the name of the worker configuration that specifies the topic name
+     * @return true if the admin client could be used to verify the topic setting, or false if
+     *         the verification could not be performed, likely because the admin client principal
+     *         did not have the required permissions or because the broker was older than 0.11.0.0
+     * @throws ConfigException if the actual topic setting did not match the required setting
+     */
+    public boolean verifyTopicCleanupPolicyOnlyCompact(String topic, String workerTopicConfig,
+            String topicPurpose) {
+<span class="fc" id="L529">        Set&lt;String&gt; cleanupPolicies = topicCleanupPolicy(topic);</span>
+<span class="pc bpc" id="L530" title="1 of 2 branches missed.">        if (cleanupPolicies.isEmpty()) {</span>
+<span class="nc" id="L531">            log.info(&quot;Unable to use admin client to verify the cleanup policy of '{}' &quot;</span>
+                      + &quot;topic is '{}', either because the broker is an older &quot;
+                      + &quot;version or because the Kafka principal used for Connect &quot;
+                      + &quot;internal topics does not have the required permission to &quot;
+                      + &quot;describe topic configurations.&quot;, topic, TopicConfig.CLEANUP_POLICY_COMPACT);
+<span class="nc" id="L536">            return false;</span>
+        }
+<span class="fc" id="L538">        Set&lt;String&gt; expectedPolicies = Set.of(TopicConfig.CLEANUP_POLICY_COMPACT);</span>
+<span class="pc bpc" id="L539" title="1 of 2 branches missed.">        if (!cleanupPolicies.equals(expectedPolicies)) {</span>
+<span class="nc" id="L540">            String expectedPolicyStr = String.join(&quot;,&quot;, expectedPolicies);</span>
+<span class="nc" id="L541">            String cleanupPolicyStr = String.join(&quot;,&quot;, cleanupPolicies);</span>
+<span class="nc" id="L542">            String msg = String.format(&quot;Topic '%s' supplied via the '%s' property is required &quot;</span>
+                    + &quot;to have '%s=%s' to guarantee consistency and durability of &quot;
+                    + &quot;%s, but found the topic currently has '%s=%s'. Continuing would likely &quot;
+                    + &quot;result in eventually losing %s and problems restarting this Connect &quot;
+                    + &quot;cluster in the future. Change the '%s' property in the &quot;
+                    + &quot;Connect worker configurations to use a topic with '%s=%s'.&quot;,
+                    topic, workerTopicConfig, TopicConfig.CLEANUP_POLICY_CONFIG, expectedPolicyStr,
+                    topicPurpose, TopicConfig.CLEANUP_POLICY_CONFIG, cleanupPolicyStr, topicPurpose,
+                    workerTopicConfig, TopicConfig.CLEANUP_POLICY_CONFIG, expectedPolicyStr);
+<span class="nc" id="L551">            throw new ConfigException(msg);</span>
+        }
+<span class="fc" id="L553">        return true;</span>
+    }
+
+    /**
+     * Get the cleanup policy for a topic.
+     *
+     * @param topic the name of the topic
+     * @return the set of cleanup policies set for the topic; may be empty if the topic does not
+     *         exist or the topic's cleanup policy could not be retrieved
+     */
+    public Set&lt;String&gt; topicCleanupPolicy(String topic) {
+<span class="fc" id="L564">        Config topicConfig = describeTopicConfig(topic);</span>
+<span class="pc bpc" id="L565" title="1 of 2 branches missed.">        if (topicConfig == null) {</span>
+            // The topic must not exist
+<span class="nc" id="L567">            log.debug(&quot;Unable to find topic '{}' when getting cleanup policy&quot;, topic);</span>
+<span class="nc" id="L568">            return Set.of();</span>
+        }
+<span class="fc" id="L570">        ConfigEntry entry = topicConfig.get(CLEANUP_POLICY_CONFIG);</span>
+<span class="pc bpc" id="L571" title="2 of 4 branches missed.">        if (entry != null &amp;&amp; entry.value() != null) {</span>
+<span class="fc" id="L572">            String policyStr = entry.value();</span>
+<span class="fc" id="L573">            log.debug(&quot;Found cleanup.policy={} for topic '{}'&quot;, policyStr, topic);</span>
+<span class="fc" id="L574">            return Arrays.stream(policyStr.split(&quot;,&quot;))</span>
+<span class="fc" id="L575">                         .map(String::trim)</span>
+<span class="pc bpc" id="L576" title="1 of 2 branches missed.">                         .filter(s -&gt; !s.isEmpty())</span>
+<span class="fc" id="L577">                         .map(String::toLowerCase)</span>
+<span class="fc" id="L578">                         .collect(Collectors.toSet());</span>
+        }
+        // This is unexpected, as the topic config should include the cleanup.policy even if
+        // the topic settings don't override the broker's log.cleanup.policy. But just to be safe.
+<span class="nc" id="L582">        log.debug(&quot;Found no cleanup.policy for topic '{}'&quot;, topic);</span>
+<span class="nc" id="L583">        return Set.of();</span>
+    }
+
+    /**
+     * Attempt to fetch the topic configuration for the given topic.
+     * Apache Kafka added support for describing topic configurations in 0.11.0.0, so this method
+     * works as expected with that and later versions. With brokers older than 0.11.0.0, this method
+     * is unable get the topic configurations and always returns a null value.
+     *
+     * &lt;p&gt;If the topic does not exist, a null value is returned.
+     *
+     * @param topic the name of the topic for which the topic configuration should be obtained
+     * @return the topic configuration if the topic exists, or null if the topic did not exist
+     * @throws RetriableException if a retriable error occurs, the operation takes too long, or the
+     *         thread is interrupted while attempting to perform this operation
+     * @throws ConnectException if a non retriable error occurs
+     */
+    public Config describeTopicConfig(String topic) {
+<span class="fc" id="L601">        return describeTopicConfigs(topic).get(topic);</span>
+    }
+
+    /**
+     * Attempt to fetch the topic configurations for the given topics.
+     * Apache Kafka added support for describing topic configurations in 0.11.0.0, so this method
+     * works as expected with that and later versions. With brokers older than 0.11.0.0, this method
+     * is unable get the topic configurations and always returns an empty set.
+     *
+     * &lt;p&gt;An entry with a null Config is placed into the resulting map for any topic that does
+     * not exist on the brokers.
+     *
+     * @param topicNames the topics to obtain configurations
+     * @return the map of topic configurations for each existing topic, or an empty map if none
+     * of the topics exist
+     * @throws RetriableException if a retriable error occurs, the operation takes too long, or the
+     *         thread is interrupted while attempting to perform this operation
+     * @throws ConnectException if a non retriable error occurs
+     */
+    public Map&lt;String, Config&gt; describeTopicConfigs(String... topicNames) {
+<span class="pc bpc" id="L621" title="1 of 2 branches missed.">        if (topicNames == null) {</span>
+<span class="nc" id="L622">            return Map.of();</span>
+        }
+<span class="fc" id="L624">        Collection&lt;String&gt; topics = Arrays.stream(topicNames)</span>
+<span class="fc" id="L625">                                          .filter(Objects::nonNull)</span>
+<span class="fc" id="L626">                                          .map(String::trim)</span>
+<span class="pc bpc" id="L627" title="1 of 2 branches missed.">                                          .filter(s -&gt; !s.isEmpty())</span>
+<span class="fc" id="L628">                                          .collect(Collectors.toList());</span>
+<span class="pc bpc" id="L629" title="1 of 2 branches missed.">        if (topics.isEmpty()) {</span>
+<span class="nc" id="L630">            return Map.of();</span>
+        }
+<span class="fc" id="L632">        String topicNameList = String.join(&quot;, &quot;, topics);</span>
+<span class="fc" id="L633">        Collection&lt;ConfigResource&gt; resources = topics.stream()</span>
+<span class="fc" id="L634">                                                     .map(t -&gt; new ConfigResource(ConfigResource.Type.TOPIC, t))</span>
+<span class="fc" id="L635">                                                     .collect(Collectors.toList());</span>
+
+<span class="fc" id="L637">        Map&lt;ConfigResource, KafkaFuture&lt;Config&gt;&gt; newResults = admin.describeConfigs(resources, new DescribeConfigsOptions()).values();</span>
+
+        // Iterate over each future so that we can handle individual failures like when some topics don't exist
+<span class="fc" id="L640">        Map&lt;String, Config&gt; result = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L641">        newResults.forEach((resource, configs) -&gt; {</span>
+<span class="fc" id="L642">            String topic = resource.name();</span>
+            try {
+<span class="fc" id="L644">                result.put(topic, configs.get());</span>
+<span class="nc" id="L645">            } catch (ExecutionException e) {</span>
+<span class="nc" id="L646">                Throwable cause = e.getCause();</span>
+<span class="nc bnc" id="L647" title="All 2 branches missed.">                if (cause instanceof UnknownTopicOrPartitionException) {</span>
+<span class="nc" id="L648">                    log.debug(&quot;Topic '{}' does not exist on the brokers at {}&quot;, topic, bootstrapServers);</span>
+<span class="nc" id="L649">                    result.put(topic, null);</span>
+<span class="nc bnc" id="L650" title="All 4 branches missed.">                } else if (cause instanceof ClusterAuthorizationException || cause instanceof TopicAuthorizationException) {</span>
+<span class="nc" id="L651">                    log.debug(&quot;Not authorized to describe topic config for topic '{}' on brokers at {}&quot;, topic, bootstrapServers);</span>
+<span class="nc bnc" id="L652" title="All 2 branches missed.">                } else if (cause instanceof UnsupportedVersionException) {</span>
+<span class="nc" id="L653">                    log.debug(&quot;API to describe topic config for topic '{}' is unsupported on brokers at {}&quot;, topic, bootstrapServers);</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">                } else if (cause instanceof TimeoutException) {</span>
+<span class="nc" id="L655">                    String msg = String.format(&quot;Timed out while waiting to describe topic config for topic '%s' on brokers at %s&quot;,</span>
+                            topic, bootstrapServers);
+<span class="nc" id="L657">                    throw new RetriableException(msg, e);</span>
+                } else {
+<span class="nc" id="L659">                    String msg = String.format(&quot;Error while attempting to describe topic config for topic '%s' on brokers at %s&quot;,</span>
+                            topic, bootstrapServers);
+<span class="nc" id="L661">                    throw new ConnectException(msg, e);</span>
+                }
+<span class="nc" id="L663">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L664">                Thread.interrupted();</span>
+<span class="nc" id="L665">                String msg = String.format(&quot;Interrupted while attempting to describe topic configs '%s'&quot;, topicNameList);</span>
+<span class="nc" id="L666">                throw new RetriableException(msg, e);</span>
+<span class="pc" id="L667">            }</span>
+<span class="fc" id="L668">        });</span>
+<span class="fc" id="L669">        return result;</span>
+    }
+
+    /**
+     * Fetch the most recent offset for each of the supplied {@link TopicPartition} objects.
+     *
+     * @param partitions the topic partitions
+     * @return the map of offset for each topic partition, or an empty map if the supplied partitions
+     *         are null or empty
+     * @throws UnsupportedVersionException if the admin client cannot read end offsets
+     * @throws TimeoutException if the offset metadata could not be fetched before the amount of time allocated
+     *         by {@code request.timeout.ms} expires, and this call can be retried
+     * @throws LeaderNotAvailableException if the leader was not available and this call can be retried
+     * @throws RetriableException if a retriable error occurs, or the thread is interrupted while attempting
+     *         to perform this operation
+     * @throws ConnectException if a non retriable error occurs
+     */
+    public Map&lt;TopicPartition, Long&gt; endOffsets(Set&lt;TopicPartition&gt; partitions) {
+<span class="pc bpc" id="L687" title="2 of 4 branches missed.">        if (partitions == null || partitions.isEmpty()) {</span>
+<span class="nc" id="L688">            return Map.of();</span>
+        }
+<span class="fc" id="L690">        Map&lt;TopicPartition, OffsetSpec&gt; offsetSpecMap = partitions.stream().collect(Collectors.toMap(Function.identity(), tp -&gt; OffsetSpec.latest()));</span>
+<span class="fc" id="L691">        ListOffsetsResult resultFuture = admin.listOffsets(offsetSpecMap, new ListOffsetsOptions(IsolationLevel.READ_UNCOMMITTED));</span>
+        // Get the individual result for each topic partition so we have better error messages
+<span class="fc" id="L693">        Map&lt;TopicPartition, Long&gt; result = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L694" title="All 2 branches covered.">        for (TopicPartition partition : partitions) {</span>
+            try {
+<span class="fc" id="L696">                ListOffsetsResultInfo info = resultFuture.partitionResult(partition).get();</span>
+<span class="fc" id="L697">                result.put(partition, info.offset());</span>
+<span class="nc" id="L698">            } catch (ExecutionException e) {</span>
+<span class="nc" id="L699">                Throwable cause = e.getCause();</span>
+<span class="nc" id="L700">                String topic = partition.topic();</span>
+<span class="nc bnc" id="L701" title="All 2 branches missed.">                if (cause instanceof AuthorizationException) {</span>
+<span class="nc" id="L702">                    String msg = String.format(&quot;Not authorized to get the end offsets for topic '%s' on brokers at %s&quot;, topic, bootstrapServers);</span>
+<span class="nc" id="L703">                    throw new ConnectException(msg, cause);</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">                } else if (cause instanceof UnsupportedVersionException) {</span>
+                    // Should theoretically never happen, because this method is the same as what the consumer uses and therefore
+                    // should exist in the broker since before the admin client was added
+<span class="nc" id="L707">                    String msg = String.format(&quot;API to get the get the end offsets for topic '%s' is unsupported on brokers at %s&quot;, topic, bootstrapServers);</span>
+<span class="nc" id="L708">                    throw new UnsupportedVersionException(msg, cause);</span>
+<span class="nc bnc" id="L709" title="All 2 branches missed.">                } else if (cause instanceof TimeoutException) {</span>
+<span class="nc" id="L710">                    String msg = String.format(&quot;Timed out while waiting to get end offsets for topic '%s' on brokers at %s&quot;, topic, bootstrapServers);</span>
+<span class="nc" id="L711">                    throw new TimeoutException(msg, cause);</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">                } else if (cause instanceof LeaderNotAvailableException) {</span>
+<span class="nc" id="L713">                    String msg = String.format(&quot;Unable to get end offsets during leader election for topic '%s' on brokers at %s&quot;, topic, bootstrapServers);</span>
+<span class="nc" id="L714">                    throw new LeaderNotAvailableException(msg, cause);</span>
+<span class="nc bnc" id="L715" title="All 2 branches missed.">                } else if (cause instanceof org.apache.kafka.common.errors.RetriableException) {</span>
+<span class="nc" id="L716">                    throw (org.apache.kafka.common.errors.RetriableException) cause;</span>
+                } else {
+<span class="nc" id="L718">                    String msg = String.format(&quot;Error while getting end offsets for topic '%s' on brokers at %s&quot;, topic, bootstrapServers);</span>
+<span class="nc" id="L719">                    throw new ConnectException(msg, cause);</span>
+                }
+<span class="nc" id="L721">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L722">                Thread.interrupted();</span>
+<span class="nc" id="L723">                String msg = String.format(&quot;Interrupted while attempting to read end offsets for topic '%s' on brokers at %s&quot;, partition.topic(), bootstrapServers);</span>
+<span class="nc" id="L724">                throw new RetriableException(msg, e);</span>
+<span class="fc" id="L725">            }</span>
+<span class="fc" id="L726">        }</span>
+<span class="fc" id="L727">        return result;</span>
+    }
+
+    /**
+     * Fetch the most recent offset for each of the supplied {@link TopicPartition} objects, and performs retry when
+     * {@link org.apache.kafka.connect.errors.RetriableException} is thrown.
+     *
+     * @param partitions        the topic partitions
+     * @param timeoutDuration   timeout duration; may not be null
+     * @param retryBackoffMs    the number of milliseconds to delay upon receiving a
+     *                          {@link org.apache.kafka.connect.errors.RetriableException} before retrying again;
+     *                          must be 0 or more
+     * @return                  the map of offset for each topic partition, or an empty map if the supplied partitions
+     *                          are null or empty
+     * @throws UnsupportedVersionException if the broker is too old to support the admin client API to read end offsets
+     * @throws ConnectException if {@code timeoutDuration} is exhausted
+     * @see TopicAdmin#endOffsets(Set)
+     */
+    public Map&lt;TopicPartition, Long&gt; retryEndOffsets(Set&lt;TopicPartition&gt; partitions, Duration timeoutDuration, long retryBackoffMs) {
+
+        try {
+<span class="fc" id="L748">            return RetryUtil.retryUntilTimeout(</span>
+<span class="fc" id="L749">                    () -&gt; endOffsets(partitions),</span>
+<span class="fc" id="L750">                    () -&gt; &quot;list offsets for topic partitions&quot;,</span>
+                    timeoutDuration,
+                    retryBackoffMs);
+<span class="nc" id="L753">        } catch (UnsupportedVersionException e) {</span>
+            // Older brokers don't support this admin method, so rethrow it without wrapping it
+<span class="nc" id="L755">            throw e;</span>
+<span class="nc" id="L756">        } catch (Exception e) {</span>
+<span class="nc" id="L757">            throw ConnectUtils.maybeWrap(e, &quot;Failed to list offsets for topic partitions&quot;);</span>
+        }
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L763">        admin.close();</span>
+<span class="nc" id="L764">    }</span>
+
+    public void close(Duration timeout) {
+<span class="fc" id="L767">        admin.close(timeout);</span>
+<span class="fc" id="L768">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

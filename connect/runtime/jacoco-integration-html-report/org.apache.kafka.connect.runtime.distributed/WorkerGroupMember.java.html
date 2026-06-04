@@ -1,0 +1,245 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>WorkerGroupMember.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.distributed</a> &gt; <span class="el_source">WorkerGroupMember.java</span></div><h1>WorkerGroupMember.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime.distributed;
+
+import org.apache.kafka.clients.ApiVersions;
+import org.apache.kafka.clients.ClientUtils;
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.GroupRebalanceConfig;
+import org.apache.kafka.clients.Metadata;
+import org.apache.kafka.clients.MetadataRecoveryStrategy;
+import org.apache.kafka.clients.NetworkClient;
+import org.apache.kafka.clients.consumer.CloseOptions;
+import org.apache.kafka.clients.consumer.internals.ConsumerNetworkClient;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.internals.ClusterResourceListeners;
+import org.apache.kafka.common.metrics.KafkaMetricsContext;
+import org.apache.kafka.common.metrics.MetricConfig;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.MetricsContext;
+import org.apache.kafka.common.metrics.MetricsReporter;
+import org.apache.kafka.common.network.ChannelBuilder;
+import org.apache.kafka.common.network.Selector;
+import org.apache.kafka.common.utils.AppInfoParser;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.runtime.WorkerConfig;
+import org.apache.kafka.connect.storage.ConfigBackingStore;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+
+import org.slf4j.Logger;
+
+import java.net.InetSocketAddress;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+
+import static org.apache.kafka.common.utils.Utils.UncheckedCloseable;
+
+/**
+ * This class manages the coordination process with brokers for the Connect cluster group membership. It ties together
+ * the Coordinator, which implements the group member protocol, with all the other pieces needed to drive the connection
+ * to the group coordinator broker. This isolates all the networking to a single thread managed by this class, with
+ * higher level operations in response to group membership events being handled by the herder.
+ */
+public class WorkerGroupMember {
+    private static final String JMX_PREFIX = &quot;kafka.connect&quot;;
+
+    private final Logger log;
+    private final String clientId;
+    private final ConsumerNetworkClient client;
+    private final Metrics metrics;
+    private final WorkerCoordinator coordinator;
+
+<span class="fc" id="L73">    private boolean stopped = false;</span>
+
+    public WorkerGroupMember(DistributedConfig config,
+                             String restUrl,
+                             ConfigBackingStore configStorage,
+                             WorkerRebalanceListener listener,
+                             Time time,
+                             String clientId,
+<span class="fc" id="L81">                             LogContext logContext) {</span>
+        try {
+<span class="fc" id="L83">            this.clientId = clientId;</span>
+<span class="fc" id="L84">            this.log = logContext.logger(WorkerGroupMember.class);</span>
+
+<span class="fc" id="L86">            Map&lt;String, String&gt; metricsTags = new LinkedHashMap&lt;&gt;();</span>
+<span class="fc" id="L87">            metricsTags.put(&quot;client-id&quot;, clientId);</span>
+<span class="fc" id="L88">            MetricConfig metricConfig = new MetricConfig().samples(config.getInt(CommonClientConfigs.METRICS_NUM_SAMPLES_CONFIG))</span>
+<span class="fc" id="L89">                    .timeWindow(config.getLong(CommonClientConfigs.METRICS_SAMPLE_WINDOW_MS_CONFIG), TimeUnit.MILLISECONDS)</span>
+<span class="fc" id="L90">                    .tags(metricsTags);</span>
+<span class="fc" id="L91">            List&lt;MetricsReporter&gt; reporters = CommonClientConfigs.metricsReporters(clientId, config);</span>
+
+<span class="fc" id="L93">            Map&lt;String, Object&gt; contextLabels = new HashMap&lt;&gt;(config.originalsWithPrefix(CommonClientConfigs.METRICS_CONTEXT_PREFIX));</span>
+<span class="fc" id="L94">            contextLabels.put(WorkerConfig.CONNECT_KAFKA_CLUSTER_ID, config.kafkaClusterId());</span>
+<span class="fc" id="L95">            contextLabels.put(WorkerConfig.CONNECT_GROUP_ID, config.getString(DistributedConfig.GROUP_ID_CONFIG));</span>
+<span class="fc" id="L96">            MetricsContext metricsContext = new KafkaMetricsContext(JMX_PREFIX, contextLabels);</span>
+
+<span class="fc" id="L98">            this.metrics = new Metrics(metricConfig, reporters, time, metricsContext);</span>
+<span class="fc" id="L99">            long retryBackoffMs = config.getLong(CommonClientConfigs.RETRY_BACKOFF_MS_CONFIG);</span>
+<span class="fc" id="L100">            long retryBackoffMaxMs = config.getLong(CommonClientConfigs.RETRY_BACKOFF_MAX_MS_CONFIG);</span>
+<span class="fc" id="L101">            Metadata metadata = new Metadata(retryBackoffMs, retryBackoffMaxMs, config.getLong(CommonClientConfigs.METADATA_MAX_AGE_CONFIG),</span>
+                    logContext, new ClusterResourceListeners());
+<span class="fc" id="L103">            List&lt;InetSocketAddress&gt; addresses = ClientUtils.parseAndValidateAddresses(</span>
+<span class="fc" id="L104">                    config.getList(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG),</span>
+<span class="fc" id="L105">                    config.getString(CommonClientConfigs.CLIENT_DNS_LOOKUP_CONFIG));</span>
+<span class="fc" id="L106">            metadata.bootstrap(addresses);</span>
+<span class="fc" id="L107">            String metricGrpPrefix = &quot;connect&quot;;</span>
+<span class="fc" id="L108">            ChannelBuilder channelBuilder = ClientUtils.createChannelBuilder(config, time, logContext);</span>
+<span class="fc" id="L109">            NetworkClient netClient = new NetworkClient(</span>
+<span class="fc" id="L110">                    new Selector(config.getLong(CommonClientConfigs.CONNECTIONS_MAX_IDLE_MS_CONFIG), metrics, time, metricGrpPrefix, channelBuilder, logContext),</span>
+                    metadata,
+                    clientId,
+                    100, // a fixed large enough value will suffice
+<span class="fc" id="L114">                    config.getLong(CommonClientConfigs.RECONNECT_BACKOFF_MS_CONFIG),</span>
+<span class="fc" id="L115">                    config.getLong(CommonClientConfigs.RECONNECT_BACKOFF_MAX_MS_CONFIG),</span>
+<span class="fc" id="L116">                    config.getInt(CommonClientConfigs.SEND_BUFFER_CONFIG),</span>
+<span class="fc" id="L117">                    config.getInt(CommonClientConfigs.RECEIVE_BUFFER_CONFIG),</span>
+<span class="fc" id="L118">                    config.getInt(CommonClientConfigs.REQUEST_TIMEOUT_MS_CONFIG),</span>
+<span class="fc" id="L119">                    config.getLong(CommonClientConfigs.SOCKET_CONNECTION_SETUP_TIMEOUT_MS_CONFIG),</span>
+<span class="fc" id="L120">                    config.getLong(CommonClientConfigs.SOCKET_CONNECTION_SETUP_TIMEOUT_MAX_MS_CONFIG),</span>
+                    time,
+                    true,
+                    new ApiVersions(),
+                    logContext,
+<span class="fc" id="L125">                    config.getLong(CommonClientConfigs.METADATA_RECOVERY_REBOOTSTRAP_TRIGGER_MS_CONFIG),</span>
+<span class="fc" id="L126">                    MetadataRecoveryStrategy.forName(config.getString(CommonClientConfigs.METADATA_RECOVERY_STRATEGY_CONFIG))</span>
+            );
+<span class="fc" id="L128">            this.client = new ConsumerNetworkClient(</span>
+                    logContext,
+                    netClient,
+                    metadata,
+                    time,
+                    retryBackoffMs,
+<span class="fc" id="L134">                    config.getInt(CommonClientConfigs.REQUEST_TIMEOUT_MS_CONFIG),</span>
+                    Integer.MAX_VALUE);
+<span class="fc" id="L136">            this.coordinator = new WorkerCoordinator(</span>
+                    new GroupRebalanceConfig(config, GroupRebalanceConfig.ProtocolType.CONNECT),
+                    logContext,
+                    this.client,
+                    metrics,
+                    metricGrpPrefix,
+                    time,
+                    restUrl,
+                    configStorage,
+                    listener,
+<span class="fc" id="L146">                    ConnectProtocolCompatibility.compatibility(config.getString(DistributedConfig.CONNECT_PROTOCOL_CONFIG)),</span>
+<span class="fc" id="L147">                    config.getInt(DistributedConfig.SCHEDULED_REBALANCE_MAX_DELAY_MS_CONFIG));</span>
+
+<span class="fc" id="L149">            AppInfoParser.registerAppInfo(JMX_PREFIX, clientId, metrics, time.milliseconds());</span>
+<span class="fc" id="L150">            log.debug(&quot;Connect group member created&quot;);</span>
+<span class="nc" id="L151">        } catch (Throwable t) {</span>
+            // call close methods if internal objects are already constructed
+            // this is to prevent resource leak. see KAFKA-2121
+<span class="nc" id="L154">            stop(true);</span>
+            // now propagate the exception
+<span class="nc" id="L156">            throw new KafkaException(&quot;Failed to construct kafka consumer&quot;, t);</span>
+<span class="fc" id="L157">        }</span>
+<span class="fc" id="L158">    }</span>
+
+    public void stop() {
+<span class="pc bpc" id="L161" title="1 of 2 branches missed.">        if (stopped) return;</span>
+<span class="fc" id="L162">        stop(false);</span>
+<span class="fc" id="L163">    }</span>
+
+    /**
+     * Ensure that the connection to the broker coordinator is up and that the worker is an
+     * active member of the group.
+     */
+    public void ensureActive(Supplier&lt;UncheckedCloseable&gt; onPoll) {
+<span class="fc" id="L170">        coordinator.poll(0, onPoll);</span>
+<span class="fc" id="L171">    }</span>
+
+    public void poll(long timeout, Supplier&lt;UncheckedCloseable&gt; onPoll) {
+<span class="pc bpc" id="L174" title="1 of 2 branches missed.">        if (timeout &lt; 0)</span>
+<span class="nc" id="L175">            throw new IllegalArgumentException(&quot;Timeout must not be negative&quot;);</span>
+<span class="fc" id="L176">        coordinator.poll(timeout, onPoll);</span>
+<span class="fc" id="L177">    }</span>
+
+    /**
+     * Interrupt any running poll() calls, causing a WakeupException to be thrown in the thread invoking that method.
+     */
+    public void wakeup() {
+<span class="fc" id="L183">        this.client.wakeup();</span>
+<span class="fc" id="L184">    }</span>
+
+    /**
+     * Get the member ID of this worker in the group of workers.
+     * &lt;p&gt;
+     * This ID is the unique member ID automatically generated.
+     *
+     * @return the member ID
+     */
+    public String memberId() {
+<span class="fc" id="L194">        return coordinator.memberId();</span>
+    }
+
+    public void requestRejoin() {
+<span class="fc" id="L198">        coordinator.requestRejoin(&quot;connect worker requested rejoin&quot;);</span>
+<span class="fc" id="L199">    }</span>
+
+    public void maybeLeaveGroup(String leaveReason) {
+<span class="nc" id="L202">        coordinator.maybeLeaveGroup(CloseOptions.GroupMembershipOperation.LEAVE_GROUP, leaveReason);</span>
+<span class="nc" id="L203">    }</span>
+
+    public String ownerUrl(String connector) {
+<span class="nc" id="L206">        return coordinator.ownerUrl(connector);</span>
+    }
+
+    public String ownerUrl(ConnectorTaskId task) {
+<span class="fc" id="L210">        return coordinator.ownerUrl(task);</span>
+    }
+
+    /**
+     * Get the version of the connect protocol that is currently active in the group of workers.
+     *
+     * @return the current connect protocol version
+     */
+    public short currentProtocolVersion() {
+<span class="fc" id="L219">        return coordinator.currentProtocolVersion();</span>
+    }
+
+    public void revokeAssignment(ExtendedAssignment assignment) {
+<span class="nc" id="L223">        coordinator.revokeAssignment(assignment);</span>
+<span class="nc" id="L224">    }</span>
+
+    private void stop(boolean swallowException) {
+<span class="fc" id="L227">        log.trace(&quot;Stopping the Connect group member.&quot;);</span>
+<span class="fc" id="L228">        AtomicReference&lt;Throwable&gt; firstException = new AtomicReference&lt;&gt;();</span>
+<span class="fc" id="L229">        this.stopped = true;</span>
+<span class="fc" id="L230">        Utils.closeQuietly(coordinator, &quot;coordinator&quot;, firstException);</span>
+<span class="fc" id="L231">        Utils.closeQuietly(metrics, &quot;consumer metrics&quot;, firstException);</span>
+<span class="fc" id="L232">        Utils.closeQuietly(client, &quot;consumer network client&quot;, firstException);</span>
+<span class="fc" id="L233">        AppInfoParser.unregisterAppInfo(JMX_PREFIX, clientId, metrics);</span>
+<span class="pc bpc" id="L234" title="3 of 4 branches missed.">        if (firstException.get() != null &amp;&amp; !swallowException)</span>
+<span class="nc" id="L235">            throw new KafkaException(&quot;Failed to stop the Connect group member&quot;, firstException.get());</span>
+        else
+<span class="fc" id="L237">            log.debug(&quot;The Connect group member has stopped.&quot;);</span>
+<span class="fc" id="L238">    }</span>
+
+    // Visible for testing
+    Metrics metrics() {
+<span class="nc" id="L242">        return this.metrics;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

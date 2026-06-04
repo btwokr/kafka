@@ -1,0 +1,460 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ClusterInstance.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.common.test</a> &gt; <span class="el_source">ClusterInstance.java</span></div><h1>ClusterInstance.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.common.test;
+
+import kafka.server.BrokerServer;
+import kafka.server.ControllerServer;
+import kafka.server.KafkaBroker;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.TopicDescription;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.GroupProtocol;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.KafkaShareConsumer;
+import org.apache.kafka.clients.consumer.ShareConsumer;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.acl.AccessControlEntry;
+import org.apache.kafka.common.acl.AclBindingFilter;
+import org.apache.kafka.common.config.SaslConfigs;
+import org.apache.kafka.common.errors.LeaderNotAvailableException;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
+import org.apache.kafka.common.network.ListenerName;
+import org.apache.kafka.common.security.auth.SecurityProtocol;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
+import org.apache.kafka.common.serialization.Deserializer;
+import org.apache.kafka.common.test.api.ClusterConfig;
+import org.apache.kafka.common.test.api.ClusterTest;
+import org.apache.kafka.common.test.api.Type;
+import org.apache.kafka.server.authorizer.Authorizer;
+import org.apache.kafka.server.fault.FaultHandlerException;
+import org.apache.kafka.storage.internals.checkpoint.OffsetCheckpointFile;
+import org.apache.kafka.storage.internals.log.UnifiedLog;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.clients.consumer.GroupProtocol.CLASSIC;
+import static org.apache.kafka.clients.consumer.GroupProtocol.CONSUMER;
+
+public interface ClusterInstance {
+
+    Type type();
+
+    Map&lt;Integer, KafkaBroker&gt; brokers();
+
+    default Map&lt;Integer, KafkaBroker&gt; aliveBrokers() {
+<span class="nc bnc" id="L85" title="All 2 branches missed.">        return brokers().entrySet().stream().filter(entry -&gt; !entry.getValue().isShutdown())</span>
+<span class="nc" id="L86">                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));</span>
+    }
+
+    Map&lt;Integer, ControllerServer&gt; controllers();
+
+    /**
+     * The immutable cluster configuration used to create this cluster.
+     */
+    ClusterConfig config();
+
+    /**
+     * Return the set of all controller IDs configured for this test. For kraft, this
+     * will return only the nodes which have the &quot;controller&quot; role enabled in `process.roles`.
+     */
+    Set&lt;Integer&gt; controllerIds();
+
+    /**
+     * Return the set of all broker IDs configured for this test.
+     */
+    default Set&lt;Integer&gt; brokerIds() {
+<span class="nc" id="L106">        return brokers().keySet();</span>
+    }
+
+    /**
+     * The listener for this cluster as configured by {@link ClusterTest} or by {@link ClusterConfig}. If
+     * unspecified by those sources, this will return the listener for the default security protocol PLAINTEXT
+     */
+    ListenerName clientListener();
+
+    /**
+     * The listener for the kraft cluster controller configured by controller.listener.names.
+     */
+    ListenerName controllerListenerName();
+
+    /**
+     * The broker connect string which can be used by clients for bootstrapping
+     */
+    String bootstrapServers();
+
+    /**
+     * The broker connect string which can be used by clients for bootstrapping to the controller quorum.
+     */
+    String bootstrapControllers();
+
+    default List&lt;Integer&gt; controllerBoundPorts() {
+<span class="nc" id="L131">        return controllers().values().stream()</span>
+<span class="nc" id="L132">            .map(ControllerServer::socketServer)</span>
+<span class="nc" id="L133">            .map(ss -&gt; ss.boundPort(controllerListenerName()))</span>
+<span class="nc" id="L134">            .toList();</span>
+    }
+
+    default List&lt;Integer&gt; brokerBoundPorts() {
+<span class="nc" id="L138">        return brokers().values().stream()</span>
+<span class="nc" id="L139">            .map(KafkaBroker::socketServer)</span>
+<span class="nc" id="L140">            .map(ss -&gt; ss.boundPort(clientListener()))</span>
+<span class="nc" id="L141">            .toList();</span>
+    }
+
+    String clusterId();
+
+    //---------------------------[producer/consumer/admin]---------------------------//
+
+    default &lt;K, V&gt; Producer&lt;K, V&gt; producer(Map&lt;String, Object&gt; configs) {
+<span class="nc" id="L149">        Map&lt;String, Object&gt; props = new HashMap&lt;&gt;(configs);</span>
+<span class="nc" id="L150">        props.putIfAbsent(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());</span>
+<span class="nc" id="L151">        props.putIfAbsent(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());</span>
+<span class="nc" id="L152">        props.putIfAbsent(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers());</span>
+<span class="nc" id="L153">        return new KafkaProducer&lt;&gt;(setClientSaslConfig(props));</span>
+    }
+
+    default &lt;K, V&gt; Producer&lt;K, V&gt; producer() {
+<span class="nc" id="L157">        return producer(Map.of());</span>
+    }
+
+    default &lt;K, V&gt; Consumer&lt;K, V&gt; consumer(Map&lt;String, Object&gt; configs) {
+<span class="nc" id="L161">        Map&lt;String, Object&gt; props = new HashMap&lt;&gt;(configs);</span>
+<span class="nc" id="L162">        props.putIfAbsent(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());</span>
+<span class="nc" id="L163">        props.putIfAbsent(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());</span>
+<span class="nc" id="L164">        props.putIfAbsent(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, &quot;earliest&quot;);</span>
+<span class="nc" id="L165">        props.putIfAbsent(ConsumerConfig.GROUP_ID_CONFIG, &quot;group_&quot; + TestUtils.randomString(5));</span>
+<span class="nc" id="L166">        props.putIfAbsent(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers());</span>
+<span class="nc" id="L167">        return new KafkaConsumer&lt;&gt;(setClientSaslConfig(props));</span>
+    }
+
+    default &lt;K, V&gt; Consumer&lt;K, V&gt; consumer() {
+<span class="nc" id="L171">        return consumer(Map.of());</span>
+    }
+
+    default &lt;K, V&gt; ShareConsumer&lt;K, V&gt; shareConsumer() {
+<span class="nc" id="L175">        return shareConsumer(Map.of());</span>
+    }
+
+    default &lt;K, V&gt; ShareConsumer&lt;K, V&gt; shareConsumer(Map&lt;String, Object&gt; configs) {
+<span class="nc" id="L179">        return shareConsumer(configs, null, null);</span>
+    }
+
+    default &lt;K, V&gt; ShareConsumer&lt;K, V&gt; shareConsumer(Map&lt;String, Object&gt; configs, Deserializer&lt;K&gt; keyDeserializer, Deserializer&lt;V&gt; valueDeserializer) {
+<span class="nc" id="L183">        Map&lt;String, Object&gt; props = new HashMap&lt;&gt;(configs);</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">        if (keyDeserializer == null) {</span>
+<span class="nc" id="L185">            props.putIfAbsent(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());</span>
+        }
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        if (valueDeserializer == null) {</span>
+<span class="nc" id="L188">            props.putIfAbsent(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());</span>
+        }
+<span class="nc" id="L190">        props.putIfAbsent(ConsumerConfig.GROUP_ID_CONFIG, &quot;group_&quot; + TestUtils.randomString(5));</span>
+<span class="nc" id="L191">        props.putIfAbsent(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers());</span>
+<span class="nc" id="L192">        return new KafkaShareConsumer&lt;&gt;(setClientSaslConfig(props), keyDeserializer, valueDeserializer);</span>
+    }
+
+    default Admin admin(Map&lt;String, Object&gt; configs, boolean usingBootstrapControllers) {
+<span class="nc" id="L196">        Map&lt;String, Object&gt; props = new HashMap&lt;&gt;(configs);</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">        if (usingBootstrapControllers) {</span>
+<span class="nc" id="L198">            props.putIfAbsent(AdminClientConfig.BOOTSTRAP_CONTROLLERS_CONFIG, bootstrapControllers());</span>
+<span class="nc" id="L199">            props.remove(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG);</span>
+        } else {
+<span class="nc" id="L201">            props.putIfAbsent(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers());</span>
+<span class="nc" id="L202">            props.remove(AdminClientConfig.BOOTSTRAP_CONTROLLERS_CONFIG);</span>
+        }
+<span class="nc" id="L204">        return Admin.create(setClientSaslConfig(props));</span>
+    }
+
+    default Map&lt;String, Object&gt; setClientSaslConfig(Map&lt;String, Object&gt; configs) {
+<span class="nc" id="L208">        Map&lt;String, Object&gt; props = new HashMap&lt;&gt;(configs);</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        if (config().brokerSecurityProtocol() == SecurityProtocol.SASL_PLAINTEXT) {</span>
+<span class="nc" id="L210">            props.putIfAbsent(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG, SecurityProtocol.SASL_PLAINTEXT.name);</span>
+<span class="nc" id="L211">            props.putIfAbsent(SaslConfigs.SASL_MECHANISM, &quot;PLAIN&quot;);</span>
+<span class="nc" id="L212">            props.putIfAbsent(</span>
+                SaslConfigs.SASL_JAAS_CONFIG,
+<span class="nc" id="L214">                String.format(</span>
+                    &quot;org.apache.kafka.common.security.plain.PlainLoginModule required username=\&quot;%s\&quot; password=\&quot;%s\&quot;;&quot;,
+                    JaasUtils.KAFKA_PLAIN_ADMIN, JaasUtils.KAFKA_PLAIN_ADMIN_PASSWORD
+                )
+            );
+        }
+<span class="nc" id="L220">        return props;</span>
+    }
+
+    default Admin admin(Map&lt;String, Object&gt; configs) {
+<span class="nc" id="L224">        return admin(configs, false);</span>
+    }
+
+    default Admin admin() {
+<span class="nc" id="L228">        return admin(Map.of(), false);</span>
+    }
+
+    default Set&lt;GroupProtocol&gt; supportedGroupProtocols() {
+<span class="nc bnc" id="L232" title="All 2 branches missed.">        if (brokers().values().stream().allMatch(b -&gt; b.dataPlaneRequestProcessor().isConsumerGroupProtocolEnabled())) {</span>
+<span class="nc" id="L233">            return Set.of(CLASSIC, CONSUMER);</span>
+        } else {
+<span class="nc" id="L235">            return Set.of(CLASSIC);</span>
+        }
+    }
+
+    /**
+     * Returns the first recorded fatal exception, if any.
+     *
+     */
+    Optional&lt;FaultHandlerException&gt; firstFatalException();
+
+    /**
+     * Return the first recorded non-fatal exception, if any.
+     */
+    Optional&lt;FaultHandlerException&gt; firstNonFatalException();
+
+    //---------------------------[modify]---------------------------//
+
+    void start();
+
+    boolean started();
+
+    void stop();
+
+    boolean stopped();
+
+    void shutdownBroker(int brokerId);
+
+    void startBroker(int brokerId);
+
+    //---------------------------[wait]---------------------------//
+
+    default void waitTopicDeletion(String topic) throws InterruptedException {
+<span class="nc" id="L267">        Collection&lt;KafkaBroker&gt; brokers = aliveBrokers().values();</span>
+        // wait for metadata
+<span class="nc" id="L269">        TestUtils.waitForCondition(</span>
+<span class="nc" id="L270">            () -&gt; brokers.stream().allMatch(</span>
+<span class="nc" id="L271">                broker -&gt; broker.metadataCache().numPartitions(topic).isEmpty()),</span>
+                60000L, topic + &quot; metadata not propagated after 60000 ms&quot;);
+
+<span class="nc" id="L274">        ensureConsistentMetadata(brokers, controllers().values());</span>
+
+<span class="nc" id="L276">        TopicPartition topicPartition = new TopicPartition(topic, 0);</span>
+
+        // Ensure that the topic-partition has been deleted from all brokers' replica managers
+<span class="nc" id="L279">        TestUtils.waitForCondition(() -&gt; brokers.stream().allMatch(broker -&gt;</span>
+<span class="nc" id="L280">                broker.replicaManager().onlinePartition(topicPartition).isEmpty()</span>
+        ), &quot;Replica manager's should have deleted all of this topic's partitions&quot;);
+
+        // Ensure that logs from all replicas are deleted
+<span class="nc" id="L284">        TestUtils.waitForCondition(() -&gt; brokers.stream().allMatch(broker -&gt;</span>
+<span class="nc" id="L285">                broker.logManager().getLog(topicPartition, false).isEmpty()</span>
+        ), &quot;Replica logs not deleted after delete topic is complete&quot;);
+
+        // Ensure that the topic is removed from all cleaner offsets
+<span class="nc" id="L289">        TestUtils.waitForCondition(() -&gt; brokers.stream().allMatch(broker -&gt; {</span>
+<span class="nc" id="L290">            Collection&lt;File&gt; liveLogDirs = broker.logManager().liveLogDirs();</span>
+<span class="nc" id="L291">            return liveLogDirs.stream().allMatch(logDir -&gt; {</span>
+                OffsetCheckpointFile checkpointFile;
+                try {
+<span class="nc" id="L294">                    checkpointFile = new OffsetCheckpointFile(new File(logDir, &quot;cleaner-offset-checkpoint&quot;), null);</span>
+<span class="nc" id="L295">                } catch (IOException e) {</span>
+<span class="nc" id="L296">                    throw new RuntimeException(e);</span>
+<span class="nc" id="L297">                }</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">                return !checkpointFile.read().containsKey(topicPartition);</span>
+            });
+        }), &quot;Cleaner offset for deleted partition should have been removed&quot;);
+
+        // Ensure that the topic directories are soft-deleted
+<span class="nc" id="L303">        TestUtils.waitForCondition(() -&gt; brokers.stream().allMatch(broker -&gt;</span>
+<span class="nc" id="L304">                broker.config().logDirs().stream().allMatch(logDir -&gt;</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                    !new File(logDir, topicPartition.topic() + &quot;-&quot; + topicPartition.partition()).exists())</span>
+        ), &quot;Failed to soft-delete the data to a delete directory&quot;);
+
+        // Ensure that the topic directories are hard-deleted
+<span class="nc" id="L309">        TestUtils.waitForCondition(() -&gt; brokers.stream().allMatch(broker -&gt;</span>
+<span class="nc" id="L310">                broker.config().logDirs().stream().allMatch(logDir -&gt;</span>
+<span class="nc" id="L311">                    Arrays.stream(Objects.requireNonNull(new File(logDir).list())).noneMatch(partitionDirectoryName -&gt;</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">                        partitionDirectoryName.startsWith(topicPartition.topic() + &quot;-&quot; + topicPartition.partition()) &amp;&amp;</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                            partitionDirectoryName.endsWith(UnifiedLog.DELETE_DIR_SUFFIX)))</span>
+        ), &quot;Failed to hard-delete the delete directory&quot;);
+<span class="nc" id="L315">    }</span>
+
+    default void createTopic(String topicName, int partitions, short replicas) throws InterruptedException {
+<span class="nc" id="L318">        createTopic(topicName, partitions, replicas, Map.of());</span>
+<span class="nc" id="L319">    }</span>
+
+    default void createTopic(String topicName, int partitions, short replicas, Map&lt;String, String&gt; props) throws InterruptedException {
+<span class="nc" id="L322">        try (Admin admin = admin()) {</span>
+<span class="nc" id="L323">            admin.createTopics(List.of(new NewTopic(topicName, partitions, replicas).configs(props)));</span>
+<span class="nc" id="L324">            waitTopicCreation(topicName, partitions);</span>
+        }
+<span class="nc" id="L326">    }</span>
+
+    default void createTopicWithAssignment(String topicName, Map&lt;Integer, List&lt;Integer&gt;&gt; replicaAssignment) throws InterruptedException {
+<span class="nc" id="L329">        try (Admin admin = admin()) {</span>
+<span class="nc" id="L330">            admin.createTopics(List.of(new NewTopic(topicName, replicaAssignment)));</span>
+<span class="nc" id="L331">            int partitions = replicaAssignment.size();</span>
+<span class="nc" id="L332">            waitTopicCreation(topicName, partitions);</span>
+        }
+<span class="nc" id="L334">    }</span>
+
+    /**
+     * Deletes a topic and waits for the deletion to complete.
+     *
+     * @param topicName The name of the topic to delete
+     * @throws InterruptedException If the operation is interrupted
+     */
+    default void deleteTopic(String topicName) throws InterruptedException, ExecutionException {
+<span class="nc" id="L343">        try (Admin admin = admin()) {</span>
+<span class="nc" id="L344">            admin.deleteTopics(List.of(topicName));</span>
+<span class="nc" id="L345">            waitTopicDeletion(topicName);</span>
+        }
+<span class="nc" id="L347">    }</span>
+
+    void waitForReadyBrokers() throws InterruptedException;
+
+    default void waitTopicCreation(String topic, int partitions) throws InterruptedException {
+<span class="nc bnc" id="L352" title="All 2 branches missed.">        if (partitions &lt;= 0) {</span>
+<span class="nc" id="L353">            throw new IllegalArgumentException(&quot;Partition count must be &gt; 0, but was &quot; + partitions);</span>
+        }
+
+        // wait for metadata
+<span class="nc" id="L357">        Collection&lt;KafkaBroker&gt; brokers = aliveBrokers().values();</span>
+<span class="nc" id="L358">        TestUtils.waitForCondition(</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">            () -&gt; brokers.stream().allMatch(broker -&gt; broker.metadataCache().numPartitions(topic).filter(p -&gt; p == partitions).isPresent()),</span>
+                60000L, topic + &quot; metadata not propagated after 60000 ms&quot;);
+
+<span class="nc" id="L362">        ensureConsistentMetadata(brokers, controllers().values());</span>
+<span class="nc" id="L363">    }</span>
+
+    default void ensureConsistentMetadata() throws InterruptedException  {
+<span class="nc" id="L366">        ensureConsistentMetadata(aliveBrokers().values(), controllers().values());</span>
+<span class="nc" id="L367">    }</span>
+
+    default void ensureConsistentMetadata(Collection&lt;KafkaBroker&gt; brokers, Collection&lt;ControllerServer&gt; controllers) throws InterruptedException  {
+<span class="nc bnc" id="L370" title="All 2 branches missed.">        for (ControllerServer controller : controllers) {</span>
+<span class="nc" id="L371">            long controllerOffset = controller.raftManager().raftLog().endOffset().offset() - 1;</span>
+<span class="nc" id="L372">            TestUtils.waitForCondition(</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">                () -&gt; brokers.stream().allMatch(broker -&gt; ((BrokerServer) broker).sharedServer().loader().lastAppliedOffset() &gt;= controllerOffset),</span>
+                60000L, &quot;Timeout waiting for controller metadata propagating to brokers&quot;);
+<span class="nc" id="L375">        }</span>
+<span class="nc" id="L376">    }</span>
+
+    default List&lt;Authorizer&gt; authorizers() {
+<span class="nc" id="L379">        List&lt;Authorizer&gt; authorizers = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L380">        authorizers.addAll(brokers().values().stream()</span>
+<span class="nc" id="L381">                .filter(server -&gt; server.authorizerPlugin().isDefined())</span>
+<span class="nc" id="L382">                .map(server -&gt; server.authorizerPlugin().get().get()).toList());</span>
+<span class="nc" id="L383">        authorizers.addAll(controllers().values().stream()</span>
+<span class="nc" id="L384">                .filter(server -&gt; server.authorizerPlugin().isDefined())</span>
+<span class="nc" id="L385">                .map(server -&gt; server.authorizerPlugin().get().get()).toList());</span>
+<span class="nc" id="L386">        return authorizers;</span>
+    }
+
+    default void waitAcls(AclBindingFilter filter, Collection&lt;AccessControlEntry&gt; entries) throws InterruptedException {
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        for (Authorizer authorizer : authorizers()) {</span>
+<span class="nc" id="L391">            AtomicReference&lt;Set&lt;AccessControlEntry&gt;&gt; actualEntries = new AtomicReference&lt;&gt;(new HashSet&lt;&gt;());</span>
+<span class="nc" id="L392">            TestUtils.waitForCondition(() -&gt; {</span>
+<span class="nc" id="L393">                Set&lt;AccessControlEntry&gt; accessControlEntrySet = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L394">                authorizer.acls(filter).forEach(aclBinding -&gt; accessControlEntrySet.add(aclBinding.entry()));</span>
+<span class="nc" id="L395">                actualEntries.set(accessControlEntrySet);</span>
+<span class="nc bnc" id="L396" title="All 4 branches missed.">                return accessControlEntrySet.containsAll(entries) &amp;&amp; entries.containsAll(accessControlEntrySet);</span>
+<span class="nc" id="L397">            }, &quot;expected acls: &quot; + entries + &quot;, actual acls: &quot; + actualEntries.get());</span>
+<span class="nc" id="L398">        }</span>
+<span class="nc" id="L399">    }</span>
+
+    /**
+     * Returns the broker id of leader partition.
+     */
+    default int getLeaderBrokerId(TopicPartition topicPartition) throws ExecutionException, InterruptedException {
+<span class="nc" id="L405">        try (var admin = admin()) {</span>
+<span class="nc" id="L406">            String topic = topicPartition.topic();</span>
+<span class="nc" id="L407">            TopicDescription description = admin.describeTopics(List.of(topic)).topicNameValues().get(topic).get();</span>
+
+<span class="nc" id="L409">            return description.partitions().stream()</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">                    .filter(tp -&gt; tp.partition() == topicPartition.partition())</span>
+<span class="nc" id="L411">                    .mapToInt(tp -&gt; tp.leader().id())</span>
+<span class="nc" id="L412">                    .findFirst()</span>
+<span class="nc" id="L413">                    .orElseThrow(() -&gt; new RuntimeException(&quot;Leader not found for tp &quot; + topicPartition));</span>
+        }
+    }
+
+    /**
+     * Wait for a leader to be elected or changed using the provided admin client.
+     */
+    default int waitUntilLeaderIsElectedOrChangedWithAdmin(Admin admin,
+                                                           String topic,
+                                                           int partitionNumber,
+                                                           long timeoutMs) throws Exception {
+<span class="nc" id="L424">        long startTime = System.currentTimeMillis();</span>
+<span class="nc" id="L425">        TopicPartition topicPartition = new TopicPartition(topic, partitionNumber);</span>
+
+<span class="nc bnc" id="L427" title="All 2 branches missed.">        while (System.currentTimeMillis() &lt; startTime + timeoutMs) {</span>
+            try {
+<span class="nc" id="L429">                TopicDescription topicDescription = admin.describeTopics(List.of(topic))</span>
+<span class="nc" id="L430">                        .allTopicNames().get().get(topic);</span>
+
+<span class="nc" id="L432">                Optional&lt;Integer&gt; leader = topicDescription.partitions().stream()</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">                        .filter(partitionInfo -&gt; partitionInfo.partition() == partitionNumber)</span>
+<span class="nc" id="L434">                        .findFirst()</span>
+<span class="nc" id="L435">                        .map(partitionInfo -&gt; {</span>
+<span class="nc" id="L436">                            int leaderId = partitionInfo.leader().id();</span>
+<span class="nc bnc" id="L437" title="All 2 branches missed.">                            return leaderId == Node.noNode().id() ? null : leaderId;</span>
+                        });
+
+<span class="nc bnc" id="L440" title="All 2 branches missed.">                if (leader.isPresent()) {</span>
+<span class="nc" id="L441">                    return leader.get();</span>
+                }
+<span class="nc" id="L443">            } catch (ExecutionException e) {</span>
+<span class="nc" id="L444">                Throwable cause = e.getCause();</span>
+<span class="nc bnc" id="L445" title="All 4 branches missed.">                if (cause instanceof UnknownTopicOrPartitionException ||</span>
+                        cause instanceof LeaderNotAvailableException) {
+<span class="nc" id="L447">                    continue;</span>
+                } else {
+<span class="nc" id="L449">                    throw e;</span>
+                }
+<span class="nc" id="L451">            }</span>
+
+<span class="nc" id="L453">            TimeUnit.MILLISECONDS.sleep(Math.min(100L, timeoutMs));</span>
+        }
+
+<span class="nc" id="L456">        throw new AssertionError(&quot;Timing out after &quot; + timeoutMs +</span>
+                &quot; ms since a leader was not elected for partition &quot; + topicPartition);
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

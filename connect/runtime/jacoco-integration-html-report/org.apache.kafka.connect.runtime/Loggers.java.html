@@ -1,0 +1,330 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Loggers.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">Loggers.java</span></div><h1>Loggers.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.connect.runtime.rest.entities.LoggerLevel;
+
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LoggerContext;
+import org.apache.logging.log4j.core.config.Configurator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+/**
+ * Manages logging levels on a single worker. Supports dynamic adjustment and querying
+ * of logging levels.
+ * &lt;p&gt;
+ * This class is thread-safe; concurrent calls to all of its public methods from any number
+ * of threads are permitted.
+ */
+public abstract class Loggers {
+
+<span class="fc" id="L49">    private static final Logger log = LoggerFactory.getLogger(Loggers.class);</span>
+
+    private static final String ROOT_LOGGER_NAME = &quot;root&quot;;
+
+    /**
+     * Log4j uses &quot;root&quot; (case-insensitive) as name of the root logger.
+     * Note: In log4j, the root logger's name was &quot;root&quot; and Kafka also followed that name for dynamic logging control feature.
+     * &lt;p&gt;
+     * While log4j2 changed the root logger's name to empty string (see: [[LogManager.ROOT_LOGGER_NAME]]),
+     * for backward-compatibility purposes, we accept both empty string and &quot;root&quot; as valid root logger names.
+     * This is why we have a dedicated definition that includes both values.
+     * &lt;/p&gt;
+     */
+<span class="fc" id="L62">    private static final List&lt;String&gt; VALID_ROOT_LOGGER_NAMES = List.of(LogManager.ROOT_LOGGER_NAME, ROOT_LOGGER_NAME);</span>
+
+    final Time time;
+
+    /**
+     * Maps logger names to their last modification timestamps.
+     * Note: The logger name &quot;root&quot; refers to the actual root logger of log4j2.
+     */
+    final Map&lt;String, Long&gt; lastModifiedTimes;
+
+    /**
+     * Creates a {@link Loggers} instance appropriate for the current environment.
+     *
+     * @param time A time source.
+     * @return A new {@link Loggers} instance, never {@link null}.
+     */
+    public static Loggers newInstance(Time time) {
+<span class="fc" id="L79">        Objects.requireNonNull(time);</span>
+        try {
+<span class="fc" id="L81">            return new Log4jLoggers(time);</span>
+<span class="nc" id="L82">        } catch (ClassCastException | LinkageError e) {</span>
+<span class="nc" id="L83">            log.info(&quot;No supported logging implementation found. Logging configuration endpoint will be disabled.&quot;);</span>
+<span class="nc" id="L84">            return new NoOpLoggers(time);</span>
+<span class="nc" id="L85">        } catch (Exception e) {</span>
+<span class="nc" id="L86">            log.warn(&quot;A problem occurred, while initializing the logging controller. Logging configuration endpoint will be disabled.&quot;, e);</span>
+<span class="nc" id="L87">            return new NoOpLoggers(time);</span>
+        }
+    }
+
+<span class="fc" id="L91">    private Loggers(Time time) {</span>
+<span class="fc" id="L92">        this.time = time;</span>
+<span class="fc" id="L93">        this.lastModifiedTimes = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L94">    }</span>
+
+    /**
+     * Retrieve the current level for a single logger.
+     *
+     * @param loggerName the name of the logger to retrieve the level for; may not be null
+     * @return the current level (falling back on the effective level if necessary) of the logger,
+     * or null if no logger with the specified name exists
+     */
+    public abstract LoggerLevel level(String loggerName);
+
+    /**
+     * Retrieve the current levels of all known loggers
+     *
+     * @return the levels of all known loggers; may be empty, but never null
+     */
+    public abstract Map&lt;String, LoggerLevel&gt; allLevels();
+
+    /**
+     * Set the level for the specified logger and all of its children
+     *
+     * @param namespace the name of the logger to adjust along with its children; may not be null
+     * @param level     the level to set for the logger and its children; may not be null
+     * @return all loggers that were affected by this action, sorted by their natural ordering;
+     * may be empty, but never null
+     */
+    public abstract List&lt;String&gt; setLevel(String namespace, String level);
+
+    public abstract boolean isValidLevel(String level);
+
+    static class Log4jLoggers extends Loggers {
+
+        // package-private for testing
+        final LoggerContext loggerContext;
+
+        // Package-private for testing
+        Log4jLoggers(Time time) {
+<span class="fc" id="L131">            super(time);</span>
+<span class="fc" id="L132">            loggerContext = (LoggerContext) LogManager.getContext(false);</span>
+<span class="fc" id="L133">        }</span>
+
+        @Override
+        public LoggerLevel level(String logger) {
+<span class="fc" id="L137">            Objects.requireNonNull(logger, &quot;Logger may not be null&quot;);</span>
+
+<span class="fc" id="L139">            org.apache.logging.log4j.Logger foundLogger = null;</span>
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">            if (isValidRootLoggerName(logger)) {</span>
+<span class="nc" id="L141">                foundLogger = rootLogger();</span>
+            } else {
+<span class="fc" id="L143">                var currentLoggers = currentLoggers().values();</span>
+                // search within existing loggers for the given name.
+                // using LogManger.getLogger() will create a logger if it doesn't exist
+                // (potential leak since these don't get cleaned up).
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">                for (org.apache.logging.log4j.Logger currentLogger : currentLoggers) {</span>
+<span class="fc bfc" id="L148" title="All 2 branches covered.">                    if (logger.equals(currentLogger.getName())) {</span>
+<span class="fc" id="L149">                        foundLogger = currentLogger;</span>
+<span class="fc" id="L150">                        break;</span>
+                    }
+<span class="fc" id="L152">                }</span>
+            }
+
+<span class="pc bpc" id="L155" title="1 of 2 branches missed.">            if (foundLogger == null) {</span>
+<span class="nc" id="L156">                log.warn(&quot;Unable to find level for logger {}&quot;, logger);</span>
+<span class="nc" id="L157">                return null;</span>
+            }
+
+<span class="fc" id="L160">            return loggerLevel(foundLogger);</span>
+        }
+
+        @Override
+        public Map&lt;String, LoggerLevel&gt; allLevels() {
+<span class="fc" id="L165">            return currentLoggers()</span>
+<span class="fc" id="L166">                    .values()</span>
+<span class="fc" id="L167">                    .stream()</span>
+<span class="fc bfc" id="L168" title="All 2 branches covered.">                    .filter(logger -&gt; !logger.getLevel().equals(Level.OFF))</span>
+<span class="fc" id="L169">                    .collect(Collectors.toMap(</span>
+                            this::getLoggerName,
+                            this::loggerLevel,
+<span class="nc" id="L172">                            (existing, replacing) -&gt; replacing,</span>
+                            TreeMap::new)
+                    );
+        }
+
+        @Override
+        public List&lt;String&gt; setLevel(String namespace, String level) {
+<span class="fc" id="L179">            Objects.requireNonNull(namespace, &quot;Logging namespace may not be null&quot;);</span>
+<span class="fc" id="L180">            Objects.requireNonNull(level, &quot;Level may not be null&quot;);</span>
+<span class="pc bpc" id="L181" title="1 of 2 branches missed.">            String internalNameSpace = isValidRootLoggerName(namespace) ? LogManager.ROOT_LOGGER_NAME : namespace;</span>
+
+<span class="fc" id="L183">            log.info(&quot;Setting level of namespace {} and children to {}&quot;, internalNameSpace, level);</span>
+
+<span class="fc" id="L185">            var loggers = loggers(internalNameSpace);</span>
+<span class="fc" id="L186">            var nameToLevel = allLevels();</span>
+
+<span class="fc" id="L188">            List&lt;String&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L189">            Configurator.setAllLevels(internalNameSpace, Level.valueOf(level));</span>
+<span class="fc bfc" id="L190" title="All 2 branches covered.">            for (org.apache.logging.log4j.Logger logger : loggers) {</span>
+                // We need to track level changes for each logger and record their update timestamps  to ensure this method
+                // correctly returns only the loggers whose levels were actually modified.
+<span class="fc" id="L193">                String name = getLoggerName(logger);</span>
+<span class="fc" id="L194">                String newLevel = logger.getLevel().name();</span>
+<span class="fc" id="L195">                String oldLevel = nameToLevel.getOrDefault(name, new LoggerLevel(&quot;&quot;, time.milliseconds())).level();</span>
+<span class="fc bfc" id="L196" title="All 2 branches covered.">                if (!newLevel.equalsIgnoreCase(oldLevel)) {</span>
+<span class="fc" id="L197">                    lastModifiedTimes.put(name, time.milliseconds());</span>
+<span class="fc" id="L198">                    result.add(name);</span>
+                }
+<span class="fc" id="L200">            }</span>
+<span class="fc" id="L201">            Collections.sort(result);</span>
+
+<span class="fc" id="L203">            return result;</span>
+        }
+
+        @Override
+        public boolean isValidLevel(String level) {
+<span class="pc bpc" id="L208" title="2 of 4 branches missed.">            return !level.isEmpty() &amp;&amp; Level.getLevel(level) != null;</span>
+        }
+
+        /**
+         * Retrieve all known loggers within a given namespace, creating an ancestor logger for that
+         * namespace if one does not already exist
+         *
+         * @param namespace the namespace that the loggers should fall under; may not be null
+         * @return all loggers that fall under the given namespace; never null, and will always contain
+         * at least one logger (the ancestor logger for the namespace)
+         */
+        private Collection&lt;org.apache.logging.log4j.core.Logger&gt; loggers(String namespace) {
+<span class="fc" id="L220">            Objects.requireNonNull(namespace, &quot;Logging namespace may not be null&quot;);</span>
+
+<span class="pc bpc" id="L222" title="1 of 2 branches missed.">            if (isValidRootLoggerName(namespace)) {</span>
+<span class="nc" id="L223">                return currentLoggers().values();</span>
+            }
+
+<span class="fc" id="L226">            var result = new ArrayList&lt;org.apache.logging.log4j.core.Logger&gt;();</span>
+<span class="fc" id="L227">            var nameToLogger = currentLoggers();</span>
+<span class="fc" id="L228">            var ancestorLogger = lookupLogger(namespace);</span>
+<span class="fc" id="L229">            var currentLoggers = nameToLogger.values();</span>
+
+<span class="fc" id="L231">            boolean present = false;</span>
+<span class="fc bfc" id="L232" title="All 2 branches covered.">            for (org.apache.logging.log4j.core.Logger currentLogger : currentLoggers) {</span>
+<span class="fc bfc" id="L233" title="All 2 branches covered.">                if (currentLogger.getName().startsWith(namespace)) {</span>
+<span class="fc" id="L234">                    result.add(currentLogger);</span>
+                }
+<span class="fc bfc" id="L236" title="All 2 branches covered.">                if (namespace.equals(currentLogger.getName())) {</span>
+<span class="fc" id="L237">                    present = true;</span>
+                }
+<span class="fc" id="L239">            }</span>
+
+<span class="fc bfc" id="L241" title="All 2 branches covered.">            if (!present) {</span>
+<span class="fc" id="L242">                result.add(ancestorLogger);</span>
+            }
+
+<span class="fc" id="L245">            return result;</span>
+        }
+
+        // visible for testing
+        org.apache.logging.log4j.core.Logger lookupLogger(String logger) {
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">            return loggerContext.getLogger(isValidRootLoggerName(logger) ? LogManager.ROOT_LOGGER_NAME : logger);</span>
+        }
+
+        // visible for testing
+        Map&lt;String, org.apache.logging.log4j.core.Logger&gt; currentLoggers() {
+<span class="fc" id="L255">            LoggerContext context = (LoggerContext) LogManager.getContext(false);</span>
+<span class="fc" id="L256">            var results = new HashMap&lt;String, org.apache.logging.log4j.core.Logger&gt;();</span>
+<span class="fc" id="L257">            context.getConfiguration().getLoggers().forEach((name, logger) -&gt; results.put(name, loggerContext.getLogger(name)));</span>
+<span class="fc" id="L258">            context.getLoggers().forEach(logger -&gt; results.put(logger.getName(), logger));</span>
+<span class="fc" id="L259">            return results;</span>
+        }
+
+        // visible for testing
+        org.apache.logging.log4j.Logger rootLogger() {
+<span class="nc" id="L264">            return LogManager.getRootLogger();</span>
+        }
+
+        private LoggerLevel loggerLevel(org.apache.logging.log4j.Logger logger) {
+<span class="fc" id="L268">            Long lastModified = lastModifiedTimes.get(getLoggerName(logger));</span>
+<span class="fc" id="L269">            return new LoggerLevel(Objects.toString(logger.getLevel()), lastModified);</span>
+        }
+
+        private boolean isValidRootLoggerName(String namespace) {
+<span class="fc" id="L273">            return VALID_ROOT_LOGGER_NAMES.stream()</span>
+<span class="fc" id="L274">                    .anyMatch(rootLoggerNames -&gt; rootLoggerNames.equalsIgnoreCase(namespace));</span>
+        }
+
+        /**
+         * Converts logger name to ensure backward compatibility between Log4j 1 and Log4j 2.
+         * If the logger name is empty (Log4j 2 root logger representation), converts it to &quot;root&quot; (Log4j 1 style).
+         * Otherwise, returns the original logger name.
+         *
+         * @param loggerName The name of the logger.
+         * @return The logger name - returns &quot;root&quot; for empty string, otherwise returns the original logger name
+         */
+        private String getLoggerName(String loggerName) {
+<span class="fc bfc" id="L286" title="All 2 branches covered.">            return loggerName.equals(LogManager.ROOT_LOGGER_NAME) ? ROOT_LOGGER_NAME : loggerName;</span>
+        }
+
+        /**
+         * Converts logger name to ensure backward compatibility between Log4j 1 and Log4j 2.
+         * If the logger name is empty (Log4j 2 root logger representation), converts it to &quot;root&quot; (Log4j 1 style).
+         * Otherwise, returns the original logger name.
+         *
+         * @param logger The logger instance to get the name from
+         * @return The logger name - returns &quot;root&quot; for empty string, otherwise returns the original logger name
+         */
+        private String getLoggerName(org.apache.logging.log4j.Logger logger) {
+<span class="fc" id="L298">            return getLoggerName(logger.getName());</span>
+        }
+
+    }
+
+    private static class NoOpLoggers extends Loggers {
+
+        private NoOpLoggers(Time time) {
+<span class="nc" id="L306">            super(time);</span>
+<span class="nc" id="L307">        }</span>
+
+        @Override
+        public LoggerLevel level(String loggerName) {
+<span class="nc" id="L311">            return new LoggerLevel(&quot;OFF&quot;, 0L);</span>
+        }
+
+        @Override
+        public Map&lt;String, LoggerLevel&gt; allLevels() {
+<span class="nc" id="L316">            return Map.of();</span>
+        }
+
+        @Override
+        public List&lt;String&gt; setLevel(String loggerName, String level) {
+<span class="nc" id="L321">            return List.of();</span>
+        }
+
+        @Override
+        public boolean isValidLevel(String level) {
+<span class="nc" id="L326">            return &quot;OFF&quot;.equals(level);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

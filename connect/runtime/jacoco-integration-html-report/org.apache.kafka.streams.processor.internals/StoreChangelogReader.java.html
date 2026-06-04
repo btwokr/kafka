@@ -1,0 +1,1136 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StoreChangelogReader.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals</a> &gt; <span class="el_source">StoreChangelogReader.java</span></div><h1>StoreChangelogReader.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals;
+
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsOptions;
+import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsSpec;
+import org.apache.kafka.clients.admin.ListOffsetsOptions;
+import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.InvalidOffsetException;
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.InterruptException;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.errors.StreamsException;
+import org.apache.kafka.streams.errors.TaskCorruptedException;
+import org.apache.kafka.streams.processor.StandbyUpdateListener;
+import org.apache.kafka.streams.processor.StateRestoreListener;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.internals.ProcessorStateManager.StateStoreMetadata;
+import org.apache.kafka.streams.processor.internals.Task.TaskType;
+import org.apache.kafka.streams.state.internals.MeteredStateStore;
+
+import org.slf4j.Logger;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+/**
+ * ChangelogReader is created and maintained by the stream thread and used for both updating standby tasks and
+ * restoring active tasks. It manages the restore consumer, including its assigned partitions, when to pause / resume
+ * these partitions, etc.
+ * &lt;p&gt;
+ * The reader also maintains the source of truth for restoration state: only active tasks restoring changelog could
+ * be completed, while standby tasks updating changelog would always be in restoring state after being initialized.
+ */
+public class StoreChangelogReader implements ChangelogReader {
+    private static final long RESTORE_LOG_INTERVAL_MS = 10_000L;
+<span class="nc" id="L72">    private long lastRestoreLogTime = 0L;</span>
+
+<span class="nc" id="L74">    enum ChangelogState {</span>
+        // registered but need to be initialized (i.e. set its starting, end, limit offsets)
+<span class="nc" id="L76">        REGISTERED(&quot;REGISTERED&quot;),</span>
+
+        // initialized and restoring
+<span class="nc" id="L79">        RESTORING(&quot;RESTORING&quot;, 0),</span>
+
+        // completed restoring (only for active restoring task, standby task should never be completed)
+<span class="nc" id="L82">        COMPLETED(&quot;COMPLETED&quot;, 1);</span>
+
+        public final String name;
+        private final List&lt;Integer&gt; prevStates;
+
+<span class="nc" id="L87">        ChangelogState(final String name, final Integer... prevStates) {</span>
+<span class="nc" id="L88">            this.name = name;</span>
+<span class="nc" id="L89">            this.prevStates = Arrays.asList(prevStates);</span>
+<span class="nc" id="L90">        }</span>
+    }
+
+    // NOTE we assume that the changelog reader is used only for either
+    //   1) restoring active task or
+    //   2) updating standby task at a given time,
+    // but never doing both
+    // A changelog reader with no tasks at all is in state ACTIVE_RESTORING
+<span class="nc" id="L98">    enum ChangelogReaderState {</span>
+<span class="nc" id="L99">        ACTIVE_RESTORING(&quot;ACTIVE_RESTORING&quot;),</span>
+
+<span class="nc" id="L101">        STANDBY_UPDATING(&quot;STANDBY_UPDATING&quot;);</span>
+
+        public final String name;
+
+<span class="nc" id="L105">        ChangelogReaderState(final String name) {</span>
+<span class="nc" id="L106">            this.name = name;</span>
+<span class="nc" id="L107">        }</span>
+    }
+
+    static class ChangelogMetadata {
+
+        private final StateStoreMetadata storeMetadata;
+
+        private final ProcessorStateManager stateManager;
+
+        private ChangelogState changelogState;
+
+        private long totalRestored;
+
+        // the end offset beyond which records should not be applied (yet) to restore the states
+        //
+        // for both active restoring tasks and standby updating tasks, it is defined as:
+        //    * log-end-offset if the changelog is not piggy-backed with source topic
+        //    * min(log-end-offset, committed-offset) if the changelog is piggy-backed with source topic
+        //
+        // the log-end-offset only needs to be updated once and only need to be for active tasks since for standby
+        // tasks it would never &quot;complete&quot; based on the end-offset;
+        //
+        // the committed-offset needs to be updated periodically for those standby tasks
+        //
+        // NOTE we do not book keep the current offset since we leverage state manager as its source of truth
+        private Long restoreEndOffset;
+
+        // buffer records polled by the restore consumer;
+        private final List&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; bufferedRecords;
+
+        // the limit index (exclusive) inside the buffered records beyond which should not be used to restore
+        // either due to limit offset (standby) or committed end offset (active)
+        private int bufferedLimitIndex;
+
+        private long restoreStartTimeNs;
+
+<span class="nc" id="L143">        private ChangelogMetadata(final StateStoreMetadata storeMetadata, final ProcessorStateManager stateManager) {</span>
+<span class="nc" id="L144">            this.changelogState = ChangelogState.REGISTERED;</span>
+<span class="nc" id="L145">            this.storeMetadata = storeMetadata;</span>
+<span class="nc" id="L146">            this.stateManager = stateManager;</span>
+<span class="nc" id="L147">            this.restoreEndOffset = null;</span>
+<span class="nc" id="L148">            this.totalRestored = 0L;</span>
+
+<span class="nc" id="L150">            this.bufferedRecords = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L151">            this.bufferedLimitIndex = 0;</span>
+<span class="nc" id="L152">        }</span>
+
+        private void clear() {
+<span class="nc" id="L155">            this.bufferedRecords.clear();</span>
+<span class="nc" id="L156">        }</span>
+
+        private void transitTo(final ChangelogState newState) {
+<span class="nc bnc" id="L159" title="All 2 branches missed.">            if (newState.prevStates.contains(changelogState.ordinal())) {</span>
+<span class="nc" id="L160">                changelogState = newState;</span>
+            } else {
+<span class="nc" id="L162">                throw new IllegalStateException(&quot;Invalid transition from &quot; + changelogState + &quot; to &quot; + newState);</span>
+            }
+<span class="nc" id="L164">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L168">            final Long currentOffset = storeMetadata.offset();</span>
+<span class="nc" id="L169">            return changelogState + &quot; &quot; + stateManager.taskType() +</span>
+                &quot; (currentOffset &quot; + currentOffset + &quot;, endOffset &quot; + restoreEndOffset + &quot;)&quot;;
+        }
+
+        // for testing only below
+        ChangelogState state() {
+<span class="nc" id="L175">            return changelogState;</span>
+        }
+
+        long totalRestored() {
+<span class="nc" id="L179">            return totalRestored;</span>
+        }
+
+        Long endOffset() {
+<span class="nc" id="L183">            return restoreEndOffset;</span>
+        }
+
+        List&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; bufferedRecords() {
+<span class="nc" id="L187">            return bufferedRecords;</span>
+        }
+
+        int bufferedLimitIndex() {
+<span class="nc" id="L191">            return bufferedLimitIndex;</span>
+        }
+
+        long calculateRestoreTime(final long restoreEndTimeNs) {
+<span class="nc" id="L195">            return restoreEndTimeNs - restoreStartTimeNs;</span>
+        }
+    }
+
+<span class="nc" id="L199">    private static final long DEFAULT_OFFSET_UPDATE_MS = Duration.ofMinutes(5L).toMillis();</span>
+
+    private ChangelogReaderState state;
+
+    private final Time time;
+    private final Logger log;
+    private final Duration pollTime;
+    private final long updateOffsetIntervalMs;
+
+    // 1) we keep adding partitions to restore consumer whenever new tasks are registered with the state manager;
+    // 2) we do not unassign partitions when we switch between standbys and actives, we just pause / resume them;
+    // 3) we only remove an assigned partition when the corresponding task is being removed from the thread.
+    private final Consumer&lt;byte[], byte[]&gt; restoreConsumer;
+    private final StateRestoreListener stateRestoreListener;
+
+    // source of the truth of the current registered changelogs;
+    // NOTE a changelog would only be removed when its corresponding task
+    // is being removed from the thread; otherwise it would stay in this map even after completed
+    private final Map&lt;TopicPartition, ChangelogMetadata&gt; changelogs;
+
+    // groupId is needed for the admin client to retrieve committed offsets
+    private final String groupId;
+
+    // the changelog reader needs the admin client to list end offsets and committed offsets
+    private final Admin adminClient;
+
+    private long lastUpdateOffsetTime;
+    private final StandbyUpdateListener standbyUpdateListener;
+
+    public StoreChangelogReader(final Time time,
+                                final StreamsConfig config,
+                                final LogContext logContext,
+                                final Admin adminClient,
+                                final Consumer&lt;byte[], byte[]&gt; restoreConsumer,
+                                final StateRestoreListener stateRestoreListener,
+<span class="nc" id="L234">                                final StandbyUpdateListener standbyUpdateListener) {</span>
+<span class="nc" id="L235">        this.time = time;</span>
+<span class="nc" id="L236">        this.log = logContext.logger(StoreChangelogReader.class);</span>
+<span class="nc" id="L237">        this.state = ChangelogReaderState.ACTIVE_RESTORING;</span>
+<span class="nc" id="L238">        this.adminClient = adminClient;</span>
+<span class="nc" id="L239">        this.restoreConsumer = restoreConsumer;</span>
+<span class="nc" id="L240">        this.stateRestoreListener = stateRestoreListener;</span>
+<span class="nc" id="L241">        this.standbyUpdateListener = standbyUpdateListener;</span>
+
+<span class="nc" id="L243">        this.groupId = config.getString(StreamsConfig.APPLICATION_ID_CONFIG);</span>
+<span class="nc" id="L244">        this.pollTime = Duration.ofMillis(config.getLong(StreamsConfig.POLL_MS_CONFIG));</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        this.updateOffsetIntervalMs = config.getLong(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG) == Long.MAX_VALUE ?</span>
+<span class="nc" id="L246">            DEFAULT_OFFSET_UPDATE_MS : config.getLong(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG);</span>
+<span class="nc" id="L247">        this.lastUpdateOffsetTime = 0L;</span>
+
+<span class="nc" id="L249">        this.changelogs = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L250">    }</span>
+
+    private static String recordEndOffset(final Long endOffset) {
+<span class="nc bnc" id="L253" title="All 2 branches missed.">        return endOffset == null ? &quot;UNKNOWN (since it is for standby task)&quot; : endOffset.toString();</span>
+    }
+
+    private boolean hasRestoredToEnd(final ChangelogMetadata metadata) {
+<span class="nc" id="L257">        final Long endOffset = metadata.restoreEndOffset;</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">        if (endOffset == null) {</span>
+            // end offset is not initialized meaning that it is from a standby task,
+            // this should never happen since we only call this function for active task in restoring phase
+<span class="nc" id="L261">            throw new IllegalStateException(&quot;End offset for changelog &quot; + metadata + &quot; is unknown when deciding &quot; +</span>
+                &quot;if it has completed restoration, this should never happen.&quot;);
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        } else if (endOffset == 0) {</span>
+            // this is a special case, meaning there's nothing to be restored since the changelog has no data
+            // OR the changelog is a source topic and there's no committed offset
+<span class="nc" id="L266">            return true;</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">        } else if (metadata.bufferedRecords.isEmpty()) {</span>
+            // NOTE there are several corner cases that we need to consider:
+            //  1) the end / committed offset returned from the consumer is the last offset + 1
+            //  2) there could be txn markers as the last record if EOS is enabled at the producer
+            //
+            // It is possible that: the last record's offset == last txn marker offset - 1 == end / committed offset - 2
+            //
+            // So we make the following decision:
+            //  1) if all the buffered records have been applied, then we compare the end offset with the
+            //     current consumer's position, which is the &quot;next&quot; record to fetch, bypassing the txn marker already
+            //  2) if not all the buffered records have been applied, then it means we are restricted by the end offset,
+            //     and the consumer's position is likely already ahead of that end offset. Then we just need to check
+            //     the first record in the remaining buffer and see if that record is no smaller than the end offset.
+<span class="nc" id="L280">            final TopicPartition partition = metadata.storeMetadata.changelogPartition();</span>
+            try {
+<span class="nc bnc" id="L282" title="All 2 branches missed.">                return restoreConsumer.position(partition) &gt;= endOffset;</span>
+<span class="nc" id="L283">            } catch (final TimeoutException timeoutException) {</span>
+                // re-throw to trigger `task.timeout.ms`
+<span class="nc" id="L285">                throw timeoutException;</span>
+<span class="nc" id="L286">            } catch (final KafkaException e) {</span>
+                // this also includes InvalidOffsetException, which should not happen under normal
+                // execution, hence it is also okay to wrap it as fatal StreamsException
+<span class="nc" id="L289">                throw new StreamsException(&quot;Restore consumer get unexpected error trying to get the position &quot; +</span>
+                    &quot; of &quot; + partition, e);
+            }
+        } else {
+<span class="nc bnc" id="L293" title="All 2 branches missed.">            return metadata.bufferedRecords.get(0).offset() &gt;= endOffset;</span>
+        }
+    }
+
+    // Once some new tasks are created, we transit to restore them and pause on the existing standby tasks. It is
+    // possible that when newly created tasks are created the changelog reader are still restoring existing
+    // active tasks, and hence this function is idempotent and can be called multiple times.
+    //
+    // NOTE: even if the newly created tasks do not need any restoring, we still first transit to this state and then
+    // immediately transit back -- there's no overhead of transiting back and forth but simplifies the logic a lot.
+    @Override
+    public void enforceRestoreActive() {
+<span class="nc bnc" id="L305" title="All 2 branches missed.">        if (state != ChangelogReaderState.ACTIVE_RESTORING) {</span>
+<span class="nc" id="L306">            log.debug(&quot;Transiting to restore active tasks: {}&quot;, changelogs);</span>
+<span class="nc" id="L307">            lastRestoreLogTime = 0L;</span>
+
+            // pause all partitions that are for standby tasks from the restore consumer
+<span class="nc" id="L310">            pauseChangelogsFromRestoreConsumer(standbyRestoringChangelogs());</span>
+
+<span class="nc" id="L312">            state = ChangelogReaderState.ACTIVE_RESTORING;</span>
+        }
+<span class="nc" id="L314">    }</span>
+
+    // Only after we've completed restoring all active tasks we'll then move back to resume updating standby tasks.
+    // This function is NOT idempotent: if it is already in updating standby tasks mode, we should not call it again.
+    //
+    // NOTE: we do not clear completed active restoring changelogs or remove partitions from restore consumer either
+    // upon completing them but only pause the corresponding partitions; the changelog metadata / partitions would only
+    // be cleared when the corresponding task is being removed from the thread. In other words, the restore consumer
+    // should contain all changelogs that are RESTORING or COMPLETED
+    @Override
+    public void transitToUpdateStandby() {
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (state != ChangelogReaderState.ACTIVE_RESTORING) {</span>
+<span class="nc" id="L326">            throw new IllegalStateException(</span>
+                &quot;The changelog reader is not restoring active tasks (is &quot; + state + &quot;) while trying to &quot; +
+                    &quot;transit to update standby tasks: &quot; + changelogs
+            );
+        }
+
+<span class="nc" id="L332">        log.debug(&quot;Transiting to update standby tasks: {}&quot;, changelogs);</span>
+
+        // resume all standby restoring changelogs from the restore consumer
+<span class="nc" id="L335">        resumeChangelogsFromRestoreConsumer(standbyRestoringChangelogs());</span>
+
+<span class="nc" id="L337">        state = ChangelogReaderState.STANDBY_UPDATING;</span>
+<span class="nc" id="L338">    }</span>
+
+    @Override
+    public boolean isRestoringActive() {
+<span class="nc bnc" id="L342" title="All 2 branches missed.">        return state == ChangelogReaderState.ACTIVE_RESTORING;</span>
+    }
+
+    /**
+     * Since it is shared for multiple tasks and hence multiple state managers, the registration would take its
+     * corresponding state manager as well for restoring.
+     */
+    @Override
+    public void register(final TopicPartition partition, final ProcessorStateManager stateManager) {
+<span class="nc" id="L351">        final StateStoreMetadata storeMetadata = stateManager.storeMetadata(partition);</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">        if (storeMetadata == null) {</span>
+<span class="nc" id="L353">            throw new IllegalStateException(&quot;Cannot find the corresponding state store metadata for changelog &quot; +</span>
+                partition);
+        }
+
+<span class="nc" id="L357">        final ChangelogMetadata changelogMetadata = new ChangelogMetadata(storeMetadata, stateManager);</span>
+
+        // initializing limit offset to 0L for standby changelog to effectively disable any restoration until it is updated
+<span class="nc bnc" id="L360" title="All 4 branches missed.">        if (stateManager.taskType() == Task.TaskType.STANDBY &amp;&amp; stateManager.changelogAsSource(partition)) {</span>
+<span class="nc" id="L361">            changelogMetadata.restoreEndOffset = 0L;</span>
+        }
+
+<span class="nc bnc" id="L364" title="All 2 branches missed.">        if (changelogs.putIfAbsent(partition, changelogMetadata) != null) {</span>
+<span class="nc" id="L365">            throw new IllegalStateException(&quot;There is already a changelog registered for &quot; + partition +</span>
+                &quot;, this should not happen: &quot; + changelogs);
+        }
+<span class="nc" id="L368">    }</span>
+
+    @Override
+    public void register(final Set&lt;TopicPartition&gt; changelogPartitions, final ProcessorStateManager stateManager) {
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        for (final TopicPartition changelogPartition : changelogPartitions) {</span>
+<span class="nc" id="L373">            register(changelogPartition, stateManager);</span>
+<span class="nc" id="L374">        }</span>
+<span class="nc" id="L375">    }</span>
+
+    private ChangelogMetadata restoringChangelogByPartition(final TopicPartition partition) {
+<span class="nc" id="L378">        final ChangelogMetadata changelogMetadata = changelogs.get(partition);</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        if (changelogMetadata == null) {</span>
+<span class="nc" id="L380">            throw new IllegalStateException(&quot;The corresponding changelog restorer for &quot; + partition +</span>
+                &quot; does not exist, this should not happen.&quot;);
+        }
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        if (changelogMetadata.changelogState != ChangelogState.RESTORING) {</span>
+<span class="nc" id="L384">            throw new IllegalStateException(&quot;The corresponding changelog restorer for &quot; + partition +</span>
+                &quot; has already transited to completed state, this should not happen.&quot;);
+        }
+
+<span class="nc" id="L388">        return changelogMetadata;</span>
+    }
+
+    private Set&lt;ChangelogMetadata&gt; registeredChangelogs() {
+<span class="nc" id="L392">        return changelogs.values().stream()</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">            .filter(metadata -&gt; metadata.changelogState == ChangelogState.REGISTERED)</span>
+<span class="nc" id="L394">            .collect(Collectors.toSet());</span>
+    }
+
+    private Set&lt;TopicPartition&gt; restoringChangelogs() {
+<span class="nc" id="L398">        return changelogs.values().stream()</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">            .filter(metadata -&gt; metadata.changelogState == ChangelogState.RESTORING)</span>
+<span class="nc" id="L400">            .map(metadata -&gt; metadata.storeMetadata.changelogPartition())</span>
+<span class="nc" id="L401">            .collect(Collectors.toSet());</span>
+    }
+
+    private Set&lt;TopicPartition&gt; activeRestoringChangelogs() {
+<span class="nc" id="L405">        return changelogs.values().stream()</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">            .filter(metadata -&gt; metadata.changelogState == ChangelogState.RESTORING &amp;&amp;</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">                metadata.stateManager.taskType() == Task.TaskType.ACTIVE)</span>
+<span class="nc" id="L408">            .map(metadata -&gt; metadata.storeMetadata.changelogPartition())</span>
+<span class="nc" id="L409">            .collect(Collectors.toSet());</span>
+    }
+
+    private Set&lt;TopicPartition&gt; standbyRestoringChangelogs() {
+<span class="nc" id="L413">        return changelogs.values().stream()</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">            .filter(metadata -&gt; metadata.changelogState == ChangelogState.RESTORING &amp;&amp;</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">                metadata.stateManager.taskType() == Task.TaskType.STANDBY)</span>
+<span class="nc" id="L416">            .map(metadata -&gt; metadata.storeMetadata.changelogPartition())</span>
+<span class="nc" id="L417">            .collect(Collectors.toSet());</span>
+    }
+
+    @Override
+    public boolean allChangelogsCompleted() {
+<span class="nc" id="L422">        return changelogs.values().stream()</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">            .allMatch(metadata -&gt; metadata.changelogState == ChangelogState.COMPLETED);</span>
+    }
+
+    @Override
+    public Set&lt;TopicPartition&gt; completedChangelogs() {
+<span class="nc" id="L428">        return changelogs.values().stream()</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">            .filter(metadata -&gt; metadata.changelogState == ChangelogState.COMPLETED)</span>
+<span class="nc" id="L430">            .map(metadata -&gt; metadata.storeMetadata.changelogPartition())</span>
+<span class="nc" id="L431">            .collect(Collectors.toSet());</span>
+    }
+
+    // 1. if there are any registered changelogs that needs initialization, try to initialize them first;
+    // 2. if all changelogs have finished, return early;
+    // 3. if there are any restoring changelogs, try to read from the restore consumer and process them.
+    @Override
+    public long restore(final Map&lt;TaskId, Task&gt; tasks) {
+<span class="nc" id="L439">        initializeChangelogs(tasks, registeredChangelogs());</span>
+
+<span class="nc bnc" id="L441" title="All 4 branches missed.">        if (!activeRestoringChangelogs().isEmpty() &amp;&amp; state == ChangelogReaderState.STANDBY_UPDATING) {</span>
+<span class="nc" id="L442">            throw new IllegalStateException(&quot;Should not be in standby updating state if there are still un-completed active changelogs&quot;);</span>
+        }
+
+<span class="nc" id="L445">        long totalRestored = 0L;</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">        if (allChangelogsCompleted()) {</span>
+<span class="nc" id="L447">            log.debug(&quot;Finished restoring all changelogs {}&quot;, changelogs.keySet());</span>
+<span class="nc" id="L448">            return totalRestored;</span>
+        }
+
+<span class="nc" id="L451">        final Set&lt;TopicPartition&gt; restoringChangelogs = restoringChangelogs();</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">        if (!restoringChangelogs.isEmpty()) {</span>
+<span class="nc" id="L453">            final ConsumerRecords&lt;byte[], byte[]&gt; polledRecords = pollRecordsFromRestoreConsumer(tasks, restoringChangelogs);</span>
+
+<span class="nc bnc" id="L455" title="All 2 branches missed.">            for (final TopicPartition partition : polledRecords.partitions()) {</span>
+<span class="nc" id="L456">                bufferChangelogRecords(restoringChangelogByPartition(partition), polledRecords.records(partition));</span>
+<span class="nc" id="L457">            }</span>
+
+<span class="nc bnc" id="L459" title="All 2 branches missed.">            for (final TopicPartition partition : restoringChangelogs) {</span>
+                // even if some partition do not have any accumulated data, we still trigger
+                // restoring since some changelog may not need to restore any at all, and the
+                // restore to end check needs to be executed still.
+                // TODO: we always try to restore as a batch when some records are accumulated, which may result in
+                //       small batches; this can be optimized in the future, e.g. wait longer for larger batches.
+<span class="nc" id="L465">                final TaskId taskId = changelogs.get(partition).stateManager.taskId();</span>
+<span class="nc" id="L466">                final Task task = tasks.get(taskId);</span>
+
+                try {
+<span class="nc" id="L469">                    final ChangelogMetadata changelogMetadata = changelogs.get(partition);</span>
+<span class="nc" id="L470">                    totalRestored += restoreChangelog(task, changelogMetadata);</span>
+<span class="nc" id="L471">                } catch (final TimeoutException timeoutException) {</span>
+<span class="nc" id="L472">                    tasks.get(taskId).maybeInitTaskTimeoutOrThrow(</span>
+<span class="nc" id="L473">                        time.milliseconds(),</span>
+                        timeoutException
+                    );
+<span class="nc" id="L476">                }</span>
+<span class="nc" id="L477">            }</span>
+
+<span class="nc" id="L479">            maybeUpdateLimitOffsetsForStandbyChangelogs(tasks);</span>
+
+<span class="nc" id="L481">            maybeLogRestorationProgress();</span>
+        }
+
+<span class="nc" id="L484">        return totalRestored;</span>
+    }
+
+    private ConsumerRecords&lt;byte[], byte[]&gt; pollRecordsFromRestoreConsumer(final Map&lt;TaskId, Task&gt; tasks,
+                                                                           final Set&lt;TopicPartition&gt; restoringChangelogs) {
+        final ConsumerRecords&lt;byte[], byte[]&gt; polledRecords;
+
+        try {
+<span class="nc" id="L492">            pauseResumePartitions(tasks, restoringChangelogs);</span>
+
+<span class="nc" id="L494">            polledRecords = restoreConsumer.poll(pollTime);</span>
+
+            // TODO (?) If we cannot fetch records during restore, should we trigger `task.timeout.ms` ?
+            // TODO (?) If we cannot fetch records for standby task, should we trigger `task.timeout.ms` ?
+<span class="nc" id="L498">        } catch (final InvalidOffsetException e) {</span>
+<span class="nc" id="L499">            log.warn(&quot;Encountered &quot; + e.getClass().getName() +</span>
+<span class="nc" id="L500">                &quot; fetching records from restore consumer for partitions &quot; + e.partitions() + &quot;, it is likely that &quot; +</span>
+                &quot;the consumer's position has fallen out of the topic partition offset range because the topic was &quot; +
+                &quot;truncated or compacted on the broker, marking the corresponding tasks as corrupted and re-initializing &quot; +
+                &quot;it later.&quot;, e);
+
+<span class="nc" id="L505">            final Set&lt;TaskId&gt; corruptedTasks = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L506">            e.partitions().forEach(partition -&gt; corruptedTasks.add(changelogs.get(partition).stateManager.taskId()));</span>
+<span class="nc" id="L507">            throw new TaskCorruptedException(corruptedTasks, e);</span>
+<span class="nc" id="L508">        } catch (final InterruptException interruptException) {</span>
+<span class="nc" id="L509">            throw interruptException;</span>
+<span class="nc" id="L510">        } catch (final KafkaException e) {</span>
+<span class="nc" id="L511">            throw new StreamsException(&quot;Restore consumer get unexpected error polling records.&quot;, e);</span>
+<span class="nc" id="L512">        }</span>
+
+<span class="nc" id="L514">        return polledRecords;</span>
+    }
+
+    private void pauseResumePartitions(final Map&lt;TaskId, Task&gt; tasks,
+                                       final Set&lt;TopicPartition&gt; restoringChangelogs) {
+<span class="nc bnc" id="L519" title="All 2 branches missed.">        if (state == ChangelogReaderState.ACTIVE_RESTORING) {</span>
+<span class="nc" id="L520">            updatePartitionsByType(tasks, restoringChangelogs, TaskType.ACTIVE);</span>
+        }
+<span class="nc bnc" id="L522" title="All 2 branches missed.">        if (state == ChangelogReaderState.STANDBY_UPDATING) {</span>
+<span class="nc" id="L523">            updatePartitionsByType(tasks, restoringChangelogs, TaskType.STANDBY);</span>
+        }
+<span class="nc" id="L525">    }</span>
+
+    private void updatePartitionsByType(final Map&lt;TaskId, Task&gt; tasks,
+                                        final Set&lt;TopicPartition&gt; restoringChangelogs,
+                                        final TaskType taskType) {
+<span class="nc" id="L530">        final Collection&lt;TopicPartition&gt; toResume =</span>
+<span class="nc" id="L531">            restoringChangelogs.stream().filter(t -&gt; shouldResume(tasks, t, taskType)).collect(Collectors.toList());</span>
+<span class="nc" id="L532">        final Collection&lt;TopicPartition&gt; toPause =</span>
+<span class="nc" id="L533">            restoringChangelogs.stream().filter(t -&gt; shouldPause(tasks, t, taskType)).collect(Collectors.toList());</span>
+<span class="nc" id="L534">        restoreConsumer.resume(toResume);</span>
+<span class="nc" id="L535">        restoreConsumer.pause(toPause);</span>
+<span class="nc" id="L536">    }</span>
+
+    private boolean shouldResume(final Map&lt;TaskId, Task&gt; tasks, final TopicPartition partition, final TaskType taskType) {
+<span class="nc" id="L539">        final ProcessorStateManager manager = changelogs.get(partition).stateManager;</span>
+<span class="nc" id="L540">        final TaskId taskId = manager.taskId();</span>
+<span class="nc" id="L541">        final Task task = tasks.get(taskId);</span>
+<span class="nc bnc" id="L542" title="All 2 branches missed.">        if (manager.taskType() == taskType) {</span>
+<span class="nc bnc" id="L543" title="All 2 branches missed.">            return task != null;</span>
+        }
+<span class="nc" id="L545">        return false;</span>
+    }
+
+    private boolean shouldPause(final Map&lt;TaskId, Task&gt; tasks, final TopicPartition partition, final TaskType taskType) {
+<span class="nc" id="L549">        final ProcessorStateManager manager = changelogs.get(partition).stateManager;</span>
+<span class="nc" id="L550">        final TaskId taskId = manager.taskId();</span>
+<span class="nc" id="L551">        final Task task = tasks.get(taskId);</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">        if (manager.taskType() == taskType) {</span>
+<span class="nc bnc" id="L553" title="All 2 branches missed.">            return task == null;</span>
+        }
+<span class="nc" id="L555">        return false;</span>
+    }
+
+    private void maybeLogRestorationProgress() {
+<span class="nc bnc" id="L559" title="All 2 branches missed.">        if (state == ChangelogReaderState.ACTIVE_RESTORING) {</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">            if (time.milliseconds() - lastRestoreLogTime &gt; RESTORE_LOG_INTERVAL_MS) {</span>
+<span class="nc" id="L561">                final Set&lt;TopicPartition&gt; topicPartitions = activeRestoringChangelogs();</span>
+<span class="nc bnc" id="L562" title="All 2 branches missed.">                if (!topicPartitions.isEmpty()) {</span>
+<span class="nc" id="L563">                    final StringBuilder builder = new StringBuilder().append(&quot;Restoration in progress for &quot;)</span>
+<span class="nc" id="L564">                                                                     .append(topicPartitions.size())</span>
+<span class="nc" id="L565">                                                                     .append(&quot; partitions.&quot;);</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">                    for (final TopicPartition partition : topicPartitions) {</span>
+<span class="nc" id="L567">                        final ChangelogMetadata changelogMetadata = restoringChangelogByPartition(partition);</span>
+<span class="nc" id="L568">                        builder.append(&quot; {&quot;)</span>
+<span class="nc" id="L569">                               .append(partition)</span>
+<span class="nc" id="L570">                               .append(&quot;: &quot;)</span>
+<span class="nc" id="L571">                               .append(&quot;position=&quot;)</span>
+<span class="nc" id="L572">                               .append(getPositionString(partition, changelogMetadata))</span>
+<span class="nc" id="L573">                               .append(&quot;, end=&quot;)</span>
+<span class="nc" id="L574">                               .append(changelogMetadata.restoreEndOffset)</span>
+<span class="nc" id="L575">                               .append(&quot;, totalRestored=&quot;)</span>
+<span class="nc" id="L576">                               .append(changelogMetadata.totalRestored)</span>
+<span class="nc" id="L577">                               .append(&quot;}&quot;);</span>
+<span class="nc" id="L578">                    }</span>
+<span class="nc" id="L579">                    log.info(builder.toString());</span>
+<span class="nc" id="L580">                    lastRestoreLogTime = time.milliseconds();</span>
+                }
+<span class="nc" id="L582">            }</span>
+        } else {
+<span class="nc" id="L584">            lastRestoreLogTime = 0L;</span>
+        }
+<span class="nc" id="L586">    }</span>
+
+    private static String getPositionString(final TopicPartition partition,
+                                            final ChangelogMetadata changelogMetadata) {
+<span class="nc" id="L590">        final ProcessorStateManager stateManager = changelogMetadata.stateManager;</span>
+<span class="nc" id="L591">        final Long offsets = stateManager.changelogOffsets().get(partition);</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">        return offsets == null ? &quot;unknown&quot; : String.valueOf(offsets);</span>
+    }
+
+    private void maybeUpdateLimitOffsetsForStandbyChangelogs(final Map&lt;TaskId, Task&gt; tasks) {
+        // we only consider updating the limit offset for standbys if we are not restoring active tasks
+<span class="nc bnc" id="L597" title="All 2 branches missed.">        if (state == ChangelogReaderState.STANDBY_UPDATING &amp;&amp;</span>
+<span class="nc bnc" id="L598" title="All 2 branches missed.">            updateOffsetIntervalMs &lt; time.milliseconds() - lastUpdateOffsetTime) {</span>
+
+            // when the interval has elapsed we should try to update the limit offset for standbys reading from
+            // a source changelog with the new committed offset, unless there are no buffered records since 
+            // we only need the limit when processing new records
+            // for other changelog partitions we do not need to update limit offset at all since we never need to
+            // check when it completes based on limit offset anyways: the end offset would keep increasing and the
+            // standby never need to stop
+<span class="nc" id="L606">            final Set&lt;TopicPartition&gt; changelogsWithLimitOffsets = changelogs.entrySet().stream()</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">                .filter(entry -&gt; entry.getValue().stateManager.taskType() == Task.TaskType.STANDBY &amp;&amp;</span>
+<span class="nc bnc" id="L608" title="All 2 branches missed.">                    entry.getValue().stateManager.changelogAsSource(entry.getKey()))</span>
+<span class="nc" id="L609">                .map(Map.Entry::getKey).collect(Collectors.toSet());</span>
+
+<span class="nc bnc" id="L611" title="All 2 branches missed.">            for (final TopicPartition partition : changelogsWithLimitOffsets) {</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">                if (!changelogs.get(partition).bufferedRecords().isEmpty()) {</span>
+<span class="nc" id="L613">                    updateLimitOffsetsForStandbyChangelogs(committedOffsetForChangelogs(tasks, changelogsWithLimitOffsets));</span>
+<span class="nc" id="L614">                    lastUpdateOffsetTime = time.milliseconds();</span>
+<span class="nc" id="L615">                    break;</span>
+                }
+<span class="nc" id="L617">            }</span>
+        }
+<span class="nc" id="L619">    }</span>
+
+    private void bufferChangelogRecords(final ChangelogMetadata changelogMetadata, final List&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; records) {
+        // update the buffered records and limit index with the fetched records
+<span class="nc bnc" id="L623" title="All 2 branches missed.">        for (final ConsumerRecord&lt;byte[], byte[]&gt; record : records) {</span>
+            // filter polled records for null-keys and also possibly update buffer limit index
+<span class="nc bnc" id="L625" title="All 2 branches missed.">            if (record.key() == null) {</span>
+<span class="nc" id="L626">                log.warn(&quot;Read changelog record with null key from changelog {} at offset {}, &quot; +</span>
+<span class="nc" id="L627">                    &quot;skipping it for restoration&quot;, changelogMetadata.storeMetadata.changelogPartition(), record.offset());</span>
+            } else {
+<span class="nc" id="L629">                changelogMetadata.bufferedRecords.add(record);</span>
+<span class="nc" id="L630">                final long offset = record.offset();</span>
+<span class="nc bnc" id="L631" title="All 4 branches missed.">                if (changelogMetadata.restoreEndOffset == null || offset &lt; changelogMetadata.restoreEndOffset) {</span>
+<span class="nc" id="L632">                    changelogMetadata.bufferedLimitIndex = changelogMetadata.bufferedRecords.size();</span>
+                }
+            }
+<span class="nc" id="L635">        }</span>
+<span class="nc" id="L636">    }</span>
+
+    /**
+     * restore a changelog with its buffered records if there's any; for active changelogs also check if
+     * it has completed the restoration and can transit to COMPLETED state and trigger restore callbacks
+     *
+     * @return number of records restored
+     */
+    private int restoreChangelog(final Task task, final ChangelogMetadata changelogMetadata) {
+<span class="nc" id="L645">        final ProcessorStateManager stateManager = changelogMetadata.stateManager;</span>
+<span class="nc" id="L646">        final StateStoreMetadata storeMetadata = changelogMetadata.storeMetadata;</span>
+<span class="nc" id="L647">        final TopicPartition partition = storeMetadata.changelogPartition();</span>
+<span class="nc" id="L648">        final String storeName = storeMetadata.store().name();</span>
+<span class="nc" id="L649">        final int numRecords = changelogMetadata.bufferedLimitIndex;</span>
+
+<span class="nc bnc" id="L651" title="All 2 branches missed.">        if (numRecords != 0) {</span>
+<span class="nc" id="L652">            final List&lt;ConsumerRecord&lt;byte[], byte[]&gt;&gt; records = changelogMetadata.bufferedRecords.subList(0, numRecords);</span>
+<span class="nc" id="L653">            final OptionalLong optionalLag = restoreConsumer.currentLag(partition);</span>
+<span class="nc" id="L654">            stateManager.restore(storeMetadata, records, optionalLag);</span>
+
+            // NOTE here we use removeRange of ArrayList in order to achieve efficiency with range shifting,
+            // otherwise one-at-a-time removal or addition would be very costly; if all records are restored
+            // then we can further optimize to save the array-shift but just set array elements to null
+<span class="nc bnc" id="L659" title="All 2 branches missed.">            if (numRecords &lt; changelogMetadata.bufferedRecords.size()) {</span>
+<span class="nc" id="L660">                records.clear();</span>
+            } else {
+<span class="nc" id="L662">                changelogMetadata.bufferedRecords.clear();</span>
+            }
+
+<span class="nc" id="L665">            task.recordRestoration(time, numRecords, false);</span>
+
+<span class="nc" id="L667">            final Long currentOffset = storeMetadata.offset();</span>
+<span class="nc" id="L668">            log.trace(&quot;Restored {} records from changelog {} to store {}, end offset is {}, current offset is {}&quot;,</span>
+<span class="nc" id="L669">                numRecords, partition, storeName, recordEndOffset(changelogMetadata.restoreEndOffset), currentOffset);</span>
+
+<span class="nc" id="L671">            changelogMetadata.bufferedLimitIndex = 0;</span>
+<span class="nc" id="L672">            changelogMetadata.totalRestored += numRecords;</span>
+
+            // do not trigger restore listener if we are processing standby tasks
+<span class="nc bnc" id="L675" title="All 2 branches missed.">            if (changelogMetadata.stateManager.taskType() == Task.TaskType.ACTIVE) {</span>
+                try {
+<span class="nc" id="L677">                    stateRestoreListener.onBatchRestored(partition, storeName, currentOffset, numRecords);</span>
+<span class="nc" id="L678">                } catch (final Exception e) {</span>
+<span class="nc" id="L679">                    throw new StreamsException(&quot;State restore listener failed on batch restored&quot;, e);</span>
+<span class="nc" id="L680">                }</span>
+<span class="nc bnc" id="L681" title="All 2 branches missed.">            } else if (changelogMetadata.stateManager.taskType() == TaskType.STANDBY) {</span>
+                try {
+<span class="nc" id="L683">                    standbyUpdateListener.onBatchLoaded(partition, storeName, stateManager.taskId(), currentOffset, numRecords, storeMetadata.endOffset());</span>
+<span class="nc" id="L684">                } catch (final Exception e) {</span>
+<span class="nc" id="L685">                    throw new StreamsException(&quot;Standby updater listener failed on batch loaded&quot;, e);</span>
+<span class="nc" id="L686">                }</span>
+            }
+        }
+
+        // we should check even if there's nothing restored, but do not check completed if we are processing standby tasks
+<span class="nc bnc" id="L691" title="All 4 branches missed.">        if (changelogMetadata.stateManager.taskType() == Task.TaskType.ACTIVE &amp;&amp; hasRestoredToEnd(changelogMetadata)) {</span>
+<span class="nc" id="L692">            log.info(&quot;Finished restoring changelog {} to store {} with a total number of {} records&quot;,</span>
+<span class="nc" id="L693">                partition, storeName, changelogMetadata.totalRestored);</span>
+
+<span class="nc" id="L695">            changelogMetadata.transitTo(ChangelogState.COMPLETED);</span>
+<span class="nc" id="L696">            pauseChangelogsFromRestoreConsumer(Collections.singleton(partition));</span>
+<span class="nc bnc" id="L697" title="All 2 branches missed.">            if (storeMetadata.store() instanceof MeteredStateStore) {</span>
+<span class="nc" id="L698">                ((MeteredStateStore) storeMetadata.store()).recordRestoreTime(changelogMetadata.calculateRestoreTime(time.nanoseconds()));</span>
+            }
+
+            try {
+<span class="nc" id="L702">                stateRestoreListener.onRestoreEnd(partition, storeName, changelogMetadata.totalRestored);</span>
+<span class="nc" id="L703">            } catch (final Exception e) {</span>
+<span class="nc" id="L704">                throw new StreamsException(&quot;State restore listener failed on restore completed&quot;, e);</span>
+<span class="nc" id="L705">            }</span>
+        }
+
+<span class="nc bnc" id="L708" title="All 4 branches missed.">        if (numRecords &gt; 0 || changelogMetadata.state().equals(ChangelogState.COMPLETED)) {</span>
+<span class="nc" id="L709">            task.clearTaskTimeout();</span>
+        }
+
+<span class="nc" id="L712">        return numRecords;</span>
+    }
+
+    private Set&lt;Task&gt; getTasksFromPartitions(final Map&lt;TaskId, Task&gt; tasks,
+                                             final Set&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L717">        final Set&lt;Task&gt; result = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L718" title="All 2 branches missed.">        for (final TopicPartition partition : partitions) {</span>
+<span class="nc" id="L719">            result.add(tasks.get(changelogs.get(partition).stateManager.taskId()));</span>
+<span class="nc" id="L720">        }</span>
+<span class="nc" id="L721">        return result;</span>
+    }
+
+    private void clearTaskTimeout(final Set&lt;Task&gt; tasks) {
+<span class="nc" id="L725">        tasks.forEach(t -&gt; {</span>
+<span class="nc bnc" id="L726" title="All 2 branches missed.">            if (t != null) {</span>
+<span class="nc" id="L727">                t.clearTaskTimeout();</span>
+            }
+<span class="nc" id="L729">        });</span>
+<span class="nc" id="L730">    }</span>
+
+    private void maybeInitTaskTimeoutOrThrow(final Set&lt;Task&gt; tasks,
+                                             final Exception cause) {
+<span class="nc" id="L734">        final long now = time.milliseconds();</span>
+<span class="nc" id="L735">        tasks.forEach(t -&gt; t.maybeInitTaskTimeoutOrThrow(now, cause));</span>
+<span class="nc" id="L736">    }</span>
+
+    private Map&lt;TopicPartition, Long&gt; committedOffsetForChangelogs(final Map&lt;TaskId, Task&gt; tasks, final Set&lt;TopicPartition&gt; partitions) {
+<span class="nc bnc" id="L739" title="All 2 branches missed.">        if (partitions.isEmpty()) {</span>
+<span class="nc" id="L740">            return Collections.emptyMap();</span>
+        }
+
+        try {
+            // those which do not have a committed offset would default to 0
+<span class="nc" id="L745">            final ListConsumerGroupOffsetsOptions options = new ListConsumerGroupOffsetsOptions()</span>
+<span class="nc" id="L746">                .requireStable(true);</span>
+<span class="nc" id="L747">            final ListConsumerGroupOffsetsSpec spec = new ListConsumerGroupOffsetsSpec()</span>
+<span class="nc" id="L748">                .topicPartitions(new ArrayList&lt;&gt;(partitions));</span>
+<span class="nc" id="L749">            final Map&lt;TopicPartition, Long&gt; committedOffsets =</span>
+<span class="nc" id="L750">                adminClient.listConsumerGroupOffsets(</span>
+<span class="nc" id="L751">                        Collections.singletonMap(groupId, spec),</span>
+                        options
+                    )
+<span class="nc" id="L754">                    .partitionsToOffsetAndMetadata(groupId).get().entrySet()</span>
+<span class="nc" id="L755">                    .stream()</span>
+<span class="nc bnc" id="L756" title="All 2 branches missed.">                    .collect(Collectors.toMap(Map.Entry::getKey, e -&gt; e.getValue() == null ? 0L : e.getValue().offset()));</span>
+
+<span class="nc" id="L758">            clearTaskTimeout(getTasksFromPartitions(tasks, partitions));</span>
+<span class="nc" id="L759">            return committedOffsets;</span>
+<span class="nc" id="L760">        } catch (final TimeoutException | InterruptedException | ExecutionException retriableException) {</span>
+<span class="nc" id="L761">            log.debug(&quot;Could not retrieve the committed offsets for partitions {} due to {}, will retry in the next run loop&quot;,</span>
+<span class="nc" id="L762">                partitions, retriableException.toString());</span>
+<span class="nc" id="L763">            maybeInitTaskTimeoutOrThrow(getTasksFromPartitions(tasks, partitions), retriableException);</span>
+<span class="nc" id="L764">            return Collections.emptyMap();</span>
+<span class="nc" id="L765">        } catch (final KafkaException e) {</span>
+<span class="nc" id="L766">            throw new StreamsException(String.format(&quot;Failed to retrieve committed offsets for %s&quot;, partitions), e);</span>
+        }
+    }
+
+    private void filterNewPartitionsToRestore(final Map&lt;TaskId, Task&gt; tasks, final Set&lt;ChangelogMetadata&gt; newPartitionsToRestore) {
+<span class="nc" id="L771">        newPartitionsToRestore.removeIf(changelogMetadata -&gt;</span>
+<span class="nc bnc" id="L772" title="All 2 branches missed.">            !tasks.containsKey(changelogs.get(changelogMetadata.storeMetadata.changelogPartition()).stateManager.taskId()));</span>
+<span class="nc" id="L773">    }</span>
+
+    private Map&lt;TopicPartition, Long&gt; endOffsetForChangelogs(final Map&lt;TaskId, Task&gt; tasks, final Set&lt;TopicPartition&gt; partitions) {
+<span class="nc bnc" id="L776" title="All 2 branches missed.">        if (partitions.isEmpty()) {</span>
+<span class="nc" id="L777">            return Collections.emptyMap();</span>
+        }
+
+        try {
+            // we always use read_uncommitted to get log end offset since the last committed txn may have not advanced the LSO for EOS,
+            // see KAFKA-10167 for more details
+<span class="nc" id="L783">            final ListOffsetsOptions options = new ListOffsetsOptions(IsolationLevel.READ_UNCOMMITTED);</span>
+<span class="nc" id="L784">            final Map&lt;TopicPartition, OffsetSpec&gt; offsetSpecs =</span>
+<span class="nc" id="L785">                partitions.stream().collect(Collectors.toMap(Function.identity(), tp -&gt; OffsetSpec.latest()));</span>
+<span class="nc" id="L786">            final Map&lt;TopicPartition, Long&gt; logEndOffsets = adminClient.listOffsets(offsetSpecs, options)</span>
+<span class="nc" id="L787">                .all().get().entrySet()</span>
+<span class="nc" id="L788">                .stream().collect(Collectors.toMap(Map.Entry::getKey, entry -&gt; entry.getValue().offset()));</span>
+
+<span class="nc" id="L790">            clearTaskTimeout(getTasksFromPartitions(tasks, partitions));</span>
+<span class="nc" id="L791">            return logEndOffsets;</span>
+<span class="nc" id="L792">        } catch (final TimeoutException | InterruptedException | ExecutionException retriableException) {</span>
+<span class="nc" id="L793">            log.debug(&quot;Could not fetch all end offsets for {} due to {}, will retry in the next run loop&quot;,</span>
+<span class="nc" id="L794">                partitions, retriableException.toString());</span>
+<span class="nc" id="L795">            maybeInitTaskTimeoutOrThrow(getTasksFromPartitions(tasks, partitions), retriableException);</span>
+<span class="nc" id="L796">            return Collections.emptyMap();</span>
+<span class="nc" id="L797">        } catch (final KafkaException e) {</span>
+<span class="nc" id="L798">            throw new StreamsException(String.format(&quot;Failed to retrieve end offsets for %s&quot;, partitions), e);</span>
+        }
+    }
+
+    private void updateLimitOffsetsForStandbyChangelogs(final Map&lt;TopicPartition, Long&gt; committedOffsets) {
+<span class="nc bnc" id="L803" title="All 2 branches missed.">        for (final ChangelogMetadata metadata : changelogs.values()) {</span>
+<span class="nc" id="L804">            final TopicPartition partition = metadata.storeMetadata.changelogPartition();</span>
+<span class="nc bnc" id="L805" title="All 2 branches missed.">            if (metadata.stateManager.taskType() == Task.TaskType.STANDBY &amp;&amp;</span>
+<span class="nc bnc" id="L806" title="All 2 branches missed.">                metadata.stateManager.changelogAsSource(partition) &amp;&amp;</span>
+<span class="nc bnc" id="L807" title="All 2 branches missed.">                committedOffsets.containsKey(partition)) {</span>
+
+<span class="nc" id="L809">                final Long newLimit = committedOffsets.get(partition);</span>
+<span class="nc" id="L810">                final Long previousLimit = metadata.restoreEndOffset;</span>
+
+<span class="nc bnc" id="L812" title="All 4 branches missed.">                if (previousLimit != null &amp;&amp; previousLimit &gt; newLimit) {</span>
+<span class="nc" id="L813">                    throw new IllegalStateException(&quot;Offset limit should monotonically increase, but was reduced for partition &quot; +</span>
+                        partition + &quot;. New limit: &quot; + newLimit + &quot;. Previous limit: &quot; + previousLimit);
+                }
+
+<span class="nc" id="L817">                metadata.restoreEndOffset = newLimit;</span>
+
+                // update the limit index for buffered records
+<span class="nc bnc" id="L820" title="All 2 branches missed.">                while (metadata.bufferedLimitIndex &lt; metadata.bufferedRecords.size() &amp;&amp;</span>
+<span class="nc bnc" id="L821" title="All 2 branches missed.">                    metadata.bufferedRecords.get(metadata.bufferedLimitIndex).offset() &lt; metadata.restoreEndOffset)</span>
+<span class="nc" id="L822">                    metadata.bufferedLimitIndex++;</span>
+            }
+<span class="nc" id="L824">        }</span>
+<span class="nc" id="L825">    }</span>
+
+    private void initializeChangelogs(final Map&lt;TaskId, Task&gt; tasks,
+                                      final Set&lt;ChangelogMetadata&gt; newPartitionsToRestore) {
+        // for those changelog partitions whose tasks are not included, in means those tasks
+        // are paused at the moment, and hence we should not try to initialize those
+        // changelogs yet
+<span class="nc" id="L832">        filterNewPartitionsToRestore(tasks, newPartitionsToRestore);</span>
+
+<span class="nc bnc" id="L834" title="All 2 branches missed.">        if (newPartitionsToRestore.isEmpty()) {</span>
+<span class="nc" id="L835">            return;</span>
+        }
+
+        // for active changelogs, we need to find their end offset before transit to restoring
+        // if the changelog is on source topic, then its end offset should be the minimum of
+        // its committed offset and its end offset; for standby tasks that use source topics
+        // as changelogs, we want to initialize their limit offsets as committed offsets as well
+<span class="nc" id="L842">        final Set&lt;TopicPartition&gt; newPartitionsToFindEndOffset = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L843">        final Set&lt;TopicPartition&gt; newPartitionsToFindCommittedOffset = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L845" title="All 2 branches missed.">        for (final ChangelogMetadata metadata : newPartitionsToRestore) {</span>
+<span class="nc" id="L846">            final TopicPartition partition = metadata.storeMetadata.changelogPartition();</span>
+
+            // TODO K9113: when TaskType.GLOBAL is added we need to modify this
+<span class="nc bnc" id="L849" title="All 2 branches missed.">            if (metadata.stateManager.taskType() == Task.TaskType.ACTIVE) {</span>
+<span class="nc" id="L850">                newPartitionsToFindEndOffset.add(partition);</span>
+            }
+
+<span class="nc bnc" id="L853" title="All 2 branches missed.">            if (metadata.stateManager.changelogAsSource(partition)) {</span>
+<span class="nc" id="L854">                newPartitionsToFindCommittedOffset.add(partition);</span>
+            }
+<span class="nc" id="L856">        }</span>
+
+        // NOTE we assume that all requested partitions will be included in the returned map for both end/committed
+        // offsets, i.e., it would not return partial result and would timeout if some of the results cannot be found
+<span class="nc" id="L860">        final Map&lt;TopicPartition, Long&gt; endOffsets = endOffsetForChangelogs(tasks, newPartitionsToFindEndOffset);</span>
+<span class="nc" id="L861">        final Map&lt;TopicPartition, Long&gt; committedOffsets = committedOffsetForChangelogs(tasks, newPartitionsToFindCommittedOffset);</span>
+
+<span class="nc bnc" id="L863" title="All 2 branches missed.">        for (final TopicPartition partition : newPartitionsToFindEndOffset) {</span>
+<span class="nc" id="L864">            final ChangelogMetadata changelogMetadata = changelogs.get(partition);</span>
+<span class="nc" id="L865">            final Long endOffset = endOffsets.get(partition);</span>
+<span class="nc bnc" id="L866" title="All 2 branches missed.">            final Long committedOffset = newPartitionsToFindCommittedOffset.contains(partition) ?</span>
+<span class="nc" id="L867">                committedOffsets.get(partition) : Long.valueOf(Long.MAX_VALUE);</span>
+
+<span class="nc bnc" id="L869" title="All 4 branches missed.">            if (endOffset != null &amp;&amp; committedOffset != null) {</span>
+<span class="nc bnc" id="L870" title="All 2 branches missed.">                if (changelogMetadata.restoreEndOffset != null) {</span>
+<span class="nc" id="L871">                    throw new IllegalStateException(&quot;End offset for &quot; + partition +</span>
+                        &quot; should only be initialized once. Existing value: &quot; + changelogMetadata.restoreEndOffset +
+                        &quot;, new value: (&quot; + endOffset + &quot;, &quot; + committedOffset + &quot;)&quot;);
+                }
+
+<span class="nc" id="L876">                changelogMetadata.restoreEndOffset = Math.min(endOffset, committedOffset);</span>
+
+<span class="nc" id="L878">                log.info(&quot;End offset for changelog {} initialized as {}.&quot;, partition, changelogMetadata.restoreEndOffset);</span>
+            } else {
+<span class="nc bnc" id="L880" title="All 2 branches missed.">                if (!newPartitionsToRestore.remove(changelogMetadata)) {</span>
+<span class="nc" id="L881">                    throw new IllegalStateException(&quot;New changelogs to restore &quot; + newPartitionsToRestore +</span>
+                        &quot; does not contain the one looking for end offset: &quot; + partition + &quot;, this should not happen.&quot;);
+                }
+
+<span class="nc" id="L885">                log.info(&quot;End offset for changelog {} cannot be found; will retry in the next time.&quot;, partition);</span>
+            }
+<span class="nc" id="L887">        }</span>
+
+        // try initializing limit offsets for standby tasks for the first time
+<span class="nc bnc" id="L890" title="All 2 branches missed.">        if (!committedOffsets.isEmpty()) {</span>
+<span class="nc" id="L891">            updateLimitOffsetsForStandbyChangelogs(committedOffsets);</span>
+        }
+
+        // add new partitions to the restore consumer and transit them to restoring state
+<span class="nc" id="L895">        addChangelogsToRestoreConsumer(newPartitionsToRestore.stream().map(metadata -&gt; metadata.storeMetadata.changelogPartition())</span>
+<span class="nc" id="L896">            .collect(Collectors.toSet()));</span>
+
+<span class="nc" id="L898">        newPartitionsToRestore.forEach(metadata -&gt; metadata.transitTo(ChangelogState.RESTORING));</span>
+
+        // if it is in the active restoring mode, we immediately pause those standby changelogs
+        // here we just blindly pause all (including the existing and newly added)
+<span class="nc bnc" id="L902" title="All 2 branches missed.">        if (state == ChangelogReaderState.ACTIVE_RESTORING) {</span>
+<span class="nc" id="L903">            pauseChangelogsFromRestoreConsumer(standbyRestoringChangelogs());</span>
+        }
+
+        // prepare newly added partitions of the restore consumer by setting their starting position
+<span class="nc" id="L907">        prepareChangelogs(tasks, newPartitionsToRestore);</span>
+<span class="nc" id="L908">    }</span>
+
+    private void addChangelogsToRestoreConsumer(final Set&lt;TopicPartition&gt; partitions) {
+<span class="nc bnc" id="L911" title="All 2 branches missed.">        if (partitions.isEmpty())</span>
+<span class="nc" id="L912">            return;</span>
+
+<span class="nc" id="L914">        final Set&lt;TopicPartition&gt; assignment = new HashSet&lt;&gt;(restoreConsumer.assignment());</span>
+
+        // the current assignment should not contain any of the new partitions
+<span class="nc bnc" id="L917" title="All 2 branches missed.">        if (assignment.removeAll(partitions)) {</span>
+<span class="nc" id="L918">            throw new IllegalStateException(&quot;The current assignment &quot; + restoreConsumer.assignment() + &quot; &quot; +</span>
+                &quot;already contains some of the new partitions &quot; + partitions);
+        }
+<span class="nc" id="L921">        assignment.addAll(partitions);</span>
+<span class="nc" id="L922">        restoreConsumer.assign(assignment);</span>
+
+<span class="nc" id="L924">        log.debug(&quot;Added partitions {} to the restore consumer, current assignment is {}&quot;, partitions, assignment);</span>
+<span class="nc" id="L925">    }</span>
+
+    private void pauseChangelogsFromRestoreConsumer(final Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L928">        final Set&lt;TopicPartition&gt; assignment = new HashSet&lt;&gt;(restoreConsumer.assignment());</span>
+
+        // the current assignment should contain all the partitions to pause
+<span class="nc bnc" id="L931" title="All 2 branches missed.">        if (!assignment.containsAll(partitions)) {</span>
+<span class="nc" id="L932">            throw new IllegalStateException(&quot;The current assignment &quot; + assignment + &quot; &quot; +</span>
+                &quot;does not contain some of the partitions &quot; + partitions + &quot; for pausing.&quot;);
+        }
+<span class="nc" id="L935">        restoreConsumer.pause(partitions);</span>
+
+<span class="nc" id="L937">        log.debug(&quot;Paused partitions {} from the restore consumer&quot;, partitions);</span>
+<span class="nc" id="L938">    }</span>
+
+    private void removeChangelogsFromRestoreConsumer(final Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc bnc" id="L941" title="All 2 branches missed.">        if (partitions.isEmpty()) {</span>
+<span class="nc" id="L942">            return;</span>
+        }
+
+<span class="nc" id="L945">        final Set&lt;TopicPartition&gt; assignment = new HashSet&lt;&gt;(restoreConsumer.assignment());</span>
+
+        // the current assignment should contain all the partitions to remove
+<span class="nc bnc" id="L948" title="All 2 branches missed.">        if (!assignment.containsAll(partitions)) {</span>
+<span class="nc" id="L949">            throw new IllegalStateException(&quot;The current assignment &quot; + assignment + &quot; &quot; +</span>
+                &quot;does not contain some of the partitions &quot; + partitions + &quot; for removing.&quot;);
+        }
+<span class="nc" id="L952">        assignment.removeAll(partitions);</span>
+<span class="nc" id="L953">        restoreConsumer.assign(assignment);</span>
+<span class="nc" id="L954">    }</span>
+
+    private void resumeChangelogsFromRestoreConsumer(final Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L957">        final Set&lt;TopicPartition&gt; assignment = new HashSet&lt;&gt;(restoreConsumer.assignment());</span>
+
+        // the current assignment should contain all the partitions to resume
+<span class="nc bnc" id="L960" title="All 2 branches missed.">        if (!assignment.containsAll(partitions)) {</span>
+<span class="nc" id="L961">            throw new IllegalStateException(&quot;The current assignment &quot; + assignment + &quot; &quot; +</span>
+                &quot;does not contain some of the partitions &quot; + partitions + &quot; for resuming.&quot;);
+        }
+<span class="nc" id="L964">        restoreConsumer.resume(partitions);</span>
+
+<span class="nc" id="L966">        log.debug(&quot;Resumed partitions {} from the restore consumer&quot;, partitions);</span>
+<span class="nc" id="L967">    }</span>
+
+    private void prepareChangelogs(final Map&lt;TaskId, Task&gt; tasks,
+                                   final Set&lt;ChangelogMetadata&gt; newPartitionsToRestore) {
+        // separate those who do not have the current offset loaded from checkpoint
+<span class="nc" id="L972">        final Set&lt;TopicPartition&gt; newPartitionsWithoutStartOffset = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L974" title="All 2 branches missed.">        for (final ChangelogMetadata changelogMetadata : newPartitionsToRestore) {</span>
+<span class="nc" id="L975">            final StateStoreMetadata storeMetadata = changelogMetadata.storeMetadata;</span>
+<span class="nc" id="L976">            final TopicPartition partition = storeMetadata.changelogPartition();</span>
+<span class="nc" id="L977">            final Long currentOffset = storeMetadata.offset();</span>
+<span class="nc" id="L978">            final Long endOffset = changelogs.get(partition).restoreEndOffset;</span>
+
+<span class="nc bnc" id="L980" title="All 2 branches missed.">            if (currentOffset != null) {</span>
+                // the current offset is the offset of the last record, so we should set the position
+                // as that offset + 1 as the &quot;next&quot; record to fetch; seek is not a blocking call so
+                // there's nothing to capture
+<span class="nc" id="L984">                restoreConsumer.seek(partition, currentOffset + 1);</span>
+
+<span class="nc" id="L986">                log.debug(&quot;Start restoring changelog partition {} from current offset {} to end offset {}.&quot;,</span>
+<span class="nc" id="L987">                    partition, currentOffset, recordEndOffset(endOffset));</span>
+            } else {
+<span class="nc" id="L989">                log.debug(&quot;Start restoring changelog partition {} from the beginning offset to end offset {} &quot; +</span>
+<span class="nc" id="L990">                    &quot;since we cannot find current offset.&quot;, partition, recordEndOffset(endOffset));</span>
+
+<span class="nc" id="L992">                newPartitionsWithoutStartOffset.add(partition);</span>
+            }
+<span class="nc" id="L994">        }</span>
+
+        // optimization: batch all seek-to-beginning offsets in a single request
+        //               seek is not a blocking call so there's nothing to capture
+<span class="nc bnc" id="L998" title="All 2 branches missed.">        if (!newPartitionsWithoutStartOffset.isEmpty()) {</span>
+<span class="nc" id="L999">            restoreConsumer.seekToBeginning(newPartitionsWithoutStartOffset);</span>
+        }
+
+<span class="nc bnc" id="L1002" title="All 2 branches missed.">        for (final ChangelogMetadata changelogMetadata : newPartitionsToRestore) {</span>
+<span class="nc" id="L1003">            final StateStoreMetadata storeMetadata = changelogMetadata.storeMetadata;</span>
+<span class="nc" id="L1004">            final TopicPartition partition = storeMetadata.changelogPartition();</span>
+<span class="nc" id="L1005">            final String storeName = storeMetadata.store().name();</span>
+<span class="nc" id="L1006">            long startOffset = 0L;</span>
+            try {
+<span class="nc" id="L1008">                startOffset = restoreConsumer.position(partition);</span>
+<span class="nc" id="L1009">            } catch (final TimeoutException swallow) {</span>
+                // if we cannot find the starting position at the beginning, just use the default 0L
+<span class="nc" id="L1011">            } catch (final KafkaException e) {</span>
+                // this also includes InvalidOffsetException, which should not happen under normal
+                // execution, hence it is also okay to wrap it as fatal StreamsException
+<span class="nc" id="L1014">                throw new StreamsException(&quot;Restore consumer get unexpected error trying to get the position &quot; +</span>
+                        &quot; of &quot; + partition, e);
+<span class="nc" id="L1016">            }</span>
+<span class="nc bnc" id="L1017" title="All 2 branches missed.">            if (changelogMetadata.stateManager.taskType() == Task.TaskType.ACTIVE) {</span>
+                try {
+<span class="nc" id="L1019">                    stateRestoreListener.onRestoreStart(partition, storeName, startOffset, changelogMetadata.restoreEndOffset);</span>
+<span class="nc" id="L1020">                } catch (final Exception e) {</span>
+<span class="nc" id="L1021">                    throw new StreamsException(&quot;State restore listener failed on restore start&quot;, e);</span>
+<span class="nc" id="L1022">                }</span>
+
+<span class="nc" id="L1024">                final TaskId taskId = changelogMetadata.stateManager.taskId();</span>
+<span class="nc" id="L1025">                final Task task = tasks.get(taskId);</span>
+                // if the log is truncated between when we get the log end offset and when we get the
+                // consumer position, then it's possible that the difference become negative and there's actually
+                // no records to restore; in this case we just initialize the sensor to zero
+<span class="nc" id="L1029">                final long recordsToRestore = Math.max(changelogMetadata.restoreEndOffset - startOffset, 0L);</span>
+<span class="nc" id="L1030">                task.recordRestoration(time, recordsToRestore, true);</span>
+<span class="nc" id="L1031">                changelogMetadata.restoreStartTimeNs = time.nanoseconds();</span>
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">            }  else if (changelogMetadata.stateManager.taskType() == TaskType.STANDBY) {</span>
+                try {
+<span class="nc" id="L1034">                    standbyUpdateListener.onUpdateStart(partition, storeName, startOffset);</span>
+<span class="nc" id="L1035">                } catch (final Exception e) {</span>
+<span class="nc" id="L1036">                    throw new StreamsException(&quot;Standby updater listener failed on update start&quot;);</span>
+<span class="nc" id="L1037">                }</span>
+            }
+<span class="nc" id="L1039">        }</span>
+<span class="nc" id="L1040">    }</span>
+
+    @Override
+    public void unregister(final Collection&lt;TopicPartition&gt; revokedChangelogs) {
+<span class="nc" id="L1044">        unregister(revokedChangelogs, StandbyUpdateListener.SuspendReason.MIGRATED);</span>
+<span class="nc" id="L1045">    }</span>
+
+    @Override
+    public void unregister(final Collection&lt;TopicPartition&gt; revokedChangelogs,
+                           final StandbyUpdateListener.SuspendReason reason) {
+        // Only changelogs that are initialized have been added to the restore consumer's assignment
+<span class="nc" id="L1051">        final List&lt;TopicPartition&gt; revokedInitializedChangelogs = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L1053" title="All 2 branches missed.">        for (final TopicPartition partition : revokedChangelogs) {</span>
+<span class="nc" id="L1054">            final ChangelogMetadata changelogMetadata = changelogs.remove(partition);</span>
+<span class="nc bnc" id="L1055" title="All 2 branches missed.">            if (changelogMetadata != null) {</span>
+                // if the changelog is still in REGISTERED, it means it has not initialized and started
+                // restoring yet, and hence we should not try to remove the changelog partition
+<span class="nc bnc" id="L1058" title="All 2 branches missed.">                if (!changelogMetadata.state().equals(ChangelogState.REGISTERED)) {</span>
+<span class="nc" id="L1059">                    revokedInitializedChangelogs.add(partition);</span>
+
+                    // if the changelog is not in RESTORING, it means
+                    // the corresponding onRestoreStart was not called; in this case
+                    // we should not call onRestoreSuspended either
+<span class="nc bnc" id="L1064" title="All 2 branches missed.">                    if (changelogMetadata.state().equals(ChangelogState.RESTORING)) {</span>
+<span class="nc" id="L1065">                        final String storeName = changelogMetadata.storeMetadata.store().name();</span>
+<span class="nc bnc" id="L1066" title="All 2 branches missed.">                        if (changelogMetadata.stateManager.taskType() == Task.TaskType.ACTIVE) {</span>
+                            try {
+<span class="nc" id="L1068">                                stateRestoreListener.onRestoreSuspended(partition, storeName, changelogMetadata.totalRestored);</span>
+<span class="nc" id="L1069">                            } catch (final Exception e) {</span>
+<span class="nc" id="L1070">                                throw new StreamsException(&quot;State restore listener failed on restore paused&quot;, e);</span>
+<span class="nc" id="L1071">                            }</span>
+<span class="nc bnc" id="L1072" title="All 2 branches missed.">                        } else if (changelogMetadata.stateManager.taskType() == TaskType.STANDBY) {</span>
+<span class="nc" id="L1073">                            final StateStoreMetadata storeMetadata = changelogMetadata.stateManager.storeMetadata(partition);</span>
+                            // endOffset and storeOffset may be unknown at this point
+<span class="nc bnc" id="L1075" title="All 2 branches missed.">                            final long storeOffset = storeMetadata.offset() != null ? storeMetadata.offset() : -1;</span>
+<span class="nc bnc" id="L1076" title="All 2 branches missed.">                            final long endOffset = storeMetadata.endOffset() != null ? storeMetadata.endOffset() : -1;</span>
+                            try {
+<span class="nc" id="L1078">                                standbyUpdateListener.onUpdateSuspended(partition, storeName, storeOffset, endOffset, reason);</span>
+<span class="nc" id="L1079">                            } catch (final Exception e) {</span>
+<span class="nc" id="L1080">                                throw new StreamsException(&quot;Standby updater listener failed on update suspended&quot;, e);</span>
+<span class="nc" id="L1081">                            }</span>
+                        }
+                    }
+                }
+
+<span class="nc" id="L1086">                changelogMetadata.clear();</span>
+            } else {
+<span class="nc" id="L1088">                log.debug(&quot;Changelog partition {} could not be found,&quot; +</span>
+                    &quot; it could be already cleaned up during the handling&quot; +
+                    &quot; of task corruption and never restore again&quot;, partition);
+            }
+<span class="nc" id="L1092">        }</span>
+
+<span class="nc" id="L1094">        removeChangelogsFromRestoreConsumer(revokedInitializedChangelogs);</span>
+
+<span class="nc bnc" id="L1096" title="All 2 branches missed.">        if (changelogs.isEmpty()) {</span>
+<span class="nc" id="L1097">            state = ChangelogReaderState.ACTIVE_RESTORING;</span>
+        }
+<span class="nc" id="L1099">    }</span>
+
+    @Override
+    public void clear() {
+<span class="nc bnc" id="L1103" title="All 2 branches missed.">        for (final ChangelogMetadata changelogMetadata : changelogs.values()) {</span>
+<span class="nc" id="L1104">            changelogMetadata.clear();</span>
+<span class="nc" id="L1105">        }</span>
+<span class="nc" id="L1106">        changelogs.clear();</span>
+
+<span class="nc" id="L1108">        state = ChangelogReaderState.ACTIVE_RESTORING;</span>
+
+        try {
+<span class="nc" id="L1111">            restoreConsumer.unsubscribe();</span>
+<span class="nc" id="L1112">        } catch (final KafkaException e) {</span>
+<span class="nc" id="L1113">            throw new StreamsException(&quot;Restore consumer get unexpected error unsubscribing&quot;, e);</span>
+<span class="nc" id="L1114">        }</span>
+<span class="nc" id="L1115">    }</span>
+
+    @Override
+    public boolean isEmpty() {
+<span class="nc" id="L1119">        return changelogs.isEmpty();</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L1124">        return &quot;StoreChangelogReader: &quot; + changelogs + &quot;\n&quot;;</span>
+    }
+
+    // for testing only
+    ChangelogMetadata changelogMetadata(final TopicPartition partition) {
+<span class="nc" id="L1129">        return changelogs.get(partition);</span>
+    }
+
+    ChangelogReaderState state() {
+<span class="nc" id="L1133">        return state;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

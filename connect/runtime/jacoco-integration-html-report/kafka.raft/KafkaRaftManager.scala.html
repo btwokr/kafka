@@ -1,0 +1,264 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaRaftManager.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">kafka.raft</a> &gt; <span class="el_source">KafkaRaftManager.scala</span></div><h1>KafkaRaftManager.scala</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package kafka.raft
+
+import java.io.File
+import java.net.InetSocketAddress
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.util.{OptionalInt, Collection =&gt; JCollection, Map =&gt; JMap}
+import java.util.concurrent.CompletableFuture
+import kafka.server.KafkaConfig
+import kafka.utils.Logging
+import org.apache.kafka.clients.{ApiVersions, ManualMetadataUpdater, MetadataRecoveryStrategy, NetworkClient}
+import org.apache.kafka.common.KafkaException
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.Uuid
+import org.apache.kafka.common.metrics.Metrics
+import org.apache.kafka.common.network.{ChannelBuilders, ListenerName, NetworkReceive, Selectable, Selector}
+import org.apache.kafka.common.protocol.ApiMessage
+import org.apache.kafka.common.requests.RequestContext
+import org.apache.kafka.common.requests.RequestHeader
+import org.apache.kafka.common.security.JaasContext
+import org.apache.kafka.common.security.auth.SecurityProtocol
+import org.apache.kafka.common.utils.{LogContext, Time, Utils}
+import org.apache.kafka.raft.internals.KafkaRaftLog
+import org.apache.kafka.raft.{Endpoints, ExternalKRaftMetrics, FileQuorumStateStore, KafkaNetworkChannel, KafkaRaftClient, KafkaRaftClientDriver, MetadataLogConfig, QuorumConfig, RaftLog, RaftManager, TimingWheelExpirationService}
+import org.apache.kafka.server.ProcessRole
+import org.apache.kafka.server.common.Feature
+import org.apache.kafka.server.common.serialization.RecordSerde
+import org.apache.kafka.server.util.{FileLock, KafkaScheduler}
+import org.apache.kafka.server.fault.FaultHandler
+import org.apache.kafka.server.util.timer.SystemTimer
+import org.apache.kafka.storage.internals.log.{LogManager, UnifiedLog}
+
+import scala.jdk.CollectionConverters._
+
+<span class="fc" id="L51">object KafkaRaftManager {</span>
+  private def createLogDirectory(logDir: File, logDirName: String): File = {
+<span class="fc" id="L53">    val logDirPath = logDir.getAbsolutePath</span>
+<span class="fc" id="L54">    val dir = new File(logDirPath, logDirName)</span>
+<span class="fc" id="L55">    Files.createDirectories(dir.toPath)</span>
+<span class="fc" id="L56">    dir</span>
+  }
+
+  private def lockDataDir(dataDir: File): FileLock = {
+<span class="nc" id="L60">    val lock = new FileLock(new File(dataDir, LogManager.LOCK_FILE_NAME))</span>
+
+<span class="nc bnc" id="L62" title="All 2 branches missed.">    if (!lock.tryLock()) {</span>
+<span class="nc" id="L63">      throw new KafkaException(</span>
+<span class="nc" id="L64">        s&quot;Failed to acquire lock on file .lock in ${lock.file.getParent}. A Kafka instance in another process or &quot; +</span>
+        &quot;thread is using this directory.&quot;
+      )
+    }
+
+<span class="nc" id="L69">    lock</span>
+  }
+
+  /**
+   * Test if the configured metadata log dir is one of the data log dirs.
+   */
+  private def hasDifferentLogDir(config: KafkaConfig): Boolean = {
+<span class="fc" id="L76">    !config</span>
+<span class="fc" id="L77">      .logDirs</span>
+      .asScala
+<span class="fc" id="L79">      .map(Paths.get(_).toAbsolutePath)</span>
+<span class="pc bpc" id="L80" title="1 of 2 branches missed.">      .contains(Paths.get(config.metadataLogDir).toAbsolutePath)</span>
+  }
+}
+
+<span class="pc bpc" id="L84" title="1 of 4 branches missed.">class KafkaRaftManager[T](</span>
+<span class="fc" id="L85">  clusterId: String,</span>
+<span class="fc" id="L86">  config: KafkaConfig,</span>
+<span class="fc" id="L87">  metadataLogDirUuid: Uuid,</span>
+<span class="fc" id="L88">  serde: RecordSerde[T],</span>
+<span class="fc" id="L89">  topicPartition: TopicPartition,</span>
+<span class="fc" id="L90">  topicId: Uuid,</span>
+<span class="fc" id="L91">  time: Time,</span>
+<span class="fc" id="L92">  metrics: Metrics,</span>
+<span class="fc" id="L93">  externalKRaftMetrics: ExternalKRaftMetrics,</span>
+  threadNamePrefixOpt: Option[String],
+<span class="fc" id="L95">  val controllerQuorumVotersFuture: CompletableFuture[JMap[Integer, InetSocketAddress]],</span>
+<span class="fc" id="L96">  bootstrapServers: JCollection[InetSocketAddress],</span>
+<span class="fc" id="L97">  localListeners: Endpoints,</span>
+  fatalFaultHandler: FaultHandler
+<span class="fc" id="L99">) extends RaftManager[T] with Logging {</span>
+
+<span class="fc" id="L101">  val apiVersions = new ApiVersions()</span>
+<span class="fc" id="L102">  private val raftConfig = new QuorumConfig(config)</span>
+<span class="pc" id="L103">  private val threadNamePrefix = threadNamePrefixOpt.getOrElse(&quot;kafka-raft&quot;)</span>
+<span class="fc" id="L104">  private val logContext = new LogContext(s&quot;[RaftManager id=${config.nodeId}] &quot;)</span>
+<span class="fc" id="L105">  this.logIdent = logContext.logPrefix()</span>
+
+<span class="fc" id="L107">  private val scheduler = new KafkaScheduler(1, true, threadNamePrefix + &quot;-scheduler&quot;)</span>
+<span class="fc" id="L108">  scheduler.startup()</span>
+
+<span class="fc" id="L110">  private val dataDir = createDataDir()</span>
+
+<span class="fc" id="L112">  private val dataDirLock = {</span>
+    // Acquire the log dir lock if the metadata log dir is different from the log dirs
+<span class="fc" id="L114">    val differentMetadataLogDir = KafkaRaftManager.hasDifferentLogDir(config)</span>
+
+    // Or this node is only a controller
+<span class="pc bpc" id="L117" title="4 of 6 branches missed.">    val isOnlyController = config.processRoles == Set(ProcessRole.ControllerRole)</span>
+
+<span class="pc bpc" id="L119" title="2 of 4 branches missed.">    if (differentMetadataLogDir || isOnlyController) {</span>
+<span class="nc" id="L120">      Some(KafkaRaftManager.lockDataDir(new File(config.metadataLogDir)))</span>
+    } else {
+<span class="fc" id="L122">      None</span>
+    }
+  }
+
+<span class="fc" id="L126">  override val raftLog: RaftLog = buildMetadataLog()</span>
+<span class="fc" id="L127">  private val netChannel = buildNetworkChannel()</span>
+<span class="fc" id="L128">  private val expirationTimer = new SystemTimer(&quot;raft-expiration-executor&quot;)</span>
+<span class="fc" id="L129">  private val expirationService = new TimingWheelExpirationService(expirationTimer)</span>
+<span class="fc" id="L130">  override val client: KafkaRaftClient[T] = buildRaftClient()</span>
+<span class="fc" id="L131">  private val clientDriver = new KafkaRaftClientDriver[T](client, threadNamePrefix, fatalFaultHandler, logContext)</span>
+
+  def startup(): Unit = {
+<span class="fc" id="L134">    client.initialize(</span>
+<span class="fc" id="L135">      controllerQuorumVotersFuture.get(),</span>
+<span class="fc" id="L136">      new FileQuorumStateStore(new File(dataDir, FileQuorumStateStore.DEFAULT_FILE_NAME)),</span>
+<span class="fc" id="L137">      metrics,</span>
+<span class="fc" id="L138">      externalKRaftMetrics</span>
+    )
+<span class="fc" id="L140">    netChannel.start()</span>
+<span class="fc" id="L141">    clientDriver.start()</span>
+  }
+
+  def shutdown(): Unit = {
+<span class="fc" id="L145">    Utils.swallow(this.logger.underlying, () =&gt; expirationService.shutdown())</span>
+<span class="fc" id="L146">    Utils.closeQuietly(expirationTimer, &quot;expiration timer&quot;)</span>
+<span class="fc" id="L147">    Utils.swallow(this.logger.underlying, () =&gt; clientDriver.shutdown())</span>
+<span class="fc" id="L148">    Utils.swallow(this.logger.underlying, () =&gt; scheduler.shutdown())</span>
+<span class="fc" id="L149">    Utils.closeQuietly(netChannel, &quot;net channel&quot;)</span>
+<span class="fc" id="L150">    Utils.closeQuietly(raftLog, &quot;raft log&quot;)</span>
+<span class="pc" id="L151">    Utils.swallow(this.logger.underlying, () =&gt; dataDirLock.foreach(_.destroy()))</span>
+  }
+
+  override def handleRequest(
+    context: RequestContext,
+    header: RequestHeader,
+    request: ApiMessage,
+    createdTimeMs: Long
+  ): CompletableFuture[ApiMessage] = {
+<span class="nc" id="L160">    clientDriver.handleRequest(context, header, request, createdTimeMs)</span>
+  }
+
+  private def buildRaftClient(): KafkaRaftClient[T] = {
+<span class="fc" id="L164">    new KafkaRaftClient(</span>
+<span class="fc" id="L165">      OptionalInt.of(config.nodeId),</span>
+<span class="fc" id="L166">      metadataLogDirUuid,</span>
+<span class="fc" id="L167">      recordSerde,</span>
+<span class="fc" id="L168">      netChannel,</span>
+<span class="fc" id="L169">      raftLog,</span>
+<span class="fc" id="L170">      time,</span>
+<span class="fc" id="L171">      expirationService,</span>
+<span class="fc" id="L172">      logContext,</span>
+      // Controllers should always flush the log on replication because they may become voters
+<span class="fc" id="L174">      config.processRoles.contains(ProcessRole.ControllerRole),</span>
+<span class="fc" id="L175">      clusterId,</span>
+<span class="fc" id="L176">      bootstrapServers,</span>
+<span class="fc" id="L177">      localListeners,</span>
+<span class="fc" id="L178">      Feature.KRAFT_VERSION.supportedVersionRange(),</span>
+<span class="fc" id="L179">      raftConfig</span>
+    )
+  }
+
+  private def buildNetworkChannel(): KafkaNetworkChannel = {
+<span class="pc bpc" id="L184" title="1 of 2 branches missed.">    val (listenerName, netClient) = buildNetworkClient()</span>
+<span class="fc" id="L185">    new KafkaNetworkChannel(time, listenerName, netClient, config.quorumConfig.requestTimeoutMs, threadNamePrefix)</span>
+  }
+
+  private def createDataDir(): File = {
+<span class="fc" id="L189">    val logDirName = UnifiedLog.logDirName(topicPartition)</span>
+<span class="fc" id="L190">    KafkaRaftManager.createLogDirectory(new File(config.metadataLogDir), logDirName)</span>
+  }
+
+  private def buildMetadataLog(): KafkaRaftLog = {
+    KafkaRaftLog.createLog(
+<span class="fc" id="L195">      topicPartition,</span>
+<span class="fc" id="L196">      topicId,</span>
+<span class="fc" id="L197">      dataDir,</span>
+<span class="fc" id="L198">      time,</span>
+<span class="fc" id="L199">      scheduler,</span>
+<span class="fc" id="L200">      new MetadataLogConfig(config),</span>
+<span class="fc" id="L201">      config.nodeId</span>
+    )
+  }
+
+  private def buildNetworkClient(): (ListenerName, NetworkClient) = {
+<span class="fc" id="L206">    val controllerListenerName = new ListenerName(config.controllerListenerNames.get(0))</span>
+<span class="fc" id="L207">    val controllerSecurityProtocol = Option(config.effectiveListenerSecurityProtocolMap.get(controllerListenerName))</span>
+<span class="pc" id="L208">      .getOrElse(SecurityProtocol.forName(controllerListenerName.value()))</span>
+    val channelBuilder = ChannelBuilders.clientChannelBuilder(
+      controllerSecurityProtocol,
+<span class="fc" id="L211">      JaasContext.Type.SERVER,</span>
+<span class="fc" id="L212">      config,</span>
+<span class="fc" id="L213">      controllerListenerName,</span>
+<span class="fc" id="L214">      config.saslMechanismControllerProtocol,</span>
+<span class="fc" id="L215">      time,</span>
+<span class="fc" id="L216">      logContext</span>
+    )
+
+<span class="fc" id="L219">    val metricGroupPrefix = &quot;raft-channel&quot;</span>
+<span class="fc" id="L220">    val collectPerConnectionMetrics = false</span>
+
+<span class="fc" id="L222">    val selector = new Selector(</span>
+<span class="fc" id="L223">      NetworkReceive.UNLIMITED,</span>
+<span class="fc" id="L224">      config.connectionsMaxIdleMs,</span>
+<span class="fc" id="L225">      metrics,</span>
+<span class="fc" id="L226">      time,</span>
+<span class="fc" id="L227">      metricGroupPrefix,</span>
+<span class="fc" id="L228">      Map.empty[String, String].asJava,</span>
+<span class="fc" id="L229">      collectPerConnectionMetrics,</span>
+<span class="fc" id="L230">      channelBuilder,</span>
+<span class="fc" id="L231">      logContext</span>
+    )
+
+<span class="fc" id="L234">    val clientId = s&quot;raft-client-${config.nodeId}&quot;</span>
+<span class="fc" id="L235">    val maxInflightRequestsPerConnection = 1</span>
+<span class="fc" id="L236">    val reconnectBackoffMs = 50</span>
+<span class="fc" id="L237">    val reconnectBackoffMsMs = 500</span>
+<span class="fc" id="L238">    val discoverBrokerVersions = true</span>
+
+<span class="fc" id="L240">    val networkClient = new NetworkClient(</span>
+<span class="fc" id="L241">      selector,</span>
+<span class="fc" id="L242">      new ManualMetadataUpdater(),</span>
+<span class="fc" id="L243">      clientId,</span>
+<span class="fc" id="L244">      maxInflightRequestsPerConnection,</span>
+<span class="fc" id="L245">      reconnectBackoffMs,</span>
+<span class="fc" id="L246">      reconnectBackoffMsMs,</span>
+<span class="fc" id="L247">      Selectable.USE_DEFAULT_BUFFER_SIZE,</span>
+<span class="fc" id="L248">      config.socketReceiveBufferBytes,</span>
+<span class="fc" id="L249">      config.quorumConfig.requestTimeoutMs,</span>
+<span class="fc" id="L250">      config.connectionSetupTimeoutMs,</span>
+<span class="fc" id="L251">      config.connectionSetupTimeoutMaxMs,</span>
+<span class="fc" id="L252">      time,</span>
+<span class="fc" id="L253">      discoverBrokerVersions,</span>
+<span class="fc" id="L254">      apiVersions,</span>
+<span class="fc" id="L255">      logContext,</span>
+<span class="fc" id="L256">      MetadataRecoveryStrategy.NONE</span>
+    )
+
+<span class="fc" id="L259">    (controllerListenerName, networkClient)</span>
+  }
+
+<span class="fc" id="L262">  override def recordSerde: RecordSerde[T] = serde</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

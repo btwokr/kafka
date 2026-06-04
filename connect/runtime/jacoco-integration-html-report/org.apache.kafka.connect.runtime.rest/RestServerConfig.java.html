@@ -1,0 +1,430 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RestServerConfig.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.rest</a> &gt; <span class="el_source">RestServerConfig.java</span></div><h1>RestServerConfig.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime.rest;
+
+import org.apache.kafka.common.config.AbstractConfig;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.config.SslClientAuth;
+import org.apache.kafka.common.config.internals.BrokerSecurityConfigs;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.runtime.WorkerConfig;
+
+import org.eclipse.jetty.util.StringUtil;
+
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+
+import static org.apache.kafka.common.config.ConfigDef.ValidString.in;
+
+/**
+ * Defines the configuration surface for a {@link RestServer} instance, with support for both
+ * {@link #forInternal(Map) internal-only} and {@link #forPublic(Integer, Map) user-facing}
+ * servers. An internal-only server will expose only the endpoints and listeners necessary for
+ * intra-cluster communication; these include the task-write and zombie-fencing endpoints. A
+ * user-facing server will expose these endpoints and, in addition, all endpoints that are part of
+ * the public REST API for Kafka Connect; these include the connector creation, connector
+ * status, configuration validation, and logging endpoints. In addition, a user-facing server will
+ * instantiate any user-configured
+ * {@link RestServerConfig#REST_EXTENSION_CLASSES_CONFIG REST extensions}.
+ */
+public abstract class RestServerConfig extends AbstractConfig {
+
+    public static final String LISTENERS_CONFIG = &quot;listeners&quot;;
+    private static final String LISTENERS_DOC
+            = &quot;List of comma-separated URIs the REST API will listen on. The supported protocols are HTTP and HTTPS.\n&quot; +
+            &quot; Specify hostname as 0.0.0.0 to bind to all interfaces.\n&quot; +
+            &quot; Leave hostname empty to bind to default interface.\n&quot; +
+            &quot; Examples of legal listener lists: HTTP://myhost:8083,HTTPS://myhost:8084&quot;;
+    // Visible for testing
+<span class="fc" id="L56">    static final List&lt;String&gt; LISTENERS_DEFAULT = List.of(&quot;http://:8083&quot;);</span>
+
+    public static final String REST_ADVERTISED_HOST_NAME_CONFIG = &quot;rest.advertised.host.name&quot;;
+    private static final String REST_ADVERTISED_HOST_NAME_DOC
+            = &quot;If this is set, this is the hostname that will be given out to other workers to connect to.&quot;;
+
+    public static final String REST_ADVERTISED_PORT_CONFIG = &quot;rest.advertised.port&quot;;
+    private static final String REST_ADVERTISED_PORT_DOC
+            = &quot;If this is set, this is the port that will be given out to other workers to connect to.&quot;;
+
+    public static final String REST_ADVERTISED_LISTENER_CONFIG = &quot;rest.advertised.listener&quot;;
+    private static final String REST_ADVERTISED_LISTENER_DOC
+            = &quot;Sets the advertised listener (HTTP or HTTPS) which will be given to other workers to use.&quot;;
+
+    public static final String ACCESS_CONTROL_ALLOW_ORIGIN_CONFIG = &quot;access.control.allow.origin&quot;;
+    private static final String ACCESS_CONTROL_ALLOW_ORIGIN_DOC =
+            &quot;Value to set the Access-Control-Allow-Origin header to for REST API requests.&quot; +
+                    &quot;To enable cross origin access, set this to the domain of the application that should be permitted&quot; +
+                    &quot; to access the API, or '*' to allow access from any domain. The default value only allows access&quot; +
+                    &quot; from the domain of the REST API.&quot;;
+    protected static final String ACCESS_CONTROL_ALLOW_ORIGIN_DEFAULT = &quot;&quot;;
+
+    public static final String ACCESS_CONTROL_ALLOW_METHODS_CONFIG = &quot;access.control.allow.methods&quot;;
+    private static final String ACCESS_CONTROL_ALLOW_METHODS_DOC =
+            &quot;Sets the methods supported for cross origin requests by setting the Access-Control-Allow-Methods header. &quot;
+                    + &quot;The default value of the Access-Control-Allow-Methods header allows cross origin requests for GET, POST and HEAD.&quot;;
+    private static final String ACCESS_CONTROL_ALLOW_METHODS_DEFAULT = &quot;&quot;;
+
+    public static final String ADMIN_LISTENERS_CONFIG = &quot;admin.listeners&quot;;
+    private static final String ADMIN_LISTENERS_DOC = &quot;List of comma-separated URIs the Admin REST API will listen on.&quot; +
+            &quot; The supported protocols are HTTP and HTTPS.&quot; +
+            &quot; An empty or blank string will disable this feature.&quot; +
+            &quot; The default behavior is to use the regular listener (specified by the 'listeners' property).&quot; +
+            &quot; A comma-separated list of valid URLs, e.g., http://localhost:8080,https://localhost:8443.&quot;;
+    public static final String ADMIN_LISTENERS_HTTPS_CONFIGS_PREFIX = &quot;admin.listeners.https.&quot;;
+
+    public static final String REST_EXTENSION_CLASSES_CONFIG = &quot;rest.extension.classes&quot;;
+    private static final String REST_EXTENSION_CLASSES_DOC =
+            &quot;Comma-separated names of &lt;code&gt;ConnectRestExtension&lt;/code&gt; classes, loaded and called &quot;
+                    + &quot;in the order specified. Implementing the interface  &quot;
+                    + &quot;&lt;code&gt;ConnectRestExtension&lt;/code&gt; allows you to inject into Connect's REST API user defined resources like filters. &quot;
+                    + &quot;Typically used to add custom capability like logging, security, etc. &quot;;
+
+    // Visible for testing
+    static final String RESPONSE_HTTP_HEADERS_CONFIG = &quot;response.http.headers.config&quot;;
+    // Visible for testing
+    static final String RESPONSE_HTTP_HEADERS_DOC = &quot;Rules for REST API HTTP response headers&quot;;
+    // Visible for testing
+    static final String RESPONSE_HTTP_HEADERS_DEFAULT = &quot;&quot;;
+<span class="fc" id="L105">    private static final Collection&lt;String&gt; HEADER_ACTIONS = List.of(&quot;set&quot;, &quot;add&quot;, &quot;setDate&quot;, &quot;addDate&quot;);</span>
+
+
+    /**
+     * @return the listeners to use for this server, or empty if no admin endpoints should be exposed,
+     * or null if the admin endpoints should be exposed on the {@link #listeners() regular listeners} for
+     * this server
+     */
+    public abstract List&lt;String&gt; adminListeners();
+
+    /**
+     * @return a list of {@link #REST_EXTENSION_CLASSES_CONFIG REST extension} classes
+     * to instantiate and use with the server
+     */
+    public abstract List&lt;String&gt; restExtensions();
+
+    /**
+     * @return whether {@link WorkerConfig#TOPIC_TRACKING_ENABLE_CONFIG topic tracking}
+     * is enabled on this worker
+     */
+    public abstract boolean topicTrackingEnabled();
+
+    /**
+     * @return whether {@link WorkerConfig#TOPIC_TRACKING_ALLOW_RESET_CONFIG topic tracking resets}
+     * are enabled on this worker
+     */
+    public abstract boolean topicTrackingResetEnabled();
+
+    /**
+     * Add the properties related to a user-facing server to the given {@link ConfigDef}.
+     * &lt;p&gt;
+     * This automatically adds the properties for intra-cluster communication; it is not necessary to
+     * invoke both {@link #addInternalConfig(ConfigDef)} and this method on the same {@link ConfigDef}.
+     * @param configDef the {@link ConfigDef} to add the properties to; may not be null
+     */
+    public static void addPublicConfig(ConfigDef configDef) {
+<span class="fc" id="L141">        addInternalConfig(configDef);</span>
+<span class="fc" id="L142">        configDef</span>
+<span class="fc" id="L143">                .define(REST_EXTENSION_CLASSES_CONFIG,</span>
+                        ConfigDef.Type.LIST,
+<span class="fc" id="L145">                        List.of(),</span>
+<span class="fc" id="L146">                        ConfigDef.ValidList.anyNonDuplicateValues(true, false),</span>
+                        ConfigDef.Importance.LOW, REST_EXTENSION_CLASSES_DOC)
+<span class="fc" id="L148">                .define(ADMIN_LISTENERS_CONFIG,</span>
+                        ConfigDef.Type.LIST,
+                        null,
+<span class="fc" id="L151">                        ConfigDef.ValidList.anyNonDuplicateValues(true, true),</span>
+                        ConfigDef.Importance.LOW,
+                        ADMIN_LISTENERS_DOC);
+<span class="fc" id="L154">    }</span>
+
+    /**
+     * Add the properties related to an internal-only server to the given {@link ConfigDef}.
+     * @param configDef the {@link ConfigDef} to add the properties to; may not be null
+     */
+    public static void addInternalConfig(ConfigDef configDef) {
+<span class="fc" id="L161">        configDef</span>
+<span class="fc" id="L162">                .define(</span>
+                        LISTENERS_CONFIG,
+                        ConfigDef.Type.LIST,
+                        LISTENERS_DEFAULT,
+                        new ListenersValidator(),
+                        ConfigDef.Importance.LOW,
+                        LISTENERS_DOC
+<span class="fc" id="L169">                ).define(</span>
+                        REST_ADVERTISED_HOST_NAME_CONFIG,
+                        ConfigDef.Type.STRING,
+                        null,
+                        ConfigDef.Importance.LOW,
+                        REST_ADVERTISED_HOST_NAME_DOC
+<span class="fc" id="L175">                ).define(</span>
+                        REST_ADVERTISED_PORT_CONFIG,
+                        ConfigDef.Type.INT,
+                        null,
+                        ConfigDef.Importance.LOW,
+                        REST_ADVERTISED_PORT_DOC
+<span class="fc" id="L181">                ).define(</span>
+                        REST_ADVERTISED_LISTENER_CONFIG,
+                        ConfigDef.Type.STRING,
+                        null,
+                        ConfigDef.Importance.LOW,
+                        REST_ADVERTISED_LISTENER_DOC
+<span class="fc" id="L187">                ).define(</span>
+                        ACCESS_CONTROL_ALLOW_ORIGIN_CONFIG,
+                        ConfigDef.Type.STRING,
+                        ACCESS_CONTROL_ALLOW_ORIGIN_DEFAULT,
+                        ConfigDef.Importance.LOW,
+                        ACCESS_CONTROL_ALLOW_ORIGIN_DOC
+<span class="fc" id="L193">                ).define(</span>
+                        ACCESS_CONTROL_ALLOW_METHODS_CONFIG,
+                        ConfigDef.Type.STRING,
+                        ACCESS_CONTROL_ALLOW_METHODS_DEFAULT,
+                        ConfigDef.Importance.LOW,
+                        ACCESS_CONTROL_ALLOW_METHODS_DOC
+<span class="fc" id="L199">                ).define(</span>
+                        RESPONSE_HTTP_HEADERS_CONFIG,
+                        ConfigDef.Type.STRING,
+                        RESPONSE_HTTP_HEADERS_DEFAULT,
+                        new ResponseHttpHeadersValidator(),
+                        ConfigDef.Importance.LOW,
+                        RESPONSE_HTTP_HEADERS_DOC
+<span class="fc" id="L206">                ).define(</span>
+                        BrokerSecurityConfigs.SSL_CLIENT_AUTH_CONFIG,
+                        ConfigDef.Type.STRING,
+                        BrokerSecurityConfigs.SSL_CLIENT_AUTH_DEFAULT,
+<span class="fc" id="L210">                        in(Utils.enumOptions(SslClientAuth.class)),</span>
+                        ConfigDef.Importance.LOW,
+                        BrokerSecurityConfigs.SSL_CLIENT_AUTH_DOC);
+<span class="fc" id="L213">    }</span>
+
+    public static RestServerConfig forPublic(Integer rebalanceTimeoutMs, Map&lt;?, ?&gt; props) {
+<span class="fc" id="L216">        return new PublicConfig(rebalanceTimeoutMs, props);</span>
+    }
+
+    public static RestServerConfig forInternal(Map&lt;?, ?&gt; props) {
+<span class="nc" id="L220">        return new InternalConfig(props);</span>
+    }
+
+    public List&lt;String&gt; listeners() {
+<span class="fc" id="L224">        return getList(LISTENERS_CONFIG);</span>
+    }
+
+    public String rawListeners() {
+<span class="fc" id="L228">        return (String) originals().get(LISTENERS_CONFIG);</span>
+    }
+
+    public String allowedOrigins() {
+<span class="fc" id="L232">        return getString(ACCESS_CONTROL_ALLOW_ORIGIN_CONFIG);</span>
+    }
+
+    public String allowedMethods() {
+<span class="nc" id="L236">        return getString(ACCESS_CONTROL_ALLOW_METHODS_CONFIG);</span>
+    }
+
+    public String responseHeaders() {
+<span class="fc" id="L240">        return getString(RESPONSE_HTTP_HEADERS_CONFIG);</span>
+    }
+
+    public String advertisedListener() {
+<span class="fc" id="L244">        return getString(RestServerConfig.REST_ADVERTISED_LISTENER_CONFIG);</span>
+    }
+
+    public String advertisedHostName() {
+<span class="fc" id="L248">        return getString(REST_ADVERTISED_HOST_NAME_CONFIG);</span>
+    }
+
+    public Integer advertisedPort() {
+<span class="fc" id="L252">        return getInt(REST_ADVERTISED_PORT_CONFIG);</span>
+    }
+
+    public Integer rebalanceTimeoutMs() {
+<span class="nc" id="L256">        return null;</span>
+    }
+
+    protected RestServerConfig(ConfigDef configDef, Map&lt;?, ?&gt; props) {
+<span class="fc" id="L260">        super(configDef, props, Utils.castToStringObjectMap(props), true);</span>
+<span class="fc" id="L261">    }</span>
+
+    // Visible for testing
+    static void validateHttpResponseHeaderConfig(String config) {
+        try {
+            // validate format
+<span class="nc" id="L267">            String[] configTokens = config.trim().split(&quot;\\s+&quot;, 2);</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">            if (configTokens.length != 2) {</span>
+<span class="nc" id="L269">                throw new ConfigException(String.format(&quot;Invalid format of header config '%s'. &quot;</span>
+                        + &quot;Expected: '[action] [header name]:[header value]'&quot;, config));
+            }
+
+            // validate action
+<span class="nc" id="L274">            String method = configTokens[0].trim();</span>
+<span class="nc" id="L275">            validateHeaderConfigAction(method);</span>
+
+            // validate header name and header value pair
+<span class="nc" id="L278">            String header = configTokens[1];</span>
+<span class="nc" id="L279">            String[] headerTokens = header.trim().split(&quot;:&quot;);</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">            if (headerTokens.length != 2) {</span>
+<span class="nc" id="L281">                throw new ConfigException(</span>
+<span class="nc" id="L282">                        String.format(&quot;Invalid format of header name and header value pair '%s'. &quot;</span>
+                                + &quot;Expected: '[header name]:[header value]'&quot;, header));
+            }
+
+            // validate header name
+<span class="nc" id="L287">            String headerName = headerTokens[0].trim();</span>
+<span class="nc bnc" id="L288" title="All 4 branches missed.">            if (headerName.isEmpty() || headerName.matches(&quot;.*\\s+.*&quot;)) {</span>
+<span class="nc" id="L289">                throw new ConfigException(String.format(&quot;Invalid header name '%s'. &quot;</span>
+                        + &quot;The '[header name]' cannot contain whitespace&quot;, headerName));
+            }
+<span class="nc" id="L292">        } catch (ArrayIndexOutOfBoundsException e) {</span>
+<span class="nc" id="L293">            throw new ConfigException(String.format(&quot;Invalid header config '%s'.&quot;, config), e);</span>
+<span class="nc" id="L294">        }</span>
+<span class="nc" id="L295">    }</span>
+
+    // Visible for testing
+    static void validateHeaderConfigAction(String action) {
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        if (HEADER_ACTIONS.stream().noneMatch(action::equalsIgnoreCase)) {</span>
+<span class="nc" id="L300">            throw new ConfigException(String.format(&quot;Invalid header config action: '%s'. &quot;</span>
+                    + &quot;Expected one of %s&quot;, action, HEADER_ACTIONS));
+        }
+<span class="nc" id="L303">    }</span>
+
+    private static class ListenersValidator implements ConfigDef.Validator {
+        @Override
+        public void ensureValid(String name, Object value) {
+<span class="pc bpc" id="L308" title="1 of 2 branches missed.">            if (!(value instanceof List&lt;?&gt; items)) {</span>
+<span class="nc" id="L309">                throw new ConfigException(&quot;Invalid value type for listeners (expected list of URLs , ex: http://localhost:8080,https://localhost:8443).&quot;);</span>
+            }
+
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">            if (items.isEmpty()) {</span>
+<span class="nc" id="L313">                throw new ConfigException(&quot;Invalid value for listeners, at least one URL is expected, ex: http://localhost:8080,https://localhost:8443.&quot;);</span>
+            }
+
+<span class="fc bfc" id="L316" title="All 2 branches covered.">            for (Object item : items) {</span>
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">                if (!(item instanceof String)) {</span>
+<span class="nc" id="L318">                    throw new ConfigException(&quot;Invalid type for listeners (expected String).&quot;);</span>
+                }
+<span class="pc bpc" id="L320" title="1 of 2 branches missed.">                if (Utils.isBlank((String) item)) {</span>
+<span class="nc" id="L321">                    throw new ConfigException(&quot;Empty URL found when parsing listeners list.&quot;);</span>
+                }
+<span class="fc" id="L323">            }</span>
+<span class="fc" id="L324">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L328">            return &quot;List of comma-separated URLs, ex: http://localhost:8080,https://localhost:8443.&quot;;</span>
+        }
+    }
+
+    private static class ResponseHttpHeadersValidator implements ConfigDef.Validator {
+        @Override
+        public void ensureValid(String name, Object value) {
+<span class="fc" id="L335">            String strValue = (String) value;</span>
+<span class="pc bpc" id="L336" title="1 of 2 branches missed.">            if (Utils.isBlank(strValue)) {</span>
+<span class="fc" id="L337">                return;</span>
+            }
+
+<span class="nc" id="L340">            String[] configs = StringUtil.csvSplit(strValue); // handles and removed surrounding quotes</span>
+<span class="nc" id="L341">            Arrays.stream(configs).forEach(RestServerConfig::validateHttpResponseHeaderConfig);</span>
+<span class="nc" id="L342">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L346">            return &quot;Comma-separated header rules, where each header rule is of the form &quot;</span>
+                    + &quot;'[action] [header name]:[header value]' and optionally surrounded by double quotes &quot;
+                    + &quot;if any part of a header rule contains a comma&quot;;
+        }
+    }
+
+    private static class InternalConfig extends RestServerConfig {
+
+        private static ConfigDef config() {
+<span class="nc" id="L355">            ConfigDef result = new ConfigDef().withClientSslSupport();</span>
+<span class="nc" id="L356">            addInternalConfig(result);</span>
+<span class="nc" id="L357">            return result;</span>
+        }
+
+        @Override
+        public List&lt;String&gt; adminListeners() {
+            // Disable admin resources (such as the logging resource)
+<span class="nc" id="L363">            return List.of();</span>
+        }
+
+        @Override
+        public List&lt;String&gt; restExtensions() {
+            // Disable the use of REST extensions
+<span class="nc" id="L369">            return null;</span>
+        }
+
+        @Override
+        public boolean topicTrackingEnabled() {
+            // Topic tracking is unnecessary if we don't expose a public REST API
+<span class="nc" id="L375">            return false;</span>
+        }
+
+        @Override
+        public boolean topicTrackingResetEnabled() {
+            // Topic tracking is unnecessary if we don't expose a public REST API
+<span class="nc" id="L381">            return false;</span>
+        }
+
+        public InternalConfig(Map&lt;?, ?&gt; props) {
+<span class="nc" id="L385">            super(config(), props);</span>
+<span class="nc" id="L386">        }</span>
+    }
+
+    private static class PublicConfig extends RestServerConfig {
+
+        private final Integer rebalanceTimeoutMs;
+        private static ConfigDef config() {
+<span class="fc" id="L393">            ConfigDef result = new ConfigDef().withClientSslSupport();</span>
+<span class="fc" id="L394">            addPublicConfig(result);</span>
+<span class="fc" id="L395">            WorkerConfig.addTopicTrackingConfig(result);</span>
+<span class="fc" id="L396">            return result;</span>
+        }
+
+        @Override
+        public List&lt;String&gt; adminListeners() {
+<span class="fc" id="L401">            return getList(ADMIN_LISTENERS_CONFIG);</span>
+        }
+
+        @Override
+        public List&lt;String&gt; restExtensions() {
+<span class="fc" id="L406">            return getList(REST_EXTENSION_CLASSES_CONFIG);</span>
+        }
+
+        @Override
+        public Integer rebalanceTimeoutMs() {
+<span class="fc" id="L411">            return rebalanceTimeoutMs;</span>
+        }
+
+        @Override
+        public boolean topicTrackingEnabled() {
+<span class="fc" id="L416">            return getBoolean(WorkerConfig.TOPIC_TRACKING_ENABLE_CONFIG);</span>
+        }
+
+        @Override
+        public boolean topicTrackingResetEnabled() {
+<span class="fc" id="L421">            return getBoolean(WorkerConfig.TOPIC_TRACKING_ALLOW_RESET_CONFIG);</span>
+        }
+
+        public PublicConfig(Integer rebalanceTimeoutMs, Map&lt;?, ?&gt; props) {
+<span class="fc" id="L425">            super(config(), props);</span>
+<span class="fc" id="L426">            this.rebalanceTimeoutMs = rebalanceTimeoutMs;</span>
+<span class="fc" id="L427">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

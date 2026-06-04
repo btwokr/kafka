@@ -1,0 +1,522 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>NetworkClientDelegate.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients.consumer.internals</a> &gt; <span class="el_source">NetworkClientDelegate.java</span></div><h1>NetworkClientDelegate.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients.consumer.internals;
+
+import org.apache.kafka.clients.ApiVersions;
+import org.apache.kafka.clients.ClientRequest;
+import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.clients.ClientUtils;
+import org.apache.kafka.clients.KafkaClient;
+import org.apache.kafka.clients.Metadata;
+import org.apache.kafka.clients.NetworkClientUtils;
+import org.apache.kafka.clients.RequestCompletionHandler;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.internals.events.BackgroundEventHandler;
+import org.apache.kafka.clients.consumer.internals.events.ErrorEvent;
+import org.apache.kafka.clients.consumer.internals.metrics.AsyncConsumerMetrics;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.errors.AuthenticationException;
+import org.apache.kafka.common.errors.DisconnectException;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.AbstractRequest;
+import org.apache.kafka.common.telemetry.internals.ClientTelemetrySender;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+
+import org.slf4j.Logger;
+
+import java.io.IOException;
+import java.util.ArrayDeque;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.BiConsumer;
+import java.util.function.Supplier;
+
+import static org.apache.kafka.clients.consumer.internals.ConsumerUtils.CONSUMER_MAX_INFLIGHT_REQUESTS_PER_CONNECTION;
+import static org.apache.kafka.clients.consumer.internals.ConsumerUtils.CONSUMER_METRIC_GROUP_PREFIX;
+
+/**
+ * A wrapper around the {@link org.apache.kafka.clients.NetworkClient} to handle network poll and send operations.
+ */
+public class NetworkClientDelegate implements AutoCloseable {
+
+    private final KafkaClient client;
+    private final BackgroundEventHandler backgroundEventHandler;
+    private final Metadata metadata;
+    private final Time time;
+    private final Logger log;
+    private final int requestTimeoutMs;
+    private final Queue&lt;UnsentRequest&gt; unsentRequests;
+    private final long retryBackoffMs;
+    private Optional&lt;Exception&gt; metadataError;
+    private final boolean notifyMetadataErrorsViaErrorQueue;
+    private final AsyncConsumerMetrics asyncConsumerMetrics;
+
+    public NetworkClientDelegate(
+            final Time time,
+            final ConsumerConfig config,
+            final LogContext logContext,
+            final KafkaClient client,
+            final Metadata metadata,
+            final BackgroundEventHandler backgroundEventHandler,
+            final boolean notifyMetadataErrorsViaErrorQueue,
+<span class="nc" id="L86">            final AsyncConsumerMetrics asyncConsumerMetrics) {</span>
+<span class="nc" id="L87">        this.time = time;</span>
+<span class="nc" id="L88">        this.client = client;</span>
+<span class="nc" id="L89">        this.metadata = metadata;</span>
+<span class="nc" id="L90">        this.backgroundEventHandler = backgroundEventHandler;</span>
+<span class="nc" id="L91">        this.log = logContext.logger(getClass());</span>
+<span class="nc" id="L92">        this.unsentRequests = new ArrayDeque&lt;&gt;();</span>
+<span class="nc" id="L93">        this.requestTimeoutMs = config.getInt(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG);</span>
+<span class="nc" id="L94">        this.retryBackoffMs = config.getLong(ConsumerConfig.RETRY_BACKOFF_MS_CONFIG);</span>
+<span class="nc" id="L95">        this.metadataError = Optional.empty();</span>
+<span class="nc" id="L96">        this.notifyMetadataErrorsViaErrorQueue = notifyMetadataErrorsViaErrorQueue;</span>
+<span class="nc" id="L97">        this.asyncConsumerMetrics = asyncConsumerMetrics;</span>
+<span class="nc" id="L98">    }</span>
+
+    // Visible for testing
+    Queue&lt;UnsentRequest&gt; unsentRequests() {
+<span class="nc" id="L102">        return unsentRequests;</span>
+    }
+
+    public int inflightRequestCount() {
+<span class="nc" id="L106">        return client.inFlightRequestCount();</span>
+    }
+
+    /**
+     * Check if the node is disconnected and unavailable for immediate reconnection (i.e. if it is in
+     * reconnect backoff window following the disconnect).
+     *
+     * @param node {@link Node} to check for availability
+     * @see NetworkClientUtils#isUnavailable(KafkaClient, Node, Time)
+     */
+    public boolean isUnavailable(Node node) {
+<span class="nc" id="L117">        return NetworkClientUtils.isUnavailable(client, node, time);</span>
+    }
+
+    /**
+     * Checks for an authentication error on a given node and throws the exception if it exists.
+     *
+     * @param node {@link Node} to check for a previous {@link AuthenticationException}; if found it is thrown
+     * @see NetworkClientUtils#maybeThrowAuthFailure(KafkaClient, Node)
+     */
+    public void maybeThrowAuthFailure(Node node) {
+<span class="nc" id="L127">        NetworkClientUtils.maybeThrowAuthFailure(client, node);</span>
+<span class="nc" id="L128">    }</span>
+
+    /**
+     * Initiate a connection if currently possible. This is only really useful for resetting
+     * the failed status of a socket.
+     *
+     * @param node The node to connect to
+     */
+    public void tryConnect(Node node) {
+<span class="nc" id="L137">        NetworkClientUtils.tryConnect(client, node, time);</span>
+<span class="nc" id="L138">    }</span>
+
+    /**
+     * This method will try to send the unsent requests, poll for responses,
+     * and check the disconnected nodes.
+     *
+     * @param timeoutMs     timeout time
+     * @param currentTimeMs current time
+     */
+    public void poll(final long timeoutMs, final long currentTimeMs) {
+<span class="nc" id="L148">        poll(timeoutMs, currentTimeMs, false);</span>
+<span class="nc" id="L149">    }</span>
+
+    /**
+     * This method will try to send the unsent requests, poll for responses,
+     * and check the disconnected nodes.
+     *
+     * @param timeoutMs     timeout time
+     * @param currentTimeMs current time
+     * @param onClose       True when the network thread is closing.
+     */
+    public void poll(final long timeoutMs, final long currentTimeMs, boolean onClose) {
+<span class="nc" id="L160">        trySend(currentTimeMs);</span>
+
+<span class="nc" id="L162">        long pollTimeoutMs = timeoutMs;</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        if (!unsentRequests.isEmpty()) {</span>
+<span class="nc" id="L164">            pollTimeoutMs = Math.min(retryBackoffMs, pollTimeoutMs);</span>
+        }
+<span class="nc" id="L166">        this.client.poll(pollTimeoutMs, currentTimeMs);</span>
+<span class="nc" id="L167">        maybePropagateMetadataError();</span>
+<span class="nc" id="L168">        checkDisconnects(currentTimeMs, onClose);</span>
+<span class="nc" id="L169">        asyncConsumerMetrics.recordUnsentRequestsQueueSize(unsentRequests.size(), currentTimeMs);</span>
+<span class="nc" id="L170">    }</span>
+
+    private void maybePropagateMetadataError() {
+        try {
+<span class="nc" id="L174">            metadata.maybeThrowAnyException();</span>
+<span class="nc" id="L175">        } catch (Exception e) {</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">            if (notifyMetadataErrorsViaErrorQueue) {</span>
+<span class="nc" id="L177">                backgroundEventHandler.add(new ErrorEvent(e));</span>
+            } else {
+<span class="nc" id="L179">                metadataError = Optional.of(e);</span>
+            }
+<span class="nc" id="L181">        }</span>
+<span class="nc" id="L182">    }</span>
+
+    /**
+     * Return true if there is at least one in-flight request or unsent request.
+     */
+    public boolean hasAnyPendingRequests() {
+<span class="nc bnc" id="L188" title="All 4 branches missed.">        return client.hasInFlightRequests() || !unsentRequests.isEmpty();</span>
+    }
+
+    /**
+     * Tries to send the requests in the unsentRequest queue. If the request doesn't have an assigned node, it will
+     * find the leastLoadedOne, and will be retried in the next {@code poll()}. If the request is expired, a
+     * {@link TimeoutException} will be thrown.
+     */
+    private void trySend(final long currentTimeMs) {
+<span class="nc" id="L197">        Iterator&lt;UnsentRequest&gt; iterator = unsentRequests.iterator();</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        while (iterator.hasNext()) {</span>
+<span class="nc" id="L199">            UnsentRequest unsent = iterator.next();</span>
+<span class="nc" id="L200">            unsent.timer.update(currentTimeMs);</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">            if (unsent.timer.isExpired()) {</span>
+<span class="nc" id="L202">                iterator.remove();</span>
+<span class="nc" id="L203">                asyncConsumerMetrics.recordUnsentRequestsQueueTime(time.milliseconds() - unsent.enqueueTimeMs());</span>
+<span class="nc" id="L204">                unsent.handler.onFailure(currentTimeMs, new TimeoutException(</span>
+<span class="nc" id="L205">                    &quot;Failed to send request after &quot; + unsent.timer.timeoutMs() + &quot; ms.&quot;));</span>
+<span class="nc" id="L206">                continue;</span>
+            }
+
+<span class="nc bnc" id="L209" title="All 2 branches missed.">            if (!doSend(unsent, currentTimeMs)) {</span>
+                // continue to retry until timeout.
+<span class="nc" id="L211">                continue;</span>
+            }
+<span class="nc" id="L213">            iterator.remove();</span>
+<span class="nc" id="L214">            asyncConsumerMetrics.recordUnsentRequestsQueueTime(time.milliseconds() - unsent.enqueueTimeMs());</span>
+<span class="nc" id="L215">        }</span>
+<span class="nc" id="L216">    }</span>
+
+    boolean doSend(final UnsentRequest r, final long currentTimeMs) {
+<span class="nc" id="L219">        Node node = r.node.orElse(client.leastLoadedNode(currentTimeMs).node());</span>
+<span class="nc bnc" id="L220" title="All 4 branches missed.">        if (node == null || nodeUnavailable(node)) {</span>
+<span class="nc" id="L221">            log.debug(&quot;No broker available to send the request: {}. Retrying.&quot;, r);</span>
+<span class="nc" id="L222">            return false;</span>
+        }
+<span class="nc" id="L224">        ClientRequest request = makeClientRequest(r, node, currentTimeMs);</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        if (!client.ready(node, currentTimeMs)) {</span>
+            // enqueue the request again if the node isn't ready yet. The request will be handled in the next iteration
+            // of the event loop
+<span class="nc" id="L228">            log.debug(&quot;Node is not ready, handle the request in the next event loop: node={}, request={}&quot;, node, r);</span>
+<span class="nc" id="L229">            return false;</span>
+        }
+<span class="nc" id="L231">        client.send(request, currentTimeMs);</span>
+<span class="nc" id="L232">        return true;</span>
+    }
+
+    protected void checkDisconnects(final long currentTimeMs, boolean onClose) {
+        // Check the connection of the unsent request. Disconnect the disconnected node if it is unable to be connected.
+<span class="nc" id="L237">        Iterator&lt;UnsentRequest&gt; iter = unsentRequests.iterator();</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">        while (iter.hasNext()) {</span>
+<span class="nc" id="L239">            UnsentRequest u = iter.next();</span>
+<span class="nc bnc" id="L240" title="All 4 branches missed.">            if (u.node.isPresent() &amp;&amp; client.connectionFailed(u.node.get())) {</span>
+<span class="nc" id="L241">                iter.remove();</span>
+<span class="nc" id="L242">                asyncConsumerMetrics.recordUnsentRequestsQueueTime(time.milliseconds() - u.enqueueTimeMs());</span>
+<span class="nc" id="L243">                AuthenticationException authenticationException = client.authenticationException(u.node.get());</span>
+<span class="nc" id="L244">                u.handler.onFailure(currentTimeMs, authenticationException);</span>
+<span class="nc bnc" id="L245" title="All 4 branches missed.">            } else if (u.node.isEmpty() &amp;&amp; onClose) {</span>
+<span class="nc" id="L246">                log.debug(&quot;Removing unsent request {} because the client is closing&quot;, u);</span>
+<span class="nc" id="L247">                iter.remove();</span>
+<span class="nc" id="L248">                asyncConsumerMetrics.recordUnsentRequestsQueueTime(time.milliseconds() - u.enqueueTimeMs());</span>
+<span class="nc" id="L249">                u.handler.onFailure(currentTimeMs, Errors.NETWORK_EXCEPTION.exception());</span>
+            }
+<span class="nc" id="L251">        }</span>
+<span class="nc" id="L252">    }</span>
+
+    private ClientRequest makeClientRequest(
+        final UnsentRequest unsent,
+        final Node node,
+        final long currentTimeMs
+    ) {
+<span class="nc" id="L259">        return client.newClientRequest(</span>
+<span class="nc" id="L260">            node.idString(),</span>
+            unsent.requestBuilder,
+            currentTimeMs,
+            true,
+<span class="nc" id="L264">            (int) unsent.timer.remainingMs(),</span>
+            unsent.handler
+        );
+    }
+    
+    public Optional&lt;Exception&gt; getAndClearMetadataError() {
+<span class="nc" id="L270">        Optional&lt;Exception&gt; metadataError = this.metadataError;</span>
+<span class="nc" id="L271">        this.metadataError = Optional.empty();</span>
+<span class="nc" id="L272">        return metadataError;</span>
+    }
+
+    public Node leastLoadedNode() {
+<span class="nc" id="L276">        return this.client.leastLoadedNode(time.milliseconds()).node();</span>
+    }
+
+    public void wakeup() {
+<span class="nc" id="L280">        client.wakeup();</span>
+<span class="nc" id="L281">    }</span>
+
+    /**
+     * Check if the code is disconnected and unavailable for immediate reconnection (i.e. if it is in reconnect
+     * backoff window following the disconnect).
+     */
+    public boolean nodeUnavailable(final Node node) {
+<span class="nc bnc" id="L288" title="All 4 branches missed.">        return client.connectionFailed(node) &amp;&amp; client.connectionDelay(node, time.milliseconds()) &gt; 0;</span>
+    }
+
+    public void close() throws IOException {
+<span class="nc" id="L292">        this.client.close();</span>
+<span class="nc" id="L293">    }</span>
+
+    public long addAll(PollResult pollResult) {
+<span class="nc" id="L296">        Objects.requireNonNull(pollResult);</span>
+<span class="nc" id="L297">        addAll(pollResult.unsentRequests);</span>
+<span class="nc" id="L298">        return pollResult.timeUntilNextPollMs;</span>
+    }
+
+    public void addAll(final List&lt;UnsentRequest&gt; requests) {
+<span class="nc" id="L302">        Objects.requireNonNull(requests);</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        if (!requests.isEmpty()) {</span>
+<span class="nc" id="L304">            requests.forEach(this::add);</span>
+        }
+<span class="nc" id="L306">    }</span>
+
+    public void add(final UnsentRequest r) {
+<span class="nc" id="L309">        Objects.requireNonNull(r);</span>
+<span class="nc" id="L310">        r.setTimer(this.time, this.requestTimeoutMs);</span>
+<span class="nc" id="L311">        r.setEnqueueTimeMs(time.milliseconds());</span>
+<span class="nc" id="L312">        unsentRequests.add(r);</span>
+<span class="nc" id="L313">    }</span>
+
+    public static class PollResult {
+        public static final long WAIT_FOREVER = Long.MAX_VALUE;
+<span class="nc" id="L317">        public static final PollResult EMPTY = new PollResult(WAIT_FOREVER);</span>
+        public final long timeUntilNextPollMs;
+        public final List&lt;UnsentRequest&gt; unsentRequests;
+
+<span class="nc" id="L321">        public PollResult(final long timeUntilNextPollMs, final List&lt;UnsentRequest&gt; unsentRequests) {</span>
+<span class="nc" id="L322">            this.timeUntilNextPollMs = timeUntilNextPollMs;</span>
+<span class="nc" id="L323">            this.unsentRequests = Collections.unmodifiableList(unsentRequests);</span>
+<span class="nc" id="L324">        }</span>
+
+        public PollResult(final List&lt;UnsentRequest&gt; unsentRequests) {
+<span class="nc" id="L327">            this(WAIT_FOREVER, unsentRequests);</span>
+<span class="nc" id="L328">        }</span>
+
+        public PollResult(final UnsentRequest unsentRequest) {
+<span class="nc" id="L331">            this(Collections.singletonList(unsentRequest));</span>
+<span class="nc" id="L332">        }</span>
+
+        public PollResult(final long timeUntilNextPollMs) {
+<span class="nc" id="L335">            this(timeUntilNextPollMs, Collections.emptyList());</span>
+<span class="nc" id="L336">        }</span>
+    }
+
+    public static class UnsentRequest {
+        private final AbstractRequest.Builder&lt;?&gt; requestBuilder;
+        private final FutureCompletionHandler handler;
+        private final Optional&lt;Node&gt; node; // empty if random node can be chosen
+
+        private Timer timer;
+        private long enqueueTimeMs; // time when the request was enqueued to unsentRequests, not duration in the queue.
+
+        public UnsentRequest(final AbstractRequest.Builder&lt;?&gt; requestBuilder,
+<span class="nc" id="L348">                             final Optional&lt;Node&gt; node) {</span>
+<span class="nc" id="L349">            Objects.requireNonNull(requestBuilder);</span>
+<span class="nc" id="L350">            this.requestBuilder = requestBuilder;</span>
+<span class="nc" id="L351">            this.node = node;</span>
+<span class="nc" id="L352">            this.handler = new FutureCompletionHandler();</span>
+<span class="nc" id="L353">        }</span>
+
+        void setTimer(final Time time, final long requestTimeoutMs) {
+<span class="nc" id="L356">            this.timer = time.timer(requestTimeoutMs);</span>
+<span class="nc" id="L357">        }</span>
+
+        Timer timer() {
+<span class="nc" id="L360">            return timer;</span>
+        }
+
+        /**
+         * Set the time when the request was enqueued to {@link NetworkClientDelegate#unsentRequests}.
+         */
+        private void setEnqueueTimeMs(final long enqueueTimeMs) {
+<span class="nc" id="L367">            this.enqueueTimeMs = enqueueTimeMs;</span>
+<span class="nc" id="L368">        }</span>
+
+        /**
+         * Return the time when the request was enqueued to {@link NetworkClientDelegate#unsentRequests}.
+         */
+        private long enqueueTimeMs() {
+<span class="nc" id="L374">            return enqueueTimeMs;</span>
+        }
+
+        CompletableFuture&lt;ClientResponse&gt; future() {
+<span class="nc" id="L378">            return handler.future;</span>
+        }
+
+        FutureCompletionHandler handler() {
+<span class="nc" id="L382">            return handler;</span>
+        }
+
+        UnsentRequest whenComplete(BiConsumer&lt;ClientResponse, Throwable&gt; callback) {
+<span class="nc" id="L386">            handler.future().whenComplete(callback);</span>
+<span class="nc" id="L387">            return this;</span>
+        }
+
+        AbstractRequest.Builder&lt;?&gt; requestBuilder() {
+<span class="nc" id="L391">            return requestBuilder;</span>
+        }
+
+        Optional&lt;Node&gt; node() {
+<span class="nc" id="L395">            return node;</span>
+        }
+
+        @Override
+        public String toString() {
+            String remainingMs;
+
+<span class="nc bnc" id="L402" title="All 2 branches missed.">            if (timer != null) {</span>
+<span class="nc" id="L403">                timer.update();</span>
+<span class="nc" id="L404">                remainingMs = String.valueOf(timer.remainingMs());</span>
+            } else {
+<span class="nc" id="L406">                remainingMs = &quot;&lt;not set&gt;&quot;;</span>
+            }
+
+<span class="nc" id="L409">            return &quot;UnsentRequest{&quot; +</span>
+                    &quot;requestBuilder=&quot; + requestBuilder +
+                    &quot;, handler=&quot; + handler +
+                    &quot;, node=&quot; + node +
+                    &quot;, remainingMs=&quot; + remainingMs +
+                    '}';
+        }
+    }
+
+    public static class FutureCompletionHandler implements RequestCompletionHandler {
+
+        private long responseCompletionTimeMs;
+        private final CompletableFuture&lt;ClientResponse&gt; future;
+
+<span class="nc" id="L423">        FutureCompletionHandler() {</span>
+<span class="nc" id="L424">            future = new CompletableFuture&lt;&gt;();</span>
+<span class="nc" id="L425">        }</span>
+
+        public void onFailure(final long currentTimeMs, final RuntimeException e) {
+<span class="nc" id="L428">            this.responseCompletionTimeMs = currentTimeMs;</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">            if (e != null) {</span>
+<span class="nc" id="L430">                this.future.completeExceptionally(e);</span>
+            } else {
+<span class="nc" id="L432">                this.future.completeExceptionally(DisconnectException.INSTANCE);</span>
+            }
+<span class="nc" id="L434">        }</span>
+
+        public long completionTimeMs() {
+<span class="nc" id="L437">            return responseCompletionTimeMs;</span>
+        }
+
+        @Override
+        public void onComplete(final ClientResponse response) {
+<span class="nc" id="L442">            long completionTimeMs = response.receivedTimeMs();</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">            if (response.authenticationException() != null) {</span>
+<span class="nc" id="L444">                onFailure(completionTimeMs, response.authenticationException());</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">            } else if (response.wasDisconnected()) {</span>
+<span class="nc" id="L446">                onFailure(completionTimeMs, DisconnectException.INSTANCE);</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">            } else if (response.versionMismatch() != null) {</span>
+<span class="nc" id="L448">                onFailure(completionTimeMs, response.versionMismatch());</span>
+            } else {
+<span class="nc" id="L450">                responseCompletionTimeMs = completionTimeMs;</span>
+<span class="nc" id="L451">                this.future.complete(response);</span>
+            }
+<span class="nc" id="L453">        }</span>
+
+        public CompletableFuture&lt;ClientResponse&gt; future() {
+<span class="nc" id="L456">            return future;</span>
+        }
+    }
+
+    /**
+     * Creates a {@link Supplier} for deferred creation during invocation by
+     * {@link ConsumerNetworkThread}.
+     */
+    public static Supplier&lt;NetworkClientDelegate&gt; supplier(final Time time,
+                                                           final LogContext logContext,
+                                                           final Metadata metadata,
+                                                           final ConsumerConfig config,
+                                                           final ApiVersions apiVersions,
+                                                           final Metrics metrics,
+                                                           final Sensor throttleTimeSensor,
+                                                           final ClientTelemetrySender clientTelemetrySender,
+                                                           final BackgroundEventHandler backgroundEventHandler,
+                                                           final boolean notifyMetadataErrorsViaErrorQueue,
+                                                           final AsyncConsumerMetrics asyncConsumerMetrics) {
+<span class="nc" id="L475">        return new CachedSupplier&lt;&gt;() {</span>
+            @Override
+            protected NetworkClientDelegate create() {
+<span class="nc" id="L478">                KafkaClient client = ClientUtils.createNetworkClient(config,</span>
+                        metrics,
+                        CONSUMER_METRIC_GROUP_PREFIX,
+                        logContext,
+                        apiVersions,
+                        time,
+                        CONSUMER_MAX_INFLIGHT_REQUESTS_PER_CONNECTION,
+                        metadata,
+                        throttleTimeSensor,
+                        clientTelemetrySender);
+<span class="nc" id="L488">                return new NetworkClientDelegate(time, config, logContext, client, metadata, backgroundEventHandler, notifyMetadataErrorsViaErrorQueue, asyncConsumerMetrics);</span>
+            }
+        };
+    }
+
+    /**
+     * Creates a {@link Supplier} for deferred creation during invocation by
+     * {@link ConsumerNetworkThread}.
+     */
+    public static Supplier&lt;NetworkClientDelegate&gt; supplier(final Time time,
+                                                           final ConsumerConfig config,
+                                                           final LogContext logContext,
+                                                           final KafkaClient client,
+                                                           final Metadata metadata,
+                                                           final BackgroundEventHandler backgroundEventHandler,
+                                                           final boolean notifyMetadataErrorsViaErrorQueue,
+                                                           final AsyncConsumerMetrics asyncConsumerMetrics) {
+<span class="nc" id="L505">        return new CachedSupplier&lt;&gt;() {</span>
+            @Override
+            protected NetworkClientDelegate create() {
+<span class="nc" id="L508">                return new NetworkClientDelegate(</span>
+                    time,
+                    config,
+                    logContext,
+                    client,
+                    metadata,
+                    backgroundEventHandler,
+                    notifyMetadataErrorsViaErrorQueue,
+                    asyncConsumerMetrics
+                );
+            }
+        };
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

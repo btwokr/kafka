@@ -1,0 +1,925 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BrokerServer.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">kafka.server</a> &gt; <span class="el_source">BrokerServer.scala</span></div><h1>BrokerServer.scala</h1><pre class="source lang-java linenums">/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package kafka.server
+
+import kafka.coordinator.group.CoordinatorPartitionWriter
+import kafka.coordinator.transaction.TransactionCoordinator
+import kafka.log.LogManager
+import kafka.network.SocketServer
+import kafka.raft.KafkaRaftManager
+import kafka.server.metadata._
+import kafka.server.share.{ShareCoordinatorMetadataCacheHelperImpl, SharePartitionManager}
+import org.apache.kafka.common.config.ConfigException
+import org.apache.kafka.common.internals.Plugin
+import org.apache.kafka.common.message.ApiMessageType.ListenerType
+import org.apache.kafka.common.metrics.Metrics
+import org.apache.kafka.common.network.ListenerName
+import org.apache.kafka.common.security.scram.internals.ScramMechanism
+import org.apache.kafka.common.security.token.delegation.internals.DelegationTokenCache
+import org.apache.kafka.common.utils.{LogContext, Time, Utils}
+import org.apache.kafka.common.{ClusterResource, TopicPartition, Uuid}
+import org.apache.kafka.coordinator.common.runtime.{CoordinatorLoaderImpl, CoordinatorRecord}
+import org.apache.kafka.coordinator.group.metrics.{GroupCoordinatorMetrics, GroupCoordinatorRuntimeMetrics}
+import org.apache.kafka.coordinator.group.{GroupConfigManager, GroupCoordinator, GroupCoordinatorRecordSerde, GroupCoordinatorService}
+import org.apache.kafka.coordinator.group.modern.share.ShareGroupConfigProvider
+import org.apache.kafka.coordinator.share.metrics.{ShareCoordinatorMetrics, ShareCoordinatorRuntimeMetrics}
+import org.apache.kafka.coordinator.share.{ShareCoordinator, ShareCoordinatorRecordSerde, ShareCoordinatorService}
+import org.apache.kafka.coordinator.transaction.ProducerIdManager
+import org.apache.kafka.image.publisher.{BrokerRegistrationTracker, MetadataPublisher}
+import org.apache.kafka.metadata.{BrokerState, KRaftMetadataCache, ListenerInfo, MetadataCache, MetadataVersionConfigValidator}
+import org.apache.kafka.metadata.publisher.{AclPublisher, DelegationTokenPublisher, DynamicClientQuotaPublisher, DynamicTopicClusterQuotaPublisher, ScramPublisher}
+import org.apache.kafka.security.{CredentialProvider, DelegationTokenManager}
+import org.apache.kafka.server.FetchSession.FetchSessionCache
+import org.apache.kafka.server.authorizer.Authorizer
+import org.apache.kafka.server.common.{ApiMessageAndVersion, DirectoryEventHandler, NodeToControllerChannelManager, ShareVersion, TopicIdPartition}
+import org.apache.kafka.server.config.{ConfigType, DelegationTokenManagerConfigs}
+import org.apache.kafka.server.log.remote.metadata.storage.BrokerReadyCallback
+import org.apache.kafka.server.log.remote.storage.{RemoteLogManager, RemoteLogManagerConfig}
+import org.apache.kafka.server.metrics.{ClientTelemetryExporterPlugin, KafkaYammerMetrics}
+import org.apache.kafka.server.network.{EndpointReadyFutures, KafkaAuthorizerServerInfo}
+import org.apache.kafka.server.share.persister.{DefaultStatePersister, NoOpStatePersister, Persister, PersisterStateManager}
+import org.apache.kafka.server.share.session.ShareSessionCache
+import org.apache.kafka.server.util.timer.{SystemTimer, SystemTimerReaper}
+import org.apache.kafka.server.util.{Deadline, FutureUtils, KafkaScheduler, NetworkPartitionMetadataClient, PartitionMetadataClient}
+import org.apache.kafka.server.{AssignmentsManager, BrokerFeatures, BrokerLifecycleManager, ClientMetricsManager, DefaultApiVersionManager, DelayedActionQueue, FetchManager, FetchSessionCacheShard, KRaftTopicCreator, NodeToControllerChannelManagerImpl, ProcessRole, RaftControllerNodeProvider}
+import org.apache.kafka.server.transaction.AddPartitionsToTxnManager
+import org.apache.kafka.storage.internals.log.{LogDirFailureChannel, LogManager =&gt; JLogManager}
+import org.apache.kafka.storage.log.metrics.BrokerTopicStats
+import org.apache.kafka.server.partition.{AlterPartitionManager, DefaultAlterPartitionManager}
+
+import java.time.Duration
+import java.util
+import java.util.Optional
+import java.util.concurrent.locks.{Condition, ReentrantLock}
+import java.util.concurrent.{CompletableFuture, ExecutionException, TimeUnit, TimeoutException}
+import java.util.stream.Collectors
+import scala.collection.Map
+import scala.jdk.CollectionConverters._
+import scala.jdk.OptionConverters.RichOption
+
+
+/**
+ * A Kafka broker that runs in KRaft (Kafka Raft) mode.
+ */
+<span class="pc bpc" id="L79" title="1 of 4 branches missed.">class BrokerServer(</span>
+<span class="fc" id="L80">  val sharedServer: SharedServer</span>
+<span class="fc" id="L81">) extends KafkaBroker {</span>
+<span class="fc" id="L82">  val config: KafkaConfig = sharedServer.brokerConfig</span>
+<span class="fc" id="L83">  val time: Time = sharedServer.time</span>
+<span class="fc" id="L84">  def metrics: Metrics = sharedServer.metrics</span>
+
+  // Get raftManager from SharedServer. It will be initialized during startup.
+<span class="fc" id="L87">  def raftManager: KafkaRaftManager[ApiMessageAndVersion] = sharedServer.raftManager</span>
+
+<span class="fc" id="L89">  override def brokerState: BrokerState = Option(lifecycleManager).</span>
+<span class="pc" id="L90">    flatMap(m =&gt; Some(m.state)).getOrElse(BrokerState.NOT_RUNNING)</span>
+
+  import kafka.server.Server._
+
+<span class="fc" id="L94">  private val logContext: LogContext = new LogContext(s&quot;[BrokerServer id=${config.nodeId}] &quot;)</span>
+
+<span class="fc" id="L96">  this.logIdent = logContext.logPrefix</span>
+
+<span class="fc" id="L98">  @volatile var lifecycleManager: BrokerLifecycleManager = _</span>
+
+<span class="fc" id="L100">  private var assignmentsManager: AssignmentsManager = _</span>
+
+<span class="fc" id="L102">  private var partitionMetadataClient: PartitionMetadataClient = _</span>
+
+<span class="fc" id="L104">  val lock: ReentrantLock = new ReentrantLock()</span>
+<span class="fc" id="L105">  val awaitShutdownCond: Condition = lock.newCondition()</span>
+<span class="fc" id="L106">  var status: ProcessStatus = SHUTDOWN</span>
+
+<span class="fc" id="L108">  @volatile var dataPlaneRequestProcessor: KafkaApis = _</span>
+
+<span class="fc" id="L110">  var authorizerPlugin: Option[Plugin[Authorizer]] = None</span>
+<span class="fc" id="L111">  @volatile var socketServer: SocketServer = _</span>
+<span class="fc" id="L112">  var dataPlaneRequestHandlerPool: KafkaRequestHandlerPool = _</span>
+
+<span class="fc" id="L114">  var logDirFailureChannel: LogDirFailureChannel = _</span>
+<span class="fc" id="L115">  var logManager: JLogManager = _</span>
+<span class="fc" id="L116">  var remoteLogManagerOpt: Option[RemoteLogManager] = None</span>
+
+<span class="fc" id="L118">  var tokenManager: DelegationTokenManager = _</span>
+
+<span class="fc" id="L120">  var dynamicConfigHandlers: Map[ConfigType, ConfigHandler] = _</span>
+
+  @volatile private[this] var _replicaManager: ReplicaManager = _
+
+<span class="fc" id="L124">  var credentialProvider: CredentialProvider = _</span>
+<span class="fc" id="L125">  var tokenCache: DelegationTokenCache = _</span>
+
+<span class="fc" id="L127">  @volatile var groupCoordinator: GroupCoordinator = _</span>
+
+<span class="fc" id="L129">  var groupConfigManager: GroupConfigManager = _</span>
+
+<span class="fc" id="L131">  var transactionCoordinator: TransactionCoordinator = _</span>
+
+<span class="fc" id="L133">  var shareCoordinator: ShareCoordinator = _</span>
+
+<span class="fc" id="L135">  var clientToControllerChannelManager: NodeToControllerChannelManager = _</span>
+
+<span class="fc" id="L137">  var forwardingManager: ForwardingManager = _</span>
+
+<span class="fc" id="L139">  var alterPartitionManager: AlterPartitionManager = _</span>
+
+<span class="fc" id="L141">  var autoTopicCreationManager: AutoTopicCreationManager = _</span>
+
+<span class="fc" id="L143">  var kafkaScheduler: KafkaScheduler = _</span>
+
+<span class="fc" id="L145">  @volatile var metadataCache: KRaftMetadataCache = _</span>
+
+<span class="fc" id="L147">  var quotaManagers: QuotaFactory.QuotaManagers = _</span>
+
+<span class="fc" id="L149">  var clientQuotaMetadataManager: ClientQuotaMetadataManager = _</span>
+
+<span class="fc" id="L151">  @volatile var brokerTopicStats: BrokerTopicStats = _</span>
+
+<span class="fc" id="L153">  val clusterId: String = sharedServer.metaPropsEnsemble.clusterId().get()</span>
+
+<span class="fc" id="L155">  var brokerMetadataPublisher: BrokerMetadataPublisher = _</span>
+
+<span class="fc" id="L157">  var brokerRegistrationTracker: BrokerRegistrationTracker = _</span>
+
+<span class="fc" id="L159">  val brokerFeatures: BrokerFeatures = BrokerFeatures.createDefault(config.unstableFeatureVersionsEnabled)</span>
+
+<span class="fc" id="L161">  def kafkaYammerMetrics: KafkaYammerMetrics = KafkaYammerMetrics.INSTANCE</span>
+
+<span class="fc" id="L163">  val metadataPublishers: util.List[MetadataPublisher] = new util.ArrayList[MetadataPublisher]()</span>
+
+<span class="fc" id="L165">  var clientMetricsManager: ClientMetricsManager = _</span>
+
+<span class="fc" id="L167">  var sharePartitionManager: SharePartitionManager = _</span>
+
+<span class="fc" id="L169">  var persister: Persister = _</span>
+
+  private def maybeChangeStatus(from: ProcessStatus, to: ProcessStatus): Boolean = {
+<span class="fc" id="L172">    lock.lock()</span>
+    try {
+<span class="pc bpc" id="L174" title="4 of 6 branches missed.">      if (status != from) return false</span>
+<span class="pc" id="L175">      info(s&quot;Transition from $status to $to&quot;)</span>
+
+<span class="fc" id="L177">      status = to</span>
+<span class="pc bpc" id="L178" title="1 of 4 branches missed.">      if (to == SHUTDOWN) {</span>
+<span class="fc" id="L179">        awaitShutdownCond.signalAll()</span>
+      }
+    } finally {
+<span class="pc" id="L182">      lock.unlock()</span>
+    }
+<span class="fc" id="L184">    true</span>
+  }
+
+<span class="fc" id="L187">  def replicaManager: ReplicaManager = _replicaManager</span>
+
+  override def startup(): Unit = {
+<span class="pc bpc" id="L190" title="1 of 2 branches missed.">    if (!maybeChangeStatus(SHUTDOWN, STARTING)) return</span>
+<span class="fc" id="L191">    val startupDeadline = Deadline.fromDelay(time, config.serverMaxStartupTimeMs, TimeUnit.MILLISECONDS)</span>
+    try {
+<span class="fc" id="L193">      sharedServer.startForBroker()</span>
+
+<span class="pc" id="L195">      info(&quot;Starting broker&quot;)</span>
+
+<span class="fc" id="L197">      val clientTelemetryExporterPlugin = new ClientTelemetryExporterPlugin()</span>
+
+<span class="fc" id="L199">      config.dynamicConfig.initialize(Some(clientTelemetryExporterPlugin))</span>
+<span class="fc" id="L200">      quotaManagers = QuotaFactory.instantiate(config, metrics, time, s&quot;broker-${config.nodeId}-&quot;, ProcessRole.BrokerRole.toString)</span>
+<span class="fc" id="L201">      DynamicBrokerConfig.readDynamicBrokerConfigsFromSnapshot(raftManager, config, quotaManagers, logContext)</span>
+
+      /* start scheduler */
+<span class="fc" id="L204">      kafkaScheduler = new KafkaScheduler(config.backgroundThreads)</span>
+<span class="fc" id="L205">      kafkaScheduler.startup()</span>
+
+      /* register broker metrics */
+<span class="fc" id="L208">      brokerTopicStats = new BrokerTopicStats(config.remoteLogManagerConfig.isRemoteStorageSystemEnabled())</span>
+
+<span class="fc" id="L210">      logDirFailureChannel = new LogDirFailureChannel(config.logDirs.size)</span>
+
+<span class="fc" id="L212">      metadataCache = new KRaftMetadataCache(config.nodeId, () =&gt; raftManager.client.kraftVersion())</span>
+
+      // Create log manager, but don't start it because we need to delay any potential unclean shutdown log recovery
+      // until we catch up on the metadata log and have up-to-date topic and broker configs.
+<span class="fc" id="L216">      logManager = LogManager(config,</span>
+<span class="fc" id="L217">        sharedServer.metaPropsEnsemble.errorLogDirs(),</span>
+<span class="fc" id="L218">        metadataCache,</span>
+<span class="fc" id="L219">        kafkaScheduler,</span>
+<span class="fc" id="L220">        time,</span>
+<span class="fc" id="L221">        brokerTopicStats,</span>
+<span class="fc" id="L222">        logDirFailureChannel)</span>
+
+<span class="fc" id="L224">      lifecycleManager = new BrokerLifecycleManager(</span>
+<span class="fc" id="L225">        config,</span>
+<span class="fc" id="L226">        time,</span>
+<span class="fc" id="L227">        s&quot;broker-${config.nodeId}-&quot;,</span>
+<span class="fc" id="L228">        logManager.directoryIdsSet,</span>
+<span class="pc" id="L229">        () =&gt; new Thread(() =&gt; shutdown(), &quot;kafka-shutdown-thread&quot;).start(),</span>
+<span class="pc" id="L230">        () =&gt; metadataCache.metadataVersion().isCordonedLogDirsSupported)</span>
+
+      // Enable delegation token cache for all SCRAM mechanisms to simplify dynamic update.
+      // This keeps the cache up-to-date if new SCRAM mechanisms are enabled dynamically.
+<span class="fc" id="L234">      tokenCache = new DelegationTokenCache(ScramMechanism.mechanismNames)</span>
+<span class="fc" id="L235">      credentialProvider = new CredentialProvider(ScramMechanism.mechanismNames, tokenCache)</span>
+
+<span class="fc" id="L237">      FutureUtils.waitWithLogging(logger.underlying, logIdent,</span>
+<span class="fc" id="L238">        &quot;controller quorum voters future&quot;,</span>
+<span class="fc" id="L239">        sharedServer.controllerQuorumVotersFuture,</span>
+<span class="fc" id="L240">        startupDeadline, time)</span>
+<span class="fc" id="L241">      val controllerNodeProvider = RaftControllerNodeProvider.create(raftManager, config)</span>
+
+<span class="fc" id="L243">      clientToControllerChannelManager = new NodeToControllerChannelManagerImpl(</span>
+<span class="fc" id="L244">        controllerNodeProvider,</span>
+<span class="fc" id="L245">        time,</span>
+<span class="fc" id="L246">        metrics,</span>
+<span class="fc" id="L247">        config,</span>
+<span class="fc" id="L248">        &quot;forwarding&quot;,</span>
+<span class="fc" id="L249">        s&quot;broker-${config.nodeId}-&quot;,</span>
+<span class="fc" id="L250">        60000</span>
+      )
+<span class="fc" id="L252">      clientToControllerChannelManager.start()</span>
+<span class="fc" id="L253">      forwardingManager = new ForwardingManagerImpl(clientToControllerChannelManager, metrics)</span>
+<span class="fc" id="L254">      clientMetricsManager = new ClientMetricsManager(clientTelemetryExporterPlugin, config.clientTelemetryMaxBytes, time, metrics)</span>
+
+<span class="fc" id="L256">      val apiVersionManager = new DefaultApiVersionManager(</span>
+<span class="fc" id="L257">        ListenerType.BROKER,</span>
+<span class="fc" id="L258">        () =&gt; forwardingManager.controllerApiVersions,</span>
+<span class="fc" id="L259">        brokerFeatures,</span>
+<span class="fc" id="L260">        metadataCache,</span>
+<span class="fc" id="L261">        config.unstableApiVersionsEnabled,</span>
+<span class="fc" id="L262">        Optional.of(clientMetricsManager)</span>
+      )
+
+<span class="fc" id="L265">      val shareFetchSessionCache : ShareSessionCache = new ShareSessionCache(</span>
+<span class="fc" id="L266">        config.shareGroupConfig.shareGroupMaxShareSessions()</span>
+      )
+
+<span class="fc" id="L269">      val connectionDisconnectListeners = Seq(</span>
+<span class="fc" id="L270">        clientMetricsManager.connectionDisconnectListener(),</span>
+<span class="fc" id="L271">        shareFetchSessionCache.connectionDisconnectListener()</span>
+      )
+
+      // Create and start the socket server acceptor threads so that the bound port is known.
+      // Delay starting processors until the end of the initialization sequence to ensure
+      // that credentials have been loaded before processing authentications.
+<span class="fc" id="L277">      socketServer = new SocketServer(config,</span>
+<span class="fc" id="L278">        metrics,</span>
+<span class="fc" id="L279">        time,</span>
+<span class="fc" id="L280">        credentialProvider,</span>
+<span class="fc" id="L281">        apiVersionManager,</span>
+<span class="fc" id="L282">        sharedServer.socketFactory,</span>
+<span class="fc" id="L283">        connectionDisconnectListeners)</span>
+
+<span class="fc" id="L285">      clientQuotaMetadataManager = new ClientQuotaMetadataManager(quotaManagers, socketServer.connectionQuotas)</span>
+
+<span class="fc" id="L287">      val listenerInfo = ListenerInfo.create(Optional.of(config.interBrokerListenerName.value()),</span>
+<span class="fc" id="L288">          config.effectiveAdvertisedBrokerListeners.asJava).</span>
+            withWildcardHostnamesResolved().
+<span class="fc" id="L290">            withEphemeralPortsCorrected(name =&gt; socketServer.boundPort(new ListenerName(name)))</span>
+
+<span class="fc" id="L292">      remoteLogManagerOpt = createRemoteLogManager(listenerInfo)</span>
+
+<span class="fc" id="L294">      alterPartitionManager = DefaultAlterPartitionManager.create(</span>
+<span class="fc" id="L295">        config,</span>
+<span class="fc" id="L296">        kafkaScheduler,</span>
+        controllerNodeProvider,
+<span class="fc" id="L298">        time,</span>
+<span class="fc" id="L299">        metrics,</span>
+<span class="fc" id="L300">        s&quot;broker-${config.nodeId}-&quot;,</span>
+<span class="pc" id="L301">        () =&gt; lifecycleManager.brokerEpoch</span>
+      )
+<span class="fc" id="L303">      alterPartitionManager.start()</span>
+
+<span class="fc" id="L305">      val addPartitionsLogContext = new LogContext(s&quot;[AddPartitionsToTxnManager broker=${config.brokerId}]&quot;)</span>
+<span class="fc" id="L306">      val addPartitionsToTxnNetworkClient = NetworkUtils.buildNetworkClient(&quot;AddPartitionsManager&quot;, config, metrics, time, addPartitionsLogContext)</span>
+<span class="fc" id="L307">      val addPartitionsToTxnManager = new AddPartitionsToTxnManager(</span>
+<span class="fc" id="L308">        config,</span>
+<span class="fc" id="L309">        addPartitionsToTxnNetworkClient,</span>
+<span class="fc" id="L310">        metadataCache,</span>
+        // The transaction coordinator is not created at this point so we must
+        // use a lambda here.
+<span class="pc" id="L313">        transactionalId =&gt; transactionCoordinator.partitionFor(transactionalId),</span>
+<span class="fc" id="L314">        time</span>
+      )
+
+<span class="fc" id="L317">      val assignmentsChannelManager = new NodeToControllerChannelManagerImpl(</span>
+<span class="fc" id="L318">        controllerNodeProvider,</span>
+<span class="fc" id="L319">        time,</span>
+<span class="fc" id="L320">        metrics,</span>
+<span class="fc" id="L321">        config,</span>
+<span class="fc" id="L322">        &quot;directory-assignments&quot;,</span>
+<span class="fc" id="L323">        s&quot;broker-${config.nodeId}-&quot;,</span>
+<span class="fc" id="L324">        60000</span>
+      )
+<span class="fc" id="L326">      assignmentsManager = new AssignmentsManager(</span>
+<span class="fc" id="L327">        time,</span>
+<span class="fc" id="L328">        assignmentsChannelManager,</span>
+<span class="fc" id="L329">        config.brokerId,</span>
+<span class="pc" id="L330">        () =&gt; metadataCache.getImage(),</span>
+<span class="pc" id="L331">        (directoryId: Uuid) =&gt; logManager.directoryPath(directoryId).</span>
+<span class="nc" id="L332">          orElse(&quot;[unknown directory path]&quot;)</span>
+      )
+<span class="pc bpc" id="L334" title="1 of 2 branches missed.">      val directoryEventHandler = new DirectoryEventHandler {</span>
+        override def handleAssignment(partition: TopicIdPartition, directoryId: Uuid, reason: String, callback: Runnable): Unit =
+<span class="nc" id="L336">          assignmentsManager.onAssignment(partition, directoryId, reason, callback)</span>
+
+        override def handleFailure(directoryId: Uuid): Unit =
+<span class="nc" id="L339">          lifecycleManager.propagateDirectoryFailure(directoryId, config.logDirFailureTimeoutMs)</span>
+
+        override def handleCordoned(directoryIds: util.Set[Uuid]): Unit =
+<span class="nc" id="L342">          lifecycleManager.propagateDirectoryCordoned(directoryIds)</span>
+
+        override def handleUncordoned(directoryIds: util.Set[Uuid]): Unit =
+<span class="nc" id="L345">          lifecycleManager.propagateDirectoryUncordoned(directoryIds)</span>
+}
+
+      /**
+       * TODO: move this action queue to handle thread so we can simplify concurrency handling
+       */
+<span class="fc" id="L351">      val defaultActionQueue = new DelayedActionQueue</span>
+
+<span class="fc" id="L353">      this._replicaManager = new ReplicaManager(</span>
+<span class="fc" id="L354">        config = config,</span>
+<span class="fc" id="L355">        metrics = metrics,</span>
+<span class="fc" id="L356">        time = time,</span>
+<span class="fc" id="L357">        scheduler = kafkaScheduler,</span>
+<span class="fc" id="L358">        logManager = logManager,</span>
+<span class="fc" id="L359">        remoteLogManager = remoteLogManagerOpt,</span>
+<span class="fc" id="L360">        quotaManagers = quotaManagers,</span>
+<span class="fc" id="L361">        metadataCache = metadataCache,</span>
+<span class="fc" id="L362">        logDirFailureChannel = logDirFailureChannel,</span>
+<span class="fc" id="L363">        alterPartitionManager = alterPartitionManager,</span>
+<span class="fc" id="L364">        brokerTopicStats = brokerTopicStats,</span>
+<span class="fc" id="L365">        delayedRemoteFetchPurgatoryParam = None,</span>
+<span class="pc" id="L366">        brokerEpochSupplier = () =&gt; lifecycleManager.brokerEpoch,</span>
+<span class="fc" id="L367">        addPartitionsToTxnManager = Some(addPartitionsToTxnManager),</span>
+<span class="fc" id="L368">        directoryEventHandler = directoryEventHandler,</span>
+<span class="fc" id="L369">        defaultActionQueue = defaultActionQueue</span>
+      )
+
+      /* start token manager */
+<span class="fc" id="L373">      tokenManager = new DelegationTokenManager(new DelegationTokenManagerConfigs(config), tokenCache)</span>
+
+      // Create and initialize an authorizer if one is configured.
+<span class="fc" id="L376">      authorizerPlugin = config.createNewAuthorizer(metrics, ProcessRole.BrokerRole.toString)</span>
+
+      /* initializing the groupConfigManager */
+<span class="fc" id="L379">      groupConfigManager = new GroupConfigManager(config.groupCoordinatorConfig, config.shareGroupConfig)</span>
+
+      /* create share coordinator */
+<span class="fc" id="L382">      shareCoordinator = createShareCoordinator()</span>
+
+      /* create persister */
+<span class="fc" id="L385">      persister = createShareStatePersister()</span>
+
+<span class="fc" id="L387">      partitionMetadataClient = createPartitionMetadataClient(metadataCache)</span>
+
+<span class="fc" id="L389">      groupCoordinator = createGroupCoordinator()</span>
+
+<span class="fc" id="L391">      val producerIdManagerSupplier = () =&gt; ProducerIdManager.rpc(</span>
+<span class="fc" id="L392">        config.brokerId,</span>
+<span class="fc" id="L393">        time,</span>
+<span class="fc" id="L394">        () =&gt; lifecycleManager.brokerEpoch,</span>
+<span class="fc" id="L395">        clientToControllerChannelManager</span>
+      )
+
+      // Create transaction coordinator, but don't start it until we've started replica manager.
+      // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good to fix the underlying issue
+<span class="fc" id="L400">      transactionCoordinator = TransactionCoordinator(config, replicaManager,</span>
+<span class="fc" id="L401">        new KafkaScheduler(1, true, &quot;transaction-log-manager-&quot;),</span>
+<span class="fc" id="L402">        producerIdManagerSupplier, metrics, metadataCache, Time.SYSTEM)</span>
+
+<span class="fc" id="L404">      val topicCreator = new KRaftTopicCreator(clientToControllerChannelManager)</span>
+<span class="fc" id="L405">      autoTopicCreationManager = new DefaultAutoTopicCreationManager(</span>
+<span class="fc" id="L406">        config, groupCoordinator, transactionCoordinator, shareCoordinator, time, topicCreator)</span>
+
+<span class="fc" id="L408">      dynamicConfigHandlers = Map[ConfigType, ConfigHandler](</span>
+<span class="fc" id="L409">        ConfigType.TOPIC -&gt; new TopicConfigHandler(replicaManager, config, quotaManagers),</span>
+<span class="fc" id="L410">        ConfigType.BROKER -&gt; new BrokerConfigHandler(config, quotaManagers),</span>
+<span class="fc" id="L411">        ConfigType.CLIENT_METRICS -&gt; new ClientMetricsConfigHandler(clientMetricsManager),</span>
+<span class="fc" id="L412">        ConfigType.GROUP -&gt; new GroupConfigHandler(groupCoordinator))</span>
+
+<span class="fc" id="L414">      val featuresRemapped = BrokerFeatures.createDefaultFeatureMap(brokerFeatures)</span>
+
+<span class="fc" id="L416">      val brokerLifecycleChannelManager = new NodeToControllerChannelManagerImpl(</span>
+<span class="fc" id="L417">        controllerNodeProvider,</span>
+<span class="fc" id="L418">        time,</span>
+<span class="fc" id="L419">        metrics,</span>
+<span class="fc" id="L420">        config,</span>
+<span class="fc" id="L421">        &quot;heartbeat&quot;,</span>
+<span class="fc" id="L422">        s&quot;broker-${config.nodeId}-&quot;,</span>
+<span class="fc" id="L423">        config.brokerHeartbeatIntervalMs</span>
+      )
+<span class="fc" id="L425">      val initialCordonedLogDirs: util.Set[Uuid] = config.cordonedLogDirs().stream()</span>
+<span class="pc" id="L426">        .map(dir =&gt; logManager.directoryId(dir).get)</span>
+<span class="fc" id="L427">        .collect(Collectors.toSet())</span>
+<span class="fc" id="L428">      lifecycleManager.start(</span>
+<span class="fc" id="L429">        () =&gt; sharedServer.loader.lastAppliedOffset(),</span>
+<span class="fc" id="L430">        brokerLifecycleChannelManager,</span>
+<span class="fc" id="L431">        clusterId,</span>
+<span class="fc" id="L432">        listenerInfo.toBrokerRegistrationRequest,</span>
+<span class="fc" id="L433">        featuresRemapped,</span>
+<span class="fc" id="L434">        logManager.readBrokerEpochFromCleanShutdownFiles(),</span>
+<span class="fc" id="L435">        initialCordonedLogDirs</span>
+      )
+
+      // The FetchSessionCache is divided into config.numIoThreads shards, each responsible
+      // for Math.max(1, shardNum * sessionIdRange) &lt;= sessionId &lt; (shardNum + 1) * sessionIdRange
+<span class="fc" id="L440">      val sessionIdRange = Int.MaxValue / NumFetchSessionCacheShards</span>
+<span class="fc" id="L441">      val fetchSessionCacheShards: util.List[FetchSessionCacheShard] = new util.ArrayList()</span>
+<span class="fc" id="L442">      for (shardNum &lt;- 0 until NumFetchSessionCacheShards) {</span>
+<span class="fc" id="L443">        fetchSessionCacheShards.add(new FetchSessionCacheShard(</span>
+<span class="fc" id="L444">          config.maxIncrementalFetchSessionCacheSlots / NumFetchSessionCacheShards,</span>
+<span class="fc" id="L445">          KafkaBroker.MIN_INCREMENTAL_FETCH_SESSION_EVICTION_MS,</span>
+<span class="fc" id="L446">          sessionIdRange,</span>
+<span class="fc" id="L447">          shardNum</span>
+        ))
+      }
+<span class="fc" id="L450">      val fetchManager = new FetchManager(Time.SYSTEM, new FetchSessionCache(fetchSessionCacheShards))</span>
+
+<span class="fc" id="L452">      sharePartitionManager = new SharePartitionManager(</span>
+<span class="fc" id="L453">        replicaManager,</span>
+<span class="fc" id="L454">        time,</span>
+<span class="fc" id="L455">        shareFetchSessionCache,</span>
+<span class="fc" id="L456">        config.shareGroupConfig.shareGroupRecordLockDurationMs,</span>
+<span class="fc" id="L457">        config.shareGroupConfig.shareGroupDeliveryCountLimit,</span>
+<span class="fc" id="L458">        config.shareGroupConfig.shareGroupPartitionMaxRecordLocks,</span>
+<span class="fc" id="L459">        config.remoteLogManagerConfig.remoteFetchMaxWaitMs().toLong,</span>
+<span class="fc" id="L460">        persister,</span>
+<span class="fc" id="L461">        new ShareGroupConfigProvider(groupConfigManager),</span>
+<span class="fc" id="L462">        brokerTopicStats,</span>
+<span class="pc" id="L463">        () =&gt; ShareVersion.fromFeatureLevel(metadataCache.features.finalizedFeatures.getOrDefault(ShareVersion.FEATURE_NAME, 0.toShort)).supportsShareGroupDLQ()</span>
+      )
+
+<span class="fc" id="L466">      dataPlaneRequestProcessor = new KafkaApis(</span>
+<span class="fc" id="L467">        requestChannel = socketServer.dataPlaneRequestChannel,</span>
+<span class="fc" id="L468">        forwardingManager = forwardingManager,</span>
+<span class="fc" id="L469">        replicaManager = replicaManager,</span>
+<span class="fc" id="L470">        groupCoordinator = groupCoordinator,</span>
+<span class="fc" id="L471">        txnCoordinator = transactionCoordinator,</span>
+<span class="fc" id="L472">        shareCoordinator = shareCoordinator,</span>
+<span class="fc" id="L473">        autoTopicCreationManager = autoTopicCreationManager,</span>
+<span class="fc" id="L474">        brokerId = config.nodeId,</span>
+<span class="fc" id="L475">        config = config,</span>
+<span class="fc" id="L476">        configRepository = metadataCache,</span>
+<span class="fc" id="L477">        metadataCache = metadataCache,</span>
+<span class="fc" id="L478">        metrics = metrics,</span>
+<span class="fc" id="L479">        authorizerPlugin = authorizerPlugin,</span>
+<span class="fc" id="L480">        quotas = quotaManagers,</span>
+<span class="fc" id="L481">        fetchManager = fetchManager,</span>
+<span class="fc" id="L482">        sharePartitionManager = sharePartitionManager,</span>
+<span class="fc" id="L483">        brokerTopicStats = brokerTopicStats,</span>
+<span class="fc" id="L484">        clusterId = clusterId,</span>
+<span class="fc" id="L485">        time = time,</span>
+<span class="fc" id="L486">        tokenManager = tokenManager,</span>
+<span class="fc" id="L487">        apiVersionManager = apiVersionManager,</span>
+<span class="fc" id="L488">        clientMetricsManager = clientMetricsManager,</span>
+<span class="fc" id="L489">        groupConfigManager = groupConfigManager)</span>
+
+<span class="fc" id="L491">      dataPlaneRequestHandlerPool = sharedServer.requestHandlerPoolFactory.createPool(</span>
+<span class="fc" id="L492">        config.nodeId,</span>
+<span class="fc" id="L493">        socketServer.dataPlaneRequestChannel,</span>
+<span class="fc" id="L494">        dataPlaneRequestProcessor,</span>
+<span class="fc" id="L495">        time,</span>
+<span class="fc" id="L496">        config.numIoThreads,</span>
+<span class="fc" id="L497">        &quot;broker&quot;</span>
+      )
+
+<span class="fc" id="L500">      metadataPublishers.add(new MetadataVersionConfigValidator(config.brokerId,</span>
+<span class="pc bpc" id="L501" title="2 of 4 branches missed.">        () =&gt; config.processRoles.contains(ProcessRole.BrokerRole) &amp;&amp; config.logDirs().size() &gt; 1,</span>
+<span class="fc" id="L502">        sharedServer.metadataPublishingFaultHandler</span>
+      ))
+<span class="fc" id="L504">      brokerMetadataPublisher = new BrokerMetadataPublisher(config,</span>
+<span class="fc" id="L505">        metadataCache,</span>
+<span class="fc" id="L506">        logManager,</span>
+<span class="fc" id="L507">        replicaManager,</span>
+<span class="fc" id="L508">        groupCoordinator,</span>
+<span class="fc" id="L509">        transactionCoordinator,</span>
+<span class="fc" id="L510">        shareCoordinator,</span>
+<span class="fc" id="L511">        sharePartitionManager,</span>
+<span class="fc" id="L512">        new DynamicConfigPublisher(</span>
+<span class="fc" id="L513">          config,</span>
+<span class="fc" id="L514">          sharedServer.metadataPublishingFaultHandler,</span>
+<span class="fc" id="L515">          dynamicConfigHandlers.toMap,</span>
+<span class="fc" id="L516">        &quot;broker&quot;),</span>
+<span class="fc" id="L517">        new DynamicClientQuotaPublisher(</span>
+<span class="fc" id="L518">          config.nodeId,</span>
+<span class="fc" id="L519">          sharedServer.metadataPublishingFaultHandler,</span>
+<span class="fc" id="L520">          &quot;broker&quot;,</span>
+<span class="fc" id="L521">          clientQuotaMetadataManager,</span>
+        ),
+<span class="fc" id="L523">        new DynamicTopicClusterQuotaPublisher(</span>
+<span class="fc" id="L524">          clusterId,</span>
+<span class="fc" id="L525">          config.nodeId,</span>
+<span class="fc" id="L526">          sharedServer.metadataPublishingFaultHandler,</span>
+<span class="fc" id="L527">          &quot;broker&quot;,</span>
+<span class="fc" id="L528">          quotaManagers.clientQuotaCallbackPlugin(),</span>
+<span class="fc" id="L529">          quotaManagers.quotaConfigChangeListener()</span>
+        ),
+<span class="fc" id="L531">        new ScramPublisher(</span>
+<span class="fc" id="L532">          config.nodeId,</span>
+<span class="fc" id="L533">          sharedServer.metadataPublishingFaultHandler,</span>
+<span class="fc" id="L534">          &quot;broker&quot;,</span>
+<span class="fc" id="L535">          credentialProvider),</span>
+<span class="fc" id="L536">        new DelegationTokenPublisher(</span>
+<span class="fc" id="L537">          config.nodeId,</span>
+<span class="fc" id="L538">          sharedServer.metadataPublishingFaultHandler,</span>
+<span class="fc" id="L539">          &quot;broker&quot;,</span>
+<span class="fc" id="L540">          tokenManager),</span>
+<span class="fc" id="L541">        new AclPublisher(</span>
+<span class="fc" id="L542">          config.nodeId,</span>
+<span class="fc" id="L543">          sharedServer.metadataPublishingFaultHandler,</span>
+<span class="fc" id="L544">          &quot;broker&quot;,</span>
+<span class="fc" id="L545">          authorizerPlugin.toJava</span>
+        ),
+<span class="fc" id="L547">        sharedServer.initialBrokerMetadataLoadFaultHandler,</span>
+<span class="fc" id="L548">        sharedServer.metadataPublishingFaultHandler</span>
+      )
+      // If the BrokerLifecycleManager's initial catch-up future fails, it means we timed out
+      // or are shutting down before we could catch up. Therefore, also fail the firstPublishFuture.
+<span class="fc" id="L552">      lifecycleManager.initialCatchUpFuture.whenComplete((_, e) =&gt; {</span>
+<span class="pc bpc" id="L553" title="1 of 2 branches missed.">        if (e != null) brokerMetadataPublisher.firstPublishFuture.completeExceptionally(e)</span>
+      })
+<span class="fc" id="L555">      metadataPublishers.add(brokerMetadataPublisher)</span>
+<span class="fc" id="L556">      brokerRegistrationTracker = new BrokerRegistrationTracker(config.brokerId,</span>
+<span class="pc" id="L557">        () =&gt; lifecycleManager.resendBrokerRegistration())</span>
+<span class="fc" id="L558">      metadataPublishers.add(brokerRegistrationTracker)</span>
+
+
+      // Register parts of the broker that can be reconfigured via dynamic configs.  This needs to
+      // be done before we publish the dynamic configs, so that we don't miss anything.
+<span class="fc" id="L563">      config.dynamicConfig.addReconfigurables(this)</span>
+
+      // Install all the metadata publishers.
+<span class="fc" id="L566">      FutureUtils.waitWithLogging(logger.underlying, logIdent,</span>
+<span class="fc" id="L567">        &quot;the broker metadata publishers to be installed&quot;,</span>
+<span class="fc" id="L568">        sharedServer.loader.installPublishers(metadataPublishers), startupDeadline, time)</span>
+
+      // Wait for this broker to contact the quorum, and for the active controller to acknowledge
+      // us as caught up. It will do this by returning a heartbeat response with isCaughtUp set to
+      // true. The BrokerLifecycleManager tracks this.
+<span class="fc" id="L573">      FutureUtils.waitWithLogging(logger.underlying, logIdent,</span>
+<span class="fc" id="L574">        &quot;the controller to acknowledge that we are caught up&quot;,</span>
+<span class="fc" id="L575">        lifecycleManager.initialCatchUpFuture, startupDeadline, time)</span>
+
+      // Wait for the first metadata update to be published. Metadata updates are not published
+      // until we read at least up to the high water mark of the cluster metadata partition.
+      // Usually, we publish the initial metadata before lifecycleManager.initialCatchUpFuture
+      // is completed, so this check is not necessary. But this is a simple check to make
+      // completely sure.
+<span class="fc" id="L582">      FutureUtils.waitWithLogging(logger.underlying, logIdent,</span>
+<span class="fc" id="L583">        &quot;the initial broker metadata update to be published&quot;,</span>
+<span class="fc" id="L584">        brokerMetadataPublisher.firstPublishFuture , startupDeadline, time)</span>
+
+      // Now that we have loaded some metadata, we can log a reasonably up-to-date broker
+      // configuration.  Keep in mind that KafkaConfig.originals is a mutable field that gets set
+      // by the dynamic configuration publisher. Ironically, KafkaConfig.originals does not
+      // contain the original configuration values.
+<span class="fc" id="L590">      new KafkaConfig(config.originals(), true)</span>
+
+      // We're now ready to unfence the broker. This also allows this broker to transition
+      // from RECOVERY state to RUNNING state, once the controller unfences the broker.
+<span class="fc" id="L594">      FutureUtils.waitWithLogging(logger.underlying, logIdent,</span>
+<span class="fc" id="L595">        &quot;the broker to be unfenced&quot;,</span>
+<span class="fc" id="L596">        lifecycleManager.setReadyToUnfence(), startupDeadline, time)</span>
+
+      // Enable inbound TCP connections. Each endpoint will be started only once its matching
+      // authorizer future is completed.
+      val endpointReadyFutures = {
+<span class="fc" id="L601">        val builder = new EndpointReadyFutures.Builder()</span>
+<span class="fc" id="L602">        builder.build(authorizerPlugin.toJava,</span>
+<span class="fc" id="L603">          new KafkaAuthorizerServerInfo(</span>
+<span class="fc" id="L604">            new ClusterResource(clusterId),</span>
+<span class="fc" id="L605">            config.nodeId,</span>
+<span class="fc" id="L606">            listenerInfo.listeners().values(),</span>
+<span class="fc" id="L607">            listenerInfo.firstListener(),</span>
+<span class="fc" id="L608">            config.earlyStartListeners.map(_.value()).asJava))</span>
+      }
+<span class="fc" id="L610">      val authorizerFutures = endpointReadyFutures.futures().asScala.toMap</span>
+<span class="fc" id="L611">      val enableRequestProcessingFuture = socketServer.enableRequestProcessing(authorizerFutures)</span>
+
+      // Block here until all the authorizer futures are complete.
+<span class="fc" id="L614">      FutureUtils.waitWithLogging(logger.underlying, logIdent,</span>
+<span class="fc" id="L615">        &quot;all of the authorizer futures to be completed&quot;,</span>
+<span class="fc" id="L616">        CompletableFuture.allOf(authorizerFutures.values.toSeq: _*), startupDeadline, time)</span>
+
+      // Wait for all the SocketServer ports to be open, and the Acceptors to be started.
+<span class="fc" id="L619">      FutureUtils.waitWithLogging(logger.underlying, logIdent,</span>
+<span class="fc" id="L620">        &quot;all of the SocketServer Acceptors to be started&quot;,</span>
+<span class="fc" id="L621">        enableRequestProcessingFuture, startupDeadline, time)</span>
+
+<span class="pc" id="L623">      remoteLogManagerOpt.foreach(rlm =&gt;</span>
+<span class="nc" id="L624">        rlm.remoteLogMetadataManager() match {</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">          case callback: BrokerReadyCallback =&gt;</span>
+            try {
+<span class="nc" id="L627">              callback.onBrokerReady()</span>
+            } catch {
+              case e: Exception =&gt;
+<span class="nc" id="L630">                error(s&quot;Error executing broker ready callback: ${callback.getClass.getSimpleName}&quot;, e)</span>
+            }
+<span class="nc" id="L632">          case _ =&gt; // Skip</span>
+        }
+      )
+
+<span class="pc" id="L636">      maybeChangeStatus(STARTING, STARTED)</span>
+    } catch {
+      case e: Throwable =&gt;
+<span class="nc" id="L639">        maybeChangeStatus(STARTING, STARTED)</span>
+<span class="nc" id="L640">        fatal(&quot;Fatal error during broker startup. Prepare to shutdown&quot;, e)</span>
+<span class="nc" id="L641">        shutdown()</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        throw if (e.isInstanceOf[ExecutionException]) e.getCause else e</span>
+    }
+  }
+
+  private def createPartitionMetadataClient(metadataCache: MetadataCache): PartitionMetadataClient = {
+<span class="fc" id="L647">    new NetworkPartitionMetadataClient(</span>
+<span class="fc" id="L648">      metadataCache,</span>
+<span class="fc" id="L649">      () =&gt; NetworkUtils.buildNetworkClient(</span>
+<span class="nc" id="L650">        &quot;NetworkPartitionMetadataClient&quot;,</span>
+<span class="nc" id="L651">        config,</span>
+<span class="nc" id="L652">        metrics,</span>
+<span class="nc" id="L653">        Time.SYSTEM,</span>
+<span class="nc" id="L654">        new LogContext(s&quot;[NetworkPartitionMetadataClient broker=${config.brokerId}]&quot;)</span>
+      ),
+<span class="fc" id="L656">      Time.SYSTEM,</span>
+<span class="fc" id="L657">      config.interBrokerListenerName(),</span>
+<span class="fc" id="L658">      new SystemTimerReaper(&quot;network-partition-metadata-client-reaper&quot;, new SystemTimer(&quot;network-partition-metadata-client&quot;))</span>
+    )
+  }
+
+  private def createGroupCoordinator(): GroupCoordinator = {
+    // Create group coordinator, but don't start it until we've started replica manager.
+    // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good
+    // to fix the underlying issue.
+<span class="fc" id="L666">    val time = Time.SYSTEM</span>
+<span class="fc" id="L667">    val serde = new GroupCoordinatorRecordSerde</span>
+<span class="fc" id="L668">    val timer = new SystemTimerReaper(</span>
+<span class="fc" id="L669">      &quot;group-coordinator-reaper&quot;,</span>
+<span class="fc" id="L670">      new SystemTimer(&quot;group-coordinator&quot;)</span>
+    )
+<span class="fc" id="L672">    val loader = new CoordinatorLoaderImpl[CoordinatorRecord](</span>
+<span class="fc" id="L673">      time,</span>
+<span class="fc" id="L674">      tp =&gt; replicaManager.getLog(tp).toJava,</span>
+<span class="fc" id="L675">      tp =&gt; replicaManager.getLogEndOffset(tp).map(Long.box).toJava,</span>
+<span class="fc" id="L676">      serde,</span>
+<span class="fc" id="L677">      config.groupCoordinatorConfig.offsetsLoadBufferSize,</span>
+<span class="fc" id="L678">      CoordinatorLoaderImpl.DEFAULT_COMMIT_INTERVAL_OFFSETS</span>
+    )
+<span class="fc" id="L680">    val writer = new CoordinatorPartitionWriter(</span>
+<span class="fc" id="L681">      replicaManager</span>
+    )
+<span class="fc" id="L683">    new GroupCoordinatorService.Builder(config.brokerId, config.groupCoordinatorConfig)</span>
+<span class="fc" id="L684">      .withTime(time)</span>
+<span class="fc" id="L685">      .withTimer(timer)</span>
+<span class="fc" id="L686">      .withLoader(loader)</span>
+<span class="fc" id="L687">      .withWriter(writer)</span>
+<span class="fc" id="L688">      .withCoordinatorRuntimeMetrics(new GroupCoordinatorRuntimeMetrics(metrics))</span>
+<span class="fc" id="L689">      .withGroupCoordinatorMetrics(new GroupCoordinatorMetrics(KafkaYammerMetrics.defaultRegistry, metrics))</span>
+<span class="fc" id="L690">      .withGroupConfigManager(groupConfigManager)</span>
+<span class="fc" id="L691">      .withPersister(persister)</span>
+<span class="fc" id="L692">      .withAuthorizerPlugin(authorizerPlugin.toJava)</span>
+<span class="fc" id="L693">      .withPartitionMetadataClient(partitionMetadataClient)</span>
+      .build()
+  }
+
+  private def createShareCoordinator(): ShareCoordinator = {
+<span class="fc" id="L698">    val time = Time.SYSTEM</span>
+<span class="fc" id="L699">    val timer = new SystemTimerReaper(</span>
+<span class="fc" id="L700">      &quot;share-coordinator-reaper&quot;,</span>
+<span class="fc" id="L701">      new SystemTimer(&quot;share-coordinator&quot;)</span>
+    )
+
+<span class="fc" id="L704">    val serde = new ShareCoordinatorRecordSerde</span>
+<span class="fc" id="L705">    val loader = new CoordinatorLoaderImpl[CoordinatorRecord](</span>
+<span class="fc" id="L706">      time,</span>
+<span class="pc" id="L707">      tp =&gt; replicaManager.getLog(tp).toJava,</span>
+<span class="pc" id="L708">      tp =&gt; replicaManager.getLogEndOffset(tp).map(Long.box).toJava,</span>
+<span class="fc" id="L709">      serde,</span>
+<span class="fc" id="L710">      config.shareCoordinatorConfig.shareCoordinatorLoadBufferSize(),</span>
+<span class="fc" id="L711">      CoordinatorLoaderImpl.DEFAULT_COMMIT_INTERVAL_OFFSETS</span>
+    )
+<span class="fc" id="L713">    val writer = new CoordinatorPartitionWriter(</span>
+<span class="fc" id="L714">      replicaManager</span>
+    )
+<span class="fc" id="L716">    new ShareCoordinatorService.Builder(config.brokerId, config.shareCoordinatorConfig)</span>
+<span class="fc" id="L717">      .withTimer(timer)</span>
+<span class="fc" id="L718">      .withTime(time)</span>
+<span class="fc" id="L719">      .withLoader(loader)</span>
+<span class="fc" id="L720">      .withWriter(writer)</span>
+<span class="fc" id="L721">      .withCoordinatorRuntimeMetrics(new ShareCoordinatorRuntimeMetrics(metrics))</span>
+<span class="fc" id="L722">      .withCoordinatorMetrics(new ShareCoordinatorMetrics(metrics))</span>
+      .build()
+  }
+
+  private def createShareStatePersister(): Persister = {
+<span class="pc bpc" id="L727" title="1 of 2 branches missed.">    if (config.shareGroupConfig.shareGroupPersisterClassName.nonEmpty) {</span>
+<span class="fc" id="L728">      val klass = Utils.loadClass(config.shareGroupConfig.shareGroupPersisterClassName, classOf[Object]).asInstanceOf[Class[Persister]]</span>
+
+<span class="pc bpc" id="L730" title="1 of 2 branches missed.">      if (klass.getName.equals(classOf[DefaultStatePersister].getName)) {</span>
+<span class="fc" id="L731">        klass.getConstructor(classOf[PersisterStateManager])</span>
+          .newInstance(
+<span class="fc" id="L733">            new PersisterStateManager(</span>
+<span class="fc" id="L734">              NetworkUtils.buildNetworkClient(&quot;Persister&quot;, config, metrics, Time.SYSTEM, new LogContext(s&quot;[Persister broker=${config.brokerId}]&quot;)),</span>
+<span class="pc" id="L735">              new ShareCoordinatorMetadataCacheHelperImpl(metadataCache, key =&gt; shareCoordinator.partitionFor(key), config.interBrokerListenerName),</span>
+<span class="fc" id="L736">              Time.SYSTEM,</span>
+<span class="fc" id="L737">              new SystemTimerReaper(</span>
+<span class="fc" id="L738">                &quot;persister-state-manager-reaper&quot;,</span>
+<span class="fc" id="L739">                new SystemTimer(&quot;persister&quot;)</span>
+              )
+            )
+          )
+<span class="nc bnc" id="L743" title="All 2 branches missed.">      } else if (klass.getName.equals(classOf[NoOpStatePersister].getName)) {</span>
+<span class="nc" id="L744">        info(&quot;Using no-op persister&quot;)</span>
+<span class="nc" id="L745">        new NoOpStatePersister()</span>
+      } else {
+<span class="nc" id="L747">        error(&quot;Unknown persister specified. Persister is only factory-pluggable!&quot;)</span>
+<span class="nc" id="L748">        throw new IllegalArgumentException(&quot;Unknown persister specified &quot; + config.shareGroupConfig.shareGroupPersisterClassName)</span>
+      }
+    } else {
+      // in case share coordinator not enabled or persister class name deliberately empty (key=)
+<span class="nc" id="L752">      info(&quot;Using no-op persister&quot;)</span>
+<span class="nc" id="L753">      new NoOpStatePersister()</span>
+    }
+  }
+
+  protected def createRemoteLogManager(listenerInfo: ListenerInfo): Option[RemoteLogManager] = {
+<span class="pc bpc" id="L758" title="1 of 2 branches missed.">    if (config.remoteLogManagerConfig.isRemoteStorageSystemEnabled) {</span>
+<span class="nc" id="L759">      val listenerName = config.remoteLogManagerConfig.remoteLogMetadataManagerListenerName()</span>
+<span class="nc bnc" id="L760" title="All 2 branches missed.">      val endpoint = if (listenerName != null) {</span>
+<span class="nc" id="L761">        Some(listenerInfo.listeners().values().stream</span>
+<span class="nc" id="L762">          .filter(e =&gt; ListenerName.normalised(e.listener()).equals(ListenerName.normalised(listenerName)))</span>
+          .findFirst()
+<span class="nc" id="L764">          .orElseThrow(() =&gt; new ConfigException(RemoteLogManagerConfig.REMOTE_LOG_METADATA_MANAGER_LISTENER_NAME_PROP,</span>
+<span class="nc" id="L765">            listenerName, &quot;Should be set as a listener name within valid broker listener name list: &quot; + listenerInfo.listeners().values())))</span>
+      } else {
+<span class="nc" id="L767">        None</span>
+      }
+
+<span class="nc" id="L770">      val rlm = new RemoteLogManager(config.remoteLogManagerConfig, config.brokerId, config.logDirs.get(0), clusterId, time,</span>
+<span class="nc" id="L771">        (tp: TopicPartition) =&gt; logManager.getLog(tp),</span>
+<span class="nc" id="L772">        (tp: TopicPartition, remoteLogStartOffset: java.lang.Long) =&gt; {</span>
+<span class="nc" id="L773">          logManager.getLog(tp).ifPresent { log =&gt;</span>
+<span class="nc" id="L774">            log.updateLogStartOffsetFromRemoteTier(remoteLogStartOffset)</span>
+          }
+        },
+<span class="nc" id="L777">        brokerTopicStats, metrics, endpoint.toJava)</span>
+<span class="nc" id="L778">      Some(rlm)</span>
+    } else {
+<span class="fc" id="L780">      None</span>
+    }
+  }
+
+  override def shutdown(timeout: Duration): Unit = {
+<span class="pc bpc" id="L785" title="1 of 2 branches missed.">    if (!maybeChangeStatus(STARTED, SHUTTING_DOWN)) return</span>
+    try {
+<span class="fc" id="L787">      val deadline = time.milliseconds() + timeout.toMillis</span>
+<span class="pc" id="L788">      info(&quot;shutting down&quot;)</span>
+
+<span class="pc bpc" id="L790" title="1 of 2 branches missed.">      if (config.controlledShutdownEnable) {</span>
+<span class="pc bpc" id="L791" title="1 of 2 branches missed.">        if (replicaManager != null)</span>
+<span class="fc" id="L792">          replicaManager.beginControlledShutdown()</span>
+
+<span class="pc bpc" id="L794" title="1 of 2 branches missed.">        if (lifecycleManager != null) {</span>
+<span class="fc" id="L795">          lifecycleManager.beginControlledShutdown()</span>
+          try {
+<span class="fc" id="L797">            val controlledShutdownTimeoutMs = deadline - time.milliseconds()</span>
+<span class="pc" id="L798">            lifecycleManager.controlledShutdownFuture.get(controlledShutdownTimeoutMs, TimeUnit.MILLISECONDS)</span>
+          } catch {
+            case _: TimeoutException =&gt;
+<span class="nc" id="L801">              error(&quot;Timed out waiting for the controller to approve controlled shutdown&quot;)</span>
+            case e: Throwable =&gt;
+<span class="nc" id="L803">              error(&quot;Got unexpected exception waiting for controlled shutdown future&quot;, e)</span>
+          }
+        }
+      }
+<span class="pc bpc" id="L807" title="1 of 2 branches missed.">      if (lifecycleManager != null)</span>
+<span class="fc" id="L808">        lifecycleManager.beginShutdown()</span>
+
+      // Stop socket server to stop accepting any more connections and requests.
+      // Socket server will be shutdown towards the end of the sequence.
+<span class="pc bpc" id="L812" title="1 of 2 branches missed.">      if (socketServer != null) {</span>
+<span class="fc" id="L813">        Utils.swallow(this.logger.underlying, () =&gt; socketServer.stopProcessingRequests())</span>
+      }
+<span class="fc" id="L815">      metadataPublishers.forEach(p =&gt; sharedServer.loader.removeAndClosePublisher(p).get())</span>
+<span class="fc" id="L816">      metadataPublishers.clear()</span>
+<span class="pc bpc" id="L817" title="1 of 2 branches missed.">      if (dataPlaneRequestHandlerPool != null)</span>
+<span class="fc" id="L818">        Utils.swallow(this.logger.underlying, () =&gt; dataPlaneRequestHandlerPool.shutdown())</span>
+<span class="pc bpc" id="L819" title="1 of 2 branches missed.">      if (dataPlaneRequestProcessor != null)</span>
+<span class="fc" id="L820">        Utils.swallow(this.logger.underlying, () =&gt; dataPlaneRequestProcessor.close())</span>
+<span class="pc" id="L821">      authorizerPlugin.foreach(Utils.closeQuietly(_, &quot;authorizer plugin&quot;))</span>
+
+      /**
+       * We must shutdown the scheduler early because otherwise, the scheduler could touch other
+       * resources that might have been shutdown and cause exceptions.
+       * For example, if we didn't shutdown the scheduler first, when LogManager was closing
+       * partitions one by one, the scheduler might concurrently delete old segments due to
+       * retention. However, the old segments could have been closed by the LogManager, which would
+       * cause an IOException and subsequently mark logdir as offline. As a result, the broker would
+       * not flush the remaining partitions or write the clean shutdown marker. Ultimately, the
+       * broker would have to take hours to recover the log during restart.
+       */
+<span class="pc bpc" id="L833" title="1 of 2 branches missed.">      if (kafkaScheduler != null)</span>
+<span class="fc" id="L834">        Utils.swallow(this.logger.underlying, () =&gt; kafkaScheduler.shutdown())</span>
+
+<span class="pc bpc" id="L836" title="1 of 2 branches missed.">      if (transactionCoordinator != null)</span>
+<span class="fc" id="L837">        Utils.swallow(this.logger.underlying, () =&gt; transactionCoordinator.shutdown())</span>
+
+<span class="pc bpc" id="L839" title="1 of 2 branches missed.">      if (groupConfigManager != null)</span>
+<span class="fc" id="L840">        Utils.swallow(this.logger.underlying, () =&gt; groupConfigManager.close())</span>
+
+<span class="pc bpc" id="L842" title="1 of 2 branches missed.">      if (groupCoordinator != null)</span>
+<span class="fc" id="L843">        Utils.swallow(this.logger.underlying, () =&gt; groupCoordinator.shutdown())</span>
+
+<span class="pc bpc" id="L845" title="1 of 2 branches missed.">      if (partitionMetadataClient != null)</span>
+<span class="fc" id="L846">        Utils.swallow(this.logger.underlying, () =&gt; partitionMetadataClient.close())</span>
+
+<span class="pc bpc" id="L848" title="1 of 2 branches missed.">      if (shareCoordinator != null)</span>
+<span class="fc" id="L849">        Utils.swallow(this.logger.underlying, () =&gt; shareCoordinator.shutdown())</span>
+
+<span class="pc bpc" id="L851" title="1 of 2 branches missed.">      if (autoTopicCreationManager != null)</span>
+<span class="fc" id="L852">        Utils.swallow(this.logger.underlying, () =&gt; autoTopicCreationManager.close())</span>
+
+<span class="pc bpc" id="L854" title="1 of 2 branches missed.">      if (assignmentsManager != null)</span>
+<span class="fc" id="L855">        Utils.swallow(this.logger.underlying, () =&gt; assignmentsManager.close())</span>
+
+<span class="pc bpc" id="L857" title="1 of 2 branches missed.">      if (replicaManager != null)</span>
+<span class="fc" id="L858">        Utils.swallow(this.logger.underlying, () =&gt; replicaManager.shutdown())</span>
+
+<span class="pc bpc" id="L860" title="1 of 2 branches missed.">      if (alterPartitionManager != null)</span>
+<span class="fc" id="L861">        Utils.swallow(this.logger.underlying, () =&gt; alterPartitionManager.shutdown())</span>
+
+<span class="pc bpc" id="L863" title="1 of 2 branches missed.">      if (forwardingManager != null)</span>
+<span class="fc" id="L864">        Utils.swallow(this.logger.underlying, () =&gt; forwardingManager.close())</span>
+
+<span class="pc bpc" id="L866" title="1 of 2 branches missed.">      if (clientToControllerChannelManager != null)</span>
+<span class="fc" id="L867">        Utils.swallow(this.logger.underlying, () =&gt; clientToControllerChannelManager.shutdown())</span>
+
+<span class="pc bpc" id="L869" title="1 of 2 branches missed.">      if (logManager != null) {</span>
+<span class="pc bpc" id="L870" title="1 of 2 branches missed.">        val brokerEpoch = if (lifecycleManager != null) lifecycleManager.brokerEpoch else -1</span>
+<span class="fc" id="L871">        Utils.swallow(this.logger.underlying, () =&gt; logManager.shutdown(brokerEpoch))</span>
+      }
+
+      // Close remote log manager to give a chance to any of its underlying clients
+      // (especially in RemoteStorageManager and RemoteLogMetadataManager) to close gracefully.
+<span class="pc" id="L876">      remoteLogManagerOpt.foreach(Utils.closeQuietly(_, &quot;remote log manager&quot;))</span>
+
+<span class="pc bpc" id="L878" title="1 of 2 branches missed.">      if (quotaManagers != null)</span>
+<span class="fc" id="L879">        Utils.swallow(this.logger.underlying, () =&gt; quotaManagers.shutdown())</span>
+
+<span class="pc bpc" id="L881" title="1 of 2 branches missed.">      if (socketServer != null)</span>
+<span class="fc" id="L882">        Utils.swallow(this.logger.underlying, () =&gt; socketServer.shutdown())</span>
+
+<span class="fc" id="L884">      Utils.closeQuietly(brokerTopicStats, &quot;broker topic stats&quot;)</span>
+<span class="fc" id="L885">      Utils.closeQuietly(sharePartitionManager, &quot;share partition manager&quot;)</span>
+
+<span class="pc bpc" id="L887" title="1 of 2 branches missed.">      if (persister != null)</span>
+<span class="fc" id="L888">        Utils.swallow(this.logger.underlying, () =&gt; persister.stop())</span>
+
+<span class="pc bpc" id="L890" title="1 of 2 branches missed.">      if (lifecycleManager != null)</span>
+<span class="fc" id="L891">        Utils.swallow(this.logger.underlying, () =&gt; lifecycleManager.close())</span>
+
+<span class="fc" id="L893">      Utils.swallow(this.logger.underlying, () =&gt; config.dynamicConfig.clear())</span>
+<span class="fc" id="L894">      Utils.closeQuietly(clientMetricsManager, &quot;client metrics manager&quot;)</span>
+<span class="fc" id="L895">      sharedServer.stopForBroker()</span>
+<span class="pc" id="L896">      info(&quot;shut down completed&quot;)</span>
+    } catch {
+      case e: Throwable =&gt;
+<span class="nc" id="L899">        fatal(&quot;Fatal error during broker shutdown.&quot;, e)</span>
+<span class="nc" id="L900">        throw e</span>
+    } finally {
+<span class="fc" id="L902">      maybeChangeStatus(SHUTTING_DOWN, SHUTDOWN)</span>
+    }
+  }
+
+  override def isShutdown(): Boolean = {
+<span class="nc bnc" id="L907" title="All 8 branches missed.">    status == SHUTDOWN || status == SHUTTING_DOWN</span>
+  }
+
+  override def awaitShutdown(): Unit = {
+<span class="fc" id="L911">    lock.lock()</span>
+    try {
+<span class="nc" id="L913">      while (true) {</span>
+<span class="pc bpc" id="L914" title="2 of 4 branches missed.">        if (status == SHUTDOWN) return</span>
+<span class="nc" id="L915">        awaitShutdownCond.awaitUninterruptibly()</span>
+      }
+    } finally {
+<span class="fc" id="L918">      lock.unlock()</span>
+    }
+  }
+
+<span class="fc" id="L922">  override def boundPort(listenerName: ListenerName): Int = socketServer.boundPort(listenerName)</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,461 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>WorkerConfig.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime</a> &gt; <span class="el_source">WorkerConfig.java</span></div><h1>WorkerConfig.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime;
+
+import org.apache.kafka.clients.ClientDnsLookup;
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.config.AbstractConfig;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigDef.Importance;
+import org.apache.kafka.common.config.ConfigDef.Type;
+import org.apache.kafka.common.metrics.JmxReporter;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.connector.policy.AllowlistConnectorClientConfigOverridePolicy;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.runtime.isolation.PluginDiscoveryMode;
+import org.apache.kafka.connect.runtime.rest.RestServerConfig;
+import org.apache.kafka.connect.storage.SimpleHeaderConverter;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ExecutionException;
+
+import static org.apache.kafka.common.config.ConfigDef.Range.atLeast;
+import static org.apache.kafka.common.config.ConfigDef.ValidString.in;
+import static org.apache.kafka.connect.runtime.SourceConnectorConfig.TOPIC_CREATION_PREFIX;
+import static org.apache.kafka.connect.runtime.isolation.PluginDiscoveryMode.HYBRID_FAIL;
+import static org.apache.kafka.connect.runtime.isolation.PluginDiscoveryMode.HYBRID_WARN;
+import static org.apache.kafka.connect.runtime.isolation.PluginDiscoveryMode.ONLY_SCAN;
+import static org.apache.kafka.connect.runtime.isolation.PluginDiscoveryMode.SERVICE_LOAD;
+
+/**
+ * Common base class providing configuration for Kafka Connect workers, whether standalone or distributed.
+ */
+public class WorkerConfig extends AbstractConfig {
+<span class="fc" id="L59">    private static final Logger log = LoggerFactory.getLogger(WorkerConfig.class);</span>
+
+    public static final String BOOTSTRAP_SERVERS_CONFIG = &quot;bootstrap.servers&quot;;
+    public static final String BOOTSTRAP_SERVERS_DOC =
+                &quot;A list of host/port pairs used to establish the initial connection to the Kafka cluster. &quot;
+                        + &quot;Clients use this list to bootstrap and discover the full set of Kafka brokers. &quot;
+                        + &quot;While the order of servers in the list does not matter, we recommend including more than one server to ensure resilience if any servers are down. &quot;
+                        + &quot;This list does not need to contain the entire set of brokers, as Kafka clients automatically manage and update connections to the cluster efficiently. &quot;
+                        + &quot;This list must be in the form &lt;code&gt;host1:port1,host2:port2,...&lt;/code&gt;.&quot;;
+
+    public static final String CLIENT_DNS_LOOKUP_CONFIG = CommonClientConfigs.CLIENT_DNS_LOOKUP_CONFIG;
+    public static final String CLIENT_DNS_LOOKUP_DOC = CommonClientConfigs.CLIENT_DNS_LOOKUP_DOC;
+
+    public static final String PLUGIN_VERSION_SUFFIX = &quot;plugin.version&quot;;
+
+    public static final String KEY_CONVERTER_CLASS_CONFIG = &quot;key.converter&quot;;
+    public static final String KEY_CONVERTER_CLASS_DOC =
+            &quot;Converter class used to convert between Kafka Connect format and the serialized form that is written to Kafka.&quot; +
+                    &quot; This controls the format of the keys in messages written to or read from Kafka, and since this is&quot; +
+                    &quot; independent of connectors it allows any connector to work with any serialization format.&quot; +
+                    &quot; Examples of common formats include JSON and Avro.&quot;;
+
+    public static final String KEY_CONVERTER_VERSION = &quot;key.converter.&quot; + PLUGIN_VERSION_SUFFIX;
+<span class="fc" id="L82">    public static final String KEY_CONVERTER_VERSION_DEFAULT = null;</span>
+    public static final String KEY_CONVERTER_VERSION_DOC = &quot;Version of the key converter.&quot;;
+
+    public static final String VALUE_CONVERTER_CLASS_CONFIG = &quot;value.converter&quot;;
+    public static final String VALUE_CONVERTER_CLASS_DOC =
+            &quot;Converter class used to convert between Kafka Connect format and the serialized form that is written to Kafka.&quot; +
+                    &quot; This controls the format of the values in messages written to or read from Kafka, and since this is&quot; +
+                    &quot; independent of connectors it allows any connector to work with any serialization format.&quot; +
+                    &quot; Examples of common formats include JSON and Avro.&quot;;
+
+    public static final String VALUE_CONVERTER_VERSION = &quot;value.converter.&quot; + PLUGIN_VERSION_SUFFIX;
+<span class="fc" id="L93">    public static final String VALUE_CONVERTER_VERSION_DEFAULT = null;</span>
+    public static final String VALUE_CONVERTER_VERSION_DOC = &quot;Version of the value converter.&quot;;
+
+    public static final String HEADER_CONVERTER_CLASS_CONFIG = &quot;header.converter&quot;;
+    public static final String HEADER_CONVERTER_CLASS_DOC =
+            &quot;HeaderConverter class used to convert between Kafka Connect format and the serialized form that is written to Kafka.&quot; +
+                    &quot; This controls the format of the header values in messages written to or read from Kafka, and since this is&quot; +
+                    &quot; independent of connectors it allows any connector to work with any serialization format.&quot; +
+                    &quot; Examples of common formats include JSON and Avro. By default, the SimpleHeaderConverter is used to serialize&quot; +
+                    &quot; header values to strings and deserialize them by inferring the schemas.&quot;;
+<span class="fc" id="L103">    public static final String HEADER_CONVERTER_CLASS_DEFAULT = SimpleHeaderConverter.class.getName();</span>
+
+    public static final String HEADER_CONVERTER_VERSION = &quot;header.converter.&quot; + PLUGIN_VERSION_SUFFIX;
+<span class="fc" id="L106">    public static final String HEADER_CONVERTER_VERSION_DEFAULT = null;</span>
+    public static final String HEADER_CONVERTER_VERSION_DOC = &quot;Version of the header converter.&quot;;
+
+    public static final String TASK_SHUTDOWN_GRACEFUL_TIMEOUT_MS_CONFIG
+            = &quot;task.shutdown.graceful.timeout.ms&quot;;
+    private static final String TASK_SHUTDOWN_GRACEFUL_TIMEOUT_MS_DOC =
+            &quot;Amount of time to wait for tasks to shutdown gracefully. This is the total amount of time,&quot;
+                    + &quot; not per task. All task have shutdown triggered, then they are waited on sequentially.&quot;;
+    private static final String TASK_SHUTDOWN_GRACEFUL_TIMEOUT_MS_DEFAULT = &quot;5000&quot;;
+
+    public static final String OFFSET_COMMIT_INTERVAL_MS_CONFIG = &quot;offset.flush.interval.ms&quot;;
+    private static final String OFFSET_COMMIT_INTERVAL_MS_DOC
+            = &quot;Interval at which to try committing offsets for tasks.&quot;;
+    public static final long OFFSET_COMMIT_INTERVAL_MS_DEFAULT = 60000L;
+
+    public static final String OFFSET_COMMIT_TIMEOUT_MS_CONFIG = &quot;offset.flush.timeout.ms&quot;;
+    private static final String OFFSET_COMMIT_TIMEOUT_MS_DOC
+            = &quot;Maximum number of milliseconds to wait for records to flush and partition offset data to be&quot;
+            + &quot; committed to offset storage before cancelling the process and restoring the offset &quot;
+            + &quot;data to be committed in a future attempt. This property has no effect for source connectors &quot;
+            + &quot;running with exactly-once support.&quot;;
+    public static final long OFFSET_COMMIT_TIMEOUT_MS_DEFAULT = 5000L;
+
+    public static final String PLUGIN_PATH_CONFIG = &quot;plugin.path&quot;;
+    protected static final String PLUGIN_PATH_DOC = &quot;List of paths separated by commas (,) that &quot;
+            + &quot;contain plugins (connectors, converters, transformations). The list should consist&quot;
+            + &quot; of top level directories that include any combination of: \n&quot;
+            + &quot;a) directories immediately containing jars with plugins and their dependencies\n&quot;
+            + &quot;b) uber-jars with plugins and their dependencies\n&quot;
+            + &quot;c) directories immediately containing the package directory structure of classes of &quot;
+            + &quot;plugins and their dependencies\n&quot;
+            + &quot;Note: symlinks will be followed to discover dependencies or plugins.\n&quot;
+            + &quot;Examples: plugin.path=/usr/local/share/java,/usr/local/share/kafka/plugins,&quot;
+            + &quot;/opt/connectors\n&quot;
+            + &quot;Do not use config provider variables in this property, since the raw path is used &quot;
+            + &quot;by the worker's scanner before config providers are initialized and used to &quot;
+            + &quot;replace variables.&quot;;
+
+    public static final String PLUGIN_DISCOVERY_CONFIG = &quot;plugin.discovery&quot;;
+<span class="fc" id="L145">    protected static final String PLUGIN_DISCOVERY_DOC = &quot;Method to use to discover plugins present in the classpath &quot;</span>
+            + &quot;and plugin.path configuration. This can be one of multiple values with the following meanings:\n&quot;
+            + &quot;* &quot; + ONLY_SCAN + &quot;: Discover plugins only by reflection. &quot;
+            + &quot;Plugins which are not discoverable by ServiceLoader will not impact worker startup.\n&quot;
+            + &quot;* &quot; + HYBRID_WARN + &quot;: Discover plugins reflectively and by ServiceLoader. &quot;
+            + &quot;Plugins which are not discoverable by ServiceLoader will print warnings during worker startup.\n&quot;
+            + &quot;* &quot; + HYBRID_FAIL + &quot;: Discover plugins reflectively and by ServiceLoader. &quot;
+            + &quot;Plugins which are not discoverable by ServiceLoader will cause worker startup to fail.\n&quot;
+            + &quot;* &quot; + SERVICE_LOAD + &quot;: Discover plugins only by ServiceLoader. Faster startup than other modes. &quot;
+            + &quot;Plugins which are not discoverable by ServiceLoader may not be usable.&quot;;
+
+    public static final String CONFIG_PROVIDERS_CONFIG = AbstractConfig.CONFIG_PROVIDERS_CONFIG;
+    protected static final String CONFIG_PROVIDERS_DOC = AbstractConfig.CONFIG_PROVIDERS_DOC;
+
+    public static final String CONNECTOR_CLIENT_POLICY_CLASS_CONFIG = &quot;connector.client.config.override.policy&quot;;
+    public static final String CONNECTOR_CLIENT_POLICY_CLASS_DOC =
+        &quot;Class name or alias of implementation of &lt;code&gt;ConnectorClientConfigOverridePolicy&lt;/code&gt;. Defines what client configurations can be &quot;
+        + &quot;overridden by the connector. The default policy is &lt;code&gt;All&lt;/code&gt;, meaning connector configurations can override all client properties. &quot;
+        + &quot;The other possible policies in the framework include &lt;code&gt;Allowlist&lt;/code&gt; to specify allowed configurations via &quot;
+        + &quot;&lt;code&gt;&quot; + AllowlistConnectorClientConfigOverridePolicy.ALLOWLIST_CONFIG + &quot;&lt;/code&gt;, &lt;code&gt;None&lt;/code&gt; to disallow connectors from overriding &quot;
+        + &quot;client properties, and &lt;code&gt;Principal&lt;/code&gt; (now deprecated) to allow connectors to override only client principals.&quot;;
+    public static final String CONNECTOR_CLIENT_POLICY_CLASS_DEFAULT = &quot;All&quot;;
+
+
+    public static final String METRICS_SAMPLE_WINDOW_MS_CONFIG = CommonClientConfigs.METRICS_SAMPLE_WINDOW_MS_CONFIG;
+    public static final String METRICS_NUM_SAMPLES_CONFIG = CommonClientConfigs.METRICS_NUM_SAMPLES_CONFIG;
+    public static final String METRICS_RECORDING_LEVEL_CONFIG = CommonClientConfigs.METRICS_RECORDING_LEVEL_CONFIG;
+    public static final String METRIC_REPORTER_CLASSES_CONFIG = CommonClientConfigs.METRIC_REPORTER_CLASSES_CONFIG;
+
+    public static final String TOPIC_TRACKING_ENABLE_CONFIG = &quot;topic.tracking.enable&quot;;
+    protected static final String TOPIC_TRACKING_ENABLE_DOC = &quot;Enable tracking the set of active &quot;
+            + &quot;topics per connector during runtime.&quot;;
+    protected static final boolean TOPIC_TRACKING_ENABLE_DEFAULT = true;
+
+    public static final String TOPIC_TRACKING_ALLOW_RESET_CONFIG = &quot;topic.tracking.allow.reset&quot;;
+    protected static final String TOPIC_TRACKING_ALLOW_RESET_DOC = &quot;If set to true, it allows &quot;
+            + &quot;user requests to reset the set of active topics per connector.&quot;;
+    protected static final boolean TOPIC_TRACKING_ALLOW_RESET_DEFAULT = true;
+
+    public static final String CONNECT_KAFKA_CLUSTER_ID = &quot;connect.kafka.cluster.id&quot;;
+    public static final String CONNECT_GROUP_ID = &quot;connect.group.id&quot;;
+
+    public static final String TOPIC_CREATION_ENABLE_CONFIG = &quot;topic.creation.enable&quot;;
+    protected static final String TOPIC_CREATION_ENABLE_DOC = &quot;Whether to allow &quot;
+            + &quot;automatic creation of topics used by source connectors, when source connectors &quot;
+            + &quot;are configured with &lt;code&gt;&quot; + TOPIC_CREATION_PREFIX + &quot;&lt;/code&gt; properties. Each task will use an &quot;
+            + &quot;admin client to create its topics and will not depend on the Kafka brokers &quot;
+            + &quot;to create topics automatically.&quot;;
+    protected static final boolean TOPIC_CREATION_ENABLE_DEFAULT = true;
+
+    /**
+     * Get a basic ConfigDef for a WorkerConfig. This includes all the common settings. Subclasses can use this to
+     * bootstrap their own ConfigDef.
+     * @return a ConfigDef with all the common options specified
+     */
+    protected static ConfigDef baseConfigDef() {
+<span class="fc" id="L201">        ConfigDef result = new ConfigDef()</span>
+<span class="fc" id="L202">                .define(BOOTSTRAP_SERVERS_CONFIG, Type.LIST, ConfigDef.NO_DEFAULT_VALUE,</span>
+<span class="fc" id="L203">                        ConfigDef.ValidList.anyNonDuplicateValues(false, false),</span>
+                        Importance.HIGH, BOOTSTRAP_SERVERS_DOC)
+<span class="fc" id="L205">                .define(CLIENT_DNS_LOOKUP_CONFIG,</span>
+                        Type.STRING,
+<span class="fc" id="L207">                        ClientDnsLookup.USE_ALL_DNS_IPS.toString(),</span>
+<span class="fc" id="L208">                        in(ClientDnsLookup.USE_ALL_DNS_IPS.toString(),</span>
+<span class="fc" id="L209">                           ClientDnsLookup.RESOLVE_CANONICAL_BOOTSTRAP_SERVERS_ONLY.toString()),</span>
+                        Importance.MEDIUM,
+                        CLIENT_DNS_LOOKUP_DOC)
+<span class="fc" id="L212">                .define(KEY_CONVERTER_CLASS_CONFIG, Type.CLASS,</span>
+                        Importance.HIGH, KEY_CONVERTER_CLASS_DOC)
+<span class="fc" id="L214">                .define(KEY_CONVERTER_VERSION, Type.STRING,</span>
+                        KEY_CONVERTER_VERSION_DEFAULT, Importance.LOW, KEY_CONVERTER_VERSION_DOC)
+<span class="fc" id="L216">                .define(VALUE_CONVERTER_CLASS_CONFIG, Type.CLASS,</span>
+                        Importance.HIGH, VALUE_CONVERTER_CLASS_DOC)
+<span class="fc" id="L218">                .define(VALUE_CONVERTER_VERSION, Type.STRING,</span>
+                        VALUE_CONVERTER_VERSION_DEFAULT, Importance.LOW, VALUE_CONVERTER_VERSION_DOC)
+<span class="fc" id="L220">                .define(TASK_SHUTDOWN_GRACEFUL_TIMEOUT_MS_CONFIG, Type.LONG,</span>
+                        TASK_SHUTDOWN_GRACEFUL_TIMEOUT_MS_DEFAULT, Importance.LOW,
+                        TASK_SHUTDOWN_GRACEFUL_TIMEOUT_MS_DOC)
+<span class="fc" id="L223">                .define(OFFSET_COMMIT_INTERVAL_MS_CONFIG, Type.LONG, OFFSET_COMMIT_INTERVAL_MS_DEFAULT,</span>
+                        Importance.LOW, OFFSET_COMMIT_INTERVAL_MS_DOC)
+<span class="fc" id="L225">                .define(OFFSET_COMMIT_TIMEOUT_MS_CONFIG, Type.LONG, OFFSET_COMMIT_TIMEOUT_MS_DEFAULT,</span>
+                        Importance.LOW, OFFSET_COMMIT_TIMEOUT_MS_DOC)
+<span class="fc" id="L227">                .define(PLUGIN_PATH_CONFIG,</span>
+                        Type.LIST,
+                        null,
+<span class="fc" id="L230">                        ConfigDef.ValidList.anyNonDuplicateValues(false, true),</span>
+                        Importance.LOW,
+                        PLUGIN_PATH_DOC)
+<span class="fc" id="L233">                .define(PLUGIN_DISCOVERY_CONFIG,</span>
+                        Type.STRING,
+<span class="fc" id="L235">                        PluginDiscoveryMode.HYBRID_WARN.toString(),</span>
+<span class="fc" id="L236">                        ConfigDef.CaseInsensitiveValidString.in(Utils.enumOptions(PluginDiscoveryMode.class)),</span>
+                        Importance.LOW,
+                        PLUGIN_DISCOVERY_DOC)
+<span class="fc" id="L239">                .define(METRICS_SAMPLE_WINDOW_MS_CONFIG, Type.LONG,</span>
+<span class="fc" id="L240">                        30000, atLeast(0), Importance.LOW,</span>
+                        CommonClientConfigs.METRICS_SAMPLE_WINDOW_MS_DOC)
+<span class="fc" id="L242">                .define(METRICS_NUM_SAMPLES_CONFIG, Type.INT,</span>
+<span class="fc" id="L243">                        2, atLeast(1), Importance.LOW,</span>
+                        CommonClientConfigs.METRICS_NUM_SAMPLES_DOC)
+<span class="fc" id="L245">                .define(METRICS_RECORDING_LEVEL_CONFIG, Type.STRING,</span>
+<span class="fc" id="L246">                        Sensor.RecordingLevel.INFO.toString(),</span>
+<span class="fc" id="L247">                        in(Sensor.RecordingLevel.INFO.toString(), Sensor.RecordingLevel.DEBUG.toString()),</span>
+                        Importance.LOW,
+                        CommonClientConfigs.METRICS_RECORDING_LEVEL_DOC)
+<span class="fc" id="L250">                .define(METRIC_REPORTER_CLASSES_CONFIG, Type.LIST,</span>
+<span class="fc" id="L251">                        JmxReporter.class.getName(),</span>
+<span class="fc" id="L252">                        ConfigDef.ValidList.anyNonDuplicateValues(true, false),</span>
+                        Importance.LOW,
+                        CommonClientConfigs.METRIC_REPORTER_CLASSES_DOC)
+<span class="fc" id="L255">                .define(HEADER_CONVERTER_CLASS_CONFIG, Type.CLASS,</span>
+                        HEADER_CONVERTER_CLASS_DEFAULT,
+                        Importance.LOW, HEADER_CONVERTER_CLASS_DOC)
+<span class="fc" id="L258">                .define(HEADER_CONVERTER_VERSION, Type.STRING,</span>
+                        HEADER_CONVERTER_VERSION_DEFAULT, Importance.LOW, HEADER_CONVERTER_VERSION_DOC)
+<span class="fc" id="L260">                .define(CONFIG_PROVIDERS_CONFIG,</span>
+                        Type.LIST,
+<span class="fc" id="L262">                        List.of(),</span>
+<span class="fc" id="L263">                        ConfigDef.ValidList.anyNonDuplicateValues(true, false),</span>
+                        Importance.LOW, CONFIG_PROVIDERS_DOC)
+<span class="fc" id="L265">                .define(CONNECTOR_CLIENT_POLICY_CLASS_CONFIG, Type.STRING, CONNECTOR_CLIENT_POLICY_CLASS_DEFAULT,</span>
+                        Importance.MEDIUM, CONNECTOR_CLIENT_POLICY_CLASS_DOC)
+<span class="fc" id="L267">                .define(TOPIC_CREATION_ENABLE_CONFIG, Type.BOOLEAN, TOPIC_CREATION_ENABLE_DEFAULT, Importance.LOW,</span>
+                        TOPIC_CREATION_ENABLE_DOC)
+                // security support
+<span class="fc" id="L270">                .withClientSslSupport();</span>
+<span class="fc" id="L271">        addTopicTrackingConfig(result);</span>
+<span class="fc" id="L272">        RestServerConfig.addPublicConfig(result);</span>
+<span class="fc" id="L273">        return result;</span>
+    }
+
+    public static void addTopicTrackingConfig(ConfigDef configDef) {
+<span class="fc" id="L277">        configDef</span>
+<span class="fc" id="L278">                .define(</span>
+                        TOPIC_TRACKING_ENABLE_CONFIG,
+                        ConfigDef.Type.BOOLEAN,
+<span class="fc" id="L281">                        TOPIC_TRACKING_ENABLE_DEFAULT,</span>
+                        ConfigDef.Importance.LOW,
+                        TOPIC_TRACKING_ENABLE_DOC
+<span class="fc" id="L284">                ).define(</span>
+                        TOPIC_TRACKING_ALLOW_RESET_CONFIG,
+                        ConfigDef.Type.BOOLEAN,
+<span class="fc" id="L287">                        TOPIC_TRACKING_ALLOW_RESET_DEFAULT,</span>
+                        ConfigDef.Importance.LOW,
+                        TOPIC_TRACKING_ALLOW_RESET_DOC);
+<span class="fc" id="L290">    }</span>
+
+    private String kafkaClusterId;
+
+    // Visible for testing
+    static String lookupKafkaClusterId(WorkerConfig config) {
+<span class="fc" id="L296">        log.info(&quot;Creating Kafka admin client&quot;);</span>
+<span class="fc" id="L297">        try (Admin adminClient = Admin.create(config.originals())) {</span>
+<span class="fc" id="L298">            return lookupKafkaClusterId(adminClient);</span>
+        }
+    }
+
+    // Visible for testing
+    static String lookupKafkaClusterId(Admin adminClient) {
+<span class="fc" id="L304">        log.debug(&quot;Looking up Kafka cluster ID&quot;);</span>
+        try {
+<span class="fc" id="L306">            KafkaFuture&lt;String&gt; clusterIdFuture = adminClient.describeCluster().clusterId();</span>
+<span class="pc bpc" id="L307" title="1 of 2 branches missed.">            if (clusterIdFuture == null) {</span>
+<span class="nc" id="L308">                log.info(&quot;Kafka cluster version is too old to return cluster ID&quot;);</span>
+<span class="nc" id="L309">                return null;</span>
+            }
+<span class="fc" id="L311">            log.debug(&quot;Fetching Kafka cluster ID&quot;);</span>
+<span class="fc" id="L312">            String kafkaClusterId = clusterIdFuture.get();</span>
+<span class="fc" id="L313">            log.info(&quot;Kafka cluster ID: {}&quot;, kafkaClusterId);</span>
+<span class="fc" id="L314">            return kafkaClusterId;</span>
+<span class="nc" id="L315">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L316">            throw new ConnectException(&quot;Unexpectedly interrupted when looking up Kafka cluster info&quot;, e);</span>
+<span class="nc" id="L317">        } catch (ExecutionException e) {</span>
+<span class="nc" id="L318">            throw new ConnectException(&quot;Failed to connect to and describe Kafka cluster. &quot;</span>
+                                       + &quot;Check worker's broker connection and security properties.&quot;, e);
+        }
+    }
+
+    private void logInternalConverterRemovalWarnings(Map&lt;String, String&gt; props) {
+<span class="fc" id="L324">        List&lt;String&gt; removedProperties = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L325" title="All 2 branches covered.">        for (String property : List.of(&quot;internal.key.converter&quot;, &quot;internal.value.converter&quot;)) {</span>
+<span class="pc bpc" id="L326" title="1 of 2 branches missed.">            if (props.containsKey(property)) {</span>
+<span class="nc" id="L327">                removedProperties.add(property);</span>
+            }
+<span class="fc" id="L329">            removedProperties.addAll(originalsWithPrefix(property + &quot;.&quot;).keySet());</span>
+<span class="fc" id="L330">        }</span>
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">        if (!removedProperties.isEmpty()) {</span>
+<span class="nc" id="L332">            log.warn(</span>
+                    &quot;The worker has been configured with one or more internal converter properties ({}). &quot;
+                     + &quot;These properties have been removed since version 3.0 and an instance of the JsonConverter with schemas.enable set to false will be used instead.&quot;,
+                    removedProperties);
+        }
+<span class="fc" id="L337">    }</span>
+
+    private void logPluginPathConfigProviderWarning(Map&lt;String, String&gt; rawOriginals) {
+<span class="fc" id="L340">        String rawPluginPath = rawOriginals.get(PLUGIN_PATH_CONFIG);</span>
+        // Can't use AbstractConfig::originalsStrings here since some values may be null, which
+        // causes that method to fail
+<span class="fc" id="L343">        String transformedPluginPath = Objects.toString(originals().get(PLUGIN_PATH_CONFIG), null);</span>
+<span class="pc bpc" id="L344" title="1 of 2 branches missed.">        if (!Objects.equals(rawPluginPath, transformedPluginPath)) {</span>
+<span class="nc" id="L345">            log.warn(</span>
+                &quot;Variables cannot be used in the 'plugin.path' property, since the property is &quot;
+                + &quot;used by plugin scanning before the config providers that replace the &quot;
+                + &quot;variables are initialized. The raw value '{}' was used for plugin scanning, as &quot;
+                + &quot;opposed to the transformed value '{}', and this may cause unexpected results.&quot;,
+                rawPluginPath,
+                transformedPluginPath
+            );
+        }
+<span class="fc" id="L354">    }</span>
+
+    /**
+     * @return the {@link CommonClientConfigs#BOOTSTRAP_SERVERS_CONFIG bootstrap servers} property
+     * used by the worker when instantiating Kafka clients for connectors and tasks (unless overridden)
+     * and its internal topics (if running in distributed mode)
+     */
+    public String bootstrapServers() {
+<span class="fc" id="L362">        return String.join(&quot;,&quot;, getList(BOOTSTRAP_SERVERS_CONFIG));</span>
+    }
+
+    public Integer rebalanceTimeout() {
+<span class="fc" id="L366">        return null;</span>
+    }
+
+    public boolean topicCreationEnable() {
+<span class="fc" id="L370">        return getBoolean(TOPIC_CREATION_ENABLE_CONFIG);</span>
+    }
+
+    /**
+     * Whether this worker is configured with exactly-once support for source connectors.
+     * The default implementation returns {@code false} and should be overridden by subclasses
+     * if the worker mode for the subclass provides exactly-once support for source connectors.
+     * @return whether exactly-once support is enabled for source connectors on this worker
+     */
+    public boolean exactlyOnceSourceEnabled() {
+<span class="fc" id="L380">        return false;</span>
+    }
+
+    /**
+     * Get the internal topic used by this worker to store source connector offsets.
+     * The default implementation returns {@code null} and should be overridden by subclasses
+     * if the worker mode for the subclass uses an internal offsets topic.
+     * @return the name of the internal offsets topic, or {@code null} if the worker does not use
+     * an internal offsets topic
+     */
+    public String offsetsTopic() {
+<span class="fc" id="L391">        return null;</span>
+    }
+
+    /**
+     * Determine whether this worker supports per-connector source offsets topics.
+     * The default implementation returns {@code false} and should be overridden by subclasses
+     * if the worker mode for the subclass supports per-connector offsets topics.
+     * @return whether the worker supports per-connector offsets topics
+     */
+    public boolean connectorOffsetsTopicsPermitted() {
+<span class="nc" id="L401">        return false;</span>
+    }
+
+    /**
+     * @return the offset commit interval for tasks created by this worker
+     */
+    public long offsetCommitInterval() {
+<span class="nc" id="L408">        return getLong(OFFSET_COMMIT_INTERVAL_MS_CONFIG);</span>
+    }
+
+    /**
+     * Get the {@link CommonClientConfigs#GROUP_ID_CONFIG group ID} used by this worker to form a cluster.
+     * The default implementation returns {@code null} and should be overridden by subclasses
+     * if the worker mode for the subclass is capable of forming a cluster using Kafka's group coordination API.
+     * @return the group ID for the worker's cluster, or {@code null} if the worker is not capable of forming a cluster.
+     */
+    public String groupId() {
+<span class="nc" id="L418">        return null;</span>
+    }
+
+    public String kafkaClusterId() {
+<span class="fc bfc" id="L422" title="All 2 branches covered.">        if (kafkaClusterId == null) {</span>
+<span class="fc" id="L423">            kafkaClusterId = lookupKafkaClusterId(this);</span>
+        }
+<span class="fc" id="L425">        return kafkaClusterId;</span>
+    }
+
+    @Override
+    protected Map&lt;String, Object&gt; postProcessParsedConfig(final Map&lt;String, Object&gt; parsedValues) {
+<span class="fc" id="L430">        return CommonClientConfigs.postProcessReconnectBackoffConfigs(this, parsedValues);</span>
+    }
+
+    public static String pluginPath(Map&lt;String, String&gt; props) {
+<span class="fc" id="L434">        return props.get(WorkerConfig.PLUGIN_PATH_CONFIG);</span>
+    }
+
+    public static PluginDiscoveryMode pluginDiscovery(Map&lt;String, String&gt; props) {
+<span class="fc" id="L438">        String value = props.getOrDefault(WorkerConfig.PLUGIN_DISCOVERY_CONFIG, PluginDiscoveryMode.HYBRID_WARN.toString());</span>
+        try {
+<span class="fc" id="L440">            return PluginDiscoveryMode.valueOf(value.toUpperCase(Locale.ROOT));</span>
+<span class="nc" id="L441">        } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L442">            throw new ConnectException(&quot;Invalid &quot; + PLUGIN_DISCOVERY_CONFIG + &quot; value, must be one of &quot;</span>
+<span class="nc" id="L443">                    + Arrays.toString(Utils.enumOptions(PluginDiscoveryMode.class)));</span>
+        }
+    }
+
+    @SuppressWarnings(&quot;this-escape&quot;)
+    public WorkerConfig(ConfigDef definition, Map&lt;String, String&gt; props) {
+<span class="fc" id="L449">        super(definition, props, Utils.castToStringObjectMap(props), true);</span>
+<span class="fc" id="L450">        logInternalConverterRemovalWarnings(props);</span>
+<span class="fc" id="L451">        logPluginPathConfigProviderWarning(props);</span>
+<span class="fc" id="L452">    }</span>
+
+    @Override
+    public Map&lt;String, Object&gt; originals() {
+<span class="fc" id="L456">        Map&lt;String, Object&gt; map = super.originals();</span>
+<span class="fc" id="L457">        map.remove(AbstractConfig.CONFIG_PROVIDERS_CONFIG);</span>
+<span class="fc" id="L458">        return map;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

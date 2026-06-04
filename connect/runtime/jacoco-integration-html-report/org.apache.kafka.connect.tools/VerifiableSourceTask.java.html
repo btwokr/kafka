@@ -1,0 +1,173 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>VerifiableSourceTask.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.tools</a> &gt; <span class="el_source">VerifiableSourceTask.java</span></div><h1>VerifiableSourceTask.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.tools;
+
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.source.SourceRecord;
+import org.apache.kafka.connect.source.SourceTask;
+import org.apache.kafka.server.util.ThroughputThrottler;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Stream;
+
+/**
+ * A connector primarily intended for system tests. The connector simply generates as many tasks as requested. The
+ * tasks print metadata in the form of JSON to stdout for each message generated, making externally visible which
+ * messages have been sent. Each message is also assigned a unique, increasing seqno that is passed to Kafka Connect; when
+ * tasks are started on new nodes, this seqno is used to resume where the task previously left off, allowing for
+ * testing of distributed Kafka Connect.
+ * &lt;p&gt;
+ * If logging is left enabled, log output on stdout can be easily ignored by checking whether a given line is valid JSON.
+ */
+<span class="nc" id="L48">public class VerifiableSourceTask extends SourceTask {</span>
+<span class="nc" id="L49">    private static final Logger log = LoggerFactory.getLogger(VerifiableSourceTask.class);</span>
+
+    public static final String NAME_CONFIG = &quot;name&quot;;
+    public static final String ID_CONFIG = &quot;id&quot;;
+    public static final String TOPIC_CONFIG = &quot;topic&quot;;
+    public static final String THROUGHPUT_CONFIG = &quot;throughput&quot;;
+    public static final String COMPLETE_RECORD_DATA_CONFIG = &quot;complete.record.data&quot;;
+
+    private static final String ID_FIELD = &quot;id&quot;;
+    private static final String SEQNO_FIELD = &quot;seqno&quot;;
+
+<span class="nc" id="L60">    private static final ObjectMapper JSON_SERDE = new ObjectMapper();</span>
+
+    private String name; // Connector name
+    private int id; // Task ID
+    private String topic;
+    private Map&lt;String, Integer&gt; partition;
+    private long startingSeqno;
+    private long seqno;
+    private ThroughputThrottler throttler;
+    private boolean completeRecordData;
+
+<span class="nc" id="L71">    private static final Schema COMPLETE_VALUE_SCHEMA = SchemaBuilder.struct()</span>
+<span class="nc" id="L72">        .field(&quot;name&quot;, Schema.STRING_SCHEMA)</span>
+<span class="nc" id="L73">        .field(&quot;task&quot;, Schema.INT32_SCHEMA)</span>
+<span class="nc" id="L74">        .field(&quot;topic&quot;, Schema.STRING_SCHEMA)</span>
+<span class="nc" id="L75">        .field(&quot;time_ms&quot;, Schema.INT64_SCHEMA)</span>
+<span class="nc" id="L76">        .field(&quot;seqno&quot;, Schema.INT64_SCHEMA)</span>
+<span class="nc" id="L77">        .build();</span>
+
+    @Override
+    public String version() {
+<span class="nc" id="L81">        return new VerifiableSourceConnector().version();</span>
+    }
+
+    @Override
+    public void start(Map&lt;String, String&gt; props) {
+        final long throughput;
+        try {
+<span class="nc" id="L88">            name = props.get(NAME_CONFIG);</span>
+<span class="nc" id="L89">            id = Integer.parseInt(props.get(ID_CONFIG));</span>
+<span class="nc" id="L90">            topic = props.get(TOPIC_CONFIG);</span>
+<span class="nc" id="L91">            throughput = Long.parseLong(props.get(THROUGHPUT_CONFIG));</span>
+<span class="nc" id="L92">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L93">            throw new ConnectException(&quot;Invalid VerifiableSourceTask configuration&quot;, e);</span>
+<span class="nc" id="L94">        }</span>
+
+<span class="nc" id="L96">        partition = Map.of(ID_FIELD, id);</span>
+<span class="nc" id="L97">        Map&lt;String, Object&gt; previousOffset = this.context.offsetStorageReader().offset(partition);</span>
+<span class="nc bnc" id="L98" title="All 2 branches missed.">        if (previousOffset != null)</span>
+<span class="nc" id="L99">            seqno = (Long) previousOffset.get(SEQNO_FIELD) + 1;</span>
+        else
+<span class="nc" id="L101">            seqno = 0;</span>
+<span class="nc" id="L102">        startingSeqno = seqno;</span>
+<span class="nc" id="L103">        throttler = new ThroughputThrottler(throughput, System.currentTimeMillis());</span>
+<span class="nc" id="L104">        completeRecordData = &quot;true&quot;.equalsIgnoreCase(props.get(COMPLETE_RECORD_DATA_CONFIG));</span>
+
+<span class="nc" id="L106">        log.info(&quot;Started VerifiableSourceTask {}-{} producing to topic {} resuming from seqno {}&quot;, name, id, topic, startingSeqno);</span>
+<span class="nc" id="L107">    }</span>
+
+    @Override
+    public List&lt;SourceRecord&gt; poll() {
+<span class="nc" id="L111">        long sendStartMs = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">        if (throttler.shouldThrottle(seqno - startingSeqno, sendStartMs))</span>
+<span class="nc" id="L113">            throttler.throttle();</span>
+
+<span class="nc" id="L115">        long nowMs = System.currentTimeMillis();</span>
+
+<span class="nc" id="L117">        Map&lt;String, Object&gt; data = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L118">        data.put(&quot;name&quot;, name);</span>
+<span class="nc" id="L119">        data.put(&quot;task&quot;, id);</span>
+<span class="nc" id="L120">        data.put(&quot;topic&quot;, this.topic);</span>
+<span class="nc" id="L121">        data.put(&quot;time_ms&quot;, nowMs);</span>
+<span class="nc" id="L122">        data.put(&quot;seqno&quot;, seqno);</span>
+        String dataJson;
+        try {
+<span class="nc" id="L125">            dataJson = JSON_SERDE.writeValueAsString(data);</span>
+<span class="nc" id="L126">        } catch (JsonProcessingException e) {</span>
+<span class="nc" id="L127">            dataJson = &quot;Bad data can't be written as json: &quot; + e.getMessage();</span>
+<span class="nc" id="L128">        }</span>
+<span class="nc" id="L129">        System.out.println(dataJson);</span>
+
+<span class="nc" id="L131">        Map&lt;String, Long&gt; ccOffset = Map.of(SEQNO_FIELD, seqno);</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        Schema valueSchema = completeRecordData ? COMPLETE_VALUE_SCHEMA : Schema.INT64_SCHEMA;</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        Object value = completeRecordData ? completeValue(data) : seqno;</span>
+<span class="nc" id="L134">        SourceRecord srcRecord = new SourceRecord(partition, ccOffset, topic, Schema.INT32_SCHEMA, id, valueSchema, value);</span>
+<span class="nc" id="L135">        List&lt;SourceRecord&gt; result = List.of(srcRecord);</span>
+<span class="nc" id="L136">        seqno++;</span>
+<span class="nc" id="L137">        return result;</span>
+    }
+
+    @Override
+    public void commitRecord(SourceRecord record, RecordMetadata metadata) {
+<span class="nc" id="L142">        Map&lt;String, Object&gt; data = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L143">        data.put(&quot;name&quot;, name);</span>
+<span class="nc" id="L144">        data.put(&quot;task&quot;, id);</span>
+<span class="nc" id="L145">        data.put(&quot;topic&quot;, this.topic);</span>
+<span class="nc" id="L146">        data.put(&quot;time_ms&quot;, System.currentTimeMillis());</span>
+<span class="nc" id="L147">        data.put(&quot;seqno&quot;, record.value());</span>
+<span class="nc" id="L148">        data.put(&quot;committed&quot;, true);</span>
+
+        String dataJson;
+        try {
+<span class="nc" id="L152">            dataJson = JSON_SERDE.writeValueAsString(data);</span>
+<span class="nc" id="L153">        } catch (JsonProcessingException e) {</span>
+<span class="nc" id="L154">            dataJson = &quot;Bad data can't be written as json: &quot; + e.getMessage();</span>
+<span class="nc" id="L155">        }</span>
+<span class="nc" id="L156">        System.out.println(dataJson);</span>
+<span class="nc" id="L157">    }</span>
+
+    @Override
+    public void stop() {
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        if (throttler != null)</span>
+<span class="nc" id="L162">            throttler.wakeup();</span>
+<span class="nc" id="L163">    }</span>
+
+    private Object completeValue(Map&lt;String, Object&gt; data) {
+<span class="nc" id="L166">        Struct result = new Struct(COMPLETE_VALUE_SCHEMA);</span>
+<span class="nc" id="L167">        Stream.of(&quot;name&quot;, &quot;task&quot;, &quot;topic&quot;, &quot;time_ms&quot;, &quot;seqno&quot;).forEach(</span>
+<span class="nc" id="L168">            field -&gt; result.put(field, data.get(field))</span>
+        );
+<span class="nc" id="L170">        return result;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

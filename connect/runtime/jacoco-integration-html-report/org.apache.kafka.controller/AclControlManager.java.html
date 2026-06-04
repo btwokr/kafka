@@ -1,0 +1,253 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AclControlManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.controller</a> &gt; <span class="el_source">AclControlManager.java</span></div><h1>AclControlManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.controller;
+
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.acl.AclBinding;
+import org.apache.kafka.common.acl.AclBindingFilter;
+import org.apache.kafka.common.errors.ApiException;
+import org.apache.kafka.common.errors.InvalidRequestException;
+import org.apache.kafka.common.errors.UnknownServerException;
+import org.apache.kafka.common.metadata.AccessControlEntryRecord;
+import org.apache.kafka.common.metadata.RemoveAccessControlEntryRecord;
+import org.apache.kafka.common.requests.ApiError;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.metadata.authorizer.StandardAcl;
+import org.apache.kafka.metadata.authorizer.StandardAclWithId;
+import org.apache.kafka.server.authorizer.AclCreateResult;
+import org.apache.kafka.server.authorizer.AclDeleteResult;
+import org.apache.kafka.server.authorizer.AclDeleteResult.AclBindingDeleteResult;
+import org.apache.kafka.server.common.ApiMessageAndVersion;
+import org.apache.kafka.server.mutable.BoundedList;
+import org.apache.kafka.server.mutable.BoundedListTooLongException;
+import org.apache.kafka.timeline.SnapshotRegistry;
+import org.apache.kafka.timeline.TimelineHashMap;
+import org.apache.kafka.timeline.TimelineHashSet;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+
+import static org.apache.kafka.controller.QuorumController.MAX_RECORDS_PER_USER_OP;
+
+
+/**
+ * The AclControlManager manages any ACLs that are stored in the __cluster_metadata topic.
+ * If the ACLs are stored externally (such as in ZooKeeper) then there will be nothing for
+ * this manager to do.
+ */
+public class AclControlManager {
+<span class="fc" id="L61">    static class Builder {</span>
+<span class="fc" id="L62">        private LogContext logContext = null;</span>
+<span class="fc" id="L63">        private SnapshotRegistry snapshotRegistry = null;</span>
+
+        Builder setLogContext(LogContext logContext) {
+<span class="fc" id="L66">            this.logContext = logContext;</span>
+<span class="fc" id="L67">            return this;</span>
+        }
+
+        Builder setSnapshotRegistry(SnapshotRegistry snapshotRegistry) {
+<span class="fc" id="L71">            this.snapshotRegistry = snapshotRegistry;</span>
+<span class="fc" id="L72">            return this;</span>
+        }
+
+        AclControlManager build() {
+<span class="pc bpc" id="L76" title="1 of 2 branches missed.">            if (logContext == null) logContext = new LogContext();</span>
+<span class="pc bpc" id="L77" title="1 of 2 branches missed.">            if (snapshotRegistry == null) snapshotRegistry = new SnapshotRegistry(logContext);</span>
+<span class="fc" id="L78">            return new AclControlManager(logContext, snapshotRegistry);</span>
+        }
+    }
+
+    private final Logger log;
+    private final TimelineHashMap&lt;Uuid, StandardAcl&gt; idToAcl;
+    private final TimelineHashSet&lt;StandardAcl&gt; existingAcls;
+
+    private AclControlManager(
+        LogContext logContext,
+        SnapshotRegistry snapshotRegistry
+<span class="fc" id="L89">    ) {</span>
+<span class="fc" id="L90">        this.log = logContext.logger(AclControlManager.class);</span>
+<span class="fc" id="L91">        this.idToAcl = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L92">        this.existingAcls = new TimelineHashSet&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L93">    }</span>
+
+    ControllerResult&lt;List&lt;AclCreateResult&gt;&gt; createAcls(List&lt;AclBinding&gt; acls) {
+<span class="nc" id="L96">        Set&lt;StandardAcl&gt; aclsToCreate = new HashSet&lt;&gt;(acls.size());</span>
+<span class="nc" id="L97">        List&lt;AclCreateResult&gt; results = new ArrayList&lt;&gt;(acls.size());</span>
+<span class="nc" id="L98">        List&lt;ApiMessageAndVersion&gt; records =</span>
+<span class="nc" id="L99">                BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">        for (AclBinding acl : acls) {</span>
+            try {
+<span class="nc" id="L102">                validateNewAcl(acl);</span>
+<span class="nc" id="L103">            } catch (Throwable t) {</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">                ApiException e = (t instanceof ApiException) ? (ApiException) t :</span>
+<span class="nc" id="L105">                    new UnknownServerException(&quot;Unknown error while trying to create ACL&quot;, t);</span>
+<span class="nc" id="L106">                results.add(new AclCreateResult(e));</span>
+<span class="nc" id="L107">                continue;</span>
+<span class="nc" id="L108">            }</span>
+<span class="nc" id="L109">            StandardAcl standardAcl = StandardAcl.fromAclBinding(acl);</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">            if (!existingAcls.contains(standardAcl)) {</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">                if (aclsToCreate.add(standardAcl)) {</span>
+<span class="nc" id="L112">                    StandardAclWithId standardAclWithId = new StandardAclWithId(newAclId(), standardAcl);</span>
+<span class="nc" id="L113">                    records.add(new ApiMessageAndVersion(standardAclWithId.toRecord(), (short) 0));</span>
+<span class="nc" id="L114">                } else {</span>
+<span class="nc" id="L115">                    log.debug(&quot;Ignoring duplicate ACL from request: {}&quot;, standardAcl);</span>
+                }
+            } else {
+<span class="nc" id="L118">                log.debug(&quot;Not creating ACL since it already exists: {}&quot;, standardAcl);</span>
+            }
+
+
+<span class="nc" id="L122">            results.add(AclCreateResult.SUCCESS);</span>
+<span class="nc" id="L123">        }</span>
+<span class="nc" id="L124">        return new ControllerResult&lt;&gt;(records, results, true);</span>
+    }
+
+    Uuid newAclId() {
+        Uuid uuid;
+        do {
+<span class="nc" id="L130">            uuid = Uuid.randomUuid();</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">        } while (idToAcl.containsKey(uuid));</span>
+<span class="nc" id="L132">        return uuid;</span>
+    }
+
+    static void validateNewAcl(AclBinding binding) {
+<span class="nc bnc" id="L136" title="All 2 branches missed.">        switch (binding.pattern().resourceType()) {</span>
+            case UNKNOWN:
+            case ANY:
+<span class="nc" id="L139">                throw new InvalidRequestException(&quot;Invalid resourceType &quot; +</span>
+<span class="nc" id="L140">                    binding.pattern().resourceType());</span>
+            default:
+                break;
+        }
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        switch (binding.pattern().patternType()) {</span>
+            case LITERAL:
+            case PREFIXED:
+<span class="nc" id="L147">                break;</span>
+            default:
+<span class="nc" id="L149">                throw new InvalidRequestException(&quot;Invalid patternType &quot; +</span>
+<span class="nc" id="L150">                    binding.pattern().patternType());</span>
+        }
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        switch (binding.entry().operation()) {</span>
+            case UNKNOWN:
+            case ANY:
+<span class="nc" id="L155">                throw new InvalidRequestException(&quot;Invalid operation &quot; +</span>
+<span class="nc" id="L156">                    binding.entry().operation());</span>
+            default:
+                break;
+        }
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        switch (binding.entry().permissionType()) {</span>
+            case DENY:
+            case ALLOW:
+<span class="nc" id="L163">                break;</span>
+            default:
+<span class="nc" id="L165">                throw new InvalidRequestException(&quot;Invalid permissionType &quot; +</span>
+<span class="nc" id="L166">                    binding.entry().permissionType());</span>
+        }
+<span class="nc bnc" id="L168" title="All 4 branches missed.">        if (binding.pattern().name() == null || binding.pattern().name().isEmpty()) {</span>
+<span class="nc" id="L169">            throw new InvalidRequestException(&quot;Resource name should not be empty&quot;);</span>
+        }
+<span class="nc" id="L171">        int colonIndex = binding.entry().principal().indexOf(&quot;:&quot;);</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        if (colonIndex == -1) {</span>
+<span class="nc" id="L173">            throw new InvalidRequestException(&quot;Could not parse principal from `&quot; +</span>
+<span class="nc" id="L174">                binding.entry().principal() + &quot;` &quot; + &quot;(no colon is present separating the &quot; +</span>
+                &quot;principal type from the principal name)&quot;);
+        }
+<span class="nc" id="L177">    }</span>
+
+    ControllerResult&lt;List&lt;AclDeleteResult&gt;&gt; deleteAcls(List&lt;AclBindingFilter&gt; filters) {
+<span class="nc" id="L180">        List&lt;AclDeleteResult&gt; results = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L181">        Set&lt;ApiMessageAndVersion&gt; records = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        for (AclBindingFilter filter : filters) {</span>
+            try {
+<span class="nc" id="L184">                validateFilter(filter);</span>
+<span class="nc" id="L185">                AclDeleteResult result = deleteAclsForFilter(filter, records);</span>
+<span class="nc" id="L186">                results.add(result);</span>
+<span class="nc" id="L187">            } catch (BoundedListTooLongException e) {</span>
+                // we do not return partial results here because the fact that only a portion of the deletions
+                // succeeded can be easily missed due to response size. instead fail the entire response
+<span class="nc" id="L190">                throw new InvalidRequestException(e.getMessage(), e);</span>
+<span class="nc" id="L191">            } catch (Throwable e) {</span>
+<span class="nc" id="L192">                results.add(new AclDeleteResult(ApiError.fromThrowable(e).exception()));</span>
+<span class="nc" id="L193">            }</span>
+<span class="nc" id="L194">        }</span>
+<span class="nc" id="L195">        return ControllerResult.atomicOf(new ArrayList&lt;&gt;(records), results);</span>
+    }
+
+    AclDeleteResult deleteAclsForFilter(AclBindingFilter filter,
+                                        Set&lt;ApiMessageAndVersion&gt; records) {
+<span class="nc" id="L200">        List&lt;AclBindingDeleteResult&gt; deleted = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">        for (Entry&lt;Uuid, StandardAcl&gt; entry : idToAcl.entrySet()) {</span>
+<span class="nc" id="L202">            Uuid id = entry.getKey();</span>
+<span class="nc" id="L203">            StandardAcl acl = entry.getValue();</span>
+<span class="nc" id="L204">            AclBinding binding = acl.toBinding();</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">            if (filter.matches(binding)) {</span>
+                // check size limitation first before adding additional records
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                if (records.size() &gt;= MAX_RECORDS_PER_USER_OP) {</span>
+<span class="nc" id="L208">                    throw new BoundedListTooLongException(&quot;Cannot remove more than &quot; +</span>
+                        MAX_RECORDS_PER_USER_OP + &quot; acls in a single delete operation.&quot;);
+                }
+<span class="nc" id="L211">                deleted.add(new AclBindingDeleteResult(binding));</span>
+<span class="nc" id="L212">                records.add(new ApiMessageAndVersion(</span>
+<span class="nc" id="L213">                    new RemoveAccessControlEntryRecord().setId(id), (short) 0));</span>
+            }
+<span class="nc" id="L215">        }</span>
+<span class="nc" id="L216">        return new AclDeleteResult(deleted);</span>
+    }
+
+    static void validateFilter(AclBindingFilter filter) {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        if (filter.patternFilter().isUnknown()) {</span>
+<span class="nc" id="L221">            throw new InvalidRequestException(&quot;Unknown patternFilter.&quot;);</span>
+        }
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        if (filter.entryFilter().isUnknown()) {</span>
+<span class="nc" id="L224">            throw new InvalidRequestException(&quot;Unknown entryFilter.&quot;);</span>
+        }
+<span class="nc" id="L226">    }</span>
+
+    public void replay(AccessControlEntryRecord record) {
+<span class="nc" id="L229">        StandardAclWithId aclWithId = StandardAclWithId.fromRecord(record);</span>
+<span class="nc" id="L230">        idToAcl.put(aclWithId.id(), aclWithId.acl());</span>
+<span class="nc" id="L231">        existingAcls.add(aclWithId.acl());</span>
+<span class="nc" id="L232">        log.info(&quot;Replayed AccessControlEntryRecord for {}, setting {}&quot;, record.id(),</span>
+<span class="nc" id="L233">                aclWithId.acl());</span>
+<span class="nc" id="L234">    }</span>
+
+    public void replay(RemoveAccessControlEntryRecord record) {
+<span class="nc" id="L237">        StandardAcl acl = idToAcl.remove(record.id());</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">        if (acl == null) {</span>
+<span class="nc" id="L239">            throw new RuntimeException(&quot;Unable to replay &quot; + record + &quot;: no acl with &quot; +</span>
+                &quot;that ID found.&quot;);
+        }
+<span class="nc bnc" id="L242" title="All 2 branches missed.">        if (!existingAcls.remove(acl)) {</span>
+<span class="nc" id="L243">            throw new RuntimeException(&quot;Unable to replay &quot; + record + &quot; for &quot; + acl +</span>
+                &quot;: acl not found &quot; + &quot;in existingAcls.&quot;);
+        }
+<span class="nc" id="L246">        log.info(&quot;Replayed RemoveAccessControlEntryRecord for {}, removing {}&quot;, record.id(), acl);</span>
+<span class="nc" id="L247">    }</span>
+
+    Map&lt;Uuid, StandardAcl&gt; idToAcl() {
+<span class="nc" id="L250">        return Collections.unmodifiableMap(idToAcl);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

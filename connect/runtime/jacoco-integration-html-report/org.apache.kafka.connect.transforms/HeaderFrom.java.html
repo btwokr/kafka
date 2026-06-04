@@ -1,0 +1,254 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HeaderFrom.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.transforms</a> &gt; <span class="el_source">HeaderFrom.java</span></div><h1>HeaderFrom.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.transforms;
+
+import org.apache.kafka.common.cache.Cache;
+import org.apache.kafka.common.cache.LRUCache;
+import org.apache.kafka.common.cache.SynchronizedCache;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.utils.AppInfoParser;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.header.Header;
+import org.apache.kafka.connect.header.Headers;
+import org.apache.kafka.connect.transforms.util.NonEmptyListValidator;
+import org.apache.kafka.connect.transforms.util.Requirements;
+import org.apache.kafka.connect.transforms.util.SchemaUtil;
+import org.apache.kafka.connect.transforms.util.SimpleConfig;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static java.lang.String.format;
+import static org.apache.kafka.common.config.ConfigDef.NO_DEFAULT_VALUE;
+
+<span class="fc" id="L44">public abstract class HeaderFrom&lt;R extends ConnectRecord&lt;R&gt;&gt; implements Transformation&lt;R&gt; {</span>
+
+    public static final String FIELDS_FIELD = &quot;fields&quot;;
+    public static final String HEADERS_FIELD = &quot;headers&quot;;
+    public static final String OPERATION_FIELD = &quot;operation&quot;;
+    private static final String MOVE_OPERATION = &quot;move&quot;;
+    private static final String COPY_OPERATION = &quot;copy&quot;;
+    public static final String REPLACE_NULL_WITH_DEFAULT_FIELD = &quot;replace.null.with.default&quot;;
+
+<span class="fc" id="L53">    public static final String OVERVIEW_DOC =</span>
+            &quot;Moves or copies fields in the key/value of a record into that record's headers. &quot; +
+                    &quot;Corresponding elements of &lt;code&gt;&quot; + FIELDS_FIELD + &quot;&lt;/code&gt; and &quot; +
+                    &quot;&lt;code&gt;&quot; + HEADERS_FIELD + &quot;&lt;/code&gt; together identify a field and the header it should be &quot; +
+                    &quot;moved or copied to. &quot; +
+                    &quot;Use the concrete transformation type designed for the record &quot; +
+<span class="fc" id="L59">                    &quot;key (&lt;code&gt;&quot; + Key.class.getName() + &quot;&lt;/code&gt;) or value (&lt;code&gt;&quot; + Value.class.getName() + &quot;&lt;/code&gt;).&quot;;</span>
+
+<span class="fc" id="L61">    public static final ConfigDef CONFIG_DEF = new ConfigDef()</span>
+<span class="fc" id="L62">            .define(FIELDS_FIELD, ConfigDef.Type.LIST,</span>
+                    NO_DEFAULT_VALUE, new NonEmptyListValidator(),
+                    ConfigDef.Importance.HIGH,
+                    &quot;Field names in the record whose values are to be copied or moved to headers.&quot;)
+<span class="fc" id="L66">            .define(HEADERS_FIELD, ConfigDef.Type.LIST,</span>
+                    NO_DEFAULT_VALUE, new NonEmptyListValidator(),
+                    ConfigDef.Importance.HIGH,
+                    &quot;Header names, in the same order as the field names listed in the fields configuration property.&quot;)
+<span class="fc" id="L70">            .define(OPERATION_FIELD, ConfigDef.Type.STRING, NO_DEFAULT_VALUE,</span>
+<span class="fc" id="L71">                    ConfigDef.ValidString.in(MOVE_OPERATION, COPY_OPERATION), ConfigDef.Importance.HIGH,</span>
+                    &quot;Either &lt;code&gt;move&lt;/code&gt; if the fields are to be moved to the headers (removed from the key/value), &quot; +
+                            &quot;or &lt;code&gt;copy&lt;/code&gt; if the fields are to be copied to the headers (retained in the key/value).&quot;)
+<span class="fc" id="L74">            .define(REPLACE_NULL_WITH_DEFAULT_FIELD, ConfigDef.Type.BOOLEAN, true, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Whether to replace fields that have a default value and that are null to the default value. When set to true, the default value is used, otherwise null is used.&quot;);
+
+<span class="fc" id="L77">    private final Cache&lt;Schema, Schema&gt; moveSchemaCache = new SynchronizedCache&lt;&gt;(new LRUCache&lt;&gt;(16));</span>
+<span class="nc" id="L78">    enum Operation {</span>
+<span class="nc" id="L79">        MOVE(MOVE_OPERATION),</span>
+<span class="nc" id="L80">        COPY(COPY_OPERATION);</span>
+
+        private final String name;
+
+<span class="nc" id="L84">        Operation(String name) {</span>
+<span class="nc" id="L85">            this.name = name;</span>
+<span class="nc" id="L86">        }</span>
+
+        static Operation fromName(String name) {
+<span class="nc bnc" id="L89" title="All 3 branches missed.">            return switch (name) {</span>
+<span class="nc" id="L90">                case MOVE_OPERATION -&gt; MOVE;</span>
+<span class="nc" id="L91">                case COPY_OPERATION -&gt; COPY;</span>
+<span class="nc" id="L92">                default -&gt; throw new IllegalArgumentException();</span>
+            };
+        }
+
+        public String toString() {
+<span class="nc" id="L97">            return name;</span>
+        }
+    }
+
+    private List&lt;String&gt; fields;
+
+    private List&lt;String&gt; headers;
+
+    private Operation operation;
+
+    private boolean replaceNullWithDefault;
+
+    @Override
+    public R apply(R record) {
+<span class="nc" id="L111">        Object operatingValue = operatingValue(record);</span>
+<span class="nc" id="L112">        Schema operatingSchema = operatingSchema(record);</span>
+
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        if (operatingSchema == null) {</span>
+<span class="nc" id="L115">            return applySchemaless(record, operatingValue);</span>
+        } else {
+<span class="nc" id="L117">            return applyWithSchema(record, operatingValue, operatingSchema);</span>
+        }
+    }
+
+    @Override
+    public String version() {
+<span class="fc" id="L123">        return AppInfoParser.getVersion();</span>
+    }
+
+    private R applyWithSchema(R record, Object operatingValue, Schema operatingSchema) {
+<span class="nc" id="L127">        Headers updatedHeaders = record.headers().duplicate();</span>
+<span class="nc" id="L128">        Struct value = Requirements.requireStruct(operatingValue, &quot;header &quot; + operation);</span>
+        final Schema updatedSchema;
+        final Struct updatedValue;
+<span class="nc bnc" id="L131" title="All 2 branches missed.">        if (operation == Operation.MOVE) {</span>
+<span class="nc" id="L132">            updatedSchema = moveSchema(operatingSchema);</span>
+<span class="nc" id="L133">            updatedValue = new Struct(updatedSchema);</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">            for (Field field : updatedSchema.fields()) {</span>
+<span class="nc" id="L135">                updatedValue.put(field, getFieldValue(value, field));</span>
+<span class="nc" id="L136">            }</span>
+        } else {
+<span class="nc" id="L138">            updatedSchema = operatingSchema;</span>
+<span class="nc" id="L139">            updatedValue = value;</span>
+        }
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        for (int i = 0; i &lt; fields.size(); i++) {</span>
+<span class="nc" id="L142">            String fieldName = fields.get(i);</span>
+<span class="nc" id="L143">            String headerName = headers.get(i);</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">            Object fieldValue = value.schema().field(fieldName) != null ? getFieldValue(value, value.schema().field(fieldName)) : null;</span>
+<span class="nc" id="L145">            Schema fieldSchema = operatingSchema.field(fieldName).schema();</span>
+<span class="nc" id="L146">            updatedHeaders.add(headerName, fieldValue, fieldSchema);</span>
+        }
+<span class="nc" id="L148">        return newRecord(record, updatedSchema, updatedValue, updatedHeaders);</span>
+    }
+
+    private Schema moveSchema(Schema operatingSchema) {
+<span class="nc" id="L152">        Schema moveSchema = this.moveSchemaCache.get(operatingSchema);</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        if (moveSchema == null) {</span>
+<span class="nc" id="L154">            final SchemaBuilder builder = SchemaUtil.copySchemaBasics(operatingSchema, SchemaBuilder.struct());</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">            for (Field field : operatingSchema.fields()) {</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">                if (!fields.contains(field.name())) {</span>
+<span class="nc" id="L157">                    builder.field(field.name(), field.schema());</span>
+                }
+<span class="nc" id="L159">            }</span>
+<span class="nc" id="L160">            moveSchema = builder.build();</span>
+<span class="nc" id="L161">            moveSchemaCache.put(operatingSchema, moveSchema);</span>
+        }
+<span class="nc" id="L163">        return moveSchema;</span>
+    }
+
+    private R applySchemaless(R record, Object operatingValue) {
+<span class="nc" id="L167">        Headers updatedHeaders = record.headers().duplicate();</span>
+<span class="nc" id="L168">        Map&lt;String, Object&gt; value = Requirements.requireMap(operatingValue, &quot;header &quot; + operation);</span>
+<span class="nc" id="L169">        Map&lt;String, Object&gt; updatedValue = new HashMap&lt;&gt;(value);</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        for (int i = 0; i &lt; fields.size(); i++) {</span>
+<span class="nc" id="L171">            String fieldName = fields.get(i);</span>
+<span class="nc" id="L172">            Object fieldValue = value.get(fieldName);</span>
+<span class="nc" id="L173">            String headerName = headers.get(i);</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">            if (operation == Operation.MOVE) {</span>
+<span class="nc" id="L175">                updatedValue.remove(fieldName);</span>
+            }
+<span class="nc" id="L177">            updatedHeaders.add(headerName, fieldValue, null);</span>
+        }
+<span class="nc" id="L179">        return newRecord(record, null, updatedValue, updatedHeaders);</span>
+    }
+
+    private Object getFieldValue(Struct value, Field field) {
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        if (replaceNullWithDefault) {</span>
+<span class="nc" id="L184">            return value.get(field.name());</span>
+        }
+<span class="nc" id="L186">        return value.getWithoutDefault(field.name());</span>
+    }
+
+    protected abstract Object operatingValue(R record);
+    protected abstract Schema operatingSchema(R record);
+    protected abstract R newRecord(R record, Schema updatedSchema, Object updatedValue, Iterable&lt;Header&gt; updatedHeaders);
+
+<span class="fc" id="L193">    public static class Key&lt;R extends ConnectRecord&lt;R&gt;&gt; extends HeaderFrom&lt;R&gt; {</span>
+
+        @Override
+        public Object operatingValue(R record) {
+<span class="nc" id="L197">            return record.key();</span>
+        }
+
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L202">            return record.keySchema();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue, Iterable&lt;Header&gt; updatedHeaders) {
+<span class="nc" id="L207">            return record.newRecord(record.topic(), record.kafkaPartition(), updatedSchema, updatedValue,</span>
+<span class="nc" id="L208">                    record.valueSchema(), record.value(), record.timestamp(), updatedHeaders);</span>
+        }
+    }
+
+<span class="fc" id="L212">    public static class Value&lt;R extends ConnectRecord&lt;R&gt;&gt; extends HeaderFrom&lt;R&gt; {</span>
+
+        @Override
+        public Object operatingValue(R record) {
+<span class="nc" id="L216">            return record.value();</span>
+        }
+
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L221">            return record.valueSchema();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue, Iterable&lt;Header&gt; updatedHeaders) {
+<span class="nc" id="L226">            return record.newRecord(record.topic(), record.kafkaPartition(), record.keySchema(), record.key(),</span>
+<span class="nc" id="L227">                    updatedSchema, updatedValue, record.timestamp(), updatedHeaders);</span>
+        }
+    }
+
+    @Override
+    public ConfigDef config() {
+<span class="nc" id="L233">        return CONFIG_DEF;</span>
+    }
+
+    @Override
+    public void close() {
+
+<span class="nc" id="L239">    }</span>
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; props) {
+<span class="nc" id="L243">        final SimpleConfig config = new SimpleConfig(CONFIG_DEF, props);</span>
+<span class="nc" id="L244">        fields = config.getList(FIELDS_FIELD);</span>
+<span class="nc" id="L245">        headers = config.getList(HEADERS_FIELD);</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">        if (headers.size() != fields.size()) {</span>
+<span class="nc" id="L247">            throw new ConfigException(format(&quot;'%s' config must have the same number of elements as '%s' config.&quot;,</span>
+                    FIELDS_FIELD, HEADERS_FIELD));
+        }
+<span class="nc" id="L250">        operation = Operation.fromName(config.getString(OPERATION_FIELD));</span>
+<span class="nc" id="L251">        replaceNullWithDefault = config.getBoolean(REPLACE_NULL_WITH_DEFAULT_FIELD);</span>
+<span class="nc" id="L252">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

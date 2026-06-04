@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SchemaSourceTask.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.tools</a> &gt; <span class="el_source">SchemaSourceTask.java</span></div><h1>SchemaSourceTask.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.tools;
+
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.source.SourceRecord;
+import org.apache.kafka.connect.source.SourceTask;
+import org.apache.kafka.server.util.ThroughputThrottler;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Task implementation for {@link SchemaSourceConnector}.
+ */
+<span class="nc" id="L36">public class SchemaSourceTask extends SourceTask {</span>
+
+<span class="nc" id="L38">    private static final Logger log = LoggerFactory.getLogger(SchemaSourceTask.class);</span>
+
+    public static final String NAME_CONFIG = &quot;name&quot;;
+    public static final String ID_CONFIG = &quot;id&quot;;
+    public static final String TOPIC_CONFIG = &quot;topic&quot;;
+    public static final String NUM_MSGS_CONFIG = &quot;num.messages&quot;;
+    public static final String THROUGHPUT_CONFIG = &quot;throughput&quot;;
+    public static final String MULTIPLE_SCHEMA_CONFIG = &quot;multiple.schema&quot;;
+    public static final String PARTITION_COUNT_CONFIG = &quot;partition.count&quot;;
+
+    private static final String ID_FIELD = &quot;id&quot;;
+    private static final String SEQNO_FIELD = &quot;seqno&quot;;
+    private ThroughputThrottler throttler;
+
+    private int id; // Task ID
+    private String topic;
+    private Map&lt;String, Integer&gt; partition;
+    private long startingSeqno;
+    private long seqno;
+    private long count;
+    private long maxNumMsgs;
+    private boolean multipleSchema;
+    private int partitionCount;
+
+<span class="nc" id="L62">    private static final Schema VALUE_SCHEMA = SchemaBuilder.struct().version(1).name(&quot;record&quot;)</span>
+<span class="nc" id="L63">        .field(&quot;boolean&quot;, Schema.BOOLEAN_SCHEMA)</span>
+<span class="nc" id="L64">        .field(&quot;int&quot;, Schema.INT32_SCHEMA)</span>
+<span class="nc" id="L65">        .field(&quot;long&quot;, Schema.INT64_SCHEMA)</span>
+<span class="nc" id="L66">        .field(&quot;float&quot;, Schema.FLOAT32_SCHEMA)</span>
+<span class="nc" id="L67">        .field(&quot;double&quot;, Schema.FLOAT64_SCHEMA)</span>
+<span class="nc" id="L68">        .field(&quot;partitioning&quot;, Schema.INT32_SCHEMA)</span>
+<span class="nc" id="L69">        .field(&quot;id&quot;, Schema.INT32_SCHEMA)</span>
+<span class="nc" id="L70">        .field(&quot;seqno&quot;, Schema.INT64_SCHEMA)</span>
+<span class="nc" id="L71">        .build();</span>
+
+<span class="nc" id="L73">    private static final Schema VALUE_SCHEMA_2 = SchemaBuilder.struct().version(2).name(&quot;record&quot;)</span>
+<span class="nc" id="L74">        .field(&quot;boolean&quot;, Schema.BOOLEAN_SCHEMA)</span>
+<span class="nc" id="L75">        .field(&quot;int&quot;, Schema.INT32_SCHEMA)</span>
+<span class="nc" id="L76">        .field(&quot;long&quot;, Schema.INT64_SCHEMA)</span>
+<span class="nc" id="L77">        .field(&quot;float&quot;, Schema.FLOAT32_SCHEMA)</span>
+<span class="nc" id="L78">        .field(&quot;double&quot;, Schema.FLOAT64_SCHEMA)</span>
+<span class="nc" id="L79">        .field(&quot;partitioning&quot;, Schema.INT32_SCHEMA)</span>
+<span class="nc" id="L80">        .field(&quot;string&quot;, SchemaBuilder.string().defaultValue(&quot;abc&quot;).build())</span>
+<span class="nc" id="L81">        .field(&quot;id&quot;, Schema.INT32_SCHEMA)</span>
+<span class="nc" id="L82">        .field(&quot;seqno&quot;, Schema.INT64_SCHEMA)</span>
+<span class="nc" id="L83">        .build();</span>
+
+    @Override
+    public String version() {
+<span class="nc" id="L87">        return new SchemaSourceConnector().version();</span>
+    }
+
+    @Override
+    public void start(Map&lt;String, String&gt; props) {
+        final long throughput;
+<span class="nc" id="L93">        String name = props.get(NAME_CONFIG);</span>
+        try {
+<span class="nc" id="L95">            id = Integer.parseInt(props.get(ID_CONFIG));</span>
+<span class="nc" id="L96">            topic = props.get(TOPIC_CONFIG);</span>
+<span class="nc" id="L97">            maxNumMsgs = Long.parseLong(props.get(NUM_MSGS_CONFIG));</span>
+<span class="nc" id="L98">            multipleSchema = Boolean.parseBoolean(props.get(MULTIPLE_SCHEMA_CONFIG));</span>
+<span class="nc" id="L99">            partitionCount = Integer.parseInt(props.getOrDefault(PARTITION_COUNT_CONFIG, &quot;1&quot;));</span>
+<span class="nc" id="L100">            throughput = Long.parseLong(props.get(THROUGHPUT_CONFIG));</span>
+<span class="nc" id="L101">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L102">            throw new ConnectException(&quot;Invalid SchemaSourceTask configuration&quot;, e);</span>
+<span class="nc" id="L103">        }</span>
+
+<span class="nc" id="L105">        throttler = new ThroughputThrottler(throughput, System.currentTimeMillis());</span>
+<span class="nc" id="L106">        partition = Map.of(ID_FIELD, id);</span>
+<span class="nc" id="L107">        Map&lt;String, Object&gt; previousOffset = this.context.offsetStorageReader().offset(partition);</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">        if (previousOffset != null) {</span>
+<span class="nc" id="L109">            seqno = (Long) previousOffset.get(SEQNO_FIELD) + 1;</span>
+        } else {
+<span class="nc" id="L111">            seqno = 0;</span>
+        }
+<span class="nc" id="L113">        startingSeqno = seqno;</span>
+<span class="nc" id="L114">        count = 0;</span>
+<span class="nc" id="L115">        log.info(&quot;Started SchemaSourceTask {}-{} producing to topic {} resuming from seqno {}&quot;, name, id, topic, startingSeqno);</span>
+<span class="nc" id="L116">    }</span>
+
+    @Override
+    public List&lt;SourceRecord&gt; poll() {
+<span class="nc bnc" id="L120" title="All 2 branches missed.">        if (count &lt; maxNumMsgs) {</span>
+<span class="nc" id="L121">            long sendStartMs = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">            if (throttler.shouldThrottle(seqno - startingSeqno, sendStartMs)) {</span>
+<span class="nc" id="L123">                throttler.throttle();</span>
+            }
+
+<span class="nc" id="L126">            Map&lt;String, Long&gt; ccOffset = Map.of(SEQNO_FIELD, seqno);</span>
+<span class="nc" id="L127">            int partitionVal = (int) (seqno % partitionCount);</span>
+            final Struct data;
+            final SourceRecord srcRecord;
+<span class="nc bnc" id="L130" title="All 4 branches missed.">            if (!multipleSchema || count % 2 == 0) {</span>
+<span class="nc" id="L131">                data = new Struct(VALUE_SCHEMA)</span>
+<span class="nc" id="L132">                    .put(&quot;boolean&quot;, true)</span>
+<span class="nc" id="L133">                    .put(&quot;int&quot;, 12)</span>
+<span class="nc" id="L134">                    .put(&quot;long&quot;, 12L)</span>
+<span class="nc" id="L135">                    .put(&quot;float&quot;, 12.2f)</span>
+<span class="nc" id="L136">                    .put(&quot;double&quot;, 12.2)</span>
+<span class="nc" id="L137">                    .put(&quot;partitioning&quot;, partitionVal)</span>
+<span class="nc" id="L138">                    .put(&quot;id&quot;, id)</span>
+<span class="nc" id="L139">                    .put(&quot;seqno&quot;, seqno);</span>
+
+<span class="nc" id="L141">                srcRecord = new SourceRecord(partition, ccOffset, topic, id, Schema.STRING_SCHEMA, &quot;key&quot;, VALUE_SCHEMA, data);</span>
+            } else {
+<span class="nc" id="L143">                data = new Struct(VALUE_SCHEMA_2)</span>
+<span class="nc" id="L144">                    .put(&quot;boolean&quot;, true)</span>
+<span class="nc" id="L145">                    .put(&quot;int&quot;, 12)</span>
+<span class="nc" id="L146">                    .put(&quot;long&quot;, 12L)</span>
+<span class="nc" id="L147">                    .put(&quot;float&quot;, 12.2f)</span>
+<span class="nc" id="L148">                    .put(&quot;double&quot;, 12.2)</span>
+<span class="nc" id="L149">                    .put(&quot;partitioning&quot;, partitionVal)</span>
+<span class="nc" id="L150">                    .put(&quot;string&quot;, &quot;def&quot;)</span>
+<span class="nc" id="L151">                    .put(&quot;id&quot;, id)</span>
+<span class="nc" id="L152">                    .put(&quot;seqno&quot;, seqno);</span>
+
+<span class="nc" id="L154">                srcRecord = new SourceRecord(partition, ccOffset, topic, id, Schema.STRING_SCHEMA, &quot;key&quot;, VALUE_SCHEMA_2, data);</span>
+            }
+
+<span class="nc" id="L157">            System.out.println(&quot;{\&quot;task\&quot;: &quot; + id + &quot;, \&quot;seqno\&quot;: &quot; + seqno + &quot;}&quot;);</span>
+<span class="nc" id="L158">            seqno++;</span>
+<span class="nc" id="L159">            count++;</span>
+<span class="nc" id="L160">            return List.of(srcRecord);</span>
+        } else {
+<span class="nc" id="L162">            throttler.throttle();</span>
+<span class="nc" id="L163">            return List.of();</span>
+        }
+    }
+
+    @Override
+    public void stop() {
+<span class="nc" id="L169">        throttler.wakeup();</span>
+<span class="nc" id="L170">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

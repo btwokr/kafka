@@ -1,0 +1,1129 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ShareCoordinatorService.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.coordinator.share</a> &gt; <span class="el_source">ShareCoordinatorService.java</span></div><h1>ShareCoordinatorService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.coordinator.share;
+
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.internals.Topic;
+import org.apache.kafka.common.message.DeleteShareGroupStateRequestData;
+import org.apache.kafka.common.message.DeleteShareGroupStateResponseData;
+import org.apache.kafka.common.message.InitializeShareGroupStateRequestData;
+import org.apache.kafka.common.message.InitializeShareGroupStateResponseData;
+import org.apache.kafka.common.message.ReadShareGroupStateRequestData;
+import org.apache.kafka.common.message.ReadShareGroupStateResponseData;
+import org.apache.kafka.common.message.ReadShareGroupStateSummaryRequestData;
+import org.apache.kafka.common.message.ReadShareGroupStateSummaryResponseData;
+import org.apache.kafka.common.message.WriteShareGroupStateRequestData;
+import org.apache.kafka.common.message.WriteShareGroupStateResponseData;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.DeleteShareGroupStateResponse;
+import org.apache.kafka.common.requests.InitializeShareGroupStateResponse;
+import org.apache.kafka.common.requests.ReadShareGroupStateResponse;
+import org.apache.kafka.common.requests.ReadShareGroupStateSummaryResponse;
+import org.apache.kafka.common.requests.RequestContext;
+import org.apache.kafka.common.requests.WriteShareGroupStateResponse;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorEventProcessor;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorLoader;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorRuntimeMetrics;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorShardBuilderSupplier;
+import org.apache.kafka.coordinator.common.runtime.KRaftCoordinatorMetadataDelta;
+import org.apache.kafka.coordinator.common.runtime.KRaftCoordinatorMetadataImage;
+import org.apache.kafka.coordinator.common.runtime.MultiThreadedEventProcessor;
+import org.apache.kafka.coordinator.common.runtime.PartitionWriter;
+import org.apache.kafka.coordinator.share.metrics.ShareCoordinatorMetrics;
+import org.apache.kafka.image.MetadataDelta;
+import org.apache.kafka.image.MetadataImage;
+import org.apache.kafka.server.common.ShareVersion;
+import org.apache.kafka.server.record.BrokerCompressionType;
+import org.apache.kafka.server.share.SharePartitionKey;
+import org.apache.kafka.server.util.FutureUtils;
+import org.apache.kafka.server.util.timer.Timer;
+import org.apache.kafka.server.util.timer.TimerTask;
+
+import org.slf4j.Logger;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.OptionalInt;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.IntSupplier;
+
+import static org.apache.kafka.coordinator.common.runtime.CoordinatorOperationExceptionHelper.handleOperationException;
+
+@SuppressWarnings({&quot;ClassDataAbstractionCoupling&quot;, &quot;ClassFanOutComplexity&quot;})
+public class ShareCoordinatorService implements ShareCoordinator {
+    private final ShareCoordinatorConfig config;
+    private final Logger log;
+<span class="fc" id="L88">    private final AtomicBoolean isActive = new AtomicBoolean(false);  // for controlling start and stop</span>
+    private final CoordinatorRuntime&lt;ShareCoordinatorShard, CoordinatorRecord&gt; runtime;
+    private final ShareCoordinatorMetrics shareCoordinatorMetrics;
+<span class="fc" id="L91">    private volatile int numPartitions = -1; // Number of partitions for __share_group_state. Provided when component is started.</span>
+    private final Time time;
+    private final Timer timer;
+    private final PartitionWriter writer;
+    private final Map&lt;TopicPartition, Long&gt; lastPrunedOffsets;
+    private volatile boolean shouldRunPeriodicJob;
+
+    public static class Builder {
+        private final int nodeId;
+        private final ShareCoordinatorConfig config;
+        private PartitionWriter writer;
+        private CoordinatorLoader&lt;CoordinatorRecord&gt; loader;
+        private Time time;
+        private Timer timer;
+        private ShareCoordinatorMetrics coordinatorMetrics;
+        private CoordinatorRuntimeMetrics coordinatorRuntimeMetrics;
+
+<span class="fc" id="L108">        public Builder(int nodeId, ShareCoordinatorConfig config) {</span>
+<span class="fc" id="L109">            this.nodeId = nodeId;</span>
+<span class="fc" id="L110">            this.config = config;</span>
+<span class="fc" id="L111">        }</span>
+
+        public Builder withWriter(PartitionWriter writer) {
+<span class="fc" id="L114">            this.writer = writer;</span>
+<span class="fc" id="L115">            return this;</span>
+        }
+
+        public Builder withLoader(CoordinatorLoader&lt;CoordinatorRecord&gt; loader) {
+<span class="fc" id="L119">            this.loader = loader;</span>
+<span class="fc" id="L120">            return this;</span>
+        }
+
+        public Builder withTime(Time time) {
+<span class="fc" id="L124">            this.time = time;</span>
+<span class="fc" id="L125">            return this;</span>
+        }
+
+        public Builder withTimer(Timer timer) {
+<span class="fc" id="L129">            this.timer = timer;</span>
+<span class="fc" id="L130">            return this;</span>
+        }
+
+        public Builder withCoordinatorMetrics(ShareCoordinatorMetrics coordinatorMetrics) {
+<span class="fc" id="L134">            this.coordinatorMetrics = coordinatorMetrics;</span>
+<span class="fc" id="L135">            return this;</span>
+        }
+
+        public Builder withCoordinatorRuntimeMetrics(CoordinatorRuntimeMetrics coordinatorRuntimeMetrics) {
+<span class="fc" id="L139">            this.coordinatorRuntimeMetrics = coordinatorRuntimeMetrics;</span>
+<span class="fc" id="L140">            return this;</span>
+        }
+
+        public ShareCoordinatorService build() {
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">            if (config == null) {</span>
+<span class="nc" id="L145">                throw new IllegalArgumentException(&quot;Config must be set.&quot;);</span>
+            }
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">            if (writer == null) {</span>
+<span class="nc" id="L148">                throw new IllegalArgumentException(&quot;Writer must be set.&quot;);</span>
+            }
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">            if (loader == null) {</span>
+<span class="nc" id="L151">                throw new IllegalArgumentException(&quot;Loader must be set.&quot;);</span>
+            }
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">            if (time == null) {</span>
+<span class="nc" id="L154">                throw new IllegalArgumentException(&quot;Time must be set.&quot;);</span>
+            }
+<span class="pc bpc" id="L156" title="1 of 2 branches missed.">            if (timer == null) {</span>
+<span class="nc" id="L157">                throw new IllegalArgumentException(&quot;Timer must be set.&quot;);</span>
+            }
+<span class="pc bpc" id="L159" title="1 of 2 branches missed.">            if (coordinatorMetrics == null) {</span>
+<span class="nc" id="L160">                throw new IllegalArgumentException(&quot;Share Coordinator metrics must be set.&quot;);</span>
+            }
+<span class="pc bpc" id="L162" title="1 of 2 branches missed.">            if (coordinatorRuntimeMetrics == null) {</span>
+<span class="nc" id="L163">                throw new IllegalArgumentException(&quot;Coordinator runtime metrics must be set.&quot;);</span>
+            }
+
+<span class="fc" id="L166">            String logPrefix = String.format(&quot;ShareCoordinator id=%d&quot;, nodeId);</span>
+<span class="fc" id="L167">            LogContext logContext = new LogContext(String.format(&quot;[%s] &quot;, logPrefix));</span>
+
+<span class="fc" id="L169">            CoordinatorShardBuilderSupplier&lt;ShareCoordinatorShard, CoordinatorRecord&gt; supplier = () -&gt;</span>
+<span class="nc" id="L170">                new ShareCoordinatorShard.Builder(config);</span>
+
+<span class="fc" id="L172">            CoordinatorEventProcessor processor = new MultiThreadedEventProcessor(</span>
+                logContext,
+                &quot;share-coordinator-event-processor-&quot;,
+<span class="fc" id="L175">                config.shareCoordinatorNumThreads(),</span>
+                time,
+                coordinatorRuntimeMetrics
+            );
+
+<span class="fc" id="L180">            CoordinatorRuntime&lt;ShareCoordinatorShard, CoordinatorRecord&gt; runtime =</span>
+                new CoordinatorRuntime.Builder&lt;ShareCoordinatorShard, CoordinatorRecord&gt;()
+<span class="fc" id="L182">                    .withTime(time)</span>
+<span class="fc" id="L183">                    .withTimer(timer)</span>
+<span class="fc" id="L184">                    .withLogPrefix(logPrefix)</span>
+<span class="fc" id="L185">                    .withLogContext(logContext)</span>
+<span class="fc" id="L186">                    .withEventProcessor(processor)</span>
+<span class="fc" id="L187">                    .withPartitionWriter(writer)</span>
+<span class="fc" id="L188">                    .withLoader(loader)</span>
+<span class="fc" id="L189">                    .withCoordinatorShardBuilderSupplier(supplier)</span>
+<span class="fc" id="L190">                    .withTime(time)</span>
+<span class="fc" id="L191">                    .withWriteTimeout(Duration.ofMillis(config.shareCoordinatorWriteTimeoutMs()))</span>
+<span class="fc" id="L192">                    .withCoordinatorRuntimeMetrics(coordinatorRuntimeMetrics)</span>
+<span class="fc" id="L193">                    .withCoordinatorMetrics(coordinatorMetrics)</span>
+<span class="fc" id="L194">                    .withSerializer(new ShareCoordinatorRecordSerde())</span>
+<span class="fc" id="L195">                    .withCompression(Compression.of(config.shareCoordinatorStateTopicCompressionType()).build())</span>
+<span class="fc" id="L196">                    .withAppendLingerMs(config.shareCoordinatorAppendLingerMs())</span>
+<span class="fc" id="L197">                    .withExecutorService(Executors.newSingleThreadExecutor())</span>
+<span class="fc" id="L198">                    .withCachedBufferMaxBytesSupplier(config::shareCoordinatorCachedBufferMaxBytes)</span>
+<span class="fc" id="L199">                    .build();</span>
+
+<span class="fc" id="L201">            return new ShareCoordinatorService(</span>
+                logContext,
+                config,
+                runtime,
+                coordinatorMetrics,
+                time,
+                timer,
+                writer
+            );
+        }
+    }
+
+    public ShareCoordinatorService(
+        LogContext logContext,
+        ShareCoordinatorConfig config,
+        CoordinatorRuntime&lt;ShareCoordinatorShard, CoordinatorRecord&gt; runtime,
+        ShareCoordinatorMetrics shareCoordinatorMetrics,
+        Time time,
+        Timer timer,
+        PartitionWriter writer
+<span class="fc" id="L221">    ) {</span>
+<span class="fc" id="L222">        this.log = logContext.logger(ShareCoordinatorService.class);</span>
+<span class="fc" id="L223">        this.config = config;</span>
+<span class="fc" id="L224">        this.runtime = runtime;</span>
+<span class="fc" id="L225">        this.shareCoordinatorMetrics = shareCoordinatorMetrics;</span>
+<span class="fc" id="L226">        this.time = time;</span>
+<span class="fc" id="L227">        this.timer = timer;</span>
+<span class="fc" id="L228">        this.writer = writer;</span>
+<span class="fc" id="L229">        this.lastPrunedOffsets = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L230">    }</span>
+
+    @Override
+    public int partitionFor(SharePartitionKey key) {
+<span class="nc" id="L234">        throwIfNotActive();</span>
+        // Call to asCoordinatorKey is necessary as we depend only on topicId (Uuid) and
+        // not topic name. We do not want this calculation to distinguish between 2
+        // SharePartitionKeys where everything except topic name is the same.
+<span class="nc" id="L238">        return Utils.abs(key.asCoordinatorKey().hashCode()) % numPartitions;</span>
+    }
+
+    @Override
+    public Properties shareGroupStateTopicConfigs() {
+<span class="nc" id="L243">        Properties properties = new Properties();</span>
+        // As defined in KIP-932.
+<span class="nc" id="L245">        properties.put(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_DELETE);</span>
+<span class="nc" id="L246">        properties.put(TopicConfig.COMPRESSION_TYPE_CONFIG, BrokerCompressionType.PRODUCER.name);</span>
+<span class="nc" id="L247">        properties.put(TopicConfig.SEGMENT_BYTES_CONFIG, config.shareCoordinatorStateTopicSegmentBytes());</span>
+<span class="nc" id="L248">        properties.put(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, config.shareCoordinatorStateTopicMinIsr());</span>
+<span class="nc" id="L249">        properties.put(TopicConfig.RETENTION_MS_CONFIG, -1);</span>
+<span class="nc" id="L250">        return properties;</span>
+    }
+
+    /**
+     * The share coordinator startup method will get invoked from BrokerMetadataPublisher.
+     * At the time of writing, the publisher uses metadata cache to fetch the number of partitions
+     * of the share state topic. In case this information is not available, the user provided
+     * config will be used to fetch the value.
+     * This is consistent with the group coordinator startup functionality.
+     *
+     * @param shareGroupTopicPartitionCount - supplier returning the number of partitions for __share_group_state topic
+     */
+    @Override
+    public void startup(
+        IntSupplier shareGroupTopicPartitionCount
+    ) {
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">        if (!isActive.compareAndSet(false, true)) {</span>
+<span class="nc" id="L267">            log.warn(&quot;Share coordinator is already running.&quot;);</span>
+<span class="nc" id="L268">            return;</span>
+        }
+
+<span class="fc" id="L271">        log.info(&quot;Starting up.&quot;);</span>
+<span class="fc" id="L272">        numPartitions = shareGroupTopicPartitionCount.getAsInt();</span>
+<span class="fc" id="L273">        log.info(&quot;Startup complete.&quot;);</span>
+<span class="fc" id="L274">    }</span>
+
+    private void setupPeriodicJobs() {
+<span class="fc" id="L277">        setupRecordPruning();</span>
+<span class="fc" id="L278">        setupSnapshotColdPartitions();</span>
+<span class="fc" id="L279">    }</span>
+
+    // Visibility for tests
+    void setupRecordPruning() {
+<span class="fc" id="L283">        log.debug(&quot;Scheduling share-group state topic prune job.&quot;);</span>
+<span class="fc" id="L284">        timer.add(new TimerTask(config.shareCoordinatorTopicPruneIntervalMs()) {</span>
+            @Override
+            public void run() {
+<span class="nc bnc" id="L287" title="All 2 branches missed.">                if (!shouldRunPeriodicJob) {</span>
+<span class="nc" id="L288">                    return;</span>
+                }
+<span class="nc" id="L290">                List&lt;CompletableFuture&lt;Void&gt;&gt; futures = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L291">                runtime.activeCoordinators().forEach(tp -&gt; futures.add(performRecordPruning(tp)));</span>
+
+<span class="nc" id="L293">                CompletableFuture.allOf(futures.toArray(new CompletableFuture&lt;?&gt;[]{}))</span>
+<span class="nc" id="L294">                    .whenComplete((res, exp) -&gt; {</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">                        if (exp != null) {</span>
+<span class="nc" id="L296">                            log.error(&quot;Received error in share-group state topic prune.&quot;, exp);</span>
+                        }
+                        // Perpetual recursion, failure or not.
+<span class="nc" id="L299">                        setupRecordPruning();</span>
+<span class="nc" id="L300">                    });</span>
+<span class="nc" id="L301">            }</span>
+        });
+<span class="fc" id="L303">    }</span>
+
+    private CompletableFuture&lt;Void&gt; performRecordPruning(TopicPartition tp) {
+<span class="nc" id="L306">        CompletableFuture&lt;Void&gt; fut = new CompletableFuture&lt;&gt;();</span>
+
+<span class="nc" id="L308">        runtime.scheduleWriteOperation(</span>
+            &quot;write-state-record-prune&quot;,
+            tp,
+            ShareCoordinatorShard::lastRedundantOffset
+<span class="nc" id="L312">        ).whenComplete((result, exception) -&gt; {</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">            if (exception != null) {</span>
+<span class="nc" id="L314">                log.debug(&quot;Last redundant offset for tp {} lookup threw an error.&quot;, tp, exception);</span>
+<span class="nc" id="L315">                Errors error = Errors.forException(exception);</span>
+                // These errors might result from partition metadata not loaded
+                // or shard re-election. Will cause unnecessary noise, hence not logging
+<span class="nc bnc" id="L318" title="All 4 branches missed.">                if (!(error.equals(Errors.COORDINATOR_LOAD_IN_PROGRESS) || error.equals(Errors.NOT_COORDINATOR))) {</span>
+<span class="nc" id="L319">                    log.error(&quot;Last redundant offset lookup for tp {} threw an error.&quot;, tp, exception);</span>
+<span class="nc" id="L320">                    fut.completeExceptionally(exception);</span>
+<span class="nc" id="L321">                    return;</span>
+                }
+<span class="nc" id="L323">                fut.complete(null);</span>
+<span class="nc" id="L324">                return;</span>
+            }
+<span class="nc bnc" id="L326" title="All 2 branches missed.">            if (result.isPresent()) {</span>
+<span class="nc" id="L327">                Long off = result.get();</span>
+<span class="nc" id="L328">                Long lastPrunedOffset = lastPrunedOffsets.get(tp);</span>
+<span class="nc bnc" id="L329" title="All 4 branches missed.">                if (lastPrunedOffset != null &amp;&amp; lastPrunedOffset.longValue() == off) {</span>
+<span class="nc" id="L330">                    log.debug(&quot;{} already pruned till offset {}&quot;, tp, off);</span>
+<span class="nc" id="L331">                    fut.complete(null);</span>
+<span class="nc" id="L332">                    return;</span>
+                }
+
+<span class="nc" id="L335">                log.debug(&quot;Pruning records in {} till offset {}.&quot;, tp, off);</span>
+<span class="nc" id="L336">                writer.deleteRecords(tp, off)</span>
+<span class="nc" id="L337">                    .whenComplete((res, exp) -&gt; {</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">                        if (exp != null) {</span>
+<span class="nc" id="L339">                            log.error(&quot;Exception while deleting records in {} till offset {}.&quot;, tp, off, exp);</span>
+<span class="nc" id="L340">                            fut.completeExceptionally(exp);</span>
+<span class="nc" id="L341">                            return;</span>
+                        }
+<span class="nc" id="L343">                        shareCoordinatorMetrics.recordPrune(</span>
+<span class="nc" id="L344">                            off,</span>
+                            tp
+                        );
+<span class="nc" id="L347">                        fut.complete(null);</span>
+                        // Best effort prevention of issuing duplicate delete calls.
+<span class="nc" id="L349">                        lastPrunedOffsets.put(tp, off);</span>
+<span class="nc" id="L350">                    });</span>
+<span class="nc" id="L351">            } else {</span>
+<span class="nc" id="L352">                log.debug(&quot;No offset value for tp {} found.&quot;, tp);</span>
+<span class="nc" id="L353">                fut.complete(null);</span>
+            }
+<span class="nc" id="L355">        });</span>
+<span class="nc" id="L356">        return fut;</span>
+    }
+
+    // Visibility for tests
+    void setupSnapshotColdPartitions() {
+<span class="fc" id="L361">        log.debug(&quot;Scheduling cold share-partition snapshotting.&quot;);</span>
+<span class="fc" id="L362">        timer.add(new TimerTask(config.shareCoordinatorColdPartitionSnapshotIntervalMs()) {</span>
+            @Override
+            public void run() {
+<span class="nc bnc" id="L365" title="All 2 branches missed.">                if (!shouldRunPeriodicJob) {</span>
+<span class="nc" id="L366">                    return;</span>
+                }
+<span class="nc" id="L368">                List&lt;CompletableFuture&lt;Void&gt;&gt; futures = runtime.scheduleWriteAllOperation(</span>
+                    &quot;snapshot-cold-partitions&quot;,
+                    ShareCoordinatorShard::snapshotColdPartitions
+                );
+
+<span class="nc" id="L373">                CompletableFuture.allOf(futures.toArray(new CompletableFuture&lt;?&gt;[]{}))</span>
+<span class="nc" id="L374">                    .whenComplete((__, exp) -&gt; {</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">                        if (exp != null) {</span>
+<span class="nc" id="L376">                            log.error(&quot;Received error while snapshotting cold partitions.&quot;, exp);</span>
+                        }
+<span class="nc" id="L378">                        setupSnapshotColdPartitions();</span>
+<span class="nc" id="L379">                    });</span>
+<span class="nc" id="L380">            }</span>
+        });
+<span class="fc" id="L382">    }</span>
+
+    @Override
+    public void shutdown() {
+<span class="pc bpc" id="L386" title="1 of 2 branches missed.">        if (!isActive.compareAndSet(true, false)) {</span>
+<span class="nc" id="L387">            log.warn(&quot;Share coordinator is already shutting down.&quot;);</span>
+<span class="nc" id="L388">            return;</span>
+        }
+
+<span class="fc" id="L391">        log.info(&quot;Shutting down.&quot;);</span>
+<span class="fc" id="L392">        Utils.closeQuietly(runtime, &quot;coordinator runtime&quot;);</span>
+<span class="fc" id="L393">        Utils.closeQuietly(shareCoordinatorMetrics, &quot;share coordinator metrics&quot;);</span>
+<span class="fc" id="L394">        log.info(&quot;Shutdown complete.&quot;);</span>
+<span class="fc" id="L395">    }</span>
+
+    @Override
+    public CompletableFuture&lt;WriteShareGroupStateResponseData&gt; writeState(RequestContext context, WriteShareGroupStateRequestData request) {
+        // Send an empty response if topic data is empty
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (isEmpty(request.topics())) {</span>
+<span class="nc" id="L401">            log.error(&quot;Topic Data is empty: {}&quot;, request);</span>
+<span class="nc" id="L402">            return CompletableFuture.completedFuture(</span>
+                new WriteShareGroupStateResponseData()
+            );
+        }
+
+        // Send an empty response if partition data is empty for any topic
+<span class="nc bnc" id="L408" title="All 2 branches missed.">        for (WriteShareGroupStateRequestData.WriteStateData topicData : request.topics()) {</span>
+<span class="nc bnc" id="L409" title="All 2 branches missed.">            if (isEmpty(topicData.partitions())) {</span>
+<span class="nc" id="L410">                log.error(&quot;Partition Data for topic {} is empty: {}&quot;, topicData.topicId(), request);</span>
+<span class="nc" id="L411">                return CompletableFuture.completedFuture(</span>
+                    new WriteShareGroupStateResponseData()
+                );
+            }
+<span class="nc" id="L415">        }</span>
+
+<span class="nc" id="L417">        String groupId = request.groupId();</span>
+        // Send an empty response if groupId is invalid
+<span class="nc bnc" id="L419" title="All 2 branches missed.">        if (isGroupIdEmpty(groupId)) {</span>
+<span class="nc" id="L420">            log.error(&quot;Group id must be specified and non-empty: {}&quot;, request);</span>
+<span class="nc" id="L421">            return CompletableFuture.completedFuture(</span>
+                new WriteShareGroupStateResponseData()
+            );
+        }
+
+        // Send an empty response if the coordinator is not active
+<span class="nc bnc" id="L427" title="All 2 branches missed.">        if (!isActive.get()) {</span>
+<span class="nc" id="L428">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L429">                generateErrorWriteStateResponse(</span>
+                    request,
+                    Errors.COORDINATOR_NOT_AVAILABLE,
+                    &quot;Share coordinator is not available.&quot;
+                )
+            );
+        }
+
+        // The request received here could have multiple keys of structure group:topic:partition. However,
+        // the writeState method in ShareCoordinatorShard expects a single key in the request. Hence, we will
+        // be looping over the keys below and constructing new WriteShareGroupStateRequestData objects to pass
+        // onto the shard method.
+<span class="nc" id="L441">        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;WriteShareGroupStateResponseData&gt;&gt;&gt; futureMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L442">        long startTimeMs = time.hiResClockMs();</span>
+
+<span class="nc" id="L444">        request.topics().forEach(topicData -&gt; {</span>
+<span class="nc" id="L445">            Map&lt;Integer, CompletableFuture&lt;WriteShareGroupStateResponseData&gt;&gt; partitionFut =</span>
+<span class="nc" id="L446">                futureMap.computeIfAbsent(topicData.topicId(), k -&gt; new HashMap&lt;&gt;());</span>
+<span class="nc" id="L447">            topicData.partitions().forEach(</span>
+                partitionData -&gt; {
+<span class="nc" id="L449">                    CompletableFuture&lt;WriteShareGroupStateResponseData&gt; future = runtime.scheduleWriteOperation(</span>
+                            &quot;write-share-group-state&quot;,
+<span class="nc" id="L451">                            topicPartitionFor(SharePartitionKey.getInstance(groupId, topicData.topicId(), partitionData.partition())),</span>
+<span class="nc" id="L452">                            coordinator -&gt; coordinator.writeState(new WriteShareGroupStateRequestData()</span>
+<span class="nc" id="L453">                                .setGroupId(groupId)</span>
+<span class="nc" id="L454">                                .setTopics(List.of(new WriteShareGroupStateRequestData.WriteStateData()</span>
+<span class="nc" id="L455">                                    .setTopicId(topicData.topicId())</span>
+<span class="nc" id="L456">                                    .setPartitions(List.of(new WriteShareGroupStateRequestData.PartitionData()</span>
+<span class="nc" id="L457">                                        .setPartition(partitionData.partition())</span>
+<span class="nc" id="L458">                                        .setStartOffset(partitionData.startOffset())</span>
+<span class="nc" id="L459">                                        .setDeliveryCompleteCount(partitionData.deliveryCompleteCount())</span>
+<span class="nc" id="L460">                                        .setLeaderEpoch(partitionData.leaderEpoch())</span>
+<span class="nc" id="L461">                                        .setStateEpoch(partitionData.stateEpoch())</span>
+<span class="nc" id="L462">                                        .setStateBatches(partitionData.stateBatches())))))))</span>
+<span class="nc" id="L463">                        .exceptionally(exception -&gt; handleOperationException(</span>
+                            &quot;write-share-group-state&quot;,
+                            request,
+                            exception,
+<span class="nc" id="L467">                            (error, message) -&gt; WriteShareGroupStateResponse.toErrorResponseData(</span>
+<span class="nc" id="L468">                                topicData.topicId(),</span>
+<span class="nc" id="L469">                                partitionData.partition(),</span>
+                                error,
+<span class="nc" id="L471">                                &quot;Unable to write share group state: &quot; + exception.getMessage()</span>
+                            ),
+                            log
+                        ));
+<span class="nc" id="L475">                    partitionFut.put(partitionData.partition(), future);</span>
+<span class="nc" id="L476">                });</span>
+<span class="nc" id="L477">        });</span>
+
+        // Combine all futures into a single CompletableFuture&lt;Void&gt;.
+<span class="nc" id="L480">        CompletableFuture&lt;Void&gt; combinedFuture = CompletableFuture.allOf(futureMap.values().stream()</span>
+<span class="nc" id="L481">            .flatMap(partMap -&gt; partMap.values().stream()).toArray(CompletableFuture[]::new));</span>
+
+        // topicId -&gt; {partitionId -&gt; responseFuture}
+<span class="nc" id="L484">        return combinedFuture.thenApply(v -&gt; {</span>
+<span class="nc" id="L485">            List&lt;WriteShareGroupStateResponseData.WriteStateResult&gt; writeStateResults = new ArrayList&lt;&gt;(futureMap.size());</span>
+<span class="nc" id="L486">            futureMap.forEach(</span>
+                (topicId, topicEntry) -&gt; {
+<span class="nc" id="L488">                    List&lt;WriteShareGroupStateResponseData.PartitionResult&gt; partitionResults = new ArrayList&lt;&gt;(topicEntry.size());</span>
+<span class="nc" id="L489">                    topicEntry.forEach(</span>
+                        // Map of partition id -&gt; responses from api.
+                        (partitionId, responseFut) -&gt; {
+                            // This is the future returned by runtime.scheduleWriteOperation which returns when the
+                            // operation has completed including error information. When this line executes, the future
+                            // should be complete as we used CompletableFuture::allOf to get a combined future from
+                            // all futures in the map.
+<span class="nc" id="L496">                            WriteShareGroupStateResponseData partitionData = responseFut.getNow(null);</span>
+<span class="nc" id="L497">                            partitionResults.addAll(partitionData.results().get(0).partitions());</span>
+<span class="nc" id="L498">                        }</span>
+                    );
+<span class="nc" id="L500">                    writeStateResults.add(WriteShareGroupStateResponse.toResponseWriteStateResult(topicId, partitionResults));</span>
+<span class="nc" id="L501">                }</span>
+            );
+
+            // Time taken for write.
+            // At this point all futures are completed written above.
+<span class="nc" id="L506">            shareCoordinatorMetrics.record(ShareCoordinatorMetrics.SHARE_COORDINATOR_WRITE_LATENCY_SENSOR_NAME,</span>
+<span class="nc" id="L507">                time.hiResClockMs() - startTimeMs);</span>
+
+<span class="nc" id="L509">            return new WriteShareGroupStateResponseData()</span>
+<span class="nc" id="L510">                .setResults(writeStateResults);</span>
+        });
+    }
+
+    @Override
+    public CompletableFuture&lt;ReadShareGroupStateResponseData&gt; readState(RequestContext context, ReadShareGroupStateRequestData request) {
+<span class="nc" id="L516">        String groupId = request.groupId();</span>
+        // A map to store the futures for each topicId and partition.
+<span class="nc" id="L518">        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;ReadShareGroupStateResponseData&gt;&gt;&gt; futureMap = new HashMap&lt;&gt;();</span>
+
+        // Send an empty response if topic data is empty.
+<span class="nc bnc" id="L521" title="All 2 branches missed.">        if (isEmpty(request.topics())) {</span>
+<span class="nc" id="L522">            log.error(&quot;Topic Data is empty: {}&quot;, request);</span>
+<span class="nc" id="L523">            return CompletableFuture.completedFuture(</span>
+                new ReadShareGroupStateResponseData()
+            );
+        }
+
+        // Send an empty response if partition data is empty for any topic.
+<span class="nc bnc" id="L529" title="All 2 branches missed.">        for (ReadShareGroupStateRequestData.ReadStateData topicData : request.topics()) {</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">            if (isEmpty(topicData.partitions())) {</span>
+<span class="nc" id="L531">                log.error(&quot;Partition Data for topic {} is empty: {}&quot;, topicData.topicId(), request);</span>
+<span class="nc" id="L532">                return CompletableFuture.completedFuture(</span>
+                    new ReadShareGroupStateResponseData()
+                );
+            }
+<span class="nc" id="L536">        }</span>
+
+        // Send an empty response if groupId is invalid.
+<span class="nc bnc" id="L539" title="All 2 branches missed.">        if (isGroupIdEmpty(groupId)) {</span>
+<span class="nc" id="L540">            log.error(&quot;Group id must be specified and non-empty: {}&quot;, request);</span>
+<span class="nc" id="L541">            return CompletableFuture.completedFuture(</span>
+                new ReadShareGroupStateResponseData()
+            );
+        }
+
+        // Send an empty response if the coordinator is not active.
+<span class="nc bnc" id="L547" title="All 2 branches missed.">        if (!isActive.get()) {</span>
+<span class="nc" id="L548">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L549">                generateErrorReadStateResponse(</span>
+                    request,
+                    Errors.COORDINATOR_NOT_AVAILABLE,
+                    &quot;Share coordinator is not available.&quot;
+                )
+            );
+        }
+
+        // The request received here could have multiple keys of structure group:topic:partition. However,
+        // the readState method in ShareCoordinatorShard expects a single key in the request. Hence, we will
+        // be looping over the keys below and constructing new ReadShareGroupStateRequestData objects to pass
+        // onto the shard method.
+
+        // It is possible that a read state request contains a leaderEpoch which is the higher than seen so
+        // far, for a specific share partition. Hence, for each read request - we must check for this
+        // and update the state appropriately.
+
+<span class="nc bnc" id="L566" title="All 2 branches missed.">        for (ReadShareGroupStateRequestData.ReadStateData topicData : request.topics()) {</span>
+<span class="nc" id="L567">            Uuid topicId = topicData.topicId();</span>
+<span class="nc bnc" id="L568" title="All 2 branches missed.">            for (ReadShareGroupStateRequestData.PartitionData partitionData : topicData.partitions()) {</span>
+<span class="nc" id="L569">                SharePartitionKey coordinatorKey = SharePartitionKey.getInstance(request.groupId(), topicId, partitionData.partition());</span>
+
+<span class="nc" id="L571">                ReadShareGroupStateRequestData requestForCurrentPartition = new ReadShareGroupStateRequestData()</span>
+<span class="nc" id="L572">                    .setGroupId(groupId)</span>
+<span class="nc" id="L573">                    .setTopics(List.of(new ReadShareGroupStateRequestData.ReadStateData()</span>
+<span class="nc" id="L574">                        .setTopicId(topicId)</span>
+<span class="nc" id="L575">                        .setPartitions(List.of(partitionData))));</span>
+
+                // We are issuing a scheduleWriteOperation even though the request is of read type since
+                // we might want to update the leader epoch, if it is the highest seen so far for the specific
+                // share partition. In that case, we require the strong consistency offered by scheduleWriteOperation.
+                // At the time of writing, read after write consistency for the readState and writeState requests
+                // is not guaranteed.
+<span class="nc" id="L582">                CompletableFuture&lt;ReadShareGroupStateResponseData&gt; readFuture = runtime.scheduleWriteOperation(</span>
+                    &quot;read-update-leader-epoch-state&quot;,
+<span class="nc" id="L584">                    topicPartitionFor(coordinatorKey),</span>
+<span class="nc" id="L585">                    coordinator -&gt; coordinator.readStateAndMaybeUpdateLeaderEpoch(requestForCurrentPartition)</span>
+<span class="nc" id="L586">                ).exceptionally(readException -&gt;</span>
+<span class="nc" id="L587">                    handleOperationException(</span>
+                        &quot;read-update-leader-epoch-state&quot;,
+                        request,
+                        readException,
+<span class="nc" id="L591">                        (error, message) -&gt; ReadShareGroupStateResponse.toErrorResponseData(</span>
+<span class="nc" id="L592">                            topicData.topicId(),</span>
+<span class="nc" id="L593">                            partitionData.partition(),</span>
+                            error,
+<span class="nc" id="L595">                            &quot;Unable to read share group state: &quot; + readException.getMessage()</span>
+                        ),
+                        log
+                    ));
+
+<span class="nc" id="L600">                futureMap.computeIfAbsent(topicId, k -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L601">                    .put(partitionData.partition(), readFuture);</span>
+<span class="nc" id="L602">            }</span>
+<span class="nc" id="L603">        }</span>
+
+        // Combine all futures into a single CompletableFuture&lt;Void&gt;.
+<span class="nc" id="L606">        CompletableFuture&lt;Void&gt; combinedFuture = CompletableFuture.allOf(futureMap.values().stream()</span>
+<span class="nc" id="L607">            .flatMap(map -&gt; map.values().stream()).toArray(CompletableFuture[]::new));</span>
+
+        // Transform the combined CompletableFuture&lt;Void&gt; into CompletableFuture&lt;ReadShareGroupStateResponseData&gt;.
+<span class="nc" id="L610">        return combinedFuture.thenApply(v -&gt; {</span>
+<span class="nc" id="L611">            List&lt;ReadShareGroupStateResponseData.ReadStateResult&gt; readStateResult = new ArrayList&lt;&gt;(futureMap.size());</span>
+<span class="nc" id="L612">            futureMap.forEach(</span>
+                (topicId, topicEntry) -&gt; {
+<span class="nc" id="L614">                    List&lt;ReadShareGroupStateResponseData.PartitionResult&gt; partitionResults = new ArrayList&lt;&gt;(topicEntry.size());</span>
+<span class="nc" id="L615">                    topicEntry.forEach(</span>
+                        (partitionId, responseFut) -&gt; {
+                            // ResponseFut would already be completed by now since we have used
+                            // CompletableFuture::allOf to create a combined future from the future map.
+<span class="nc" id="L619">                            partitionResults.add(</span>
+<span class="nc" id="L620">                                responseFut.getNow(null).results().get(0).partitions().get(0)</span>
+                            );
+<span class="nc" id="L622">                        }</span>
+                    );
+<span class="nc" id="L624">                    readStateResult.add(ReadShareGroupStateResponse.toResponseReadStateResult(topicId, partitionResults));</span>
+<span class="nc" id="L625">                }</span>
+            );
+<span class="nc" id="L627">            return new ReadShareGroupStateResponseData()</span>
+<span class="nc" id="L628">                .setResults(readStateResult);</span>
+        });
+    }
+
+    @Override
+    public CompletableFuture&lt;ReadShareGroupStateSummaryResponseData&gt; readStateSummary(RequestContext context, ReadShareGroupStateSummaryRequestData request) {
+        // Send an empty response if the coordinator is not active.
+<span class="nc bnc" id="L635" title="All 2 branches missed.">        if (!isActive.get()) {</span>
+<span class="nc" id="L636">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L637">                generateErrorReadStateSummaryResponse(</span>
+                    request,
+                    Errors.COORDINATOR_NOT_AVAILABLE,
+                    &quot;Share coordinator is not available.&quot;
+                )
+            );
+        }
+
+<span class="nc" id="L645">        String groupId = request.groupId();</span>
+        // Send an empty response if groupId is invalid.
+<span class="nc bnc" id="L647" title="All 2 branches missed.">        if (isGroupIdEmpty(groupId)) {</span>
+<span class="nc" id="L648">            log.error(&quot;Group id must be specified and non-empty: {}&quot;, request);</span>
+<span class="nc" id="L649">            return CompletableFuture.completedFuture(</span>
+                new ReadShareGroupStateSummaryResponseData()
+            );
+        }
+
+        // Send an empty response if topic data is empty.
+<span class="nc bnc" id="L655" title="All 2 branches missed.">        if (isEmpty(request.topics())) {</span>
+<span class="nc" id="L656">            log.error(&quot;Topic Data is empty: {}&quot;, request);</span>
+<span class="nc" id="L657">            return CompletableFuture.completedFuture(</span>
+                new ReadShareGroupStateSummaryResponseData()
+            );
+        }
+
+        // Send an empty response if partition data is empty for any topic.
+<span class="nc bnc" id="L663" title="All 2 branches missed.">        for (ReadShareGroupStateSummaryRequestData.ReadStateSummaryData topicData : request.topics()) {</span>
+<span class="nc bnc" id="L664" title="All 2 branches missed.">            if (isEmpty(topicData.partitions())) {</span>
+<span class="nc" id="L665">                log.error(&quot;Partition Data for topic {} is empty: {}&quot;, topicData.topicId(), request);</span>
+<span class="nc" id="L666">                return CompletableFuture.completedFuture(</span>
+                    new ReadShareGroupStateSummaryResponseData()
+                );
+            }
+<span class="nc" id="L670">        }</span>
+
+        // A map to store the futures for each topicId and partition.
+<span class="nc" id="L673">        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;ReadShareGroupStateSummaryResponseData&gt;&gt;&gt; futureMap = new HashMap&lt;&gt;();</span>
+
+        // The request received here could have multiple keys of structure group:topic:partition. However,
+        // the readStateSummary method in ShareCoordinatorShard expects a single key in the request. Hence, we will
+        // be looping over the keys below and constructing new ReadShareGroupStateSummaryRequestData objects to pass
+        // onto the shard method.
+
+<span class="nc bnc" id="L680" title="All 2 branches missed.">        for (ReadShareGroupStateSummaryRequestData.ReadStateSummaryData topicData : request.topics()) {</span>
+<span class="nc" id="L681">            Uuid topicId = topicData.topicId();</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">            for (ReadShareGroupStateSummaryRequestData.PartitionData partitionData : topicData.partitions()) {</span>
+<span class="nc" id="L683">                SharePartitionKey coordinatorKey = SharePartitionKey.getInstance(request.groupId(), topicId, partitionData.partition());</span>
+
+<span class="nc" id="L685">                ReadShareGroupStateSummaryRequestData requestForCurrentPartition = new ReadShareGroupStateSummaryRequestData()</span>
+<span class="nc" id="L686">                    .setGroupId(groupId)</span>
+<span class="nc" id="L687">                    .setTopics(List.of(new ReadShareGroupStateSummaryRequestData.ReadStateSummaryData()</span>
+<span class="nc" id="L688">                        .setTopicId(topicId)</span>
+<span class="nc" id="L689">                        .setPartitions(List.of(partitionData))));</span>
+
+<span class="nc" id="L691">                CompletableFuture&lt;ReadShareGroupStateSummaryResponseData&gt; readFuture = runtime.scheduleWriteOperation(</span>
+                    &quot;read-share-group-state-summary&quot;,
+<span class="nc" id="L693">                    topicPartitionFor(coordinatorKey),</span>
+<span class="nc" id="L694">                    coordinator -&gt; coordinator.readStateSummary(requestForCurrentPartition)</span>
+<span class="nc" id="L695">                ).exceptionally(readException -&gt;</span>
+<span class="nc" id="L696">                    handleOperationException(</span>
+                        &quot;read-share-group-state-summary&quot;,
+                        request,
+                        readException,
+<span class="nc" id="L700">                        (error, message) -&gt; ReadShareGroupStateSummaryResponse.toErrorResponseData(</span>
+<span class="nc" id="L701">                            topicData.topicId(),</span>
+<span class="nc" id="L702">                            partitionData.partition(),</span>
+                            error,
+<span class="nc" id="L704">                            &quot;Unable to read share group state summary: &quot; + readException.getMessage()</span>
+                        ),
+                        log
+                    ));
+
+<span class="nc" id="L709">                futureMap.computeIfAbsent(topicId, k -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L710">                    .put(partitionData.partition(), readFuture);</span>
+<span class="nc" id="L711">            }</span>
+<span class="nc" id="L712">        }</span>
+
+        // Combine all futures into a single CompletableFuture&lt;Void&gt;.
+<span class="nc" id="L715">        CompletableFuture&lt;Void&gt; combinedFuture = CompletableFuture.allOf(futureMap.values().stream()</span>
+<span class="nc" id="L716">            .flatMap(map -&gt; map.values().stream()).toArray(CompletableFuture[]::new));</span>
+
+        // Transform the combined CompletableFuture&lt;Void&gt; into CompletableFuture&lt;ReadShareGroupStateSummaryResponseData&gt;.
+<span class="nc" id="L719">        return combinedFuture.thenApply(v -&gt; {</span>
+<span class="nc" id="L720">            List&lt;ReadShareGroupStateSummaryResponseData.ReadStateSummaryResult&gt; readStateSummaryResult = new ArrayList&lt;&gt;(futureMap.size());</span>
+<span class="nc" id="L721">            futureMap.forEach(</span>
+                (topicId, topicEntry) -&gt; {
+<span class="nc" id="L723">                    List&lt;ReadShareGroupStateSummaryResponseData.PartitionResult&gt; partitionResults = new ArrayList&lt;&gt;(topicEntry.size());</span>
+<span class="nc" id="L724">                    topicEntry.forEach(</span>
+                        (partitionId, responseFut) -&gt; {
+                            // ResponseFut would already be completed by now since we have used
+                            // CompletableFuture::allOf to create a combined future from the future map.
+<span class="nc" id="L728">                            partitionResults.add(</span>
+<span class="nc" id="L729">                                responseFut.getNow(null).results().get(0).partitions().get(0)</span>
+                            );
+<span class="nc" id="L731">                        }</span>
+                    );
+<span class="nc" id="L733">                    readStateSummaryResult.add(ReadShareGroupStateSummaryResponse.toResponseReadStateSummaryResult(topicId, partitionResults));</span>
+<span class="nc" id="L734">                }</span>
+            );
+<span class="nc" id="L736">            return new ReadShareGroupStateSummaryResponseData()</span>
+<span class="nc" id="L737">                .setResults(readStateSummaryResult);</span>
+        });
+    }
+
+    @Override
+    public CompletableFuture&lt;DeleteShareGroupStateResponseData&gt; deleteState(RequestContext context, DeleteShareGroupStateRequestData request) {
+        // Send an empty response if the coordinator is not active.
+<span class="nc bnc" id="L744" title="All 2 branches missed.">        if (!isActive.get()) {</span>
+<span class="nc" id="L745">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L746">                generateErrorDeleteStateResponse(</span>
+                    request,
+                    Errors.COORDINATOR_NOT_AVAILABLE,
+                    &quot;Share coordinator is not available.&quot;
+                )
+            );
+        }
+
+<span class="nc" id="L754">        String groupId = request.groupId();</span>
+        // Send an empty response if groupId is invalid.
+<span class="nc bnc" id="L756" title="All 2 branches missed.">        if (isGroupIdEmpty(groupId)) {</span>
+<span class="nc" id="L757">            log.error(&quot;Group id must be specified and non-empty: {}&quot;, request);</span>
+<span class="nc" id="L758">            return CompletableFuture.completedFuture(</span>
+                new DeleteShareGroupStateResponseData()
+            );
+        }
+
+        // Send an empty response if topic data is empty.
+<span class="nc bnc" id="L764" title="All 2 branches missed.">        if (isEmpty(request.topics())) {</span>
+<span class="nc" id="L765">            log.error(&quot;Topic Data is empty: {}&quot;, request);</span>
+<span class="nc" id="L766">            return CompletableFuture.completedFuture(</span>
+                new DeleteShareGroupStateResponseData()
+            );
+        }
+
+        // Send an empty response if partition data is empty for any topic.
+<span class="nc bnc" id="L772" title="All 2 branches missed.">        for (DeleteShareGroupStateRequestData.DeleteStateData topicData : request.topics()) {</span>
+<span class="nc bnc" id="L773" title="All 2 branches missed.">            if (isEmpty(topicData.partitions())) {</span>
+<span class="nc" id="L774">                log.error(&quot;Partition Data for topic {} is empty: {}&quot;, topicData.topicId(), request);</span>
+<span class="nc" id="L775">                return CompletableFuture.completedFuture(</span>
+                    new DeleteShareGroupStateResponseData()
+                );
+            }
+<span class="nc" id="L779">        }</span>
+
+        // A map to store the futures for each topicId and partition.
+<span class="nc" id="L782">        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;DeleteShareGroupStateResponseData&gt;&gt;&gt; futureMap = new HashMap&lt;&gt;();</span>
+
+        // The request received here could have multiple keys of structure group:topic:partition. However,
+        // the deleteState method in ShareCoordinatorShard expects a single key in the request. Hence, we will
+        // be looping over the keys below and constructing new DeleteShareGroupStateRequestData objects to pass
+        // onto the shard method.
+
+<span class="nc bnc" id="L789" title="All 2 branches missed.">        for (DeleteShareGroupStateRequestData.DeleteStateData topicData : request.topics()) {</span>
+<span class="nc" id="L790">            Uuid topicId = topicData.topicId();</span>
+<span class="nc bnc" id="L791" title="All 2 branches missed.">            for (DeleteShareGroupStateRequestData.PartitionData partitionData : topicData.partitions()) {</span>
+<span class="nc" id="L792">                SharePartitionKey coordinatorKey = SharePartitionKey.getInstance(request.groupId(), topicId, partitionData.partition());</span>
+
+<span class="nc" id="L794">                DeleteShareGroupStateRequestData requestForCurrentPartition = new DeleteShareGroupStateRequestData()</span>
+<span class="nc" id="L795">                    .setGroupId(groupId)</span>
+<span class="nc" id="L796">                    .setTopics(List.of(new DeleteShareGroupStateRequestData.DeleteStateData()</span>
+<span class="nc" id="L797">                        .setTopicId(topicId)</span>
+<span class="nc" id="L798">                        .setPartitions(List.of(partitionData))));</span>
+
+<span class="nc" id="L800">                CompletableFuture&lt;DeleteShareGroupStateResponseData&gt; deleteFuture = runtime.scheduleWriteOperation(</span>
+                    &quot;delete-share-group-state&quot;,
+<span class="nc" id="L802">                    topicPartitionFor(coordinatorKey),</span>
+<span class="nc" id="L803">                    coordinator -&gt; coordinator.deleteState(requestForCurrentPartition)</span>
+<span class="nc" id="L804">                ).exceptionally(deleteException -&gt;</span>
+<span class="nc" id="L805">                    handleOperationException(</span>
+                        &quot;delete-share-group-state&quot;,
+                        request,
+                        deleteException,
+<span class="nc" id="L809">                        (error, message) -&gt; DeleteShareGroupStateResponse.toErrorResponseData(</span>
+<span class="nc" id="L810">                            topicData.topicId(),</span>
+<span class="nc" id="L811">                            partitionData.partition(),</span>
+                            error,
+<span class="nc" id="L813">                            &quot;Unable to delete share group state: &quot; + deleteException.getMessage()</span>
+                        ),
+                        log
+                    ));
+
+<span class="nc" id="L818">                futureMap.computeIfAbsent(topicId, k -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L819">                    .put(partitionData.partition(), deleteFuture);</span>
+<span class="nc" id="L820">            }</span>
+<span class="nc" id="L821">        }</span>
+
+        // Combine all futures into a single CompletableFuture&lt;Void&gt;.
+<span class="nc" id="L824">        CompletableFuture&lt;Void&gt; combinedFuture = CompletableFuture.allOf(futureMap.values().stream()</span>
+<span class="nc" id="L825">            .flatMap(map -&gt; map.values().stream()).toArray(CompletableFuture[]::new));</span>
+
+        // Transform the combined CompletableFuture&lt;Void&gt; into CompletableFuture&lt;DeleteShareGroupStateResponseData&gt;.
+<span class="nc" id="L828">        return combinedFuture.thenApply(v -&gt; {</span>
+<span class="nc" id="L829">            List&lt;DeleteShareGroupStateResponseData.DeleteStateResult&gt; deleteStateResult = new ArrayList&lt;&gt;(futureMap.size());</span>
+<span class="nc" id="L830">            futureMap.forEach(</span>
+                (topicId, topicEntry) -&gt; {
+<span class="nc" id="L832">                    List&lt;DeleteShareGroupStateResponseData.PartitionResult&gt; partitionResults = new ArrayList&lt;&gt;(topicEntry.size());</span>
+<span class="nc" id="L833">                    topicEntry.forEach(</span>
+                        (partitionId, responseFut) -&gt; {
+                            // ResponseFut would already be completed by now since we have used
+                            // CompletableFuture::allOf to create a combined future from the future map.
+<span class="nc" id="L837">                            partitionResults.add(</span>
+<span class="nc" id="L838">                                responseFut.getNow(null).results().get(0).partitions().get(0)</span>
+                            );
+<span class="nc" id="L840">                        }</span>
+                    );
+<span class="nc" id="L842">                    deleteStateResult.add(DeleteShareGroupStateResponse.toResponseDeleteStateResult(topicId, partitionResults));</span>
+<span class="nc" id="L843">                }</span>
+            );
+<span class="nc" id="L845">            return new DeleteShareGroupStateResponseData()</span>
+<span class="nc" id="L846">                .setResults(deleteStateResult);</span>
+        });
+    }
+
+    @Override
+    public CompletableFuture&lt;InitializeShareGroupStateResponseData&gt; initializeState(RequestContext context, InitializeShareGroupStateRequestData request) {
+        // Send an empty response if the coordinator is not active.
+<span class="nc bnc" id="L853" title="All 2 branches missed.">        if (!isActive.get()) {</span>
+<span class="nc" id="L854">            return CompletableFuture.completedFuture(</span>
+<span class="nc" id="L855">                generateErrorInitStateResponse(</span>
+                    request,
+                    Errors.COORDINATOR_NOT_AVAILABLE,
+                    &quot;Share coordinator is not available.&quot;
+                )
+            );
+        }
+
+<span class="nc" id="L863">        String groupId = request.groupId();</span>
+        // Send an empty response if groupId is invalid.
+<span class="nc bnc" id="L865" title="All 2 branches missed.">        if (isGroupIdEmpty(groupId)) {</span>
+<span class="nc" id="L866">            log.error(&quot;Group id must be specified and non-empty: {}&quot;, request);</span>
+<span class="nc" id="L867">            return CompletableFuture.completedFuture(</span>
+                new InitializeShareGroupStateResponseData()
+            );
+        }
+
+        // Send an empty response if topic data is empty.
+<span class="nc bnc" id="L873" title="All 2 branches missed.">        if (isEmpty(request.topics())) {</span>
+<span class="nc" id="L874">            log.error(&quot;Topic Data is empty: {}&quot;, request);</span>
+<span class="nc" id="L875">            return CompletableFuture.completedFuture(</span>
+                new InitializeShareGroupStateResponseData()
+            );
+        }
+
+        // A map to store the futures for each topicId and partition.
+<span class="nc" id="L881">        Map&lt;Uuid, Map&lt;Integer, CompletableFuture&lt;InitializeShareGroupStateResponseData&gt;&gt;&gt; futureMap = new HashMap&lt;&gt;();</span>
+
+        // The request received here could have multiple keys of structure group:topic:partition. However,
+        // the initializeState method in ShareCoordinatorShard expects a single key in the request. Hence, we will
+        // be looping over the keys below and constructing new InitializeShareGroupStateRequestData objects to pass
+        // onto the shard method.
+
+<span class="nc bnc" id="L888" title="All 2 branches missed.">        for (InitializeShareGroupStateRequestData.InitializeStateData topicData : request.topics()) {</span>
+<span class="nc" id="L889">            Uuid topicId = topicData.topicId();</span>
+<span class="nc bnc" id="L890" title="All 2 branches missed.">            for (InitializeShareGroupStateRequestData.PartitionData partitionData : topicData.partitions()) {</span>
+<span class="nc" id="L891">                SharePartitionKey coordinatorKey = SharePartitionKey.getInstance(request.groupId(), topicId, partitionData.partition());</span>
+
+<span class="nc" id="L893">                InitializeShareGroupStateRequestData requestForCurrentPartition = new InitializeShareGroupStateRequestData()</span>
+<span class="nc" id="L894">                    .setGroupId(groupId)</span>
+<span class="nc" id="L895">                    .setTopics(List.of(new InitializeShareGroupStateRequestData.InitializeStateData()</span>
+<span class="nc" id="L896">                        .setTopicId(topicId)</span>
+<span class="nc" id="L897">                        .setPartitions(List.of(partitionData))));</span>
+
+<span class="nc" id="L899">                CompletableFuture&lt;InitializeShareGroupStateResponseData&gt; initializeFuture = runtime.scheduleWriteOperation(</span>
+                    &quot;initialize-share-group-state&quot;,
+<span class="nc" id="L901">                    topicPartitionFor(coordinatorKey),</span>
+<span class="nc" id="L902">                    coordinator -&gt; coordinator.initializeState(requestForCurrentPartition)</span>
+<span class="nc" id="L903">                ).exceptionally(initializeException -&gt;</span>
+<span class="nc" id="L904">                    handleOperationException(</span>
+                        &quot;initialize-share-group-state&quot;,
+                        request,
+                        initializeException,
+<span class="nc" id="L908">                        (error, message) -&gt; InitializeShareGroupStateResponse.toErrorResponseData(</span>
+<span class="nc" id="L909">                            topicData.topicId(),</span>
+<span class="nc" id="L910">                            partitionData.partition(),</span>
+                            error,
+<span class="nc" id="L912">                            &quot;Unable to initialize share group state: &quot; + initializeException.getMessage()</span>
+                        ),
+                        log
+                    ));
+
+<span class="nc" id="L917">                futureMap.computeIfAbsent(topicId, k -&gt; new HashMap&lt;&gt;())</span>
+<span class="nc" id="L918">                    .put(partitionData.partition(), initializeFuture);</span>
+<span class="nc" id="L919">            }</span>
+<span class="nc" id="L920">        }</span>
+
+        // Combine all futures into a single CompletableFuture&lt;Void&gt;.
+<span class="nc" id="L923">        CompletableFuture&lt;Void&gt; combinedFuture = CompletableFuture.allOf(futureMap.values().stream()</span>
+<span class="nc" id="L924">            .flatMap(map -&gt; map.values().stream()).toArray(CompletableFuture[]::new));</span>
+
+        // Transform the combined CompletableFuture&lt;Void&gt; into CompletableFuture&lt;InitializeShareGroupStateResponseData&gt;.
+<span class="nc" id="L927">        return combinedFuture.thenApply(v -&gt; {</span>
+<span class="nc" id="L928">            List&lt;InitializeShareGroupStateResponseData.InitializeStateResult&gt; initializeStateResult = new ArrayList&lt;&gt;(futureMap.size());</span>
+<span class="nc" id="L929">            futureMap.forEach(</span>
+                (topicId, topicEntry) -&gt; {
+<span class="nc" id="L931">                    List&lt;InitializeShareGroupStateResponseData.PartitionResult&gt; partitionResults = new ArrayList&lt;&gt;(topicEntry.size());</span>
+<span class="nc" id="L932">                    topicEntry.forEach(</span>
+                        (partitionId, responseFut) -&gt; {
+                            // ResponseFut would already be completed by now since we have used
+                            // CompletableFuture::allOf to create a combined future from the future map.
+<span class="nc" id="L936">                            partitionResults.add(</span>
+<span class="nc" id="L937">                                responseFut.getNow(null).results().get(0).partitions().get(0)</span>
+                            );
+<span class="nc" id="L939">                        }</span>
+                    );
+<span class="nc" id="L941">                    initializeStateResult.add(InitializeShareGroupStateResponse.toResponseInitializeStateResult(topicId, partitionResults));</span>
+<span class="nc" id="L942">                }</span>
+            );
+<span class="nc" id="L944">            return new InitializeShareGroupStateResponseData()</span>
+<span class="nc" id="L945">                .setResults(initializeStateResult);</span>
+        });
+    }
+
+    private ReadShareGroupStateResponseData generateErrorReadStateResponse(
+        ReadShareGroupStateRequestData request,
+        Errors error,
+        String errorMessage
+    ) {
+<span class="nc" id="L954">        return new ReadShareGroupStateResponseData().setResults(request.topics().stream()</span>
+<span class="nc" id="L955">            .map(topicData -&gt; {</span>
+<span class="nc" id="L956">                ReadShareGroupStateResponseData.ReadStateResult resultData = new ReadShareGroupStateResponseData.ReadStateResult();</span>
+<span class="nc" id="L957">                resultData.setTopicId(topicData.topicId());</span>
+<span class="nc" id="L958">                resultData.setPartitions(topicData.partitions().stream()</span>
+<span class="nc" id="L959">                    .map(partitionData -&gt; ReadShareGroupStateResponse.toErrorResponsePartitionResult(</span>
+<span class="nc" id="L960">                        partitionData.partition(), error, errorMessage</span>
+<span class="nc" id="L961">                    )).toList());</span>
+<span class="nc" id="L962">                return resultData;</span>
+<span class="nc" id="L963">            }).toList());</span>
+    }
+
+    private ReadShareGroupStateSummaryResponseData generateErrorReadStateSummaryResponse(
+        ReadShareGroupStateSummaryRequestData request,
+        Errors error,
+        String errorMessage
+    ) {
+<span class="nc" id="L971">        return new ReadShareGroupStateSummaryResponseData().setResults(request.topics().stream()</span>
+<span class="nc" id="L972">            .map(topicData -&gt; {</span>
+<span class="nc" id="L973">                ReadShareGroupStateSummaryResponseData.ReadStateSummaryResult resultData = new ReadShareGroupStateSummaryResponseData.ReadStateSummaryResult();</span>
+<span class="nc" id="L974">                resultData.setTopicId(topicData.topicId());</span>
+<span class="nc" id="L975">                resultData.setPartitions(topicData.partitions().stream()</span>
+<span class="nc" id="L976">                    .map(partitionData -&gt; ReadShareGroupStateSummaryResponse.toErrorResponsePartitionResult(</span>
+<span class="nc" id="L977">                        partitionData.partition(), error, errorMessage</span>
+<span class="nc" id="L978">                    )).toList());</span>
+<span class="nc" id="L979">                return resultData;</span>
+<span class="nc" id="L980">            }).toList());</span>
+    }
+
+    private WriteShareGroupStateResponseData generateErrorWriteStateResponse(
+        WriteShareGroupStateRequestData request,
+        Errors error,
+        String errorMessage
+    ) {
+<span class="nc" id="L988">        return new WriteShareGroupStateResponseData()</span>
+<span class="nc" id="L989">            .setResults(request.topics().stream()</span>
+<span class="nc" id="L990">                .map(topicData -&gt; {</span>
+<span class="nc" id="L991">                    WriteShareGroupStateResponseData.WriteStateResult resultData = new WriteShareGroupStateResponseData.WriteStateResult();</span>
+<span class="nc" id="L992">                    resultData.setTopicId(topicData.topicId());</span>
+<span class="nc" id="L993">                    resultData.setPartitions(topicData.partitions().stream()</span>
+<span class="nc" id="L994">                        .map(partitionData -&gt; WriteShareGroupStateResponse.toErrorResponsePartitionResult(</span>
+<span class="nc" id="L995">                            partitionData.partition(), error, errorMessage</span>
+<span class="nc" id="L996">                        )).toList());</span>
+<span class="nc" id="L997">                    return resultData;</span>
+<span class="nc" id="L998">                }).toList());</span>
+    }
+
+    private DeleteShareGroupStateResponseData generateErrorDeleteStateResponse(
+        DeleteShareGroupStateRequestData request,
+        Errors error,
+        String errorMessage
+    ) {
+<span class="nc" id="L1006">        return new DeleteShareGroupStateResponseData().setResults(request.topics().stream()</span>
+<span class="nc" id="L1007">            .map(topicData -&gt; {</span>
+<span class="nc" id="L1008">                DeleteShareGroupStateResponseData.DeleteStateResult resultData = new DeleteShareGroupStateResponseData.DeleteStateResult();</span>
+<span class="nc" id="L1009">                resultData.setTopicId(topicData.topicId());</span>
+<span class="nc" id="L1010">                resultData.setPartitions(topicData.partitions().stream()</span>
+<span class="nc" id="L1011">                    .map(partitionData -&gt; DeleteShareGroupStateResponse.toErrorResponsePartitionResult(</span>
+<span class="nc" id="L1012">                        partitionData.partition(), error, errorMessage</span>
+<span class="nc" id="L1013">                    )).toList());</span>
+<span class="nc" id="L1014">                return resultData;</span>
+<span class="nc" id="L1015">            }).toList());</span>
+    }
+
+    private InitializeShareGroupStateResponseData generateErrorInitStateResponse(
+        InitializeShareGroupStateRequestData request,
+        Errors error,
+        String errorMessage
+    ) {
+<span class="nc" id="L1023">        return new InitializeShareGroupStateResponseData().setResults(request.topics().stream()</span>
+<span class="nc" id="L1024">            .map(topicData -&gt; {</span>
+<span class="nc" id="L1025">                InitializeShareGroupStateResponseData.InitializeStateResult resultData = new InitializeShareGroupStateResponseData.InitializeStateResult();</span>
+<span class="nc" id="L1026">                resultData.setTopicId(topicData.topicId());</span>
+<span class="nc" id="L1027">                resultData.setPartitions(topicData.partitions().stream()</span>
+<span class="nc" id="L1028">                    .map(partitionData -&gt; InitializeShareGroupStateResponse.toErrorResponsePartitionResult(</span>
+<span class="nc" id="L1029">                        partitionData.partition(), error, errorMessage</span>
+<span class="nc" id="L1030">                    )).toList());</span>
+<span class="nc" id="L1031">                return resultData;</span>
+<span class="nc" id="L1032">            }).toList());</span>
+    }
+
+    private static boolean isGroupIdEmpty(String groupId) {
+<span class="nc bnc" id="L1036" title="All 4 branches missed.">        return groupId == null || groupId.isEmpty();</span>
+    }
+
+    @Override
+    public void onElection(int partitionIndex, int partitionLeaderEpoch) {
+<span class="nc" id="L1041">        throwIfNotActive();</span>
+<span class="nc" id="L1042">        runtime.scheduleLoadOperation(</span>
+            new TopicPartition(Topic.SHARE_GROUP_STATE_TOPIC_NAME, partitionIndex),
+            partitionLeaderEpoch
+        );
+<span class="nc" id="L1046">    }</span>
+
+    @Override
+    public void onResignation(int partitionIndex, OptionalInt partitionLeaderEpoch) {
+<span class="nc" id="L1050">        throwIfNotActive();</span>
+<span class="nc" id="L1051">        TopicPartition tp = new TopicPartition(Topic.SHARE_GROUP_STATE_TOPIC_NAME, partitionIndex);</span>
+<span class="nc" id="L1052">        lastPrunedOffsets.remove(tp);</span>
+<span class="nc" id="L1053">        runtime.scheduleUnloadOperation(</span>
+            tp,
+            partitionLeaderEpoch
+        );
+<span class="nc" id="L1057">    }</span>
+
+    @Override
+    public void onMetadataUpdate(MetadataDelta delta, MetadataImage newImage) {
+<span class="fc" id="L1061">        throwIfNotActive();</span>
+<span class="fc" id="L1062">        Objects.requireNonNull(delta, &quot;delta must be provided&quot;);</span>
+<span class="fc" id="L1063">        Objects.requireNonNull(newImage, &quot;newImage must be provided&quot;);</span>
+
+<span class="fc" id="L1065">        this.runtime.onMetadataUpdate(</span>
+            new KRaftCoordinatorMetadataDelta(delta),
+            new KRaftCoordinatorMetadataImage(newImage)
+        );
+
+        // Handle topic deletions from the delta.
+<span class="fc bfc" id="L1071" title="All 4 branches covered.">        if (delta.topicsDelta() != null &amp;&amp; !delta.topicsDelta().deletedTopicIds().isEmpty()) {</span>
+<span class="fc" id="L1072">            handleTopicsDeletion(delta.topicsDelta().deletedTopicIds());</span>
+        }
+
+<span class="fc" id="L1075">        boolean enabled = isShareGroupsEnabled(newImage);</span>
+        // enabled    shouldRunJob         result (XOR)
+        // 0            0               no op on flag, do not call jobs
+        // 0            1               disable flag, do not call jobs                      =&gt; action
+        // 1            0               enable flag, call jobs as they are not recursing    =&gt; action
+        // 1            1               no op on flag, do not call jobs
+<span class="fc bfc" id="L1081" title="All 2 branches covered.">        if (enabled ^ shouldRunPeriodicJob) {</span>
+<span class="fc" id="L1082">            shouldRunPeriodicJob = enabled;</span>
+<span class="pc bpc" id="L1083" title="1 of 2 branches missed.">            if (enabled) {</span>
+<span class="fc" id="L1084">                setupPeriodicJobs();</span>
+            }
+        }
+<span class="fc" id="L1087">    }</span>
+
+    private void handleTopicsDeletion(Set&lt;Uuid&gt; deletedTopicIds) {
+<span class="fc" id="L1090">        CompletableFuture.allOf(</span>
+<span class="fc" id="L1091">            FutureUtils.mapExceptionally(</span>
+<span class="fc" id="L1092">                runtime.scheduleWriteAllOperation(</span>
+                    &quot;on-topics-deleted&quot;,
+<span class="nc" id="L1094">                    coordinator -&gt; coordinator.maybeCleanupShareState(deletedTopicIds)</span>
+                ),
+                exception -&gt; {
+<span class="nc" id="L1097">                    log.error(&quot;Received error while trying to cleanup deleted topics.&quot;, exception);</span>
+<span class="nc" id="L1098">                    return null;</span>
+                }
+<span class="fc" id="L1100">            ).toArray(new CompletableFuture&lt;?&gt;[0])</span>
+<span class="fc" id="L1101">        ).join();</span>
+<span class="fc" id="L1102">    }</span>
+
+    TopicPartition topicPartitionFor(SharePartitionKey key) {
+<span class="nc" id="L1105">        return new TopicPartition(Topic.SHARE_GROUP_STATE_TOPIC_NAME, partitionFor(key));</span>
+    }
+
+    private static &lt;P&gt; boolean isEmpty(List&lt;P&gt; list) {
+<span class="nc bnc" id="L1109" title="All 4 branches missed.">        return list == null || list.isEmpty();</span>
+    }
+
+    private void throwIfNotActive() {
+<span class="pc bpc" id="L1113" title="1 of 2 branches missed.">        if (!isActive.get()) {</span>
+<span class="nc" id="L1114">            throw Errors.COORDINATOR_NOT_AVAILABLE.exception();</span>
+        }
+<span class="fc" id="L1116">    }</span>
+
+    private boolean isShareGroupsEnabled(MetadataImage image) {
+<span class="fc" id="L1119">        return ShareVersion.fromFeatureLevel(</span>
+<span class="fc" id="L1120">            image.features().finalizedVersions().getOrDefault(ShareVersion.FEATURE_NAME, (short) 0)</span>
+<span class="fc" id="L1121">        ).supportsShareGroups();</span>
+    }
+
+    // Visibility for tests
+    boolean shouldRunPeriodicJob() {
+<span class="nc" id="L1126">        return shouldRunPeriodicJob;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

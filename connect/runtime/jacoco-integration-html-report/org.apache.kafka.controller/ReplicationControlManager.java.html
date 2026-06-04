@@ -1,0 +1,2550 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ReplicationControlManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.controller</a> &gt; <span class="el_source">ReplicationControlManager.java</span></div><h1>ReplicationControlManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.controller;
+
+import org.apache.kafka.clients.admin.AlterConfigOp.OpType;
+import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.common.DirectoryId;
+import org.apache.kafka.common.ElectionType;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.config.ConfigResource;
+import org.apache.kafka.common.errors.ApiException;
+import org.apache.kafka.common.errors.BrokerIdNotRegisteredException;
+import org.apache.kafka.common.errors.InvalidPartitionsException;
+import org.apache.kafka.common.errors.InvalidReplicaAssignmentException;
+import org.apache.kafka.common.errors.InvalidReplicationFactorException;
+import org.apache.kafka.common.errors.InvalidRequestException;
+import org.apache.kafka.common.errors.InvalidTopicException;
+import org.apache.kafka.common.errors.NoReassignmentInProgressException;
+import org.apache.kafka.common.errors.PolicyViolationException;
+import org.apache.kafka.common.errors.ThrottlingQuotaExceededException;
+import org.apache.kafka.common.errors.UnknownServerException;
+import org.apache.kafka.common.errors.UnknownTopicIdException;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.internals.Topic;
+import org.apache.kafka.common.message.AlterPartitionReassignmentsRequestData;
+import org.apache.kafka.common.message.AlterPartitionReassignmentsRequestData.ReassignablePartition;
+import org.apache.kafka.common.message.AlterPartitionReassignmentsRequestData.ReassignableTopic;
+import org.apache.kafka.common.message.AlterPartitionReassignmentsResponseData;
+import org.apache.kafka.common.message.AlterPartitionReassignmentsResponseData.ReassignablePartitionResponse;
+import org.apache.kafka.common.message.AlterPartitionReassignmentsResponseData.ReassignableTopicResponse;
+import org.apache.kafka.common.message.AlterPartitionRequestData;
+import org.apache.kafka.common.message.AlterPartitionRequestData.BrokerState;
+import org.apache.kafka.common.message.AlterPartitionResponseData;
+import org.apache.kafka.common.message.AssignReplicasToDirsRequestData;
+import org.apache.kafka.common.message.AssignReplicasToDirsResponseData;
+import org.apache.kafka.common.message.BrokerHeartbeatRequestData;
+import org.apache.kafka.common.message.CreatePartitionsRequestData.CreatePartitionsTopic;
+import org.apache.kafka.common.message.CreatePartitionsResponseData.CreatePartitionsTopicResult;
+import org.apache.kafka.common.message.CreateTopicsRequestData;
+import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableReplicaAssignment;
+import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopic;
+import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicCollection;
+import org.apache.kafka.common.message.CreateTopicsRequestData.CreatableTopicConfigCollection;
+import org.apache.kafka.common.message.CreateTopicsResponseData;
+import org.apache.kafka.common.message.CreateTopicsResponseData.CreatableTopicResult;
+import org.apache.kafka.common.message.ElectLeadersRequestData;
+import org.apache.kafka.common.message.ElectLeadersRequestData.TopicPartitions;
+import org.apache.kafka.common.message.ElectLeadersResponseData;
+import org.apache.kafka.common.message.ElectLeadersResponseData.PartitionResult;
+import org.apache.kafka.common.message.ElectLeadersResponseData.ReplicaElectionResult;
+import org.apache.kafka.common.message.ListPartitionReassignmentsRequestData.ListPartitionReassignmentsTopics;
+import org.apache.kafka.common.message.ListPartitionReassignmentsResponseData;
+import org.apache.kafka.common.message.ListPartitionReassignmentsResponseData.OngoingPartitionReassignment;
+import org.apache.kafka.common.message.ListPartitionReassignmentsResponseData.OngoingTopicReassignment;
+import org.apache.kafka.common.metadata.BrokerRegistrationChangeRecord;
+import org.apache.kafka.common.metadata.ClearElrRecord;
+import org.apache.kafka.common.metadata.PartitionChangeRecord;
+import org.apache.kafka.common.metadata.PartitionRecord;
+import org.apache.kafka.common.metadata.RemoveTopicRecord;
+import org.apache.kafka.common.metadata.TopicRecord;
+import org.apache.kafka.common.metadata.UnregisterBrokerRecord;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.AlterPartitionRequest;
+import org.apache.kafka.common.requests.ApiError;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.image.writer.ImageWriterOptions;
+import org.apache.kafka.metadata.BrokerHeartbeatReply;
+import org.apache.kafka.metadata.BrokerRegistration;
+import org.apache.kafka.metadata.BrokerRegistrationFencingChange;
+import org.apache.kafka.metadata.BrokerRegistrationInControlledShutdownChange;
+import org.apache.kafka.metadata.KafkaConfigSchema;
+import org.apache.kafka.metadata.LeaderRecoveryState;
+import org.apache.kafka.metadata.PartitionRegistration;
+import org.apache.kafka.metadata.Replicas;
+import org.apache.kafka.metadata.placement.ClusterDescriber;
+import org.apache.kafka.metadata.placement.PartitionAssignment;
+import org.apache.kafka.metadata.placement.PlacementSpec;
+import org.apache.kafka.metadata.placement.TopicAssignment;
+import org.apache.kafka.metadata.placement.UsableBroker;
+import org.apache.kafka.server.common.ApiMessageAndVersion;
+import org.apache.kafka.server.common.TopicIdPartition;
+import org.apache.kafka.server.mutable.BoundedList;
+import org.apache.kafka.server.policy.CreateTopicPolicy;
+import org.apache.kafka.timeline.SnapshotRegistry;
+import org.apache.kafka.timeline.TimelineHashMap;
+import org.apache.kafka.timeline.TimelineHashSet;
+
+import org.slf4j.Logger;
+
+import java.util.AbstractMap.SimpleImmutableEntry;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.Set;
+import java.util.function.IntPredicate;
+import java.util.function.Supplier;
+
+import static org.apache.kafka.clients.admin.AlterConfigOp.OpType.SET;
+import static org.apache.kafka.common.config.ConfigResource.Type.TOPIC;
+import static org.apache.kafka.common.config.TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG;
+import static org.apache.kafka.common.protocol.Errors.FENCED_LEADER_EPOCH;
+import static org.apache.kafka.common.protocol.Errors.INELIGIBLE_REPLICA;
+import static org.apache.kafka.common.protocol.Errors.INVALID_REQUEST;
+import static org.apache.kafka.common.protocol.Errors.INVALID_UPDATE_VERSION;
+import static org.apache.kafka.common.protocol.Errors.NEW_LEADER_ELECTED;
+import static org.apache.kafka.common.protocol.Errors.NONE;
+import static org.apache.kafka.common.protocol.Errors.NOT_CONTROLLER;
+import static org.apache.kafka.common.protocol.Errors.NO_REASSIGNMENT_IN_PROGRESS;
+import static org.apache.kafka.common.protocol.Errors.TOPIC_AUTHORIZATION_FAILED;
+import static org.apache.kafka.common.protocol.Errors.UNKNOWN_TOPIC_ID;
+import static org.apache.kafka.common.protocol.Errors.UNKNOWN_TOPIC_OR_PARTITION;
+import static org.apache.kafka.controller.PartitionReassignmentReplicas.isReassignmentInProgress;
+import static org.apache.kafka.controller.QuorumController.MAX_RECORDS_PER_USER_OP;
+import static org.apache.kafka.metadata.LeaderConstants.NO_LEADER;
+import static org.apache.kafka.metadata.LeaderConstants.NO_LEADER_CHANGE;
+
+
+/**
+ * The ReplicationControlManager is the part of the controller which deals with topics
+ * and partitions. It is responsible for managing the in-sync replica set and leader
+ * of each partition, as well as administrative tasks like creating or deleting topics.
+ */
+public class ReplicationControlManager {
+    static final int MAX_ELECTIONS_PER_IMBALANCE = 1_000;
+    static final int MAX_PARTITIONS_PER_BATCH = 10_000;
+
+<span class="fc" id="L154">    static class Builder {</span>
+<span class="fc" id="L155">        private SnapshotRegistry snapshotRegistry = null;</span>
+<span class="fc" id="L156">        private LogContext logContext = null;</span>
+<span class="fc" id="L157">        private short defaultReplicationFactor = (short) 3;</span>
+<span class="fc" id="L158">        private int defaultNumPartitions = 1;</span>
+
+<span class="fc" id="L160">        private int maxElectionsPerImbalance = MAX_ELECTIONS_PER_IMBALANCE;</span>
+<span class="fc" id="L161">        private ConfigurationControlManager configurationControl = null;</span>
+<span class="fc" id="L162">        private ClusterControlManager clusterControl = null;</span>
+<span class="fc" id="L163">        private Optional&lt;CreateTopicPolicy&gt; createTopicPolicy = Optional.empty();</span>
+<span class="fc" id="L164">        private FeatureControlManager featureControl = null;</span>
+
+        Builder setSnapshotRegistry(SnapshotRegistry snapshotRegistry) {
+<span class="fc" id="L167">            this.snapshotRegistry = snapshotRegistry;</span>
+<span class="fc" id="L168">            return this;</span>
+        }
+
+        Builder setLogContext(LogContext logContext) {
+<span class="fc" id="L172">            this.logContext = logContext;</span>
+<span class="fc" id="L173">            return this;</span>
+        }
+
+        Builder setDefaultReplicationFactor(short defaultReplicationFactor) {
+<span class="fc" id="L177">            this.defaultReplicationFactor = defaultReplicationFactor;</span>
+<span class="fc" id="L178">            return this;</span>
+        }
+
+        Builder setDefaultNumPartitions(int defaultNumPartitions) {
+<span class="fc" id="L182">            this.defaultNumPartitions = defaultNumPartitions;</span>
+<span class="fc" id="L183">            return this;</span>
+        }
+
+        Builder setMaxElectionsPerImbalance(int maxElectionsPerImbalance) {
+<span class="fc" id="L187">            this.maxElectionsPerImbalance = maxElectionsPerImbalance;</span>
+<span class="fc" id="L188">            return this;</span>
+        }
+
+        Builder setConfigurationControl(ConfigurationControlManager configurationControl) {
+<span class="fc" id="L192">            this.configurationControl = configurationControl;</span>
+<span class="fc" id="L193">            return this;</span>
+        }
+
+        Builder setClusterControl(ClusterControlManager clusterControl) {
+<span class="fc" id="L197">            this.clusterControl = clusterControl;</span>
+<span class="fc" id="L198">            return this;</span>
+        }
+
+        Builder setCreateTopicPolicy(Optional&lt;CreateTopicPolicy&gt; createTopicPolicy) {
+<span class="fc" id="L202">            this.createTopicPolicy = createTopicPolicy;</span>
+<span class="fc" id="L203">            return this;</span>
+        }
+
+        public Builder setFeatureControl(FeatureControlManager featureControl) {
+<span class="fc" id="L207">            this.featureControl = featureControl;</span>
+<span class="fc" id="L208">            return this;</span>
+        }
+
+        ReplicationControlManager build() {
+<span class="pc bpc" id="L212" title="1 of 2 branches missed.">            if (configurationControl == null) {</span>
+<span class="nc" id="L213">                throw new IllegalStateException(&quot;Configuration control must be set before building&quot;);</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">            } else if (clusterControl == null) {</span>
+<span class="nc" id="L215">                throw new IllegalStateException(&quot;Cluster control must be set before building&quot;);</span>
+            }
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">            if (logContext == null) logContext = new LogContext();</span>
+<span class="pc bpc" id="L218" title="1 of 2 branches missed.">            if (snapshotRegistry == null) snapshotRegistry = configurationControl.snapshotRegistry();</span>
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">            if (featureControl == null) {</span>
+<span class="nc" id="L220">                throw new IllegalStateException(&quot;FeatureControlManager must not be null&quot;);</span>
+            }
+<span class="fc" id="L222">            return new ReplicationControlManager(snapshotRegistry,</span>
+                logContext,
+                defaultReplicationFactor,
+                defaultNumPartitions,
+                maxElectionsPerImbalance,
+                configurationControl,
+                clusterControl,
+                createTopicPolicy,
+                featureControl);
+        }
+    }
+
+<span class="fc" id="L234">    class KRaftClusterDescriber implements ClusterDescriber {</span>
+        @Override
+        public Iterator&lt;UsableBroker&gt; usableBrokers() {
+<span class="fc" id="L237">            return clusterControl.usableBrokers();</span>
+        }
+
+        @Override
+        public Uuid defaultDir(int brokerId) {
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">            if (featureControl.metadataVersionOrThrow().isDirectoryAssignmentSupported()) {</span>
+<span class="fc" id="L243">                return clusterControl.defaultDir(brokerId);</span>
+            } else {
+<span class="nc" id="L245">                return DirectoryId.MIGRATING;</span>
+            }
+        }
+    }
+
+    static class TopicControlInfo {
+        private final String name;
+        private final Uuid id;
+        private final TimelineHashMap&lt;Integer, PartitionRegistration&gt; parts;
+
+<span class="fc" id="L255">        TopicControlInfo(String name, SnapshotRegistry snapshotRegistry, Uuid id) {</span>
+<span class="fc" id="L256">            this.name = name;</span>
+<span class="fc" id="L257">            this.id = id;</span>
+<span class="fc" id="L258">            this.parts = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L259">        }</span>
+
+        public String name() {
+<span class="nc" id="L262">            return name;</span>
+        }
+
+        public Uuid topicId() {
+<span class="nc" id="L266">            return id;</span>
+        }
+
+        public int numPartitions(long epoch) {
+<span class="nc" id="L270">            return parts.size(epoch);</span>
+        }
+    }
+
+    /**
+     * Translate a CreatableTopicConfigCollection to a map from string to string.
+     */
+    static Map&lt;String, String&gt; translateCreationConfigs(CreatableTopicConfigCollection collection) {
+<span class="fc" id="L278">        HashMap&lt;String, String&gt; result = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L279">        collection.forEach(config -&gt; result.put(config.name(), config.value()));</span>
+<span class="fc" id="L280">        return Collections.unmodifiableMap(result);</span>
+    }
+
+    private final SnapshotRegistry snapshotRegistry;
+    private final Logger log;
+
+    /**
+     * The KIP-464 default replication factor that is used if a CreateTopics request does
+     * not specify one.
+     */
+    private final short defaultReplicationFactor;
+
+    /**
+     * The KIP-464 default number of partitions that is used if a CreateTopics request does
+     * not specify a number of partitions.
+     */
+    private final int defaultNumPartitions;
+
+    /**
+     * Maximum number of leader elections to perform during one partition leader balancing operation.
+     */
+    private final int maxElectionsPerImbalance;
+
+    /**
+     * A reference to the controller's configuration control manager.
+     */
+    private final ConfigurationControlManager configurationControl;
+
+    /**
+     * A reference to the controller's cluster control manager.
+     */
+    private final ClusterControlManager clusterControl;
+
+    /**
+     * The policy to use to validate that topic assignments are valid, if one is present.
+     */
+    private final Optional&lt;CreateTopicPolicy&gt; createTopicPolicy;
+
+    /**
+     * The feature control manager.
+     */
+    private final FeatureControlManager featureControl;
+
+    /**
+     * Maps topic names to topic UUIDs.
+     */
+    private final TimelineHashMap&lt;String, Uuid&gt; topicsByName;
+
+    /**
+     * We try to prevent topics from being created if their names would collide with
+     * existing topics when periods in the topic name are replaced with underscores.
+     * The reason for this is that some per-topic metrics do replace periods with
+     * underscores, and would therefore be ambiguous otherwise.
+     *
+     * This map is from normalized topic name to a set of topic names. So if we had two
+     * topics named foo.bar and foo_bar this map would contain
+     * a mapping from foo_bar to a set containing foo.bar and foo_bar.
+     *
+     * Since we reject topic creations that would collide, under normal conditions the
+     * sets in this map should only have a size of 1. However, if the cluster was
+     * upgraded from a version prior to KAFKA-13743, it may be possible to have more
+     * values here, since colliding topic names will be &quot;grandfathered in.&quot;
+     */
+    private final TimelineHashMap&lt;String, TimelineHashSet&lt;String&gt;&gt; topicsWithCollisionChars;
+
+    /**
+     * Maps topic UUIDs to structures containing topic information, including partitions.
+     */
+    private final TimelineHashMap&lt;Uuid, TopicControlInfo&gt; topics;
+
+    /**
+     * A map of broker IDs to the partitions that the broker is in the ISR for.
+     */
+    private final BrokersToIsrs brokersToIsrs;
+
+    /**
+     * A map of broker IDs to the partitions that the broker is in the ELR for.
+     * Note that, a broker should not be in both brokersToIsrs and brokersToElrs.
+     */
+    private final BrokersToElrs brokersToElrs;
+
+    /**
+     * A map from topic IDs to the partitions in the topic which are reassigning.
+     */
+    private final TimelineHashMap&lt;Uuid, int[]&gt; reassigningTopics;
+
+    /**
+     * The set of topic partitions for which the leader is not the preferred leader.
+     */
+    private final TimelineHashSet&lt;TopicIdPartition&gt; imbalancedPartitions;
+
+    /**
+     * A map from registered directory IDs to the partitions that are stored in that directory.
+     */
+    private final TimelineHashMap&lt;Uuid, TimelineHashSet&lt;TopicIdPartition&gt;&gt; directoriesToPartitions;
+
+    /**
+     * A ClusterDescriber which supplies cluster information to our ReplicaPlacer.
+     */
+<span class="fc" id="L379">    final KRaftClusterDescriber clusterDescriber = new KRaftClusterDescriber();</span>
+
+    private ReplicationControlManager(
+        SnapshotRegistry snapshotRegistry,
+        LogContext logContext,
+        short defaultReplicationFactor,
+        int defaultNumPartitions,
+        int maxElectionsPerImbalance,
+        ConfigurationControlManager configurationControl,
+        ClusterControlManager clusterControl,
+        Optional&lt;CreateTopicPolicy&gt; createTopicPolicy,
+        FeatureControlManager featureControl
+<span class="fc" id="L391">    ) {</span>
+<span class="fc" id="L392">        this.snapshotRegistry = snapshotRegistry;</span>
+<span class="fc" id="L393">        this.log = logContext.logger(ReplicationControlManager.class);</span>
+<span class="fc" id="L394">        this.defaultReplicationFactor = defaultReplicationFactor;</span>
+<span class="fc" id="L395">        this.defaultNumPartitions = defaultNumPartitions;</span>
+<span class="fc" id="L396">        this.maxElectionsPerImbalance = maxElectionsPerImbalance;</span>
+<span class="fc" id="L397">        this.configurationControl = configurationControl;</span>
+<span class="fc" id="L398">        this.createTopicPolicy = createTopicPolicy;</span>
+<span class="fc" id="L399">        this.featureControl = featureControl;</span>
+<span class="fc" id="L400">        this.clusterControl = clusterControl;</span>
+<span class="fc" id="L401">        this.topicsByName = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L402">        this.topicsWithCollisionChars = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L403">        this.topics = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L404">        this.brokersToIsrs = new BrokersToIsrs(snapshotRegistry);</span>
+<span class="fc" id="L405">        this.brokersToElrs = new BrokersToElrs(snapshotRegistry);</span>
+<span class="fc" id="L406">        this.reassigningTopics = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L407">        this.imbalancedPartitions = new TimelineHashSet&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L408">        this.directoriesToPartitions = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L409">    }</span>
+
+    public void replay(TopicRecord record) {
+<span class="fc" id="L412">        Uuid existingUuid = topicsByName.put(record.name(), record.topicId());</span>
+<span class="pc bpc" id="L413" title="1 of 2 branches missed.">        if (existingUuid != null) {</span>
+            // We don't currently support sending a second TopicRecord for the same topic name...
+            // unless, of course, there is a RemoveTopicRecord in between.
+<span class="nc bnc" id="L416" title="All 2 branches missed.">            if (existingUuid.equals(record.topicId())) {</span>
+<span class="nc" id="L417">                throw new RuntimeException(&quot;Found duplicate TopicRecord for &quot; + record.name() +</span>
+<span class="nc" id="L418">                        &quot; with topic ID &quot; + record.topicId());</span>
+            } else {
+<span class="nc" id="L420">                throw new RuntimeException(&quot;Found duplicate TopicRecord for &quot; + record.name() +</span>
+                        &quot; with a different ID than before. Previous ID was &quot; + existingUuid +
+<span class="nc" id="L422">                        &quot; and new ID is &quot; + record.topicId());</span>
+            }
+        }
+<span class="fc bfc" id="L425" title="All 2 branches covered.">        if (Topic.hasCollisionChars(record.name())) {</span>
+<span class="fc" id="L426">            String normalizedName = Topic.unifyCollisionChars(record.name());</span>
+<span class="fc" id="L427">            TimelineHashSet&lt;String&gt; topicNames = topicsWithCollisionChars.get(normalizedName);</span>
+<span class="pc bpc" id="L428" title="1 of 2 branches missed.">            if (topicNames == null) {</span>
+<span class="fc" id="L429">                topicNames = new TimelineHashSet&lt;&gt;(snapshotRegistry, 1);</span>
+<span class="fc" id="L430">                topicsWithCollisionChars.put(normalizedName, topicNames);</span>
+            }
+<span class="fc" id="L432">            topicNames.add(record.name());</span>
+        }
+<span class="fc" id="L434">        topics.put(record.topicId(),</span>
+<span class="fc" id="L435">            new TopicControlInfo(record.name(), snapshotRegistry, record.topicId()));</span>
+<span class="fc" id="L436">        log.info(&quot;Replayed TopicRecord for topic {} with topic ID {}.&quot;, record.name(), record.topicId());</span>
+<span class="fc" id="L437">    }</span>
+
+    public void replay(PartitionRecord record) {
+<span class="fc" id="L440">        TopicControlInfo topicInfo = topics.get(record.topicId());</span>
+<span class="pc bpc" id="L441" title="1 of 2 branches missed.">        if (topicInfo == null) {</span>
+<span class="nc" id="L442">            throw new RuntimeException(&quot;Tried to create partition &quot; + record.topicId() +</span>
+<span class="nc" id="L443">                &quot;:&quot; + record.partitionId() + &quot;, but no topic with that ID was found.&quot;);</span>
+        }
+<span class="fc" id="L445">        PartitionRegistration newPartInfo = new PartitionRegistration(record);</span>
+<span class="fc" id="L446">        PartitionRegistration prevPartInfo = topicInfo.parts.get(record.partitionId());</span>
+<span class="fc" id="L447">        String description = topicInfo.name + &quot;-&quot; + record.partitionId() +</span>
+<span class="fc" id="L448">            &quot; with topic ID &quot; + record.topicId();</span>
+<span class="pc bpc" id="L449" title="1 of 2 branches missed.">        if (prevPartInfo == null) {</span>
+<span class="fc" id="L450">            log.info(&quot;Replayed PartitionRecord for new partition {} and {}.&quot;, description,</span>
+                    newPartInfo);
+<span class="fc" id="L452">            topicInfo.parts.put(record.partitionId(), newPartInfo);</span>
+<span class="fc" id="L453">            updatePartitionInfo(record.topicId(), record.partitionId(), null, newPartInfo);</span>
+<span class="fc" id="L454">            updatePartitionDirectories(record.topicId(), record.partitionId(), null, newPartInfo.directories);</span>
+<span class="fc" id="L455">            updateReassigningTopicsIfNeeded(record.topicId(), record.partitionId(),</span>
+<span class="fc" id="L456">                    false,  isReassignmentInProgress(newPartInfo));</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        } else if (!newPartInfo.equals(prevPartInfo)) {</span>
+<span class="nc" id="L458">            log.info(&quot;Replayed PartitionRecord for existing partition {} and {}.&quot;, description,</span>
+                    newPartInfo);
+<span class="nc" id="L460">            newPartInfo.maybeLogPartitionChange(log, description, prevPartInfo);</span>
+<span class="nc" id="L461">            topicInfo.parts.put(record.partitionId(), newPartInfo);</span>
+<span class="nc" id="L462">            updatePartitionInfo(record.topicId(), record.partitionId(), prevPartInfo, newPartInfo);</span>
+<span class="nc" id="L463">            updatePartitionDirectories(record.topicId(), record.partitionId(), prevPartInfo.directories, newPartInfo.directories);</span>
+<span class="nc" id="L464">            updateReassigningTopicsIfNeeded(record.topicId(), record.partitionId(),</span>
+<span class="nc" id="L465">                    isReassignmentInProgress(prevPartInfo), isReassignmentInProgress(newPartInfo));</span>
+        }
+
+<span class="pc bpc" id="L468" title="1 of 2 branches missed.">        if (newPartInfo.hasPreferredLeader()) {</span>
+<span class="fc" id="L469">            imbalancedPartitions.remove(new TopicIdPartition(record.topicId(), record.partitionId()));</span>
+        } else {
+<span class="nc" id="L471">            imbalancedPartitions.add(new TopicIdPartition(record.topicId(), record.partitionId()));</span>
+        }
+<span class="fc" id="L473">    }</span>
+
+    private void updateReassigningTopicsIfNeeded(Uuid topicId, int partitionId,
+                                                 boolean wasReassigning, boolean isReassigning) {
+<span class="pc bpc" id="L477" title="1 of 2 branches missed.">        if (!wasReassigning) {</span>
+<span class="pc bpc" id="L478" title="1 of 2 branches missed.">            if (isReassigning) {</span>
+<span class="nc" id="L479">                int[] prevReassigningParts = reassigningTopics.getOrDefault(topicId, Replicas.NONE);</span>
+<span class="nc" id="L480">                reassigningTopics.put(topicId, Replicas.copyWith(prevReassigningParts, partitionId));</span>
+<span class="nc" id="L481">            }</span>
+<span class="nc bnc" id="L482" title="All 2 branches missed.">        } else if (!isReassigning) {</span>
+<span class="nc" id="L483">            int[] prevReassigningParts = reassigningTopics.getOrDefault(topicId, Replicas.NONE);</span>
+<span class="nc" id="L484">            int[] newReassigningParts = Replicas.copyWithout(prevReassigningParts, partitionId);</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">            if (newReassigningParts.length == 0) {</span>
+<span class="nc" id="L486">                reassigningTopics.remove(topicId);</span>
+            } else {
+<span class="nc" id="L488">                reassigningTopics.put(topicId, newReassigningParts);</span>
+            }
+        }
+<span class="fc" id="L491">    }</span>
+
+    public void replay(PartitionChangeRecord record) {
+<span class="fc" id="L494">        TopicControlInfo topicInfo = topics.get(record.topicId());</span>
+<span class="pc bpc" id="L495" title="1 of 2 branches missed.">        if (topicInfo == null) {</span>
+<span class="nc" id="L496">            throw new RuntimeException(&quot;Tried to create partition &quot; + record.topicId() +</span>
+<span class="nc" id="L497">                &quot;:&quot; + record.partitionId() + &quot;, but no topic with that ID was found.&quot;);</span>
+        }
+<span class="fc" id="L499">        PartitionRegistration prevPartitionInfo = topicInfo.parts.get(record.partitionId());</span>
+<span class="pc bpc" id="L500" title="1 of 2 branches missed.">        if (prevPartitionInfo == null) {</span>
+<span class="nc" id="L501">            throw new RuntimeException(&quot;Tried to create partition &quot; + record.topicId() +</span>
+<span class="nc" id="L502">                &quot;:&quot; + record.partitionId() + &quot;, but no partition with that id was found.&quot;);</span>
+        }
+<span class="fc" id="L504">        PartitionRegistration newPartitionInfo = prevPartitionInfo.merge(record);</span>
+<span class="fc" id="L505">        updateReassigningTopicsIfNeeded(record.topicId(), record.partitionId(),</span>
+<span class="fc" id="L506">                isReassignmentInProgress(prevPartitionInfo), isReassignmentInProgress(newPartitionInfo));</span>
+<span class="fc" id="L507">        topicInfo.parts.put(record.partitionId(), newPartitionInfo);</span>
+<span class="fc" id="L508">        updatePartitionInfo(record.topicId(), record.partitionId(), prevPartitionInfo, newPartitionInfo);</span>
+<span class="fc" id="L509">        updatePartitionDirectories(record.topicId(), record.partitionId(), prevPartitionInfo.directories, newPartitionInfo.directories);</span>
+<span class="fc" id="L510">        String topicPart = topicInfo.name + &quot;-&quot; + record.partitionId() + &quot; with topic ID &quot; +</span>
+<span class="fc" id="L511">            record.topicId();</span>
+<span class="fc" id="L512">        newPartitionInfo.maybeLogPartitionChange(log, topicPart, prevPartitionInfo);</span>
+
+<span class="fc bfc" id="L514" title="All 2 branches covered.">        if (newPartitionInfo.hasPreferredLeader()) {</span>
+<span class="fc" id="L515">            imbalancedPartitions.remove(new TopicIdPartition(record.topicId(), record.partitionId()));</span>
+        } else {
+<span class="fc" id="L517">            imbalancedPartitions.add(new TopicIdPartition(record.topicId(), record.partitionId()));</span>
+        }
+
+<span class="pc bpc" id="L520" title="2 of 4 branches missed.">        if (record.removingReplicas() != null || record.addingReplicas() != null) {</span>
+<span class="nc" id="L521">            log.info(&quot;Replayed partition assignment change {} for topic {}. &quot; +</span>
+                    &quot;(isr: {} -&gt; {}, replicaSet: {} -&gt; {}, partitionEpoch: {}, leaderEpoch: {})&quot;,
+                record, topicInfo.name, prevPartitionInfo.isr, newPartitionInfo.isr, prevPartitionInfo.replicas,
+<span class="nc" id="L524">                newPartitionInfo.replicas, newPartitionInfo.partitionEpoch, newPartitionInfo.leaderEpoch);</span>
+<span class="pc bpc" id="L525" title="1 of 2 branches missed.">        } else if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L526">            log.debug(&quot;Replayed partition change {} for topic {}. &quot; +</span>
+                    &quot;(isr: {} -&gt; {}, replicaSet: {} -&gt; {}, partitionEpoch: {}, leaderEpoch: {})&quot;,
+                record, topicInfo.name, prevPartitionInfo.isr, newPartitionInfo.isr, prevPartitionInfo.replicas,
+<span class="nc" id="L529">                newPartitionInfo.replicas, newPartitionInfo.partitionEpoch, newPartitionInfo.leaderEpoch);</span>
+        }
+<span class="fc" id="L531">    }</span>
+
+    public void replay(RemoveTopicRecord record) {
+        // Remove this topic from the topics map and the topicsByName map.
+<span class="fc" id="L535">        TopicControlInfo topic = topics.remove(record.topicId());</span>
+<span class="pc bpc" id="L536" title="1 of 2 branches missed.">        if (topic == null) {</span>
+<span class="nc" id="L537">            throw new UnknownTopicIdException(&quot;Can't find topic with ID &quot; + record.topicId() +</span>
+                &quot; to remove.&quot;);
+        }
+<span class="fc" id="L540">        topicsByName.remove(topic.name);</span>
+<span class="pc bpc" id="L541" title="1 of 2 branches missed.">        if (Topic.hasCollisionChars(topic.name)) {</span>
+<span class="nc" id="L542">            String normalizedName = Topic.unifyCollisionChars(topic.name);</span>
+<span class="nc" id="L543">            TimelineHashSet&lt;String&gt; colliding = topicsWithCollisionChars.get(normalizedName);</span>
+<span class="nc bnc" id="L544" title="All 2 branches missed.">            if (colliding != null) {</span>
+<span class="nc" id="L545">                colliding.remove(topic.name);</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">                if (colliding.isEmpty()) {</span>
+<span class="nc" id="L547">                    topicsWithCollisionChars.remove(normalizedName);</span>
+                }
+            }
+        }
+<span class="fc" id="L551">        reassigningTopics.remove(record.topicId());</span>
+
+        // Delete the configurations associated with this topic.
+<span class="fc" id="L554">        configurationControl.deleteTopicConfigs(topic.name);</span>
+
+<span class="fc bfc" id="L556" title="All 2 branches covered.">        for (Map.Entry&lt;Integer, PartitionRegistration&gt; entry : topic.parts.entrySet()) {</span>
+<span class="fc" id="L557">            int partitionId = entry.getKey();</span>
+<span class="fc" id="L558">            PartitionRegistration partition = entry.getValue();</span>
+
+            // Remove the entries for this topic in brokersToIsrs.
+<span class="fc bfc" id="L561" title="All 2 branches covered.">            for (int i = 0; i &lt; partition.isr.length; i++) {</span>
+<span class="fc" id="L562">                brokersToIsrs.removeTopicEntryForBroker(topic.id, partition.isr[i]);</span>
+<span class="fc" id="L563">                updatePartitionDirectories(topic.id, partitionId, partition.directories, null);</span>
+            }
+
+<span class="pc bpc" id="L566" title="1 of 2 branches missed.">            for (int elrMember : partition.elr) {</span>
+<span class="nc" id="L567">                brokersToElrs.removeTopicEntryForBroker(topic.id, elrMember);</span>
+            }
+
+<span class="fc" id="L570">            imbalancedPartitions.remove(new TopicIdPartition(record.topicId(), partitionId));</span>
+<span class="fc" id="L571">        }</span>
+<span class="fc" id="L572">        brokersToIsrs.removeTopicEntryForBroker(topic.id, NO_LEADER);</span>
+
+<span class="fc" id="L574">        log.info(&quot;Replayed RemoveTopicRecord for topic {} with ID {}.&quot;, topic.name, record.topicId());</span>
+<span class="fc" id="L575">    }</span>
+
+    public void replay(ClearElrRecord record) {
+<span class="nc bnc" id="L578" title="All 2 branches missed.">        if (record.topicName().isEmpty()) {</span>
+<span class="nc" id="L579">            replayClearAllElrs();</span>
+        } else {
+<span class="nc" id="L581">            replayClearTopicElrs(record.topicName());</span>
+        }
+
+<span class="nc" id="L584">    }</span>
+
+    void replayClearAllElrs() {
+<span class="nc" id="L587">        long numRemoved = 0;</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">        for (TopicControlInfo topic : topics.values()) {</span>
+<span class="nc" id="L589">            numRemoved += removeTopicElrs(topic);</span>
+<span class="nc" id="L590">        }</span>
+<span class="nc" id="L591">        log.info(&quot;Removed ELRs from {} partitions in all topics.&quot;, numRemoved);</span>
+<span class="nc" id="L592">    }</span>
+
+    void replayClearTopicElrs(String topicName) {
+<span class="nc" id="L595">        Uuid topicId = topicsByName.get(topicName);</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">        if (topicId == null) {</span>
+<span class="nc" id="L597">            throw new RuntimeException(&quot;Unable to find a topic named &quot; + topicName +</span>
+                    &quot; in order to clear its ELRs.&quot;);
+        }
+<span class="nc" id="L600">        TopicControlInfo topic = topics.get(topicId);</span>
+<span class="nc bnc" id="L601" title="All 2 branches missed.">        if (topic == null) {</span>
+<span class="nc" id="L602">            throw new RuntimeException(&quot;Unable to find a topic with ID &quot; + topicId +</span>
+                    &quot; in order to clear its ELRs.&quot;);
+        }
+<span class="nc" id="L605">        int numRemoved = removeTopicElrs(topic);</span>
+<span class="nc" id="L606">        log.info(&quot;Removed ELRs from {} partitions of topic {}.&quot;, numRemoved, topicName);</span>
+<span class="nc" id="L607">    }</span>
+
+    int removeTopicElrs(TopicControlInfo topic) {
+<span class="nc" id="L610">        int numRemoved = 0;</span>
+<span class="nc" id="L611">        List&lt;Integer&gt; partitionIds = new ArrayList&lt;&gt;(topic.parts.keySet());</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">        for (int partitionId : partitionIds) {</span>
+<span class="nc" id="L613">            PartitionRegistration partition = topic.parts.get(partitionId);</span>
+<span class="nc bnc" id="L614" title="All 4 branches missed.">            if (partition.elr.length != 0 || partition.lastKnownElr.length != 0) {</span>
+<span class="nc" id="L615">                topic.parts.put(partitionId, partition.merge(</span>
+                    new PartitionChangeRecord().
+<span class="nc" id="L617">                        setPartitionId(partitionId).</span>
+<span class="nc" id="L618">                        setTopicId(topic.id).</span>
+<span class="nc" id="L619">                        setEligibleLeaderReplicas(List.of()).</span>
+<span class="nc" id="L620">                        setLastKnownElr(List.of())));</span>
+<span class="nc" id="L621">                numRemoved++;</span>
+            }
+<span class="nc" id="L623">        }</span>
+<span class="nc" id="L624">        return numRemoved;</span>
+    }
+
+    ControllerResult&lt;CreateTopicsResponseData&gt; createTopics(
+        ControllerRequestContext context,
+        CreateTopicsRequestData request,
+        Set&lt;String&gt; describable
+    ) {
+<span class="fc" id="L632">        Map&lt;String, ApiError&gt; topicErrors = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L633">        List&lt;ApiMessageAndVersion&gt; records = BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);</span>
+
+<span class="fc" id="L635">        validateTotalNumberOfPartitions(request, defaultNumPartitions);</span>
+
+        // Check the topic names.
+<span class="fc" id="L638">        validateNewTopicNames(topicErrors, request.topics(), topicsWithCollisionChars);</span>
+
+        // Identify topics that already exist and mark them with the appropriate error
+<span class="fc" id="L641">        request.topics().stream().filter(creatableTopic -&gt; topicsByName.containsKey(creatableTopic.name()))</span>
+<span class="fc" id="L642">                .forEach(t -&gt; topicErrors.put(t.name(), new ApiError(Errors.TOPIC_ALREADY_EXISTS,</span>
+<span class="fc" id="L643">                    &quot;Topic '&quot; + t.name() + &quot;' already exists.&quot;)));</span>
+
+        // Verify that the configurations for the new topics are OK, and figure out what
+        // configurations should be created.
+<span class="fc" id="L647">        Map&lt;ConfigResource, Map&lt;String, Entry&lt;OpType, String&gt;&gt;&gt; configChanges =</span>
+<span class="fc" id="L648">            computeConfigChanges(topicErrors, request.topics());</span>
+
+        // Try to create whatever topics are needed.
+<span class="fc" id="L651">        Map&lt;String, CreatableTopicResult&gt; successes = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L652" title="All 2 branches covered.">        for (CreatableTopic topic : request.topics()) {</span>
+<span class="fc bfc" id="L653" title="All 2 branches covered.">            if (topicErrors.containsKey(topic.name())) continue;</span>
+            // Figure out what ConfigRecords should be created, if any.
+<span class="fc" id="L655">            ConfigResource configResource = new ConfigResource(TOPIC, topic.name());</span>
+<span class="fc" id="L656">            Map&lt;String, Entry&lt;OpType, String&gt;&gt; keyToOps = configChanges.get(configResource);</span>
+            List&lt;ApiMessageAndVersion&gt; configRecords;
+<span class="fc bfc" id="L658" title="All 2 branches covered.">            if (keyToOps != null) {</span>
+<span class="fc" id="L659">                ControllerResult&lt;ApiError&gt; configResult =</span>
+<span class="fc" id="L660">                    configurationControl.incrementalAlterConfig(configResource, keyToOps, true);</span>
+<span class="pc bpc" id="L661" title="1 of 2 branches missed.">                if (configResult.response().isFailure()) {</span>
+<span class="nc" id="L662">                    topicErrors.put(topic.name(), configResult.response());</span>
+<span class="nc" id="L663">                    continue;</span>
+                } else {
+<span class="fc" id="L665">                    configRecords = configResult.records();</span>
+                }
+<span class="fc" id="L667">            } else {</span>
+<span class="fc" id="L668">                configRecords = List.of();</span>
+            }
+            ApiError error;
+            try {
+<span class="fc" id="L672">                error = createTopic(context, topic, records, successes, configRecords, describable.contains(topic.name()));</span>
+<span class="nc" id="L673">            } catch (ApiException e) {</span>
+<span class="nc" id="L674">                error = ApiError.fromThrowable(e);</span>
+<span class="fc" id="L675">            }</span>
+<span class="pc bpc" id="L676" title="1 of 2 branches missed.">            if (error.isFailure()) {</span>
+<span class="nc" id="L677">                topicErrors.put(topic.name(), error);</span>
+            }
+<span class="fc" id="L679">        }</span>
+
+        // Create responses for all topics.
+<span class="fc" id="L682">        CreateTopicsResponseData data = new CreateTopicsResponseData();</span>
+<span class="fc" id="L683">        StringBuilder resultsBuilder = new StringBuilder();</span>
+<span class="fc" id="L684">        String resultsPrefix = &quot;&quot;;</span>
+<span class="fc bfc" id="L685" title="All 2 branches covered.">        for (CreatableTopic topic : request.topics()) {</span>
+<span class="fc" id="L686">            ApiError error = topicErrors.get(topic.name());</span>
+<span class="fc bfc" id="L687" title="All 2 branches covered.">            if (error != null) {</span>
+<span class="fc" id="L688">                data.topics().add(new CreatableTopicResult().</span>
+<span class="fc" id="L689">                    setName(topic.name()).</span>
+<span class="fc" id="L690">                    setErrorCode(error.error().code()).</span>
+<span class="fc" id="L691">                    setErrorMessage(error.message()));</span>
+<span class="fc" id="L692">                resultsBuilder.append(resultsPrefix).append(topic).append(&quot;: &quot;).</span>
+<span class="fc" id="L693">                    append(error.error()).append(&quot; (&quot;).append(error.message()).append(&quot;)&quot;);</span>
+<span class="fc" id="L694">                resultsPrefix = &quot;, &quot;;</span>
+<span class="fc" id="L695">                continue;</span>
+            }
+<span class="fc" id="L697">            CreatableTopicResult result = successes.get(topic.name());</span>
+<span class="fc" id="L698">            data.topics().add(result);</span>
+<span class="fc" id="L699">            resultsBuilder.append(resultsPrefix).append(topic).append(&quot;: &quot;).</span>
+<span class="fc" id="L700">                append(&quot;SUCCESS&quot;);</span>
+<span class="fc" id="L701">            resultsPrefix = &quot;, &quot;;</span>
+<span class="fc" id="L702">        }</span>
+<span class="pc bpc" id="L703" title="1 of 2 branches missed.">        if (request.validateOnly()) {</span>
+<span class="nc" id="L704">            log.info(&quot;Validate-only CreateTopics result(s): {}&quot;, resultsBuilder);</span>
+<span class="nc" id="L705">            return ControllerResult.atomicOf(List.of(), data);</span>
+        } else {
+<span class="fc" id="L707">            log.info(&quot;CreateTopics result(s): {}&quot;, resultsBuilder);</span>
+<span class="fc" id="L708">            return ControllerResult.atomicOf(records, data);</span>
+        }
+    }
+
+    private ApiError createTopic(ControllerRequestContext context,
+                                 CreatableTopic topic,
+                                 List&lt;ApiMessageAndVersion&gt; records,
+                                 Map&lt;String, CreatableTopicResult&gt; successes,
+                                 List&lt;ApiMessageAndVersion&gt; configRecords,
+                                 boolean authorizedToReturnConfigs) {
+<span class="fc" id="L718">        Map&lt;String, String&gt; creationConfigs = translateCreationConfigs(topic.configs());</span>
+<span class="fc" id="L719">        Map&lt;Integer, PartitionRegistration&gt; newParts = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L720" title="1 of 2 branches missed.">        if (!topic.assignments().isEmpty()) {</span>
+<span class="nc bnc" id="L721" title="All 2 branches missed.">            if (topic.replicationFactor() != -1) {</span>
+<span class="nc" id="L722">                return new ApiError(INVALID_REQUEST,</span>
+                    &quot;A manual partition assignment was specified, but replication &quot; +
+                    &quot;factor was not set to -1.&quot;);
+            }
+<span class="nc bnc" id="L726" title="All 2 branches missed.">            if (topic.numPartitions() != -1) {</span>
+<span class="nc" id="L727">                return new ApiError(INVALID_REQUEST,</span>
+                    &quot;A manual partition assignment was specified, but numPartitions &quot; +
+                        &quot;was not set to -1.&quot;);
+            }
+<span class="nc" id="L731">            OptionalInt replicationFactor = OptionalInt.empty();</span>
+<span class="nc bnc" id="L732" title="All 2 branches missed.">            for (CreatableReplicaAssignment assignment : topic.assignments()) {</span>
+<span class="nc bnc" id="L733" title="All 2 branches missed.">                if (newParts.containsKey(assignment.partitionIndex())) {</span>
+<span class="nc" id="L734">                    return new ApiError(Errors.INVALID_REPLICA_ASSIGNMENT,</span>
+                        &quot;Found multiple manual partition assignments for partition &quot; +
+<span class="nc" id="L736">                            assignment.partitionIndex());</span>
+                }
+<span class="nc" id="L738">                PartitionAssignment partitionAssignment = new PartitionAssignment(assignment.brokerIds(), clusterDescriber);</span>
+<span class="nc" id="L739">                validateManualPartitionAssignment(partitionAssignment, replicationFactor);</span>
+<span class="nc" id="L740">                replicationFactor = OptionalInt.of(assignment.brokerIds().size());</span>
+<span class="nc" id="L741">                List&lt;Integer&gt; isr = assignment.brokerIds().stream().</span>
+<span class="nc" id="L742">                    filter(clusterControl::isActive).toList();</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">                if (isr.isEmpty()) {</span>
+<span class="nc" id="L744">                    return new ApiError(Errors.INVALID_REPLICA_ASSIGNMENT,</span>
+                        &quot;All brokers specified in the manual partition assignment for &quot; +
+<span class="nc" id="L746">                        &quot;partition &quot; + assignment.partitionIndex() + &quot; are fenced or in controlled shutdown.&quot;);</span>
+                }
+<span class="nc" id="L748">                newParts.put(</span>
+<span class="nc" id="L749">                    assignment.partitionIndex(),</span>
+<span class="nc" id="L750">                    buildPartitionRegistration(partitionAssignment, isr)</span>
+                );
+<span class="nc" id="L752">            }</span>
+<span class="nc bnc" id="L753" title="All 2 branches missed.">            for (int i = 0; i &lt; newParts.size(); i++) {</span>
+<span class="nc bnc" id="L754" title="All 2 branches missed.">                if (!newParts.containsKey(i)) {</span>
+<span class="nc" id="L755">                    return new ApiError(Errors.INVALID_REPLICA_ASSIGNMENT,</span>
+                            &quot;partitions should be a consecutive 0-based integer sequence&quot;);
+                }
+            }
+<span class="nc" id="L759">            ApiError error = maybeCheckCreateTopicPolicy(() -&gt; {</span>
+<span class="nc" id="L760">                Map&lt;Integer, List&lt;Integer&gt;&gt; assignments = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L761">                newParts.forEach((key, value) -&gt; assignments.put(key, Replicas.toList(value.replicas)));</span>
+<span class="nc" id="L762">                return new CreateTopicPolicy.RequestMetadata(</span>
+<span class="nc" id="L763">                    topic.name(), null, null, assignments, creationConfigs);</span>
+            });
+<span class="nc bnc" id="L765" title="All 2 branches missed.">            if (error.isFailure()) return error;</span>
+<span class="pc bpc" id="L766" title="2 of 4 branches missed.">        } else if (topic.replicationFactor() &lt; -1 || topic.replicationFactor() == 0) {</span>
+<span class="nc" id="L767">            return new ApiError(Errors.INVALID_REPLICATION_FACTOR,</span>
+                &quot;Replication factor must be larger than 0, or -1 to use the default value.&quot;);
+<span class="pc bpc" id="L769" title="2 of 4 branches missed.">        } else if (topic.numPartitions() &lt; -1 || topic.numPartitions() == 0) {</span>
+<span class="nc" id="L770">            return new ApiError(Errors.INVALID_PARTITIONS,</span>
+                &quot;Number of partitions was set to an invalid non-positive value.&quot;);
+        } else {
+<span class="pc bpc" id="L773" title="1 of 2 branches missed.">            int numPartitions = topic.numPartitions() == -1 ?</span>
+<span class="pc" id="L774">                defaultNumPartitions : topic.numPartitions();</span>
+<span class="pc bpc" id="L775" title="1 of 2 branches missed.">            short replicationFactor = topic.replicationFactor() == -1 ?</span>
+<span class="pc" id="L776">                defaultReplicationFactor : topic.replicationFactor();</span>
+            try {
+<span class="fc" id="L778">                TopicAssignment topicAssignment = clusterControl.replicaPlacer().place(new PlacementSpec(</span>
+                    0,
+                    numPartitions,
+                    replicationFactor
+                ), clusterDescriber);
+<span class="fc bfc" id="L783" title="All 2 branches covered.">                for (int partitionId = 0; partitionId &lt; topicAssignment.assignments().size(); partitionId++) {</span>
+<span class="fc" id="L784">                    PartitionAssignment partitionAssignment = topicAssignment.assignments().get(partitionId);</span>
+<span class="fc" id="L785">                    List&lt;Integer&gt; isr = partitionAssignment.replicas().stream().</span>
+<span class="fc" id="L786">                        filter(clusterControl::isActive).toList();</span>
+                    // If the ISR is empty, it means that all brokers are fenced or
+                    // in controlled shutdown. To be consistent with the replica placer,
+                    // we reject the create topic request with INVALID_REPLICATION_FACTOR.
+<span class="pc bpc" id="L790" title="1 of 2 branches missed.">                    if (isr.isEmpty()) {</span>
+<span class="nc" id="L791">                        return new ApiError(Errors.INVALID_REPLICATION_FACTOR,</span>
+                            &quot;Unable to replicate the partition &quot; + replicationFactor +
+                                &quot; time(s): All brokers are currently fenced or in controlled shutdown.&quot;);
+                    }
+<span class="fc" id="L795">                    newParts.put(</span>
+<span class="fc" id="L796">                        partitionId,</span>
+<span class="fc" id="L797">                        buildPartitionRegistration(partitionAssignment, isr)</span>
+                    );
+                }
+<span class="nc" id="L800">            } catch (InvalidReplicationFactorException e) {</span>
+<span class="nc" id="L801">                return new ApiError(Errors.INVALID_REPLICATION_FACTOR,</span>
+                    &quot;Unable to replicate the partition &quot; + replicationFactor +
+<span class="nc" id="L803">                        &quot; time(s): &quot; + e.getMessage());</span>
+<span class="fc" id="L804">            }</span>
+<span class="pc" id="L805">            ApiError error = maybeCheckCreateTopicPolicy(() -&gt; new CreateTopicPolicy.RequestMetadata(</span>
+<span class="nc" id="L806">                topic.name(), numPartitions, replicationFactor, null, creationConfigs));</span>
+<span class="pc bpc" id="L807" title="1 of 2 branches missed.">            if (error.isFailure()) return error;</span>
+        }
+<span class="fc" id="L809">        int numPartitions = newParts.size();</span>
+        try {
+<span class="fc" id="L811">            context.applyPartitionChangeQuota(numPartitions); // check controller mutation quota</span>
+<span class="nc" id="L812">        } catch (ThrottlingQuotaExceededException e) {</span>
+<span class="nc" id="L813">            log.debug(&quot;Topic creation of {} partitions not allowed because quota is violated. Delay time: {}&quot;,</span>
+<span class="nc" id="L814">                numPartitions, e.throttleTimeMs());</span>
+<span class="nc" id="L815">            return ApiError.fromThrowable(e);</span>
+<span class="fc" id="L816">        }</span>
+<span class="fc" id="L817">        Uuid topicId = Uuid.randomUuid();</span>
+<span class="fc" id="L818">        CreatableTopicResult result = new CreatableTopicResult().</span>
+<span class="fc" id="L819">            setName(topic.name()).</span>
+<span class="fc" id="L820">            setTopicId(topicId).</span>
+<span class="fc" id="L821">            setErrorCode(NONE.code()).</span>
+<span class="fc" id="L822">            setErrorMessage(null);</span>
+<span class="pc bpc" id="L823" title="1 of 2 branches missed.">        if (authorizedToReturnConfigs) {</span>
+<span class="fc" id="L824">            Map&lt;String, ConfigEntry&gt; effectiveConfig = configurationControl.</span>
+<span class="fc" id="L825">                computeEffectiveTopicConfigs(creationConfigs);</span>
+<span class="fc" id="L826">            List&lt;String&gt; configNames = new ArrayList&lt;&gt;(effectiveConfig.keySet());</span>
+<span class="fc" id="L827">            configNames.sort(String::compareTo);</span>
+<span class="fc bfc" id="L828" title="All 2 branches covered.">            for (String configName : configNames) {</span>
+<span class="fc" id="L829">                ConfigEntry entry = effectiveConfig.get(configName);</span>
+<span class="fc" id="L830">                result.configs().add(new CreateTopicsResponseData.CreatableTopicConfigs().</span>
+<span class="fc" id="L831">                    setName(entry.name()).</span>
+<span class="pc bpc" id="L832" title="1 of 2 branches missed.">                    setValue(entry.isSensitive() ? null : entry.value()).</span>
+<span class="fc" id="L833">                    setReadOnly(entry.isReadOnly()).</span>
+<span class="fc" id="L834">                    setConfigSource(KafkaConfigSchema.translateConfigSource(entry.source()).id()).</span>
+<span class="fc" id="L835">                    setIsSensitive(entry.isSensitive()));</span>
+<span class="fc" id="L836">            }</span>
+<span class="fc" id="L837">            result.setNumPartitions(numPartitions);</span>
+<span class="fc" id="L838">            result.setReplicationFactor((short) newParts.values().iterator().next().replicas.length);</span>
+<span class="fc" id="L839">            result.setTopicConfigErrorCode(NONE.code());</span>
+<span class="fc" id="L840">        } else {</span>
+<span class="nc" id="L841">            result.setTopicConfigErrorCode(TOPIC_AUTHORIZATION_FAILED.code());</span>
+        }
+<span class="fc" id="L843">        successes.put(topic.name(), result);</span>
+<span class="fc" id="L844">        records.add(new ApiMessageAndVersion(new TopicRecord().</span>
+<span class="fc" id="L845">            setName(topic.name()).</span>
+<span class="fc" id="L846">            setTopicId(topicId), (short) 0));</span>
+        // ConfigRecords go after TopicRecord but before PartitionRecord(s).
+<span class="fc" id="L848">        records.addAll(configRecords);</span>
+<span class="fc bfc" id="L849" title="All 2 branches covered.">        for (Entry&lt;Integer, PartitionRegistration&gt; partEntry : newParts.entrySet()) {</span>
+<span class="fc" id="L850">            int partitionIndex = partEntry.getKey();</span>
+<span class="fc" id="L851">            PartitionRegistration info = partEntry.getValue();</span>
+<span class="fc" id="L852">            records.add(info.toRecord(topicId, partitionIndex, new ImageWriterOptions.Builder(featureControl.metadataVersionOrThrow()).</span>
+<span class="fc" id="L853">                setEligibleLeaderReplicasEnabled(featureControl.isElrFeatureEnabled()).</span>
+<span class="fc" id="L854">                build()));</span>
+<span class="fc" id="L855">        }</span>
+<span class="fc" id="L856">        return ApiError.NONE;</span>
+    }
+
+    private static PartitionRegistration buildPartitionRegistration(
+        PartitionAssignment partitionAssignment,
+        List&lt;Integer&gt; isr
+    ) {
+<span class="fc" id="L863">        return new PartitionRegistration.Builder().</span>
+<span class="fc" id="L864">            setReplicas(Replicas.toArray(partitionAssignment.replicas())).</span>
+<span class="fc" id="L865">            setDirectories(Uuid.toArray(partitionAssignment.directories())).</span>
+<span class="fc" id="L866">            setIsr(Replicas.toArray(isr)).</span>
+<span class="fc" id="L867">            setLeader(isr.get(0)).</span>
+<span class="fc" id="L868">            setLeaderRecoveryState(LeaderRecoveryState.RECOVERED).</span>
+<span class="fc" id="L869">            setLeaderEpoch(0).</span>
+<span class="fc" id="L870">            setPartitionEpoch(0).</span>
+<span class="fc" id="L871">            build();</span>
+    }
+
+    private ApiError maybeCheckCreateTopicPolicy(Supplier&lt;CreateTopicPolicy.RequestMetadata&gt; supplier) {
+<span class="pc bpc" id="L875" title="1 of 2 branches missed.">        if (createTopicPolicy.isPresent()) {</span>
+            try {
+<span class="nc" id="L877">                createTopicPolicy.get().validate(supplier.get());</span>
+<span class="nc" id="L878">            } catch (PolicyViolationException e) {</span>
+<span class="nc" id="L879">                return new ApiError(Errors.POLICY_VIOLATION, e.getMessage());</span>
+<span class="nc" id="L880">            } catch (Throwable e) {</span>
+                // return the corresponding API error, but emit the stack trace first if it is an unknown server error
+<span class="nc" id="L882">                ApiError apiError = ApiError.fromThrowable(e);</span>
+<span class="nc bnc" id="L883" title="All 2 branches missed.">                if (apiError.error() == Errors.UNKNOWN_SERVER_ERROR) {</span>
+<span class="nc" id="L884">                    log.error(&quot;Unknown server error validating Create Topic&quot;, e);</span>
+                }
+<span class="nc" id="L886">                return apiError;</span>
+<span class="nc" id="L887">            }</span>
+        }
+<span class="fc" id="L889">        return ApiError.NONE;</span>
+    }
+
+    static void validateNewTopicNames(Map&lt;String, ApiError&gt; topicErrors,
+                                      CreatableTopicCollection topics,
+                                      Map&lt;String, ? extends Set&lt;String&gt;&gt; topicsWithCollisionChars) {
+<span class="fc bfc" id="L895" title="All 2 branches covered.">        for (CreatableTopic topic : topics) {</span>
+<span class="pc bpc" id="L896" title="1 of 2 branches missed.">            if (topicErrors.containsKey(topic.name())) continue;</span>
+            try {
+<span class="fc" id="L898">                Topic.validate(topic.name());</span>
+<span class="nc" id="L899">            } catch (InvalidTopicException e) {</span>
+<span class="nc" id="L900">                topicErrors.put(topic.name(),</span>
+<span class="nc" id="L901">                    new ApiError(Errors.INVALID_TOPIC_EXCEPTION, e.getMessage()));</span>
+<span class="fc" id="L902">            }</span>
+<span class="fc bfc" id="L903" title="All 2 branches covered.">            if (Topic.hasCollisionChars(topic.name())) {</span>
+<span class="fc" id="L904">                String normalizedName = Topic.unifyCollisionChars(topic.name());</span>
+<span class="fc" id="L905">                Set&lt;String&gt; colliding = topicsWithCollisionChars.get(normalizedName);</span>
+<span class="pc bpc" id="L906" title="1 of 2 branches missed.">                if (colliding != null) {</span>
+<span class="nc" id="L907">                    topicErrors.put(topic.name(), new ApiError(Errors.INVALID_TOPIC_EXCEPTION,</span>
+<span class="nc" id="L908">                        &quot;Topic '&quot; + topic.name() + &quot;' collides with existing topic: &quot; +</span>
+<span class="nc" id="L909">                            colliding.iterator().next()));</span>
+                }
+            }
+<span class="fc" id="L912">        }</span>
+<span class="fc" id="L913">    }</span>
+
+    static Map&lt;ConfigResource, Map&lt;String, Entry&lt;OpType, String&gt;&gt;&gt;
+            computeConfigChanges(Map&lt;String, ApiError&gt; topicErrors,
+                                 CreatableTopicCollection topics) {
+<span class="fc" id="L918">        Map&lt;ConfigResource, Map&lt;String, Entry&lt;OpType, String&gt;&gt;&gt; configChanges = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L919" title="All 2 branches covered.">        for (CreatableTopic topic : topics) {</span>
+<span class="fc bfc" id="L920" title="All 2 branches covered.">            if (topicErrors.containsKey(topic.name())) continue;</span>
+<span class="fc" id="L921">            Map&lt;String, Entry&lt;OpType, String&gt;&gt; topicConfigs = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L922">            List&lt;String&gt; nullConfigs = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L923" title="All 2 branches covered.">            for (CreateTopicsRequestData.CreatableTopicConfig config : topic.configs()) {</span>
+<span class="pc bpc" id="L924" title="1 of 2 branches missed.">                if (config.value() == null) {</span>
+<span class="nc" id="L925">                    nullConfigs.add(config.name());</span>
+                } else {
+<span class="fc" id="L927">                    topicConfigs.put(config.name(), new SimpleImmutableEntry&lt;&gt;(SET, config.value()));</span>
+                }
+<span class="fc" id="L929">            }</span>
+<span class="pc bpc" id="L930" title="1 of 2 branches missed.">            if (!nullConfigs.isEmpty()) {</span>
+<span class="nc" id="L931">                topicErrors.put(topic.name(), new ApiError(Errors.INVALID_CONFIG,</span>
+<span class="nc" id="L932">                    &quot;Null value not supported for topic configs: &quot; + String.join(&quot;,&quot;, nullConfigs)));</span>
+<span class="fc bfc" id="L933" title="All 2 branches covered.">            } else if (!topicConfigs.isEmpty()) {</span>
+<span class="fc" id="L934">                configChanges.put(new ConfigResource(TOPIC, topic.name()), topicConfigs);</span>
+            }
+<span class="fc" id="L936">        }</span>
+<span class="fc" id="L937">        return configChanges;</span>
+    }
+
+    Map&lt;String, ResultOrError&lt;Uuid&gt;&gt; findTopicIds(long offset, Collection&lt;String&gt; names) {
+<span class="fc" id="L941">        Map&lt;String, ResultOrError&lt;Uuid&gt;&gt; results = new HashMap&lt;&gt;(names.size());</span>
+<span class="fc bfc" id="L942" title="All 2 branches covered.">        for (String name : names) {</span>
+<span class="pc bpc" id="L943" title="1 of 2 branches missed.">            if (name == null) {</span>
+<span class="nc" id="L944">                results.put(null, new ResultOrError&lt;&gt;(INVALID_REQUEST, &quot;Invalid null topic name.&quot;));</span>
+            } else {
+<span class="fc" id="L946">                Uuid id = topicsByName.get(name, offset);</span>
+<span class="pc bpc" id="L947" title="1 of 2 branches missed.">                if (id == null) {</span>
+<span class="nc" id="L948">                    results.put(name, new ResultOrError&lt;&gt;(</span>
+                        new ApiError(UNKNOWN_TOPIC_OR_PARTITION)));
+                } else {
+<span class="fc" id="L951">                    results.put(name, new ResultOrError&lt;&gt;(id));</span>
+                }
+            }
+<span class="fc" id="L954">        }</span>
+<span class="fc" id="L955">        return results;</span>
+    }
+
+    Map&lt;String, Uuid&gt; findAllTopicIds(long offset) {
+<span class="nc" id="L959">        HashMap&lt;String, Uuid&gt; result = new HashMap&lt;&gt;(topicsByName.size(offset));</span>
+<span class="nc bnc" id="L960" title="All 2 branches missed.">        for (Entry&lt;String, Uuid&gt; entry : topicsByName.entrySet(offset)) {</span>
+<span class="nc" id="L961">            result.put(entry.getKey(), entry.getValue());</span>
+<span class="nc" id="L962">        }</span>
+<span class="nc" id="L963">        return result;</span>
+    }
+
+    Map&lt;Uuid, ResultOrError&lt;String&gt;&gt; findTopicNames(long offset, Collection&lt;Uuid&gt; ids) {
+<span class="nc" id="L967">        Map&lt;Uuid, ResultOrError&lt;String&gt;&gt; results = new HashMap&lt;&gt;(ids.size());</span>
+<span class="nc bnc" id="L968" title="All 2 branches missed.">        for (Uuid id : ids) {</span>
+<span class="nc bnc" id="L969" title="All 4 branches missed.">            if (id == null || id.equals(Uuid.ZERO_UUID)) {</span>
+<span class="nc" id="L970">                results.put(id, new ResultOrError&lt;&gt;(new ApiError(INVALID_REQUEST,</span>
+                    &quot;Attempt to find topic with invalid topicId &quot; + id)));
+            } else {
+<span class="nc" id="L973">                TopicControlInfo topic = topics.get(id, offset);</span>
+<span class="nc bnc" id="L974" title="All 2 branches missed.">                if (topic == null) {</span>
+<span class="nc" id="L975">                    results.put(id, new ResultOrError&lt;&gt;(new ApiError(UNKNOWN_TOPIC_ID)));</span>
+                } else {
+<span class="nc" id="L977">                    results.put(id, new ResultOrError&lt;&gt;(topic.name));</span>
+                }
+            }
+<span class="nc" id="L980">        }</span>
+<span class="nc" id="L981">        return results;</span>
+    }
+
+    ControllerResult&lt;Map&lt;Uuid, ApiError&gt;&gt; deleteTopics(ControllerRequestContext context, Collection&lt;Uuid&gt; ids) {
+<span class="fc" id="L985">        Map&lt;Uuid, ApiError&gt; results = new HashMap&lt;&gt;(ids.size());</span>
+<span class="fc" id="L986">        List&lt;ApiMessageAndVersion&gt; records =</span>
+<span class="fc" id="L987">                BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP, ids.size());</span>
+<span class="fc" id="L988">        StringBuilder resultsBuilder = new StringBuilder();</span>
+<span class="fc" id="L989">        String resultsPrefix = &quot;&quot;;</span>
+
+<span class="fc bfc" id="L991" title="All 2 branches covered.">        for (Uuid id : ids) {</span>
+<span class="fc" id="L992">            String topicName = &quot;null&quot;;</span>
+            ApiError error;
+            try {
+<span class="fc" id="L995">                log.trace(&quot;Starting deletion of topic with ID {}.&quot;, id);</span>
+<span class="fc" id="L996">                deleteTopic(context, id, records);</span>
+<span class="fc" id="L997">                error = ApiError.NONE;</span>
+<span class="nc" id="L998">            } catch (ApiException e) {</span>
+<span class="nc" id="L999">                error = ApiError.fromThrowable(e);</span>
+<span class="nc" id="L1000">            } catch (Exception e) {</span>
+<span class="nc" id="L1001">                log.error(&quot;Unexpected deleteTopics error for {}&quot;, id, e);</span>
+<span class="nc" id="L1002">                error = ApiError.fromThrowable(e);</span>
+<span class="pc" id="L1003">            }</span>
+
+<span class="fc" id="L1005">            results.put(id, error);</span>
+
+<span class="pc bpc" id="L1007" title="3 of 4 branches missed.">            if (!error.isFailure() || error.error() != UNKNOWN_TOPIC_ID) {</span>
+<span class="fc" id="L1008">                topicName = topics.get(id).name;</span>
+            }
+
+<span class="fc" id="L1011">            resultsBuilder.append(resultsPrefix)</span>
+<span class="fc" id="L1012">                    .append(&quot;{id: &quot;).append(id)</span>
+<span class="fc" id="L1013">                    .append(&quot;, name: &quot;).append(topicName)</span>
+<span class="fc" id="L1014">                    .append(&quot;, result: &quot;)</span>
+<span class="pc bpc" id="L1015" title="1 of 2 branches missed.">                    .append(error.isFailure() ? error.error() : &quot;SUCCESS&quot;)</span>
+<span class="fc" id="L1016">                    .append(&quot;}&quot;);</span>
+<span class="fc" id="L1017">            resultsPrefix = &quot;, &quot;;</span>
+<span class="fc" id="L1018">        }</span>
+
+<span class="fc" id="L1020">        log.info(&quot;DeleteTopics result(s): {}&quot;, resultsBuilder);</span>
+<span class="fc" id="L1021">        return ControllerResult.atomicOf(records, results);</span>
+    }
+
+    void deleteTopic(ControllerRequestContext context, Uuid id, List&lt;ApiMessageAndVersion&gt; records) {
+<span class="fc" id="L1025">        TopicControlInfo topic = topics.get(id);</span>
+<span class="pc bpc" id="L1026" title="1 of 2 branches missed.">        if (topic == null) {</span>
+<span class="nc" id="L1027">            throw new UnknownTopicIdException(UNKNOWN_TOPIC_ID.message());</span>
+        }
+<span class="fc" id="L1029">        int numPartitions = topic.parts.size();</span>
+<span class="fc" id="L1030">        log.trace(&quot;Deleting topic {} with ID {} and {} partitions&quot;, topic.name, id, numPartitions);</span>
+        try {
+<span class="fc" id="L1032">            context.applyPartitionChangeQuota(numPartitions); // check controller mutation quota</span>
+<span class="fc" id="L1033">            log.trace(&quot;Checked for a partition change quota on topic {} with ID {}&quot;, topic.name, id);</span>
+<span class="nc" id="L1034">        } catch (ThrottlingQuotaExceededException e) {</span>
+            // log a message and rethrow the exception
+<span class="nc" id="L1036">            log.debug(&quot;Topic deletion of {} partitions not allowed because quota is violated. Delay time: {}&quot;,</span>
+<span class="nc" id="L1037">                numPartitions, e.throttleTimeMs());</span>
+<span class="nc" id="L1038">            throw e;</span>
+<span class="fc" id="L1039">        }</span>
+<span class="fc" id="L1040">        records.add(new ApiMessageAndVersion(new RemoveTopicRecord().</span>
+<span class="fc" id="L1041">            setTopicId(id), (short) 0));</span>
+<span class="fc" id="L1042">    }</span>
+
+    // VisibleForTesting
+    PartitionRegistration getPartition(Uuid topicId, int partitionId) {
+<span class="nc" id="L1046">        TopicControlInfo topic = topics.get(topicId);</span>
+<span class="nc bnc" id="L1047" title="All 2 branches missed.">        if (topic == null) {</span>
+<span class="nc" id="L1048">            return null;</span>
+        }
+<span class="nc" id="L1050">        return topic.parts.get(partitionId);</span>
+    }
+
+    // VisibleForTesting
+    TopicControlInfo getTopic(Uuid topicId) {
+<span class="nc" id="L1055">        return topics.get(topicId);</span>
+    }
+
+    Uuid getTopicId(String name) {
+<span class="nc" id="L1059">        return topicsByName.get(name);</span>
+    }
+
+    // VisibleForTesting
+    BrokersToIsrs brokersToIsrs() {
+<span class="nc" id="L1064">        return brokersToIsrs;</span>
+    }
+
+    // VisibleForTesting
+    BrokersToElrs brokersToElrs() {
+<span class="nc" id="L1069">        return brokersToElrs;</span>
+    }
+
+    // VisibleForTesting
+    TimelineHashSet&lt;TopicIdPartition&gt; imbalancedPartitions() {
+<span class="nc" id="L1074">        return imbalancedPartitions;</span>
+    }
+
+    ControllerResult&lt;AlterPartitionResponseData&gt; alterPartition(
+        ControllerRequestContext context,
+        AlterPartitionRequestData request
+    ) {
+<span class="nc" id="L1081">        short requestVersion = context.requestHeader().requestApiVersion();</span>
+<span class="nc" id="L1082">        clusterControl.checkBrokerEpoch(request.brokerId(), request.brokerEpoch());</span>
+<span class="nc" id="L1083">        AlterPartitionResponseData response = new AlterPartitionResponseData();</span>
+<span class="nc" id="L1084">        List&lt;ApiMessageAndVersion&gt; records = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1085" title="All 2 branches missed.">        for (AlterPartitionRequestData.TopicData topicData : request.topics()) {</span>
+<span class="nc" id="L1086">            AlterPartitionResponseData.TopicData responseTopicData =</span>
+                new AlterPartitionResponseData.TopicData().
+<span class="nc" id="L1088">                    setTopicId(topicData.topicId());</span>
+<span class="nc" id="L1089">            response.topics().add(responseTopicData);</span>
+
+<span class="nc" id="L1091">            Uuid topicId = topicData.topicId();</span>
+<span class="nc bnc" id="L1092" title="All 6 branches missed.">            if (topicId == null || topicId.equals(Uuid.ZERO_UUID) || !topics.containsKey(topicId)) {</span>
+<span class="nc bnc" id="L1093" title="All 2 branches missed.">                for (AlterPartitionRequestData.PartitionData partitionData : topicData.partitions()) {</span>
+<span class="nc" id="L1094">                    responseTopicData.partitions().add(new AlterPartitionResponseData.PartitionData().</span>
+<span class="nc" id="L1095">                        setPartitionIndex(partitionData.partitionIndex()).</span>
+<span class="nc" id="L1096">                        setErrorCode(UNKNOWN_TOPIC_ID.code()));</span>
+<span class="nc" id="L1097">                }</span>
+<span class="nc" id="L1098">                log.info(&quot;Rejecting AlterPartition request for unknown topic ID {}.&quot;, topicData.topicId());</span>
+<span class="nc" id="L1099">                continue;</span>
+            }
+
+<span class="nc" id="L1102">            TopicControlInfo topic = topics.get(topicId);</span>
+<span class="nc bnc" id="L1103" title="All 2 branches missed.">            for (AlterPartitionRequestData.PartitionData partitionData : topicData.partitions()) {</span>
+<span class="nc bnc" id="L1104" title="All 2 branches missed.">                if (requestVersion &lt; 3) {</span>
+<span class="nc" id="L1105">                    partitionData.setNewIsrWithEpochs(</span>
+<span class="nc" id="L1106">                        AlterPartitionRequest.newIsrToSimpleNewIsrWithBrokerEpochs(partitionData.newIsr())</span>
+                    );
+                }
+
+<span class="nc" id="L1110">                int partitionId = partitionData.partitionIndex();</span>
+<span class="nc" id="L1111">                PartitionRegistration partition = topic.parts.get(partitionId);</span>
+
+<span class="nc" id="L1113">                Errors validationError = validateAlterPartitionData(</span>
+<span class="nc" id="L1114">                    request.brokerId(),</span>
+                    topic,
+                    partitionId,
+                    partition,
+                    partitionData);
+
+<span class="nc bnc" id="L1120" title="All 2 branches missed.">                if (validationError != Errors.NONE) {</span>
+<span class="nc" id="L1121">                    responseTopicData.partitions().add(</span>
+                        new AlterPartitionResponseData.PartitionData()
+<span class="nc" id="L1123">                            .setPartitionIndex(partitionId)</span>
+<span class="nc" id="L1124">                            .setErrorCode(validationError.code())</span>
+                    );
+
+<span class="nc" id="L1127">                    continue;</span>
+                }
+
+<span class="nc" id="L1130">                PartitionChangeBuilder builder = new PartitionChangeBuilder(</span>
+                    partition,
+                    topic.id,
+                    partitionId,
+                    new LeaderAcceptor(clusterControl, partition),
+<span class="nc" id="L1135">                    featureControl.metadataVersionOrThrow(),</span>
+<span class="nc" id="L1136">                    getTopicEffectiveMinIsr(topic.name),</span>
+<span class="nc" id="L1137">                    featureControl.isElrFeatureEnabled()</span>
+                );
+<span class="nc bnc" id="L1139" title="All 2 branches missed.">                if (configurationControl.uncleanLeaderElectionEnabledForTopic(topic.name())) {</span>
+<span class="nc" id="L1140">                    builder.setElection(PartitionChangeBuilder.Election.UNCLEAN);</span>
+                }
+<span class="nc" id="L1142">                Optional&lt;ApiMessageAndVersion&gt; record = builder</span>
+<span class="nc" id="L1143">                    .setTargetIsrWithBrokerStates(partitionData.newIsrWithEpochs())</span>
+<span class="nc" id="L1144">                    .setTargetLeaderRecoveryState(LeaderRecoveryState.of(partitionData.leaderRecoveryState()))</span>
+<span class="nc" id="L1145">                    .setDefaultDirProvider(clusterDescriber)</span>
+<span class="nc" id="L1146">                    .build();</span>
+<span class="nc bnc" id="L1147" title="All 2 branches missed.">                if (record.isPresent()) {</span>
+<span class="nc" id="L1148">                    records.add(record.get());</span>
+<span class="nc" id="L1149">                    PartitionChangeRecord change = (PartitionChangeRecord) record.get().message();</span>
+<span class="nc" id="L1150">                    PartitionRegistration originalPartition = partition;</span>
+<span class="nc" id="L1151">                    partition = originalPartition.merge(change);</span>
+<span class="nc bnc" id="L1152" title="All 2 branches missed.">                    if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L1153">                        log.debug(&quot;Node {} has altered ISR for {}-{}. {}&quot;,</span>
+<span class="nc" id="L1154">                            request.brokerId(), topic.name, partitionId, logPartitionChangeInfo(originalPartition, partition));</span>
+                    }
+<span class="nc bnc" id="L1156" title="All 2 branches missed.">                    if (change.leader() != request.brokerId() &amp;&amp;</span>
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">                            change.leader() != NO_LEADER_CHANGE) {</span>
+                        // Normally, an AlterPartition request, which is made by the partition
+                        // leader itself, is not allowed to modify the partition leader.
+                        // However, if there is an ongoing partition reassignment and the
+                        // ISR change completes it, then the leader may change as part of
+                        // the changes made during reassignment cleanup.
+                        //
+                        // In this case, we report back NEW_LEADER_ELECTED to the leader
+                        // which made the AlterPartition request. This lets it know that it must
+                        // fetch new metadata before trying again. This return code is
+                        // unusual because we both return an error and generate a new
+                        // metadata record. We usually only do one or the other.
+<span class="nc" id="L1169">                        Errors error = NEW_LEADER_ELECTED;</span>
+<span class="nc" id="L1170">                        log.info(&quot;AlterPartition request from node {} for {}-{} completed &quot; +</span>
+                            &quot;the ongoing partition reassignment and triggered a leadership change {}. Returning {}.&quot;,
+<span class="nc" id="L1172">                            request.brokerId(), topic.name, partitionId,</span>
+<span class="nc" id="L1173">                            logPartitionChangeInfo(originalPartition, partition), error);</span>
+<span class="nc" id="L1174">                        responseTopicData.partitions().add(new AlterPartitionResponseData.PartitionData().</span>
+<span class="nc" id="L1175">                            setPartitionIndex(partitionId).</span>
+<span class="nc" id="L1176">                            setErrorCode(error.code()));</span>
+<span class="nc" id="L1177">                        continue;</span>
+<span class="nc bnc" id="L1178" title="All 2 branches missed.">                    } else if (isReassignmentInProgress(partition)) {</span>
+<span class="nc" id="L1179">                        log.info(&quot;AlterPartition request from node {} for {}-{} completed &quot; +</span>
+                            &quot;the ongoing partition reassignment. {}&quot;,
+<span class="nc" id="L1181">                            request.brokerId(), topic.name, partitionId, logPartitionChangeInfo(originalPartition, partition));</span>
+                    }
+                }
+
+                /* Setting the LeaderRecoveryState field is always safe because it will always be the
+                 * same as the value set in the request. For version 0, that is always the default
+                 * RECOVERED which is ignored when serializing to version 0. For any other version, the
+                 * LeaderRecoveryState field is supported.
+                 */
+<span class="nc" id="L1190">                responseTopicData.partitions().add(new AlterPartitionResponseData.PartitionData().</span>
+<span class="nc" id="L1191">                    setPartitionIndex(partitionId).</span>
+<span class="nc" id="L1192">                    setErrorCode(Errors.NONE.code()).</span>
+<span class="nc" id="L1193">                    setLeaderId(partition.leader).</span>
+<span class="nc" id="L1194">                    setIsr(Replicas.toList(partition.isr)).</span>
+<span class="nc" id="L1195">                    setLeaderRecoveryState(partition.leaderRecoveryState.value()).</span>
+<span class="nc" id="L1196">                    setLeaderEpoch(partition.leaderEpoch).</span>
+<span class="nc" id="L1197">                    setPartitionEpoch(partition.partitionEpoch));</span>
+<span class="nc" id="L1198">            }</span>
+<span class="nc" id="L1199">        }</span>
+
+<span class="nc" id="L1201">        return ControllerResult.of(records, response);</span>
+    }
+
+    private static String logPartitionChangeInfo(PartitionRegistration oldRegistration, PartitionRegistration newRegistration) {
+<span class="nc" id="L1205">        return String.format(&quot;isr: %s -&gt; %s, replicaSet: %s -&gt; %s, partitionEpoch: %d -&gt; %d, leaderEpoch: %d -&gt; %d&quot;,</span>
+<span class="nc" id="L1206">            Arrays.toString(oldRegistration.isr), Arrays.toString(newRegistration.isr),</span>
+<span class="nc" id="L1207">            Arrays.toString(oldRegistration.replicas), Arrays.toString(newRegistration.replicas),</span>
+<span class="nc" id="L1208">            oldRegistration.partitionEpoch, newRegistration.partitionEpoch,</span>
+<span class="nc" id="L1209">            oldRegistration.leaderEpoch, newRegistration.leaderEpoch);</span>
+    }
+
+    /**
+     * Validates that a batch of topics will create less than {@value MAX_PARTITIONS_PER_BATCH}. Exceeding this number of topics per batch
+     * has led to out-of-memory exceptions. We use this validation to fail earlier to avoid allocating the memory.
+     * Validates an upper bound number of partitions. The actual number may be smaller if some topics are misconfigured.
+     *
+     * @param request a batch of topics to create.
+     * @param defaultNumPartitions default number of partitions to assign if unspecified.
+     * @throws PolicyViolationException if total number of partitions exceeds {@value MAX_PARTITIONS_PER_BATCH}.
+     */
+    static void validateTotalNumberOfPartitions(CreateTopicsRequestData request, int defaultNumPartitions) {
+<span class="fc" id="L1222">        int totalPartitions = 0;</span>
+<span class="fc bfc" id="L1223" title="All 2 branches covered.">        for (CreatableTopic topic: request.topics()) {</span>
+<span class="pc bpc" id="L1224" title="1 of 2 branches missed.">            if (topic.assignments().isEmpty()) {</span>
+<span class="pc bpc" id="L1225" title="1 of 2 branches missed.">                if (topic.numPartitions() == -1) {</span>
+<span class="nc" id="L1226">                    totalPartitions += defaultNumPartitions;</span>
+<span class="pc bpc" id="L1227" title="1 of 2 branches missed.">                } else if (topic.numPartitions() &gt; 0) {</span>
+<span class="fc" id="L1228">                    totalPartitions += topic.numPartitions();</span>
+                }
+            } else {
+<span class="nc" id="L1231">                totalPartitions += topic.assignments().size();</span>
+            }
+
+<span class="fc" id="L1234">        }</span>
+<span class="pc bpc" id="L1235" title="1 of 2 branches missed.">        if (totalPartitions &gt; MAX_PARTITIONS_PER_BATCH) {</span>
+<span class="nc" id="L1236">            throw new PolicyViolationException(&quot;Excessively large number of partitions per request.&quot;);</span>
+        }
+<span class="fc" id="L1238">    }</span>
+
+    /**
+     * Validate the partition information included in the alter partition request.
+     *
+     * @param brokerId id of the broker requesting the alter partition
+     * @param topic current topic information store by the replication manager
+     * @param partitionId partition id being altered
+     * @param partition current partition registration for the partition being altered
+     * @param partitionData partition data from the alter partition request
+     *
+     * @return Errors.NONE for valid alter partition data; otherwise the validation error
+     */
+    private Errors validateAlterPartitionData(
+        int brokerId,
+        TopicControlInfo topic,
+        int partitionId,
+        PartitionRegistration partition,
+        AlterPartitionRequestData.PartitionData partitionData
+    ) {
+<span class="nc bnc" id="L1258" title="All 2 branches missed.">        if (partition == null) {</span>
+<span class="nc" id="L1259">            log.info(&quot;Rejecting AlterPartition request for unknown partition {}-{}.&quot;,</span>
+<span class="nc" id="L1260">                    topic.name, partitionId);</span>
+
+<span class="nc" id="L1262">            return UNKNOWN_TOPIC_OR_PARTITION;</span>
+        }
+
+        // If the partition leader has a higher leader/partition epoch, then it is likely
+        // that this node is no longer the active controller. We return NOT_CONTROLLER in
+        // this case to give the leader an opportunity to find the new controller.
+<span class="nc bnc" id="L1268" title="All 2 branches missed.">        if (partitionData.leaderEpoch() &gt; partition.leaderEpoch) {</span>
+<span class="nc" id="L1269">            log.debug(&quot;Rejecting AlterPartition request from node {} for {}-{} because &quot; +</span>
+                    &quot;the current leader epoch is {}, which is lower than the request value {}. {}&quot;,
+<span class="nc" id="L1271">                brokerId, topic.name, partitionId, partition.leaderEpoch, partitionData.leaderEpoch(),</span>
+<span class="nc" id="L1272">                logPartitionChangeInfo(partition, partitionData.newIsrWithEpochs()));</span>
+<span class="nc" id="L1273">            return NOT_CONTROLLER;</span>
+        }
+<span class="nc bnc" id="L1275" title="All 2 branches missed.">        if (partitionData.partitionEpoch() &gt; partition.partitionEpoch) {</span>
+<span class="nc" id="L1276">            log.debug(&quot;Rejecting AlterPartition request from node {} for {}-{} because &quot; +</span>
+                    &quot;the current partition epoch is {}, which is lower than the request value {}. {}&quot;,
+<span class="nc" id="L1278">                brokerId, topic.name, partitionId, partition.partitionEpoch, partitionData.partitionEpoch(),</span>
+<span class="nc" id="L1279">                logPartitionChangeInfo(partition, partitionData.newIsrWithEpochs()));</span>
+<span class="nc" id="L1280">            return NOT_CONTROLLER;</span>
+        }
+<span class="nc bnc" id="L1282" title="All 2 branches missed.">        if (partitionData.leaderEpoch() &lt; partition.leaderEpoch) {</span>
+<span class="nc" id="L1283">            log.debug(&quot;Rejecting AlterPartition request from node {} for {}-{} because &quot; +</span>
+<span class="nc" id="L1284">                    &quot;the current leader epoch is {}, not {}. {}&quot;, brokerId, topic.name,</span>
+<span class="nc" id="L1285">                    partitionId, partition.leaderEpoch, partitionData.leaderEpoch(),</span>
+<span class="nc" id="L1286">                    logPartitionChangeInfo(partition, partitionData.newIsrWithEpochs()));</span>
+
+<span class="nc" id="L1288">            return FENCED_LEADER_EPOCH;</span>
+        }
+<span class="nc bnc" id="L1290" title="All 2 branches missed.">        if (brokerId != partition.leader) {</span>
+<span class="nc" id="L1291">            log.info(&quot;Rejecting AlterPartition request from node {} for {}-{} because &quot; +</span>
+<span class="nc" id="L1292">                    &quot;the current leader is {}. {}&quot;, brokerId, topic.name,</span>
+<span class="nc" id="L1293">                    partitionId, partition.leader, logPartitionChangeInfo(partition, partitionData.newIsrWithEpochs()));</span>
+
+<span class="nc" id="L1295">            return INVALID_REQUEST;</span>
+        }
+<span class="nc bnc" id="L1297" title="All 2 branches missed.">        if (partitionData.partitionEpoch() &lt; partition.partitionEpoch) {</span>
+<span class="nc" id="L1298">            log.info(&quot;Rejecting AlterPartition request from node {} for {}-{} because &quot; +</span>
+<span class="nc" id="L1299">                    &quot;the current partition epoch is {}, not {}. {}&quot;, brokerId,</span>
+<span class="nc" id="L1300">                    topic.name, partitionId, partition.partitionEpoch,</span>
+<span class="nc" id="L1301">                    partitionData.partitionEpoch(), logPartitionChangeInfo(partition, partitionData.newIsrWithEpochs()));</span>
+
+<span class="nc" id="L1303">            return INVALID_UPDATE_VERSION;</span>
+        }
+
+<span class="nc" id="L1306">        int[] newIsr = partitionData.newIsrWithEpochs().stream()</span>
+<span class="nc" id="L1307">            .mapToInt(BrokerState::brokerId).toArray();</span>
+
+<span class="nc bnc" id="L1309" title="All 2 branches missed.">        if (!Replicas.validateIsr(partition.replicas, newIsr)) {</span>
+<span class="nc" id="L1310">            log.error(&quot;Rejecting AlterPartition request from node {} for {}-{} because &quot; +</span>
+<span class="nc" id="L1311">                    &quot;it specified an invalid ISR. {}&quot;, brokerId,</span>
+<span class="nc" id="L1312">                    topic.name, partitionId, logPartitionChangeInfo(partition, partitionData.newIsrWithEpochs()));</span>
+
+<span class="nc" id="L1314">            return INVALID_REQUEST;</span>
+        }
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">        if (!Replicas.contains(newIsr, partition.leader)) {</span>
+            // The ISR must always include the current leader.
+<span class="nc" id="L1318">            log.error(&quot;Rejecting AlterPartition request from node {} for {}-{} because &quot; +</span>
+                    &quot;it specified an invalid ISR that doesn't include itself. {}&quot;,
+<span class="nc" id="L1320">                    brokerId, topic.name, partitionId,</span>
+<span class="nc" id="L1321">                    logPartitionChangeInfo(partition, partitionData.newIsrWithEpochs()));</span>
+
+<span class="nc" id="L1323">            return INVALID_REQUEST;</span>
+        }
+<span class="nc" id="L1325">        LeaderRecoveryState leaderRecoveryState = LeaderRecoveryState.of(partitionData.leaderRecoveryState());</span>
+<span class="nc bnc" id="L1326" title="All 4 branches missed.">        if (leaderRecoveryState == LeaderRecoveryState.RECOVERING &amp;&amp; newIsr.length &gt; 1) {</span>
+<span class="nc" id="L1327">            log.info(&quot;Rejecting AlterPartition request from node {} for {}-{} because &quot; +</span>
+                    &quot;the ISR had more than one replica while the leader was still &quot; +
+                    &quot;recovering from an unclean leader election {}. {}&quot;,
+<span class="nc" id="L1330">                    brokerId, topic.name, partitionId, leaderRecoveryState,</span>
+<span class="nc" id="L1331">                    logPartitionChangeInfo(partition, partitionData.newIsrWithEpochs()));</span>
+
+<span class="nc" id="L1333">            return INVALID_REQUEST;</span>
+        }
+<span class="nc bnc" id="L1335" title="All 4 branches missed.">        if (partition.leaderRecoveryState == LeaderRecoveryState.RECOVERED &amp;&amp;</span>
+                leaderRecoveryState == LeaderRecoveryState.RECOVERING) {
+<span class="nc" id="L1337">            log.info(&quot;Rejecting AlterPartition request from node {} for {}-{} because &quot; +</span>
+                    &quot;the leader recovery state cannot change from RECOVERED to RECOVERING. {}&quot;,
+<span class="nc" id="L1339">                    brokerId, topic.name, partitionId,</span>
+<span class="nc" id="L1340">                    logPartitionChangeInfo(partition, partitionData.newIsrWithEpochs()));</span>
+
+<span class="nc" id="L1342">            return INVALID_REQUEST;</span>
+        }
+
+<span class="nc" id="L1345">        List&lt;IneligibleReplica&gt; ineligibleReplicas = ineligibleReplicasForIsr(partitionData.newIsrWithEpochs());</span>
+<span class="nc bnc" id="L1346" title="All 2 branches missed.">        if (!ineligibleReplicas.isEmpty()) {</span>
+<span class="nc" id="L1347">            log.info(&quot;Rejecting AlterPartition request from node {} for {}-{} because &quot; +</span>
+                    &quot;it specified ineligible replicas {} in the new ISR. {}&quot;,
+<span class="nc" id="L1349">                    brokerId, topic.name, partitionId, ineligibleReplicas,</span>
+<span class="nc" id="L1350">                    logPartitionChangeInfo(partition, partitionData.newIsrWithEpochs()));</span>
+<span class="nc" id="L1351">            return INELIGIBLE_REPLICA;</span>
+        }
+
+<span class="nc" id="L1354">        return Errors.NONE;</span>
+    }
+
+    private static String logPartitionChangeInfo(
+        PartitionRegistration partition,
+        List&lt;BrokerState&gt; requestedIsr
+    ) {
+<span class="nc" id="L1361">        return String.format(&quot;Proposed ISR was %s and current ISR is %s. &quot; +</span>
+                &quot;Current replica set is %s. Current partitionEpoch is %d. Current leaderEpoch is %d.&quot;,
+<span class="nc" id="L1363">            requestedIsr, Arrays.toString(partition.isr), Arrays.toString(partition.replicas),</span>
+<span class="nc" id="L1364">            partition.partitionEpoch, partition.leaderEpoch);</span>
+    }
+
+    private List&lt;IneligibleReplica&gt; ineligibleReplicasForIsr(List&lt;BrokerState&gt; brokerStates) {
+<span class="nc" id="L1368">        List&lt;IneligibleReplica&gt; ineligibleReplicas = new ArrayList&lt;&gt;(0);</span>
+<span class="nc bnc" id="L1369" title="All 2 branches missed.">        for (BrokerState brokerState : brokerStates) {</span>
+<span class="nc" id="L1370">            int brokerId = brokerState.brokerId();</span>
+<span class="nc" id="L1371">            BrokerRegistration registration = clusterControl.registration(brokerId);</span>
+<span class="nc bnc" id="L1372" title="All 2 branches missed.">            if (registration == null) {</span>
+<span class="nc" id="L1373">                ineligibleReplicas.add(new IneligibleReplica(brokerId, &quot;not registered&quot;));</span>
+<span class="nc bnc" id="L1374" title="All 2 branches missed.">            } else if (registration.inControlledShutdown()) {</span>
+<span class="nc" id="L1375">                ineligibleReplicas.add(new IneligibleReplica(brokerId, &quot;shutting down&quot;));</span>
+<span class="nc bnc" id="L1376" title="All 2 branches missed.">            } else if (registration.fenced()) {</span>
+<span class="nc" id="L1377">                ineligibleReplicas.add(new IneligibleReplica(brokerId, &quot;fenced&quot;));</span>
+<span class="nc bnc" id="L1378" title="All 4 branches missed.">            } else if (brokerState.brokerEpoch() != -1 &amp;&amp; registration.epoch() != brokerState.brokerEpoch()) {</span>
+                // The given broker epoch should match with the broker epoch in the broker registration, except the
+                // given broker epoch is -1 which means skipping the broker epoch verification.
+<span class="nc" id="L1381">                ineligibleReplicas.add(new IneligibleReplica(brokerId,</span>
+<span class="nc" id="L1382">                    &quot;broker epoch mismatch: requested=&quot; + brokerState.brokerEpoch()</span>
+<span class="nc" id="L1383">                        + &quot; VS expected=&quot; + registration.epoch()));</span>
+            }
+<span class="nc" id="L1385">        }</span>
+<span class="nc" id="L1386">        return ineligibleReplicas;</span>
+    }
+
+    /**
+     * Generate the appropriate records to handle a broker being fenced.
+     *
+     * First, we remove this broker from any ISR. Then we generate a
+     * BrokerRegistrationChangeRecord.
+     *
+     * @param brokerId      The broker id.
+     * @param records       The record list to append to.
+     */
+    void handleBrokerFenced(int brokerId, List&lt;ApiMessageAndVersion&gt; records) {
+<span class="fc" id="L1399">        BrokerRegistration brokerRegistration = clusterControl.brokerRegistrations().get(brokerId);</span>
+<span class="pc bpc" id="L1400" title="1 of 2 branches missed.">        if (brokerRegistration == null) {</span>
+<span class="nc" id="L1401">            throw new RuntimeException(&quot;Can't find broker registration for broker &quot; + brokerId);</span>
+        }
+<span class="fc" id="L1403">        generateLeaderAndIsrUpdates(&quot;handleBrokerFenced&quot;, brokerId, NO_LEADER, NO_LEADER, records,</span>
+<span class="fc" id="L1404">            brokersToIsrs.partitionsWithBrokerInIsr(brokerId));</span>
+<span class="fc" id="L1405">        records.add(new ApiMessageAndVersion(new BrokerRegistrationChangeRecord().</span>
+<span class="fc" id="L1406">            setBrokerId(brokerId).setBrokerEpoch(brokerRegistration.epoch()).</span>
+<span class="fc" id="L1407">            setFenced(BrokerRegistrationFencingChange.FENCE.value()),</span>
+            (short) 0));
+<span class="fc" id="L1409">    }</span>
+
+    /**
+     * Generate the appropriate records to handle a broker being unregistered.
+     *
+     * First, we remove this broker from any ISR or ELR. Then we generate an
+     * UnregisterBrokerRecord.
+     *
+     * @param brokerId      The broker id.
+     * @param brokerEpoch   The broker epoch.
+     * @param records       The record list to append to.
+     */
+    void handleBrokerUnregistered(int brokerId, long brokerEpoch,
+                                  List&lt;ApiMessageAndVersion&gt; records) {
+<span class="nc" id="L1423">        generateLeaderAndIsrUpdates(&quot;handleBrokerUnregistered&quot;, brokerId, NO_LEADER, NO_LEADER, records,</span>
+<span class="nc" id="L1424">            brokersToIsrs.partitionsWithBrokerInIsr(brokerId));</span>
+<span class="nc" id="L1425">        generateLeaderAndIsrUpdates(&quot;handleBrokerUnregistered&quot;, brokerId, NO_LEADER, NO_LEADER, records,</span>
+<span class="nc" id="L1426">            brokersToElrs.partitionsWithBrokerInElr(brokerId));</span>
+<span class="nc" id="L1427">        records.add(new ApiMessageAndVersion(new UnregisterBrokerRecord().</span>
+<span class="nc" id="L1428">            setBrokerId(brokerId).setBrokerEpoch(brokerEpoch),</span>
+            (short) 0));
+<span class="nc" id="L1430">    }</span>
+
+    /**
+     * Generate the appropriate records to handle a broker becoming unfenced.
+     *
+     * First, we create a BrokerRegistrationChangeRecord. Then, we check if there are any
+     * partitions that don't currently have a leader that should be led by the newly
+     * unfenced broker.
+     *
+     * @param brokerId      The broker id.
+     * @param brokerEpoch   The broker epoch.
+     * @param records       The record list to append to.
+     */
+    void handleBrokerUnfenced(int brokerId, long brokerEpoch, List&lt;ApiMessageAndVersion&gt; records) {
+<span class="fc" id="L1444">        records.add(new ApiMessageAndVersion(new BrokerRegistrationChangeRecord().</span>
+<span class="fc" id="L1445">            setBrokerId(brokerId).setBrokerEpoch(brokerEpoch).</span>
+<span class="fc" id="L1446">            setFenced(BrokerRegistrationFencingChange.UNFENCE.value()),</span>
+            (short) 0));
+<span class="fc" id="L1448">        generateLeaderAndIsrUpdates(&quot;handleBrokerUnfenced&quot;, NO_LEADER, brokerId, NO_LEADER, records,</span>
+<span class="fc" id="L1449">            brokersToIsrs.partitionsWithNoLeader());</span>
+<span class="fc" id="L1450">    }</span>
+
+    /**
+     * Generate the appropriate records to handle a broker starting a controlled shutdown.
+     *
+     * First, we create an BrokerRegistrationChangeRecord. Then, we remove this broker
+     * from any ISR and elect new leaders for partitions led by this
+     * broker.
+     *
+     * @param brokerId      The broker id.
+     * @param brokerEpoch   The broker epoch.
+     * @param records       The record list to append to.
+     */
+    void handleBrokerInControlledShutdown(int brokerId, long brokerEpoch, List&lt;ApiMessageAndVersion&gt; records) {
+<span class="pc bpc" id="L1464" title="1 of 2 branches missed.">        if (!clusterControl.inControlledShutdown(brokerId)) {</span>
+<span class="fc" id="L1465">            records.add(new ApiMessageAndVersion(new BrokerRegistrationChangeRecord().</span>
+<span class="fc" id="L1466">                setBrokerId(brokerId).setBrokerEpoch(brokerEpoch).</span>
+<span class="fc" id="L1467">                setInControlledShutdown(BrokerRegistrationInControlledShutdownChange.IN_CONTROLLED_SHUTDOWN.value()),</span>
+                (short) 1));
+        }
+<span class="fc" id="L1470">        generateLeaderAndIsrUpdates(&quot;enterControlledShutdown[&quot; + brokerId + &quot;]&quot;,</span>
+<span class="fc" id="L1471">            brokerId, NO_LEADER, NO_LEADER, records, brokersToIsrs.partitionsWithBrokerInIsr(brokerId));</span>
+<span class="fc" id="L1472">    }</span>
+
+    /**
+     * Create partition change records to remove replicas from any ISR or ELR for brokers when the shutdown is detected.
+     *
+     * @param brokerId           The broker id to be shut down.
+     * @param isCleanShutdown    Whether the broker has a clean shutdown.
+     * @param records            The record list to append to.
+     */
+    void handleBrokerShutdown(int brokerId, boolean isCleanShutdown, List&lt;ApiMessageAndVersion&gt; records) {
+<span class="pc bpc" id="L1482" title="1 of 4 branches missed.">        if (featureControl.isElrFeatureEnabled() &amp;&amp; !isCleanShutdown) {</span>
+            // ELR is enabled, generate unclean shutdown partition change records
+<span class="fc" id="L1484">            generateLeaderAndIsrUpdates(&quot;handleBrokerUncleanShutdown&quot;, NO_LEADER, NO_LEADER, brokerId, records,</span>
+<span class="fc" id="L1485">                brokersToIsrs.partitionsWithBrokerInIsr(brokerId));</span>
+<span class="fc" id="L1486">            generateLeaderAndIsrUpdates(&quot;handleBrokerUncleanShutdown&quot;, NO_LEADER, NO_LEADER, brokerId, records,</span>
+<span class="fc" id="L1487">                brokersToElrs.partitionsWithBrokerInElr(brokerId));</span>
+        } else {
+            // ELR is not enabled or if it is a clean shutdown, handle the shutdown as if the broker was fenced
+<span class="fc" id="L1490">            generateLeaderAndIsrUpdates(&quot;handleBrokerShutdown&quot;, brokerId, NO_LEADER, NO_LEADER, records,</span>
+<span class="fc" id="L1491">                brokersToIsrs.partitionsWithBrokerInIsr(brokerId));</span>
+        }
+<span class="fc" id="L1493">    }</span>
+
+    /**
+     * Generates the appropriate records to handle a list of directories being reported offline.
+     *
+     * If the reported directories include directories that were previously online, this includes
+     * a BrokerRegistrationChangeRecord and any number of PartitionChangeRecord to update
+     * leadership and ISR for partitions in those directories that were previously online.
+     *
+     * @param brokerId    The broker id.
+     * @param brokerEpoch The broker epoch.
+     * @param offlineDirs The list of directories that are offline.
+     * @param records     The record list to append to.
+     */
+    void handleDirectoriesOffline(
+        int brokerId,
+        long brokerEpoch,
+        List&lt;Uuid&gt; offlineDirs,
+        List&lt;ApiMessageAndVersion&gt; records
+    ) {
+<span class="fc" id="L1513">        BrokerRegistration registration = clusterControl.registration(brokerId);</span>
+<span class="fc" id="L1514">        List&lt;Uuid&gt; newOfflineDirs = registration.directoryIntersection(offlineDirs);</span>
+<span class="pc bpc" id="L1515" title="1 of 2 branches missed.">        if (!newOfflineDirs.isEmpty()) {</span>
+<span class="nc bnc" id="L1516" title="All 2 branches missed.">            for (Uuid newOfflineDir : newOfflineDirs) {</span>
+<span class="nc" id="L1517">                TimelineHashSet&lt;TopicIdPartition&gt; parts = directoriesToPartitions.get(newOfflineDir);</span>
+<span class="nc bnc" id="L1518" title="All 2 branches missed.">                Iterator&lt;TopicIdPartition&gt; iterator = (parts == null) ?</span>
+<span class="nc" id="L1519">                        Collections.emptyIterator() : parts.iterator();</span>
+<span class="nc" id="L1520">                generateLeaderAndIsrUpdates(</span>
+                        &quot;handleDirectoriesOffline[&quot; + brokerId + &quot;:&quot; + newOfflineDir + &quot;]&quot;,
+                        brokerId, NO_LEADER, NO_LEADER, records, iterator);
+<span class="nc" id="L1523">            }</span>
+<span class="nc" id="L1524">            List&lt;Uuid&gt; newOnlineDirs = registration.directoryDifference(offlineDirs);</span>
+<span class="nc" id="L1525">            records.add(new ApiMessageAndVersion(new BrokerRegistrationChangeRecord().</span>
+<span class="nc" id="L1526">                    setBrokerId(brokerId).setBrokerEpoch(brokerEpoch).</span>
+<span class="nc" id="L1527">                    setLogDirs(newOnlineDirs),</span>
+                    (short) 2));
+<span class="nc" id="L1529">            log.warn(&quot;Directories {} in broker {} marked offline, remaining directories: {}&quot;,</span>
+<span class="nc" id="L1530">                    newOfflineDirs, brokerId, newOnlineDirs);</span>
+        }
+<span class="fc" id="L1532">    }</span>
+
+    /**
+     * Generates the appropriate record to handle a list of directories that are cordoned.
+     *
+     * @param brokerId     The broker id.
+     * @param brokerEpoch  The broker epoch.
+     * @param cordonedDirs The list of directories that are cordoned.
+     * @param records      The record list to append to.
+     */
+    void handleDirectoriesCordoned(
+            int brokerId,
+            long brokerEpoch,
+            List&lt;Uuid&gt; cordonedDirs,
+            List&lt;ApiMessageAndVersion&gt; records
+    ) {
+<span class="fc" id="L1548">        BrokerRegistration registration = clusterControl.registration(brokerId);</span>
+<span class="fc" id="L1549">        List&lt;Uuid&gt; newCordonedDirs = registration.directoryIntersection(cordonedDirs);</span>
+<span class="pc bpc" id="L1550" title="1 of 2 branches missed.">        if (!newCordonedDirs.isEmpty()) {</span>
+<span class="nc" id="L1551">            records.add(new ApiMessageAndVersion(new BrokerRegistrationChangeRecord().</span>
+<span class="nc" id="L1552">                    setBrokerId(brokerId).setBrokerEpoch(brokerEpoch).</span>
+<span class="nc" id="L1553">                    setCordonedLogDirs(newCordonedDirs),</span>
+                    (short) 3));
+<span class="nc bnc" id="L1555" title="All 2 branches missed.">            if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L1556">                List&lt;Uuid&gt; newUncordonedDirs = registration.directoryDifference(newCordonedDirs);</span>
+<span class="nc" id="L1557">                log.debug(&quot;Directories {} in broker {} marked cordoned, uncordoned directories: {}&quot;,</span>
+<span class="nc" id="L1558">                        newCordonedDirs, brokerId, newUncordonedDirs);</span>
+            }
+        }
+<span class="fc" id="L1561">    }</span>
+
+    ControllerResult&lt;ElectLeadersResponseData&gt; electLeaders(ElectLeadersRequestData request) {
+<span class="nc" id="L1564">        ElectionType electionType = electionType(request.electionType());</span>
+<span class="nc" id="L1565">        List&lt;ApiMessageAndVersion&gt; records = BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);</span>
+<span class="nc" id="L1566">        ElectLeadersResponseData response = new ElectLeadersResponseData();</span>
+<span class="nc bnc" id="L1567" title="All 2 branches missed.">        if (request.topicPartitions() == null) {</span>
+            // If topicPartitions is null, we try to elect a new leader for every partition.  There
+            // are some obvious issues with this wire protocol.  For example, what if we have too
+            // many partitions to fit the results in a single RPC?  This behavior should probably be
+            // removed from the protocol.  For now, however, we have to implement this for
+            // compatibility with the old controller.
+<span class="nc bnc" id="L1573" title="All 2 branches missed.">            for (Entry&lt;String, Uuid&gt; topicEntry : topicsByName.entrySet()) {</span>
+<span class="nc" id="L1574">                String topicName = topicEntry.getKey();</span>
+<span class="nc" id="L1575">                ReplicaElectionResult topicResults =</span>
+<span class="nc" id="L1576">                    new ReplicaElectionResult().setTopic(topicName);</span>
+<span class="nc" id="L1577">                response.replicaElectionResults().add(topicResults);</span>
+<span class="nc" id="L1578">                TopicControlInfo topic = topics.get(topicEntry.getValue());</span>
+<span class="nc bnc" id="L1579" title="All 2 branches missed.">                if (topic != null) {</span>
+<span class="nc bnc" id="L1580" title="All 2 branches missed.">                    for (int partitionId : topic.parts.keySet()) {</span>
+<span class="nc" id="L1581">                        ApiError error = electLeader(topicName, partitionId, electionType, records);</span>
+
+                        // When electing leaders for all partitions, we do not return
+                        // partitions which already have the desired leader.
+<span class="nc bnc" id="L1585" title="All 2 branches missed.">                        if (error.error() != Errors.ELECTION_NOT_NEEDED) {</span>
+<span class="nc" id="L1586">                            topicResults.partitionResult().add(new PartitionResult().</span>
+<span class="nc" id="L1587">                                setPartitionId(partitionId).</span>
+<span class="nc" id="L1588">                                setErrorCode(error.error().code()).</span>
+<span class="nc" id="L1589">                                setErrorMessage(error.message()));</span>
+                        }
+<span class="nc" id="L1591">                    }</span>
+                }
+<span class="nc" id="L1593">            }</span>
+        } else {
+<span class="nc bnc" id="L1595" title="All 2 branches missed.">            for (TopicPartitions topic : request.topicPartitions()) {</span>
+<span class="nc" id="L1596">                ReplicaElectionResult topicResults =</span>
+<span class="nc" id="L1597">                    new ReplicaElectionResult().setTopic(topic.topic());</span>
+<span class="nc" id="L1598">                response.replicaElectionResults().add(topicResults);</span>
+<span class="nc bnc" id="L1599" title="All 2 branches missed.">                for (int partitionId : topic.partitions()) {</span>
+<span class="nc" id="L1600">                    ApiError error = electLeader(topic.topic(), partitionId, electionType, records);</span>
+<span class="nc" id="L1601">                    topicResults.partitionResult().add(new PartitionResult().</span>
+<span class="nc" id="L1602">                        setPartitionId(partitionId).</span>
+<span class="nc" id="L1603">                        setErrorCode(error.error().code()).</span>
+<span class="nc" id="L1604">                        setErrorMessage(error.message()));</span>
+<span class="nc" id="L1605">                }</span>
+<span class="nc" id="L1606">            }</span>
+        }
+<span class="nc" id="L1608">        return ControllerResult.of(records, response);</span>
+    }
+
+    private static ElectionType electionType(byte electionType) {
+        try {
+<span class="nc" id="L1613">            return ElectionType.valueOf(electionType);</span>
+<span class="nc" id="L1614">        } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1615">            throw new InvalidRequestException(&quot;Unknown election type &quot; + (int) electionType);</span>
+        }
+    }
+
+    ApiError electLeader(String topic, int partitionId, ElectionType electionType,
+                         List&lt;ApiMessageAndVersion&gt; records) {
+<span class="nc" id="L1621">        Uuid topicId = topicsByName.get(topic);</span>
+<span class="nc bnc" id="L1622" title="All 2 branches missed.">        if (topicId == null) {</span>
+<span class="nc" id="L1623">            return new ApiError(UNKNOWN_TOPIC_OR_PARTITION,</span>
+                &quot;No such topic as &quot; + topic);
+        }
+<span class="nc" id="L1626">        TopicControlInfo topicInfo = topics.get(topicId);</span>
+<span class="nc bnc" id="L1627" title="All 2 branches missed.">        if (topicInfo == null) {</span>
+<span class="nc" id="L1628">            return new ApiError(UNKNOWN_TOPIC_OR_PARTITION,</span>
+                &quot;No such topic id as &quot; + topicId);
+        }
+<span class="nc" id="L1631">        PartitionRegistration partition = topicInfo.parts.get(partitionId);</span>
+<span class="nc bnc" id="L1632" title="All 2 branches missed.">        if (partition == null) {</span>
+<span class="nc" id="L1633">            return new ApiError(UNKNOWN_TOPIC_OR_PARTITION,</span>
+                &quot;No such partition as &quot; + topic + &quot;-&quot; + partitionId);
+        }
+<span class="nc bnc" id="L1636" title="All 6 branches missed.">        if ((electionType == ElectionType.PREFERRED &amp;&amp; partition.hasPreferredLeader())</span>
+<span class="nc bnc" id="L1637" title="All 2 branches missed.">            || (electionType == ElectionType.UNCLEAN &amp;&amp; partition.hasLeader())) {</span>
+<span class="nc" id="L1638">            return new ApiError(Errors.ELECTION_NOT_NEEDED);</span>
+        }
+
+<span class="nc" id="L1641">        PartitionChangeBuilder.Election election = PartitionChangeBuilder.Election.PREFERRED;</span>
+<span class="nc bnc" id="L1642" title="All 2 branches missed.">        if (electionType == ElectionType.UNCLEAN) {</span>
+<span class="nc" id="L1643">            election = PartitionChangeBuilder.Election.UNCLEAN;</span>
+        }
+<span class="nc" id="L1645">        Optional&lt;ApiMessageAndVersion&gt; record = new PartitionChangeBuilder(</span>
+            partition,
+            topicId,
+            partitionId,
+            new LeaderAcceptor(clusterControl, partition),
+<span class="nc" id="L1650">            featureControl.metadataVersionOrThrow(),</span>
+<span class="nc" id="L1651">            getTopicEffectiveMinIsr(topic),</span>
+<span class="nc" id="L1652">            featureControl.isElrFeatureEnabled()</span>
+        )
+<span class="nc" id="L1654">            .setElection(election)</span>
+<span class="nc" id="L1655">            .setDefaultDirProvider(clusterDescriber)</span>
+<span class="nc" id="L1656">            .build();</span>
+<span class="nc bnc" id="L1657" title="All 2 branches missed.">        if (record.isEmpty()) {</span>
+<span class="nc bnc" id="L1658" title="All 2 branches missed.">            if (electionType == ElectionType.PREFERRED) {</span>
+<span class="nc" id="L1659">                return new ApiError(Errors.PREFERRED_LEADER_NOT_AVAILABLE);</span>
+            } else {
+<span class="nc" id="L1661">                return new ApiError(Errors.ELIGIBLE_LEADERS_NOT_AVAILABLE);</span>
+            }
+        }
+<span class="nc" id="L1664">        records.add(record.get());</span>
+<span class="nc" id="L1665">        return ApiError.NONE;</span>
+    }
+
+    ControllerResult&lt;BrokerHeartbeatReply&gt; processBrokerHeartbeat(
+        BrokerHeartbeatRequestData request,
+        long registerBrokerRecordOffset
+    ) {
+<span class="fc" id="L1672">        int brokerId = request.brokerId();</span>
+<span class="fc" id="L1673">        long brokerEpoch = request.brokerEpoch();</span>
+<span class="fc" id="L1674">        clusterControl.checkBrokerEpoch(brokerId, brokerEpoch);</span>
+<span class="fc" id="L1675">        BrokerHeartbeatManager heartbeatManager = clusterControl.heartbeatManager();</span>
+<span class="fc" id="L1676">        BrokerControlStates states = heartbeatManager.calculateNextBrokerState(brokerId,</span>
+<span class="fc" id="L1677">            request, registerBrokerRecordOffset, () -&gt; brokersToIsrs.hasLeaderships(brokerId));</span>
+<span class="fc" id="L1678">        List&lt;ApiMessageAndVersion&gt; records = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L1679" title="All 2 branches covered.">        if (states.current() != states.next()) {</span>
+<span class="pc bpc" id="L1680" title="1 of 4 branches missed.">            switch (states.next()) {</span>
+                case FENCED:
+                case SHUTDOWN_NOW:
+<span class="fc" id="L1683">                    handleBrokerFenced(brokerId, records);</span>
+<span class="fc" id="L1684">                    break;</span>
+                case UNFENCED:
+<span class="fc" id="L1686">                    handleBrokerUnfenced(brokerId, brokerEpoch, records);</span>
+<span class="fc" id="L1687">                    break;</span>
+                case CONTROLLED_SHUTDOWN:
+<span class="fc" id="L1689">                    handleBrokerInControlledShutdown(brokerId, brokerEpoch, records);</span>
+                    break;
+            }
+        }
+<span class="fc" id="L1693">        heartbeatManager.touch(brokerId,</span>
+<span class="fc" id="L1694">            states.next().fenced(),</span>
+<span class="fc" id="L1695">            request.currentMetadataOffset());</span>
+<span class="pc bpc" id="L1696" title="1 of 2 branches missed.">        if (featureControl.metadataVersionOrThrow().isDirectoryAssignmentSupported()) {</span>
+<span class="fc" id="L1697">            handleDirectoriesOffline(brokerId, brokerEpoch, request.offlineLogDirs(), records);</span>
+        }
+<span class="pc bpc" id="L1699" title="1 of 2 branches missed.">        if (featureControl.metadataVersionOrThrow().isCordonedLogDirsSupported()) {</span>
+<span class="fc" id="L1700">            clusterControl.updateCordonedLogDirs(brokerId, request.cordonedLogDirs());</span>
+<span class="fc" id="L1701">            handleDirectoriesCordoned(brokerId, brokerEpoch, request.cordonedLogDirs(), records);</span>
+        }
+<span class="fc bfc" id="L1703" title="All 2 branches covered.">        boolean isCaughtUp = request.currentMetadataOffset() &gt;= registerBrokerRecordOffset;</span>
+<span class="fc" id="L1704">        BrokerHeartbeatReply reply = new BrokerHeartbeatReply(isCaughtUp,</span>
+<span class="fc" id="L1705">                states.next().fenced(),</span>
+<span class="fc" id="L1706">                states.next().inControlledShutdown(),</span>
+<span class="fc" id="L1707">                states.next().shouldShutDown());</span>
+<span class="fc" id="L1708">        return ControllerResult.of(records, reply);</span>
+    }
+
+    /**
+     * Process a broker heartbeat which has been sitting on the queue for too long, and has
+     * expired. With default settings, this would happen after 1 second. We process expired
+     * heartbeats by updating the lastSeenNs of the broker, so that the broker won't get fenced
+     * incorrectly. However, we don't perform any state changes that we normally would, such as
+     * unfencing a fenced broker, etc.
+     */
+    void processExpiredBrokerHeartbeat(BrokerHeartbeatRequestData request) {
+<span class="nc" id="L1719">        int brokerId = request.brokerId();</span>
+<span class="nc" id="L1720">        clusterControl.checkBrokerEpoch(brokerId, request.brokerEpoch());</span>
+<span class="nc" id="L1721">        clusterControl.heartbeatManager().touch(brokerId,</span>
+<span class="nc" id="L1722">                clusterControl.brokerRegistrations().get(brokerId).fenced(),</span>
+<span class="nc" id="L1723">                request.currentMetadataOffset());</span>
+<span class="nc" id="L1724">        log.error(&quot;processExpiredBrokerHeartbeat: controller event queue overloaded. Timed out &quot; +</span>
+<span class="nc" id="L1725">                &quot;heartbeat from broker {}.&quot;, brokerId);</span>
+<span class="nc" id="L1726">    }</span>
+
+    public ControllerResult&lt;Void&gt; unregisterBroker(int brokerId) {
+<span class="nc" id="L1729">        BrokerRegistration registration = clusterControl.brokerRegistrations().get(brokerId);</span>
+<span class="nc bnc" id="L1730" title="All 2 branches missed.">        if (registration == null) {</span>
+<span class="nc" id="L1731">            throw new BrokerIdNotRegisteredException(&quot;Broker ID &quot; + brokerId +</span>
+                &quot; is not currently registered&quot;);
+        }
+<span class="nc" id="L1734">        List&lt;ApiMessageAndVersion&gt; records = BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);</span>
+<span class="nc" id="L1735">        handleBrokerUnregistered(brokerId, registration.epoch(), records);</span>
+<span class="nc" id="L1736">        return ControllerResult.of(records, null);</span>
+    }
+
+    ControllerResult&lt;Boolean&gt; maybeFenceOneStaleBroker() {
+<span class="fc" id="L1740">        BrokerHeartbeatManager heartbeatManager = clusterControl.heartbeatManager();</span>
+<span class="fc" id="L1741">        Optional&lt;BrokerIdAndEpoch&gt; idAndEpoch = heartbeatManager.tracker().maybeRemoveExpired();</span>
+<span class="fc bfc" id="L1742" title="All 2 branches covered.">        if (idAndEpoch.isEmpty()) {</span>
+<span class="fc" id="L1743">            log.debug(&quot;No stale brokers found.&quot;);</span>
+<span class="fc" id="L1744">            return ControllerResult.of(List.of(), false);</span>
+        }
+<span class="fc" id="L1746">        int id = idAndEpoch.get().id();</span>
+<span class="fc" id="L1747">        long epoch = idAndEpoch.get().epoch();</span>
+<span class="pc bpc" id="L1748" title="1 of 2 branches missed.">        if (!clusterControl.brokerRegistrations().containsKey(id)) {</span>
+<span class="nc" id="L1749">            log.info(&quot;Removing heartbeat tracker entry for unknown broker {} at epoch {}.&quot;,</span>
+<span class="nc" id="L1750">                    id, epoch);</span>
+<span class="nc" id="L1751">            heartbeatManager.remove(id);</span>
+<span class="nc" id="L1752">            return ControllerResult.of(List.of(), true);</span>
+<span class="pc bpc" id="L1753" title="1 of 2 branches missed.">        } else if (clusterControl.brokerRegistrations().get(id).epoch() != epoch) {</span>
+<span class="nc" id="L1754">            log.info(&quot;Removing heartbeat tracker entry for broker {} at previous epoch {}. &quot; +</span>
+<span class="nc" id="L1755">                &quot;Current epoch is {}&quot;, id, epoch,</span>
+<span class="nc" id="L1756">                clusterControl.brokerRegistrations().get(id).epoch());</span>
+<span class="nc" id="L1757">            return ControllerResult.of(List.of(), true);</span>
+        }
+        // Even though multiple brokers can go stale at a time, we will process
+        // fencing one at a time so that the effect of fencing each broker is visible
+        // to the system prior to processing the next one.
+<span class="fc" id="L1762">        log.info(&quot;Fencing broker {} at epoch {} because its session has timed out.&quot;, id, epoch);</span>
+<span class="fc" id="L1763">        List&lt;ApiMessageAndVersion&gt; records = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1764">        handleBrokerFenced(id, records);</span>
+<span class="fc" id="L1765">        heartbeatManager.fence(id);</span>
+<span class="fc" id="L1766">        return ControllerResult.of(records, true);</span>
+    }
+
+    boolean arePartitionLeadersImbalanced() {
+<span class="nc bnc" id="L1770" title="All 2 branches missed.">        return !imbalancedPartitions.isEmpty();</span>
+    }
+
+    boolean areSomePartitionsLeaderless() {
+<span class="nc" id="L1774">        return brokersToIsrs.partitionsWithNoLeader().hasNext();</span>
+    }
+
+    /**
+     * Attempt to elect a preferred leader for all topic partitions which have a leader that is not the preferred replica.
+     *
+     * The response() method in the return object is true if this method returned without electing all possible preferred replicas.
+     * The quorum controller should reschedule this operation immediately if it is true.
+     *
+     * @return All of the election records and if there may be more available preferred replicas to elect as leader
+     */
+    ControllerResult&lt;Boolean&gt; maybeBalancePartitionLeaders() {
+<span class="nc" id="L1786">        List&lt;ApiMessageAndVersion&gt; records = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1787">        maybeTriggerLeaderChangeForPartitionsWithoutPreferredLeader(records, maxElectionsPerImbalance);</span>
+<span class="nc bnc" id="L1788" title="All 2 branches missed.">        return ControllerResult.of(records, records.size() &gt;= maxElectionsPerImbalance);</span>
+    }
+
+    void maybeTriggerLeaderChangeForPartitionsWithoutPreferredLeader(
+        List&lt;ApiMessageAndVersion&gt; records,
+        int maxElections
+    ) {
+<span class="nc bnc" id="L1795" title="All 2 branches missed.">        for (TopicIdPartition topicPartition : imbalancedPartitions) {</span>
+<span class="nc bnc" id="L1796" title="All 2 branches missed.">            if (records.size() &gt;= maxElections) {</span>
+<span class="nc" id="L1797">                return;</span>
+            }
+
+<span class="nc" id="L1800">            TopicControlInfo topic = topics.get(topicPartition.topicId());</span>
+<span class="nc bnc" id="L1801" title="All 2 branches missed.">            if (topic == null) {</span>
+<span class="nc" id="L1802">                log.error(&quot;Skipping unknown imbalanced topic {}&quot;, topicPartition);</span>
+<span class="nc" id="L1803">                continue;</span>
+            }
+
+<span class="nc" id="L1806">            PartitionRegistration partition = topic.parts.get(topicPartition.partitionId());</span>
+<span class="nc bnc" id="L1807" title="All 2 branches missed.">            if (partition == null) {</span>
+<span class="nc" id="L1808">                log.error(&quot;Skipping unknown imbalanced partition {}&quot;, topicPartition);</span>
+<span class="nc" id="L1809">                continue;</span>
+            }
+
+            // Attempt to perform a preferred leader election
+<span class="nc" id="L1813">            new PartitionChangeBuilder(</span>
+                partition,
+<span class="nc" id="L1815">                topicPartition.topicId(),</span>
+<span class="nc" id="L1816">                topicPartition.partitionId(),</span>
+                new LeaderAcceptor(clusterControl, partition),
+<span class="nc" id="L1818">                featureControl.metadataVersionOrThrow(),</span>
+<span class="nc" id="L1819">                getTopicEffectiveMinIsr(topic.name),</span>
+<span class="nc" id="L1820">                featureControl.isElrFeatureEnabled()</span>
+            )
+<span class="nc" id="L1822">                .setElection(PartitionChangeBuilder.Election.PREFERRED)</span>
+<span class="nc" id="L1823">                .setDefaultDirProvider(clusterDescriber)</span>
+<span class="nc" id="L1824">                .build().ifPresent(records::add);</span>
+<span class="nc" id="L1825">        }</span>
+<span class="nc" id="L1826">    }</span>
+
+    /**
+     * Check if we can do an unclean election for partitions with no leader.
+     *
+     * The response() method in the return object is true if this method returned without electing all possible preferred replicas.
+     * The quorum controller should reschedule this operation immediately if it is true.
+     *
+     * @return All of the election records and true if there may be more elections to be done.
+     */
+    ControllerResult&lt;Boolean&gt; maybeElectUncleanLeaders() {
+<span class="nc" id="L1837">        List&lt;ApiMessageAndVersion&gt; records = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1838">        maybeTriggerUncleanLeaderElectionForLeaderlessPartitions(records, maxElectionsPerImbalance);</span>
+<span class="nc bnc" id="L1839" title="All 2 branches missed.">        return ControllerResult.of(records, records.size() &gt;= maxElectionsPerImbalance);</span>
+    }
+
+    /**
+     * Trigger unclean leader election for partitions without leader (visible for testing)
+     *
+     * @param records       The record list to append to.
+     * @param maxElections  The maximum number of elections to perform.
+     */
+    void maybeTriggerUncleanLeaderElectionForLeaderlessPartitions(
+            List&lt;ApiMessageAndVersion&gt; records,
+            int maxElections
+    ) {
+<span class="nc" id="L1852">        Iterator&lt;TopicIdPartition&gt; iterator = brokersToIsrs.partitionsWithNoLeader();</span>
+<span class="nc bnc" id="L1853" title="All 4 branches missed.">        while (iterator.hasNext() &amp;&amp; records.size() &lt; maxElections) {</span>
+<span class="nc" id="L1854">            TopicIdPartition topicIdPartition = iterator.next();</span>
+<span class="nc" id="L1855">            int partitionId = topicIdPartition.partitionId();</span>
+<span class="nc" id="L1856">            TopicControlInfo topic = topics.get(topicIdPartition.topicId());</span>
+
+<span class="nc bnc" id="L1858" title="All 2 branches missed.">            if (configurationControl.uncleanLeaderElectionEnabledForTopic(topic.name)) {</span>
+<span class="nc" id="L1859">                ApiError result = electLeader(topic.name, partitionId,</span>
+                        ElectionType.UNCLEAN, records);
+<span class="nc bnc" id="L1861" title="All 2 branches missed.">                if (result.error().equals(Errors.NONE)) {</span>
+<span class="nc" id="L1862">                    log.info(&quot;Triggering unclean leader election for offline partition {}-{}. {}&quot;,</span>
+<span class="nc" id="L1863">                            topic.name, partitionId, logPartitionInfo(topic.parts.get(partitionId)));</span>
+                } else {
+<span class="nc" id="L1865">                    log.warn(&quot;Cannot trigger unclean leader election for offline partition {}-{}: {}. {}&quot;,</span>
+<span class="nc" id="L1866">                            topic.name, partitionId, result.error(), logPartitionInfo(topic.parts.get(partitionId)));</span>
+                }
+<span class="nc bnc" id="L1868" title="All 2 branches missed.">            } else if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L1869">                log.debug(&quot;Cannot trigger unclean leader election for offline partition {}-{} &quot; +</span>
+                                &quot;because unclean leader election is disabled for this topic. {}&quot;,
+<span class="nc" id="L1871">                        topic.name, partitionId, logPartitionInfo(topic.parts.get(partitionId)));</span>
+            }
+<span class="nc" id="L1873">        }</span>
+<span class="nc" id="L1874">    }</span>
+
+    private static String logPartitionInfo(PartitionRegistration partition) {
+<span class="nc" id="L1877">        return String.format(&quot;(isr: %s, replicaSet: %s, partitionEpoch: %d, leaderEpoch: %d)&quot;,</span>
+<span class="nc" id="L1878">            Arrays.toString(partition.isr), Arrays.toString(partition.replicas), partition.partitionEpoch,</span>
+<span class="nc" id="L1879">            partition.leaderEpoch);</span>
+    }
+
+    ControllerResult&lt;List&lt;CreatePartitionsTopicResult&gt;&gt; createPartitions(
+        ControllerRequestContext context,
+        List&lt;CreatePartitionsTopic&gt; topics
+    ) {
+<span class="nc" id="L1886">        List&lt;ApiMessageAndVersion&gt; records = BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);</span>
+<span class="nc" id="L1887">        List&lt;CreatePartitionsTopicResult&gt; results = BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);</span>
+<span class="nc bnc" id="L1888" title="All 2 branches missed.">        for (CreatePartitionsTopic topic : topics) {</span>
+<span class="nc" id="L1889">            ApiError apiError = ApiError.NONE;</span>
+            try {
+<span class="nc" id="L1891">                createPartitions(context, topic, records);</span>
+<span class="nc" id="L1892">            } catch (ApiException e) {</span>
+<span class="nc" id="L1893">                apiError = ApiError.fromThrowable(e);</span>
+<span class="nc" id="L1894">            } catch (Exception e) {</span>
+<span class="nc" id="L1895">                log.error(&quot;Unexpected createPartitions error for {}&quot;, topic, e);</span>
+<span class="nc" id="L1896">                apiError = ApiError.fromThrowable(e);</span>
+<span class="nc" id="L1897">            }</span>
+<span class="nc" id="L1898">            results.add(new CreatePartitionsTopicResult().</span>
+<span class="nc" id="L1899">                setName(topic.name()).</span>
+<span class="nc" id="L1900">                setErrorCode(apiError.error().code()).</span>
+<span class="nc" id="L1901">                setErrorMessage(apiError.message()));</span>
+<span class="nc" id="L1902">        }</span>
+<span class="nc" id="L1903">        return ControllerResult.atomicOf(records, results);</span>
+    }
+
+    void createPartitions(ControllerRequestContext context,
+                          CreatePartitionsTopic topic,
+                          List&lt;ApiMessageAndVersion&gt; records) {
+<span class="nc" id="L1909">        Uuid topicId = topicsByName.get(topic.name());</span>
+<span class="nc bnc" id="L1910" title="All 2 branches missed.">        if (topicId == null) {</span>
+<span class="nc" id="L1911">            throw new UnknownTopicOrPartitionException();</span>
+        }
+<span class="nc" id="L1913">        TopicControlInfo topicInfo = topics.get(topicId);</span>
+<span class="nc bnc" id="L1914" title="All 2 branches missed.">        if (topicInfo == null) {</span>
+<span class="nc" id="L1915">            throw new UnknownTopicOrPartitionException();</span>
+        }
+<span class="nc bnc" id="L1917" title="All 2 branches missed.">        if (topic.count() == topicInfo.parts.size()) {</span>
+<span class="nc" id="L1918">            throw new InvalidPartitionsException(&quot;Topic already has &quot; +</span>
+<span class="nc" id="L1919">                topicInfo.parts.size() + &quot; partition(s).&quot;);</span>
+<span class="nc bnc" id="L1920" title="All 2 branches missed.">        } else if (topic.count() &lt; topicInfo.parts.size()) {</span>
+<span class="nc" id="L1921">            throw new InvalidPartitionsException(&quot;The topic &quot; + topic.name() + &quot; currently &quot; +</span>
+<span class="nc" id="L1922">                &quot;has &quot; + topicInfo.parts.size() + &quot; partition(s); &quot; + topic.count() +</span>
+                &quot; would not be an increase.&quot;);
+        }
+<span class="nc" id="L1925">        int additional = topic.count() - topicInfo.parts.size();</span>
+<span class="nc bnc" id="L1926" title="All 2 branches missed.">        if (topic.assignments() != null) {</span>
+<span class="nc bnc" id="L1927" title="All 2 branches missed.">            if (topic.assignments().size() != additional) {</span>
+<span class="nc" id="L1928">                throw new InvalidReplicaAssignmentException(&quot;Attempted to add &quot; + additional +</span>
+<span class="nc" id="L1929">                    &quot; additional partition(s), but only &quot; + topic.assignments().size() +</span>
+                    &quot; assignment(s) were specified.&quot;);
+            }
+        }
+        try {
+<span class="nc" id="L1934">            context.applyPartitionChangeQuota(additional); // check controller mutation quota</span>
+<span class="nc" id="L1935">        } catch (ThrottlingQuotaExceededException e) {</span>
+            // log a message and rethrow the exception
+<span class="nc" id="L1937">            log.debug(&quot;Partition creation of {} partitions not allowed because quota is violated. Delay time: {}&quot;,</span>
+<span class="nc" id="L1938">                additional, e.throttleTimeMs());</span>
+<span class="nc" id="L1939">            throw e;</span>
+<span class="nc" id="L1940">        }</span>
+<span class="nc" id="L1941">        Iterator&lt;PartitionRegistration&gt; iterator = topicInfo.parts.values().iterator();</span>
+<span class="nc bnc" id="L1942" title="All 2 branches missed.">        if (!iterator.hasNext()) {</span>
+<span class="nc" id="L1943">            throw new UnknownServerException(&quot;Invalid state: topic &quot; + topic.name() +</span>
+                &quot; appears to have no partitions.&quot;);
+        }
+<span class="nc" id="L1946">        PartitionRegistration partitionInfo = iterator.next();</span>
+<span class="nc bnc" id="L1947" title="All 2 branches missed.">        if (partitionInfo.replicas.length &gt; Short.MAX_VALUE) {</span>
+<span class="nc" id="L1948">            throw new UnknownServerException(&quot;Invalid replication factor &quot; +</span>
+                partitionInfo.replicas.length + &quot;: expected a number equal to less than &quot; +
+                Short.MAX_VALUE);
+        }
+<span class="nc" id="L1952">        short replicationFactor = (short) partitionInfo.replicas.length;</span>
+<span class="nc" id="L1953">        int startPartitionId = topicInfo.parts.size();</span>
+
+        List&lt;PartitionAssignment&gt; partitionAssignments;
+        List&lt;List&lt;Integer&gt;&gt; isrs;
+<span class="nc bnc" id="L1957" title="All 2 branches missed.">        if (topic.assignments() != null) {</span>
+<span class="nc" id="L1958">            partitionAssignments = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1959">            isrs = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1960" title="All 2 branches missed.">            for (int i = 0; i &lt; topic.assignments().size(); i++) {</span>
+<span class="nc" id="L1961">                List&lt;Integer&gt; replicas = topic.assignments().get(i).brokerIds();</span>
+<span class="nc" id="L1962">                PartitionAssignment partitionAssignment = new PartitionAssignment(replicas, clusterDescriber);</span>
+<span class="nc" id="L1963">                validateManualPartitionAssignment(partitionAssignment, OptionalInt.of(replicationFactor));</span>
+<span class="nc" id="L1964">                partitionAssignments.add(partitionAssignment);</span>
+<span class="nc" id="L1965">                List&lt;Integer&gt; isr = partitionAssignment.replicas().stream().</span>
+<span class="nc" id="L1966">                    filter(clusterControl::isActive).toList();</span>
+<span class="nc bnc" id="L1967" title="All 2 branches missed.">                if (isr.isEmpty()) {</span>
+<span class="nc" id="L1968">                    throw new InvalidReplicaAssignmentException(</span>
+                        &quot;All brokers specified in the manual partition assignment for &quot; +
+                            &quot;partition &quot; + (startPartitionId + i) + &quot; are fenced or in controlled shutdown.&quot;);
+                }
+<span class="nc" id="L1972">                isrs.add(isr);</span>
+            }
+        } else {
+<span class="nc" id="L1975">            partitionAssignments = clusterControl.replicaPlacer().place(</span>
+                new PlacementSpec(startPartitionId, additional, replicationFactor),
+                clusterDescriber
+<span class="nc" id="L1978">            ).assignments();</span>
+<span class="nc" id="L1979">            isrs = partitionAssignments.stream().map(PartitionAssignment::replicas).toList();</span>
+        }
+<span class="nc" id="L1981">        int partitionId = startPartitionId;</span>
+<span class="nc bnc" id="L1982" title="All 2 branches missed.">        for (int i = 0; i &lt; partitionAssignments.size(); i++) {</span>
+<span class="nc" id="L1983">            PartitionAssignment partitionAssignment = partitionAssignments.get(i);</span>
+<span class="nc" id="L1984">            List&lt;Integer&gt; isr = isrs.get(i).stream().</span>
+<span class="nc" id="L1985">                filter(clusterControl::isActive).toList();</span>
+            // If the ISR is empty, it means that all brokers are fenced or
+            // in controlled shutdown. To be consistent with the replica placer,
+            // we reject the create topic request with INVALID_REPLICATION_FACTOR.
+<span class="nc bnc" id="L1989" title="All 2 branches missed.">            if (isr.isEmpty()) {</span>
+<span class="nc" id="L1990">                throw new InvalidReplicationFactorException(</span>
+                    &quot;Unable to replicate the partition &quot; + replicationFactor +
+                        &quot; time(s): All brokers are currently fenced or in controlled shutdown.&quot;);
+            }
+<span class="nc" id="L1994">            records.add(buildPartitionRegistration(partitionAssignment, isr)</span>
+<span class="nc" id="L1995">                .toRecord(topicId, partitionId, new ImageWriterOptions.Builder(featureControl.metadataVersionOrThrow()).</span>
+<span class="nc" id="L1996">                        setEligibleLeaderReplicasEnabled(featureControl.isElrFeatureEnabled()).</span>
+<span class="nc" id="L1997">                        build()));</span>
+<span class="nc" id="L1998">            partitionId++;</span>
+        }
+<span class="nc" id="L2000">    }</span>
+
+    void validateManualPartitionAssignment(
+        PartitionAssignment assignment,
+        OptionalInt replicationFactor
+    ) {
+<span class="nc bnc" id="L2006" title="All 2 branches missed.">        if (assignment.replicas().isEmpty()) {</span>
+<span class="nc" id="L2007">            throw new InvalidReplicaAssignmentException(&quot;The manual partition &quot; +</span>
+                &quot;assignment includes an empty replica list.&quot;);
+        }
+<span class="nc" id="L2010">        List&lt;Integer&gt; sortedBrokerIds = new ArrayList&lt;&gt;(assignment.replicas());</span>
+<span class="nc" id="L2011">        sortedBrokerIds.sort(Integer::compare);</span>
+<span class="nc" id="L2012">        Integer prevBrokerId = null;</span>
+<span class="nc bnc" id="L2013" title="All 2 branches missed.">        for (Integer brokerId : sortedBrokerIds) {</span>
+<span class="nc bnc" id="L2014" title="All 2 branches missed.">            if (!clusterControl.brokerRegistrations().containsKey(brokerId)) {</span>
+<span class="nc" id="L2015">                throw new InvalidReplicaAssignmentException(&quot;The manual partition &quot; +</span>
+                    &quot;assignment includes broker &quot; + brokerId + &quot;, but no such broker is &quot; +
+                    &quot;registered.&quot;);
+            }
+<span class="nc bnc" id="L2019" title="All 2 branches missed.">            if (brokerId.equals(prevBrokerId)) {</span>
+<span class="nc" id="L2020">                throw new InvalidReplicaAssignmentException(&quot;The manual partition &quot; +</span>
+                    &quot;assignment includes the broker &quot; + prevBrokerId + &quot; more than &quot; +
+                    &quot;once.&quot;);
+            }
+<span class="nc" id="L2024">            prevBrokerId = brokerId;</span>
+<span class="nc" id="L2025">        }</span>
+<span class="nc bnc" id="L2026" title="All 2 branches missed.">        if (replicationFactor.isPresent() &amp;&amp;</span>
+<span class="nc bnc" id="L2027" title="All 2 branches missed.">                sortedBrokerIds.size() != replicationFactor.getAsInt()) {</span>
+<span class="nc" id="L2028">            throw new InvalidReplicaAssignmentException(&quot;The manual partition &quot; +</span>
+<span class="nc" id="L2029">                &quot;assignment includes a partition with &quot; + sortedBrokerIds.size() +</span>
+                &quot; replica(s), but this is not consistent with previous &quot; +
+<span class="nc" id="L2031">                &quot;partitions, which have &quot; + replicationFactor.getAsInt() + &quot; replica(s).&quot;);</span>
+        }
+<span class="nc" id="L2033">    }</span>
+
+    /**
+     * Iterate over a sequence of partitions and generate ISR/ELR changes and/or leader
+     * changes if necessary.
+     *
+     * @param context           A human-readable context string used in log4j logging.
+     * @param brokerToRemove    NO_LEADER if no broker is being removed; the ID of the
+     *                          broker to remove from the ISR and leadership, otherwise.
+     * @param brokerToAdd       NO_LEADER if no broker is being added; the ID of the
+     *                          broker which is now eligible to be a leader, otherwise.
+     * @param brokerWithUncleanShutdown
+     *                          NO_LEADER if no broker has unclean shutdown; the ID of the
+     *                          broker which is now removed from the ISR, ELR and
+     *                          leadership, otherwise.
+     * @param records           A list of records which we will append to.
+     * @param iterator          The iterator containing the partitions to examine.
+     */
+    void generateLeaderAndIsrUpdates(String context,
+                                     int brokerToRemove,
+                                     int brokerToAdd,
+                                     int brokerWithUncleanShutdown,
+                                     List&lt;ApiMessageAndVersion&gt; records,
+                                     Iterator&lt;TopicIdPartition&gt; iterator) {
+<span class="fc" id="L2057">        int oldSize = records.size();</span>
+
+        // If the caller passed a valid broker ID for brokerToAdd, rather than passing
+        // NO_LEADER, that node will be considered an acceptable leader even if it is
+        // currently fenced. This is useful when handling unfencing. The reason is that
+        // while we're generating the records to handle unfencing, the ClusterControlManager
+        // still shows the node as fenced.
+        //
+        // Similarly, if the caller passed a valid broker ID for brokerToRemove, rather
+        // than passing NO_LEADER, that node will never be considered an acceptable leader.
+        // This is useful when handling a newly fenced node. We also exclude brokerToRemove
+        // from the target ISR, but we need to exclude it here too, to handle the case
+        // where there is an unclean leader election which chooses a leader from outside
+        // the ISR.
+        //
+        // If the caller passed a valid broker ID for brokerWithUncleanShutdown, rather than
+        // passing NO_LEADER, this node should not be an acceptable leader. We also exclude
+        // brokerWithUncleanShutdown from ELR and ISR.
+<span class="fc" id="L2075">        IntPredicate isAcceptableLeader =</span>
+<span class="pc bpc" id="L2076" title="2 of 6 branches missed.">            r -&gt; (r != brokerToRemove &amp;&amp; r != brokerWithUncleanShutdown)</span>
+<span class="pc bnc" id="L2077" title="All 2 branches missed.">                &amp;&amp; (r == brokerToAdd || clusterControl.isActive(r));</span>
+
+<span class="fc bfc" id="L2079" title="All 2 branches covered.">        while (iterator.hasNext()) {</span>
+<span class="fc" id="L2080">            TopicIdPartition topicIdPart = iterator.next();</span>
+<span class="fc" id="L2081">            TopicControlInfo topic = topics.get(topicIdPart.topicId());</span>
+<span class="pc bpc" id="L2082" title="1 of 2 branches missed.">            if (topic == null) {</span>
+<span class="nc" id="L2083">                throw new RuntimeException(&quot;Topic ID &quot; + topicIdPart.topicId() +</span>
+                    &quot; existed in isrMembers, but not in the topics map.&quot;);
+            }
+<span class="fc" id="L2086">            PartitionRegistration partition = topic.parts.get(topicIdPart.partitionId());</span>
+<span class="pc bpc" id="L2087" title="1 of 2 branches missed.">            if (partition == null) {</span>
+<span class="nc" id="L2088">                throw new RuntimeException(&quot;Partition &quot; + topicIdPart +</span>
+                    &quot; existed in isrMembers, but not in the partitions map.&quot;);
+            }
+<span class="fc" id="L2091">            PartitionChangeBuilder builder = new PartitionChangeBuilder(</span>
+                partition,
+<span class="fc" id="L2093">                topicIdPart.topicId(),</span>
+<span class="fc" id="L2094">                topicIdPart.partitionId(),</span>
+                new LeaderAcceptor(clusterControl, partition, isAcceptableLeader),
+<span class="fc" id="L2096">                featureControl.metadataVersionOrThrow(),</span>
+<span class="fc" id="L2097">                getTopicEffectiveMinIsr(topic.name),</span>
+<span class="fc" id="L2098">                featureControl.isElrFeatureEnabled()</span>
+            );
+<span class="pc bpc" id="L2100" title="1 of 2 branches missed.">            if (configurationControl.uncleanLeaderElectionEnabledForTopic(topic.name)) {</span>
+<span class="nc" id="L2101">                builder.setElection(PartitionChangeBuilder.Election.UNCLEAN);</span>
+            }
+<span class="pc bpc" id="L2103" title="1 of 2 branches missed.">            if (brokerWithUncleanShutdown != NO_LEADER) {</span>
+<span class="nc" id="L2104">                builder.setUncleanShutdownReplicas(List.of(brokerWithUncleanShutdown));</span>
+            }
+
+            // Note: if brokerToRemove and brokerWithUncleanShutdown were passed as NO_LEADER, this is a no-op (the new
+            // target ISR will be the same as the old one).
+<span class="fc" id="L2109">            builder.setTargetIsr(Replicas.toList(</span>
+<span class="fc" id="L2110">                Replicas.copyWithout(partition.isr, new int[] {brokerToRemove, brokerWithUncleanShutdown})));</span>
+
+<span class="fc" id="L2112">            builder.setDefaultDirProvider(clusterDescriber)</span>
+<span class="fc" id="L2113">                    .build().ifPresent(records::add);</span>
+<span class="fc" id="L2114">        }</span>
+<span class="fc bfc" id="L2115" title="All 2 branches covered.">        if (records.size() != oldSize) {</span>
+<span class="pc bpc" id="L2116" title="1 of 2 branches missed.">            if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L2117">                StringBuilder bld = new StringBuilder();</span>
+<span class="nc" id="L2118">                String prefix = &quot;&quot;;</span>
+<span class="nc" id="L2119">                for (ListIterator&lt;ApiMessageAndVersion&gt; iter = records.listIterator(oldSize);</span>
+<span class="nc bnc" id="L2120" title="All 2 branches missed.">                     iter.hasNext(); ) {</span>
+<span class="nc" id="L2121">                    ApiMessageAndVersion apiMessageAndVersion = iter.next();</span>
+<span class="nc" id="L2122">                    PartitionChangeRecord record = (PartitionChangeRecord) apiMessageAndVersion.message();</span>
+<span class="nc" id="L2123">                    bld.append(prefix).append(topics.get(record.topicId()).name).append(&quot;-&quot;).</span>
+<span class="nc" id="L2124">                        append(record.partitionId());</span>
+<span class="nc" id="L2125">                    prefix = &quot;, &quot;;</span>
+<span class="nc" id="L2126">                }</span>
+<span class="nc" id="L2127">                log.debug(&quot;{}: changing partition(s): {}&quot;, context, bld);</span>
+<span class="pc bpc" id="L2128" title="1 of 2 branches missed.">            } else if (log.isInfoEnabled()) {</span>
+<span class="fc" id="L2129">                log.info(&quot;{}: changing {} partition(s)&quot;, context, records.size() - oldSize);</span>
+            }
+        }
+<span class="fc" id="L2132">    }</span>
+
+    ControllerResult&lt;AlterPartitionReassignmentsResponseData&gt;
+            alterPartitionReassignments(AlterPartitionReassignmentsRequestData request) {
+<span class="nc" id="L2136">        List&lt;ApiMessageAndVersion&gt; records = BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);</span>
+<span class="nc" id="L2137">        boolean allowRFChange = request.allowReplicationFactorChange();</span>
+<span class="nc" id="L2138">        AlterPartitionReassignmentsResponseData result =</span>
+<span class="nc" id="L2139">                new AlterPartitionReassignmentsResponseData().setErrorMessage(null)</span>
+<span class="nc" id="L2140">                        .setAllowReplicationFactorChange(allowRFChange);</span>
+<span class="nc" id="L2141">        int successfulAlterations = 0, totalAlterations = 0;</span>
+<span class="nc bnc" id="L2142" title="All 2 branches missed.">        for (ReassignableTopic topic : request.topics()) {</span>
+<span class="nc" id="L2143">            ReassignableTopicResponse topicResponse = new ReassignableTopicResponse().</span>
+<span class="nc" id="L2144">                setName(topic.name());</span>
+<span class="nc bnc" id="L2145" title="All 2 branches missed.">            for (ReassignablePartition partition : topic.partitions()) {</span>
+<span class="nc" id="L2146">                ApiError error = ApiError.NONE;</span>
+                try {
+<span class="nc" id="L2148">                    alterPartitionReassignment(topic.name(), partition, records, allowRFChange);</span>
+<span class="nc" id="L2149">                    successfulAlterations++;</span>
+<span class="nc" id="L2150">                } catch (Throwable e) {</span>
+<span class="nc" id="L2151">                    log.info(&quot;Unable to alter partition reassignment for {}:{} because of an {} error: {}&quot;,</span>
+<span class="nc" id="L2152">                            topic.name(), partition.partitionIndex(), e.getClass().getSimpleName(), e.getMessage());</span>
+<span class="nc" id="L2153">                    error = ApiError.fromThrowable(e);</span>
+<span class="nc" id="L2154">                }</span>
+<span class="nc" id="L2155">                totalAlterations++;</span>
+<span class="nc" id="L2156">                topicResponse.partitions().add(new ReassignablePartitionResponse().</span>
+<span class="nc" id="L2157">                    setPartitionIndex(partition.partitionIndex()).</span>
+<span class="nc" id="L2158">                    setErrorCode(error.error().code()).</span>
+<span class="nc" id="L2159">                    setErrorMessage(error.message()));</span>
+<span class="nc" id="L2160">            }</span>
+<span class="nc" id="L2161">            result.responses().add(topicResponse);</span>
+<span class="nc" id="L2162">        }</span>
+<span class="nc" id="L2163">        log.info(&quot;Successfully altered {} out of {} partition reassignment(s).&quot;,</span>
+<span class="nc" id="L2164">            successfulAlterations, totalAlterations);</span>
+<span class="nc" id="L2165">        return ControllerResult.atomicOf(records, result);</span>
+    }
+
+    void alterPartitionReassignment(String topicName,
+                                    ReassignablePartition target,
+                                    List&lt;ApiMessageAndVersion&gt; records,
+                                    boolean allowRFChange) {
+<span class="nc" id="L2172">        Uuid topicId = topicsByName.get(topicName);</span>
+<span class="nc bnc" id="L2173" title="All 2 branches missed.">        if (topicId == null) {</span>
+<span class="nc" id="L2174">            throw new UnknownTopicOrPartitionException(&quot;Unable to find a topic &quot; +</span>
+                &quot;named &quot; + topicName + &quot;.&quot;);
+        }
+<span class="nc" id="L2177">        TopicControlInfo topicInfo = topics.get(topicId);</span>
+<span class="nc bnc" id="L2178" title="All 2 branches missed.">        if (topicInfo == null) {</span>
+<span class="nc" id="L2179">            throw new UnknownTopicOrPartitionException(&quot;Unable to find a topic &quot; +</span>
+                &quot;with ID &quot; + topicId + &quot;.&quot;);
+        }
+<span class="nc" id="L2182">        TopicIdPartition tp = new TopicIdPartition(topicId, target.partitionIndex());</span>
+<span class="nc" id="L2183">        PartitionRegistration part = topicInfo.parts.get(target.partitionIndex());</span>
+<span class="nc bnc" id="L2184" title="All 2 branches missed.">        if (part == null) {</span>
+<span class="nc" id="L2185">            throw new UnknownTopicOrPartitionException(&quot;Unable to find partition &quot; +</span>
+<span class="nc" id="L2186">                topicName + &quot;:&quot; + target.partitionIndex() + &quot;.&quot;);</span>
+        }
+        Optional&lt;ApiMessageAndVersion&gt; record;
+<span class="nc bnc" id="L2189" title="All 2 branches missed.">        if (target.replicas() == null) {</span>
+<span class="nc" id="L2190">            record = cancelPartitionReassignment(topicName, tp, part);</span>
+        } else {
+<span class="nc" id="L2192">            record = changePartitionReassignment(tp, part, target, allowRFChange);</span>
+        }
+<span class="nc" id="L2194">        record.ifPresent(records::add);</span>
+<span class="nc" id="L2195">    }</span>
+
+    Optional&lt;ApiMessageAndVersion&gt; cancelPartitionReassignment(String topicName,
+                                                               TopicIdPartition tp,
+                                                               PartitionRegistration part) {
+<span class="nc bnc" id="L2200" title="All 2 branches missed.">        if (!isReassignmentInProgress(part)) {</span>
+<span class="nc" id="L2201">            throw new NoReassignmentInProgressException(NO_REASSIGNMENT_IN_PROGRESS.message());</span>
+        }
+<span class="nc" id="L2203">        PartitionReassignmentRevert revert = new PartitionReassignmentRevert(part);</span>
+<span class="nc bnc" id="L2204" title="All 2 branches missed.">        if (revert.unclean()) {</span>
+<span class="nc bnc" id="L2205" title="All 2 branches missed.">            if (!configurationControl.uncleanLeaderElectionEnabledForTopic(topicName)) {</span>
+<span class="nc" id="L2206">                throw new InvalidReplicaAssignmentException(&quot;Unable to revert partition &quot; +</span>
+<span class="nc" id="L2207">                    &quot;assignment for &quot; + topicName + &quot;:&quot; + tp.partitionId() + &quot; because &quot; +</span>
+                    &quot;it would require an unclean leader election.&quot;);
+            }
+        }
+<span class="nc" id="L2211">        PartitionChangeBuilder builder = new PartitionChangeBuilder(</span>
+            part,
+<span class="nc" id="L2213">            tp.topicId(),</span>
+<span class="nc" id="L2214">            tp.partitionId(),</span>
+            new LeaderAcceptor(clusterControl, part),
+<span class="nc" id="L2216">            featureControl.metadataVersionOrThrow(),</span>
+<span class="nc" id="L2217">            getTopicEffectiveMinIsr(topicName),</span>
+<span class="nc" id="L2218">            featureControl.isElrFeatureEnabled()</span>
+        );
+<span class="nc bnc" id="L2220" title="All 2 branches missed.">        if (configurationControl.uncleanLeaderElectionEnabledForTopic(topicName)) {</span>
+<span class="nc" id="L2221">            builder.setElection(PartitionChangeBuilder.Election.UNCLEAN);</span>
+        }
+<span class="nc" id="L2223">        return builder</span>
+<span class="nc" id="L2224">            .setTargetIsr(revert.isr()).</span>
+<span class="nc" id="L2225">            setTargetReplicas(revert.replicas()).</span>
+<span class="nc" id="L2226">            setTargetRemoving(List.of()).</span>
+<span class="nc" id="L2227">            setTargetAdding(List.of()).</span>
+<span class="nc" id="L2228">            setDefaultDirProvider(clusterDescriber).</span>
+<span class="nc" id="L2229">            build();</span>
+    }
+
+    /**
+     * Apply a given partition reassignment. In general a partition reassignment goes
+     * through several stages:
+     *
+     * 1. Issue a PartitionChangeRecord adding all the new replicas to the partition's
+     * main replica list, and setting removingReplicas and addingReplicas.
+     *
+     * 2. Wait for the partition to have an ISR that contains all the new replicas. Or
+     * if there are no new replicas, wait until we have an ISR that contains at least one
+     * replica that we are not removing.
+     *
+     * 3. Issue a second PartitionChangeRecord removing all removingReplicas from the
+     * partitions' main replica list, and clearing removingReplicas and addingReplicas.
+     *
+     * After stage 3, the reassignment is done.
+     *
+     * Under some conditions, steps #1 and #2 can be skipped entirely since the ISR is
+     * already suitable to progress to stage #3. For example, a partition reassignment
+     * that merely rearranges existing replicas in the list can bypass step #1 and #2 and
+     * complete immediately.
+     *
+     * @param tp                The topic id and partition id.
+     * @param part              The existing partition info.
+     * @param target            The target partition info.
+     * @param allowRFChange     Validate if partition replication factor can change. KIP-860
+     *
+     * @return                  The ChangePartitionRecord for the new partition assignment,
+     *                          or empty if no change is needed.
+     */
+    Optional&lt;ApiMessageAndVersion&gt; changePartitionReassignment(TopicIdPartition tp,
+                                                               PartitionRegistration part,
+                                                               ReassignablePartition target,
+                                                               boolean allowRFChange) {
+        // Check that the requested partition assignment is valid.
+<span class="nc" id="L2266">        PartitionAssignment currentAssignment = new PartitionAssignment(Replicas.toList(part.replicas), part::directory);</span>
+<span class="nc" id="L2267">        PartitionAssignment targetAssignment = new PartitionAssignment(target.replicas(), clusterDescriber);</span>
+
+<span class="nc" id="L2269">        validateManualPartitionAssignment(targetAssignment, OptionalInt.empty());</span>
+<span class="nc bnc" id="L2270" title="All 2 branches missed.">        if (!allowRFChange) {</span>
+<span class="nc" id="L2271">            validatePartitionReplicationFactorUnchanged(part, target);</span>
+        }
+
+<span class="nc" id="L2274">        List&lt;Integer&gt; currentReplicas = Replicas.toList(part.replicas);</span>
+<span class="nc" id="L2275">        PartitionReassignmentReplicas reassignment =</span>
+            new PartitionReassignmentReplicas(currentAssignment, targetAssignment);
+<span class="nc" id="L2277">        PartitionChangeBuilder builder = new PartitionChangeBuilder(</span>
+            part,
+<span class="nc" id="L2279">            tp.topicId(),</span>
+<span class="nc" id="L2280">            tp.partitionId(),</span>
+            new LeaderAcceptor(clusterControl, part),
+<span class="nc" id="L2282">            featureControl.metadataVersionOrThrow(),</span>
+<span class="nc" id="L2283">            getTopicEffectiveMinIsr(topics.get(tp.topicId()).name),</span>
+<span class="nc" id="L2284">            featureControl.isElrFeatureEnabled()</span>
+        );
+<span class="nc bnc" id="L2286" title="All 2 branches missed.">        if (!reassignment.replicas().equals(currentReplicas)) {</span>
+<span class="nc" id="L2287">            builder.setTargetReplicas(reassignment.replicas());</span>
+        }
+<span class="nc bnc" id="L2289" title="All 2 branches missed.">        if (!reassignment.removing().isEmpty()) {</span>
+<span class="nc" id="L2290">            builder.setTargetRemoving(reassignment.removing());</span>
+        }
+<span class="nc bnc" id="L2292" title="All 2 branches missed.">        if (!reassignment.adding().isEmpty()) {</span>
+<span class="nc" id="L2293">            builder.setTargetAdding(reassignment.adding());</span>
+        }
+<span class="nc" id="L2295">        return builder.setDefaultDirProvider(clusterDescriber).build();</span>
+    }
+
+    ListPartitionReassignmentsResponseData listPartitionReassignments(
+        List&lt;ListPartitionReassignmentsTopics&gt; topicList,
+        long epoch
+    ) {
+<span class="nc" id="L2302">        ListPartitionReassignmentsResponseData response =</span>
+<span class="nc" id="L2303">            new ListPartitionReassignmentsResponseData().setErrorMessage(null);</span>
+<span class="nc bnc" id="L2304" title="All 2 branches missed.">        if (topicList == null) {</span>
+            // List all reassigning topics.
+<span class="nc bnc" id="L2306" title="All 2 branches missed.">            for (Entry&lt;Uuid, int[]&gt; entry : reassigningTopics.entrySet(epoch)) {</span>
+<span class="nc" id="L2307">                listReassigningTopic(response, entry.getKey(), Replicas.toList(entry.getValue()));</span>
+<span class="nc" id="L2308">            }</span>
+        } else {
+            // List the given topics.
+<span class="nc bnc" id="L2311" title="All 2 branches missed.">            for (ListPartitionReassignmentsTopics topic : topicList) {</span>
+<span class="nc" id="L2312">                Uuid topicId = topicsByName.get(topic.name(), epoch);</span>
+<span class="nc bnc" id="L2313" title="All 2 branches missed.">                if (topicId != null) {</span>
+<span class="nc" id="L2314">                    listReassigningTopic(response, topicId, topic.partitionIndexes());</span>
+                }
+<span class="nc" id="L2316">            }</span>
+        }
+<span class="nc" id="L2318">        return response;</span>
+    }
+
+    ControllerResult&lt;AssignReplicasToDirsResponseData&gt; handleAssignReplicasToDirs(AssignReplicasToDirsRequestData request) {
+<span class="nc bnc" id="L2322" title="All 2 branches missed.">        if (!featureControl.metadataVersionOrThrow().isDirectoryAssignmentSupported()) {</span>
+<span class="nc" id="L2323">            throw new UnsupportedVersionException(&quot;Directory assignment is not supported yet.&quot;);</span>
+        }
+<span class="nc" id="L2325">        int brokerId = request.brokerId();</span>
+<span class="nc" id="L2326">        clusterControl.checkBrokerEpoch(brokerId, request.brokerEpoch());</span>
+<span class="nc" id="L2327">        BrokerRegistration brokerRegistration = clusterControl.brokerRegistrations().get(brokerId);</span>
+<span class="nc bnc" id="L2328" title="All 2 branches missed.">        if (brokerRegistration == null) {</span>
+<span class="nc" id="L2329">            throw new BrokerIdNotRegisteredException(&quot;Broker ID &quot; + brokerId + &quot; is not currently registered&quot;);</span>
+        }
+<span class="nc" id="L2331">        List&lt;ApiMessageAndVersion&gt; records = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L2332">        AssignReplicasToDirsResponseData response = new AssignReplicasToDirsResponseData();</span>
+<span class="nc" id="L2333">        Set&lt;TopicIdPartition&gt; leaderAndIsrUpdates = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L2334" title="All 2 branches missed.">        for (AssignReplicasToDirsRequestData.DirectoryData reqDir : request.directories()) {</span>
+<span class="nc" id="L2335">            Uuid dirId = reqDir.id();</span>
+<span class="nc bnc" id="L2336" title="All 2 branches missed.">            boolean directoryIsOffline = !brokerRegistration.hasOnlineDir(dirId);</span>
+<span class="nc" id="L2337">            AssignReplicasToDirsResponseData.DirectoryData resDir = new AssignReplicasToDirsResponseData.DirectoryData().setId(dirId);</span>
+<span class="nc bnc" id="L2338" title="All 2 branches missed.">            for (AssignReplicasToDirsRequestData.TopicData reqTopic : reqDir.topics()) {</span>
+<span class="nc" id="L2339">                Uuid topicId = reqTopic.topicId();</span>
+<span class="nc" id="L2340">                Errors topicError = Errors.NONE;</span>
+<span class="nc" id="L2341">                TopicControlInfo topicInfo = this.topics.get(topicId);</span>
+<span class="nc bnc" id="L2342" title="All 2 branches missed.">                if (topicInfo == null) {</span>
+<span class="nc" id="L2343">                    log.warn(&quot;AssignReplicasToDirsRequest from broker {} references unknown topic ID {}&quot;, brokerId, topicId);</span>
+<span class="nc" id="L2344">                    topicError = Errors.UNKNOWN_TOPIC_ID;</span>
+                }
+<span class="nc" id="L2346">                AssignReplicasToDirsResponseData.TopicData resTopic = new AssignReplicasToDirsResponseData.TopicData().setTopicId(topicId);</span>
+<span class="nc bnc" id="L2347" title="All 2 branches missed.">                for (AssignReplicasToDirsRequestData.PartitionData reqPartition : reqTopic.partitions()) {</span>
+<span class="nc" id="L2348">                    int partitionIndex = reqPartition.partitionIndex();</span>
+<span class="nc" id="L2349">                    Errors partitionError = topicError;</span>
+<span class="nc bnc" id="L2350" title="All 2 branches missed.">                    if (topicError == Errors.NONE) {</span>
+<span class="nc" id="L2351">                        String topicName = topicInfo.name;</span>
+<span class="nc" id="L2352">                        PartitionRegistration partitionRegistration = topicInfo.parts.get(partitionIndex);</span>
+<span class="nc bnc" id="L2353" title="All 2 branches missed.">                        if (partitionRegistration == null) {</span>
+<span class="nc" id="L2354">                            log.warn(&quot;AssignReplicasToDirsRequest from broker {} references unknown partition {}-{}&quot;, brokerId, topicName, partitionIndex);</span>
+<span class="nc" id="L2355">                            partitionError = Errors.UNKNOWN_TOPIC_OR_PARTITION;</span>
+<span class="nc bnc" id="L2356" title="All 2 branches missed.">                        } else if (!Replicas.contains(partitionRegistration.replicas, brokerId)) {</span>
+<span class="nc" id="L2357">                            log.warn(&quot;AssignReplicasToDirsRequest from broker {} references non assigned partition {}-{}&quot;, brokerId, topicName, partitionIndex);</span>
+<span class="nc" id="L2358">                            partitionError = Errors.NOT_LEADER_OR_FOLLOWER;</span>
+                        } else {
+<span class="nc" id="L2360">                            Optional&lt;ApiMessageAndVersion&gt; partitionChangeRecord = new PartitionChangeBuilder(</span>
+                                    partitionRegistration,
+                                    topicId,
+                                    partitionIndex,
+                                    new LeaderAcceptor(clusterControl, partitionRegistration),
+<span class="nc" id="L2365">                                    featureControl.metadataVersionOrThrow(),</span>
+<span class="nc" id="L2366">                                    getTopicEffectiveMinIsr(topicName),</span>
+<span class="nc" id="L2367">                                    featureControl.isElrFeatureEnabled()</span>
+                            )
+<span class="nc" id="L2369">                                    .setDirectory(brokerId, dirId)</span>
+<span class="nc" id="L2370">                                    .setDefaultDirProvider(clusterDescriber)</span>
+<span class="nc" id="L2371">                                    .build();</span>
+<span class="nc" id="L2372">                            partitionChangeRecord.ifPresent(records::add);</span>
+<span class="nc bnc" id="L2373" title="All 2 branches missed.">                            if (directoryIsOffline) {</span>
+<span class="nc" id="L2374">                                leaderAndIsrUpdates.add(new TopicIdPartition(topicId, partitionIndex));</span>
+                            }
+<span class="nc bnc" id="L2376" title="All 2 branches missed.">                            if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L2377">                                log.debug(&quot;Broker {} assigned partition {}:{} to {} dir {}&quot;,</span>
+<span class="nc" id="L2378">                                    brokerId, topics.get(topicId).name(), partitionIndex,</span>
+<span class="nc bnc" id="L2379" title="All 2 branches missed.">                                    directoryIsOffline ? &quot;OFFLINE&quot; : &quot;ONLINE&quot;, dirId);</span>
+                            }
+                        }
+                    }
+<span class="nc" id="L2383">                    resTopic.partitions().add(new AssignReplicasToDirsResponseData.PartitionData().</span>
+<span class="nc" id="L2384">                            setPartitionIndex(partitionIndex).</span>
+<span class="nc" id="L2385">                            setErrorCode(partitionError.code()));</span>
+<span class="nc" id="L2386">                }</span>
+<span class="nc" id="L2387">                resDir.topics().add(resTopic);</span>
+<span class="nc" id="L2388">            }</span>
+<span class="nc" id="L2389">            response.directories().add(resDir);</span>
+<span class="nc" id="L2390">        }</span>
+<span class="nc bnc" id="L2391" title="All 2 branches missed.">        if (!leaderAndIsrUpdates.isEmpty()) {</span>
+<span class="nc" id="L2392">            generateLeaderAndIsrUpdates(&quot;offline-dir-assignment&quot;, brokerId, NO_LEADER, NO_LEADER, records, leaderAndIsrUpdates.iterator());</span>
+        }
+<span class="nc" id="L2394">        return ControllerResult.of(records, response);</span>
+    }
+
+    private void listReassigningTopic(ListPartitionReassignmentsResponseData response,
+                                      Uuid topicId,
+                                      List&lt;Integer&gt; partitionIds) {
+<span class="nc" id="L2400">        TopicControlInfo topicInfo = topics.get(topicId);</span>
+<span class="nc bnc" id="L2401" title="All 2 branches missed.">        if (topicInfo == null) return;</span>
+<span class="nc" id="L2402">        OngoingTopicReassignment ongoingTopic = new OngoingTopicReassignment().</span>
+<span class="nc" id="L2403">            setName(topicInfo.name);</span>
+<span class="nc bnc" id="L2404" title="All 2 branches missed.">        for (int partitionId : partitionIds) {</span>
+<span class="nc" id="L2405">            Optional&lt;OngoingPartitionReassignment&gt; ongoing =</span>
+<span class="nc" id="L2406">                getOngoingPartitionReassignment(topicInfo, partitionId);</span>
+<span class="nc" id="L2407">            ongoing.ifPresent(ongoingPartitionReassignment -&gt; ongoingTopic.partitions().add(ongoingPartitionReassignment));</span>
+<span class="nc" id="L2408">        }</span>
+<span class="nc bnc" id="L2409" title="All 2 branches missed.">        if (!ongoingTopic.partitions().isEmpty()) {</span>
+<span class="nc" id="L2410">            response.topics().add(ongoingTopic);</span>
+        }
+<span class="nc" id="L2412">    }</span>
+
+    private Optional&lt;OngoingPartitionReassignment&gt;
+            getOngoingPartitionReassignment(TopicControlInfo topicInfo, int partitionId) {
+<span class="nc" id="L2416">        PartitionRegistration partition = topicInfo.parts.get(partitionId);</span>
+<span class="nc bnc" id="L2417" title="All 4 branches missed.">        if (partition == null || !isReassignmentInProgress(partition)) {</span>
+<span class="nc" id="L2418">            return Optional.empty();</span>
+        }
+<span class="nc" id="L2420">        return Optional.of(new OngoingPartitionReassignment().</span>
+<span class="nc" id="L2421">            setAddingReplicas(Replicas.toList(partition.addingReplicas)).</span>
+<span class="nc" id="L2422">            setRemovingReplicas(Replicas.toList(partition.removingReplicas)).</span>
+<span class="nc" id="L2423">            setPartitionIndex(partitionId).</span>
+<span class="nc" id="L2424">            setReplicas(Replicas.toList(partition.replicas)));</span>
+    }
+
+    // Visible to test.
+    int getTopicEffectiveMinIsr(String topicName) {
+<span class="fc" id="L2429">        String minIsrConfig = configurationControl.getTopicConfig(topicName, MIN_IN_SYNC_REPLICAS_CONFIG).value();</span>
+<span class="fc" id="L2430">        int currentMinIsr = Integer.parseInt(minIsrConfig);</span>
+<span class="fc" id="L2431">        Uuid topicId = topicsByName.get(topicName);</span>
+<span class="fc" id="L2432">        int replicationFactor = topics.get(topicId).parts.get(0).replicas.length;</span>
+<span class="fc" id="L2433">        return Math.min(currentMinIsr, replicationFactor);</span>
+    }
+
+    /**
+     * Updates the directory to partition mapping for a single partition.
+     * Assignments to reserved directory IDs are ignored, since they cannot
+     * be used for directories, there's no use in maintaining a set of
+     * partitions assigned to them.
+     */
+    private void updatePartitionDirectories(
+        Uuid topicId,
+        int partitionId,
+        Uuid[] previousDirectoryIds,
+        Uuid[] newDirectoryIds
+    ) {
+<span class="fc" id="L2448">        Objects.requireNonNull(topicId, &quot;topicId cannot be null&quot;);</span>
+<span class="fc" id="L2449">        TopicIdPartition topicIdPartition = new TopicIdPartition(topicId, partitionId);</span>
+<span class="fc bfc" id="L2450" title="All 2 branches covered.">        if (previousDirectoryIds != null) {</span>
+<span class="fc bfc" id="L2451" title="All 2 branches covered.">            for (Uuid dir : previousDirectoryIds) {</span>
+<span class="pc bpc" id="L2452" title="1 of 2 branches missed.">                if (!DirectoryId.reserved(dir)) {</span>
+<span class="fc" id="L2453">                    TimelineHashSet&lt;TopicIdPartition&gt; partitions = directoriesToPartitions.get(dir);</span>
+<span class="pc bpc" id="L2454" title="1 of 2 branches missed.">                    if (partitions != null) {</span>
+<span class="fc" id="L2455">                        partitions.remove(topicIdPartition);</span>
+<span class="pc bpc" id="L2456" title="1 of 2 branches missed.">                        if (partitions.isEmpty()) {</span>
+<span class="nc" id="L2457">                            directoriesToPartitions.remove(dir);</span>
+                        }
+                    }
+                }
+            }
+        }
+<span class="fc bfc" id="L2463" title="All 2 branches covered.">        if (newDirectoryIds != null) {</span>
+<span class="fc bfc" id="L2464" title="All 2 branches covered.">            for (Uuid dir : newDirectoryIds) {</span>
+<span class="pc bpc" id="L2465" title="1 of 2 branches missed.">                if (!DirectoryId.reserved(dir)) {</span>
+<span class="fc" id="L2466">                    Set&lt;TopicIdPartition&gt; partitions = directoriesToPartitions.computeIfAbsent(dir,</span>
+<span class="fc" id="L2467">                        __ -&gt; new TimelineHashSet&lt;&gt;(snapshotRegistry, 0));</span>
+<span class="fc" id="L2468">                    partitions.add(topicIdPartition);</span>
+                }
+            }
+        }
+<span class="fc" id="L2472">    }</span>
+
+    private void updatePartitionInfo(
+        Uuid topicId,
+        Integer partitionId,
+        PartitionRegistration prevPartInfo,
+        PartitionRegistration newPartInfo
+    ) {
+<span class="fc" id="L2480">        HashSet&lt;Integer&gt; validationSet = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L2481">        Arrays.stream(newPartInfo.isr).forEach(validationSet::add);</span>
+<span class="fc" id="L2482">        Arrays.stream(newPartInfo.elr).forEach(validationSet::add);</span>
+<span class="pc bpc" id="L2483" title="1 of 2 branches missed.">        if (validationSet.size() != newPartInfo.isr.length + newPartInfo.elr.length) {</span>
+<span class="nc" id="L2484">            log.error(&quot;{}-{} has overlapping ISR={} and ELR={}&quot;, topics.get(topicId).name, partitionId,</span>
+<span class="nc" id="L2485">                Arrays.toString(newPartInfo.isr), Arrays.toString(newPartInfo.elr));</span>
+        }
+<span class="fc bfc" id="L2487" title="All 2 branches covered.">        brokersToIsrs.update(topicId, partitionId, prevPartInfo == null ? null : prevPartInfo.isr,</span>
+<span class="fc bfc" id="L2488" title="All 2 branches covered.">            newPartInfo.isr, prevPartInfo == null ? NO_LEADER : prevPartInfo.leader, newPartInfo.leader);</span>
+<span class="fc bfc" id="L2489" title="All 2 branches covered.">        brokersToElrs.update(topicId, partitionId, prevPartInfo == null ? null : prevPartInfo.elr,</span>
+            newPartInfo.elr);
+<span class="fc" id="L2491">    }</span>
+
+    private void validatePartitionReplicationFactorUnchanged(PartitionRegistration part,
+                                                             ReassignablePartition target) {
+        int currentReassignmentSetSize;
+<span class="nc bnc" id="L2496" title="All 2 branches missed.">        if (isReassignmentInProgress(part)) {</span>
+<span class="nc" id="L2497">            Set&lt;Integer&gt; set = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L2498" title="All 2 branches missed.">            for (int r : part.replicas) {</span>
+<span class="nc" id="L2499">                set.add(r);</span>
+            }
+<span class="nc bnc" id="L2501" title="All 2 branches missed.">            for (int r : part.addingReplicas) {</span>
+<span class="nc" id="L2502">                set.add(r);</span>
+            }
+<span class="nc bnc" id="L2504" title="All 2 branches missed.">            for (int r : part.removingReplicas) {</span>
+<span class="nc" id="L2505">                set.remove(r);</span>
+            }
+<span class="nc" id="L2507">            currentReassignmentSetSize = set.size();</span>
+<span class="nc" id="L2508">        } else {</span>
+<span class="nc" id="L2509">            currentReassignmentSetSize = part.replicas.length;</span>
+        }
+<span class="nc bnc" id="L2511" title="All 2 branches missed.">        if (currentReassignmentSetSize != target.replicas().size()) {</span>
+<span class="nc" id="L2512">            throw new InvalidReplicationFactorException(&quot;The replication factor is changed from &quot; +</span>
+<span class="nc" id="L2513">                    currentReassignmentSetSize + &quot; to &quot; + target.replicas().size());</span>
+        }
+<span class="nc" id="L2515">    }</span>
+
+<span class="nc" id="L2517">    private record IneligibleReplica(int replicaId, String reason) {</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L2521">            return replicaId + &quot; (&quot; + reason + &quot;)&quot;;</span>
+        }
+    }
+
+    private static final class LeaderAcceptor implements IntPredicate {
+        private final ClusterControlManager clusterControl;
+        private final PartitionRegistration partition;
+        private final IntPredicate isAcceptableLeader;
+
+        private LeaderAcceptor(ClusterControlManager clusterControl, PartitionRegistration partition) {
+<span class="nc" id="L2531">            this(clusterControl, partition, clusterControl::isActive);</span>
+<span class="nc" id="L2532">        }</span>
+
+<span class="fc" id="L2534">        private LeaderAcceptor(ClusterControlManager clusterControl, PartitionRegistration partition, IntPredicate isAcceptableLeader) {</span>
+<span class="fc" id="L2535">            this.clusterControl = clusterControl;</span>
+<span class="fc" id="L2536">            this.partition = partition;</span>
+<span class="fc" id="L2537">            this.isAcceptableLeader = isAcceptableLeader;</span>
+<span class="fc" id="L2538">        }</span>
+
+        @Override
+        public boolean test(int brokerId) {
+<span class="fc bfc" id="L2542" title="All 2 branches covered.">            if (!isAcceptableLeader.test(brokerId)) {</span>
+<span class="fc" id="L2543">                return false;</span>
+            }
+<span class="fc" id="L2545">            Uuid replicaDirectory = partition.directory(brokerId);</span>
+<span class="fc" id="L2546">            return clusterControl.hasOnlineDir(brokerId, replicaDirectory);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,767 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConfigurationControlManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.controller</a> &gt; <span class="el_source">ConfigurationControlManager.java</span></div><h1>ConfigurationControlManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.controller;
+
+import org.apache.kafka.clients.admin.AlterConfigOp.OpType;
+import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.clients.admin.FeatureUpdate;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.config.ConfigResource;
+import org.apache.kafka.common.config.ConfigResource.Type;
+import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.config.types.Password;
+import org.apache.kafka.common.metadata.ClearElrRecord;
+import org.apache.kafka.common.metadata.ConfigRecord;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.ApiError;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.metadata.KafkaConfigSchema;
+import org.apache.kafka.metadata.SupportedConfigChecker;
+import org.apache.kafka.server.common.ApiMessageAndVersion;
+import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
+import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.mutable.BoundedList;
+import org.apache.kafka.server.policy.AlterConfigPolicy;
+import org.apache.kafka.server.policy.AlterConfigPolicy.RequestMetadata;
+import org.apache.kafka.timeline.SnapshotRegistry;
+import org.apache.kafka.timeline.TimelineHashMap;
+import org.apache.kafka.timeline.TimelineHashSet;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Consumer;
+
+import static org.apache.kafka.clients.admin.AlterConfigOp.OpType.APPEND;
+import static org.apache.kafka.common.config.ConfigResource.Type.BROKER;
+import static org.apache.kafka.common.config.TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG;
+import static org.apache.kafka.common.config.TopicConfig.UNCLEAN_LEADER_ELECTION_ENABLE_CONFIG;
+import static org.apache.kafka.common.metadata.MetadataRecordType.CONFIG_RECORD;
+import static org.apache.kafka.common.protocol.Errors.INVALID_CONFIG;
+import static org.apache.kafka.controller.QuorumController.MAX_RECORDS_PER_USER_OP;
+import static org.apache.kafka.server.config.ServerLogConfigs.CORDONED_LOG_DIRS_CONFIG;
+
+
+public class ConfigurationControlManager {
+<span class="fc" id="L69">    public static final ConfigResource DEFAULT_NODE = new ConfigResource(Type.BROKER, &quot;&quot;);</span>
+
+    private final Logger log;
+    private final SnapshotRegistry snapshotRegistry;
+    private final KafkaConfigSchema configSchema;
+    private final Consumer&lt;ConfigResource&gt; existenceChecker;
+    private final Optional&lt;AlterConfigPolicy&gt; alterConfigPolicy;
+    private final ConfigurationValidator validator;
+    private final TimelineHashMap&lt;ConfigResource, TimelineHashMap&lt;String, String&gt;&gt; configData;
+    private final TimelineHashSet&lt;Integer&gt; brokersWithConfigs;
+    private final Map&lt;String, Object&gt; staticConfig;
+    private final ConfigResource currentController;
+    private final FeatureControlManager featureControl;
+    private final SupportedConfigChecker supportedConfigChecker;
+
+<span class="fc" id="L84">    static class Builder {</span>
+<span class="fc" id="L85">        private LogContext logContext = null;</span>
+<span class="fc" id="L86">        private SnapshotRegistry snapshotRegistry = null;</span>
+<span class="fc" id="L87">        private KafkaConfigSchema configSchema = null;</span>
+<span class="pc" id="L88">        private Consumer&lt;ConfigResource&gt; existenceChecker = __ -&gt; { };</span>
+<span class="fc" id="L89">        private Optional&lt;AlterConfigPolicy&gt; alterConfigPolicy = Optional.empty();</span>
+<span class="fc" id="L90">        private ConfigurationValidator validator = ConfigurationValidator.NO_OP;</span>
+<span class="fc" id="L91">        private Map&lt;String, Object&gt; staticConfig = Map.of();</span>
+<span class="fc" id="L92">        private int nodeId = 0;</span>
+<span class="fc" id="L93">        private FeatureControlManager featureControl = null;</span>
+<span class="fc" id="L94">        private SupportedConfigChecker supportedConfigChecker = SupportedConfigChecker.TRUE;</span>
+
+        Builder setLogContext(LogContext logContext) {
+<span class="fc" id="L97">            this.logContext = logContext;</span>
+<span class="fc" id="L98">            return this;</span>
+        }
+
+        Builder setSnapshotRegistry(SnapshotRegistry snapshotRegistry) {
+<span class="fc" id="L102">            this.snapshotRegistry = snapshotRegistry;</span>
+<span class="fc" id="L103">            return this;</span>
+        }
+
+        Builder setKafkaConfigSchema(KafkaConfigSchema configSchema) {
+<span class="fc" id="L107">            this.configSchema = configSchema;</span>
+<span class="fc" id="L108">            return this;</span>
+        }
+
+        Builder setExistenceChecker(Consumer&lt;ConfigResource&gt; existenceChecker) {
+<span class="fc" id="L112">            this.existenceChecker = existenceChecker;</span>
+<span class="fc" id="L113">            return this;</span>
+        }
+
+        Builder setAlterConfigPolicy(Optional&lt;AlterConfigPolicy&gt; alterConfigPolicy) {
+<span class="fc" id="L117">            this.alterConfigPolicy = alterConfigPolicy;</span>
+<span class="fc" id="L118">            return this;</span>
+        }
+
+        Builder setValidator(ConfigurationValidator validator) {
+<span class="fc" id="L122">            this.validator = validator;</span>
+<span class="fc" id="L123">            return this;</span>
+        }
+
+        Builder setStaticConfig(Map&lt;String, Object&gt; staticConfig) {
+<span class="fc" id="L127">            this.staticConfig = staticConfig;</span>
+<span class="fc" id="L128">            return this;</span>
+        }
+
+        Builder setNodeId(int nodeId) {
+<span class="fc" id="L132">            this.nodeId = nodeId;</span>
+<span class="fc" id="L133">            return this;</span>
+        }
+
+        Builder setFeatureControl(FeatureControlManager featureControl) {
+<span class="fc" id="L137">            this.featureControl = featureControl;</span>
+<span class="fc" id="L138">            return this;</span>
+        }
+
+        Builder setSupportedConfigChecker(SupportedConfigChecker supportedConfigChecker) {
+<span class="fc" id="L142">            this.supportedConfigChecker = supportedConfigChecker;</span>
+<span class="fc" id="L143">            return this;</span>
+        }
+
+        ConfigurationControlManager build() {
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">            if (logContext == null) logContext = new LogContext();</span>
+<span class="pc bpc" id="L148" title="1 of 2 branches missed.">            if (snapshotRegistry == null) snapshotRegistry = new SnapshotRegistry(logContext);</span>
+<span class="pc bpc" id="L149" title="1 of 2 branches missed.">            if (configSchema == null) {</span>
+<span class="nc" id="L150">                throw new RuntimeException(&quot;You must set the configSchema.&quot;);</span>
+            }
+<span class="pc bpc" id="L152" title="1 of 2 branches missed.">            if (featureControl == null) {</span>
+<span class="nc" id="L153">                featureControl = new FeatureControlManager.Builder().build();</span>
+            }
+<span class="fc" id="L155">            return new ConfigurationControlManager(</span>
+                logContext,
+                snapshotRegistry,
+                configSchema,
+                existenceChecker,
+                alterConfigPolicy,
+                validator,
+                staticConfig,
+                nodeId,
+                featureControl,
+                supportedConfigChecker);
+        }
+    }
+
+    private ConfigurationControlManager(LogContext logContext,
+            SnapshotRegistry snapshotRegistry,
+            KafkaConfigSchema configSchema,
+            Consumer&lt;ConfigResource&gt; existenceChecker,
+            Optional&lt;AlterConfigPolicy&gt; alterConfigPolicy,
+            ConfigurationValidator validator,
+            Map&lt;String, Object&gt; staticConfig,
+            int nodeId,
+            FeatureControlManager featureControl,
+            SupportedConfigChecker supportedConfigChecker
+<span class="fc" id="L179">    ) {</span>
+<span class="fc" id="L180">        this.log = logContext.logger(ConfigurationControlManager.class);</span>
+<span class="fc" id="L181">        this.snapshotRegistry = snapshotRegistry;</span>
+<span class="fc" id="L182">        this.configSchema = configSchema;</span>
+<span class="fc" id="L183">        this.existenceChecker = existenceChecker;</span>
+<span class="fc" id="L184">        this.alterConfigPolicy = alterConfigPolicy;</span>
+<span class="fc" id="L185">        this.validator = validator;</span>
+<span class="fc" id="L186">        this.configData = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L187">        this.brokersWithConfigs = new TimelineHashSet&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L188">        this.staticConfig = Map.copyOf(staticConfig);</span>
+<span class="fc" id="L189">        this.currentController = new ConfigResource(Type.BROKER, Integer.toString(nodeId));</span>
+<span class="fc" id="L190">        this.featureControl = featureControl;</span>
+<span class="fc" id="L191">        this.supportedConfigChecker = supportedConfigChecker;</span>
+<span class="fc" id="L192">    }</span>
+
+    SnapshotRegistry snapshotRegistry() {
+<span class="nc" id="L195">        return snapshotRegistry;</span>
+    }
+
+    /**
+     * Determine the result of applying a batch of incremental configuration changes.  Note
+     * that this method does not change the contents of memory.  It just generates a
+     * result, that you can replay later if you wish using replay().
+     *
+     * Note that there can only be one result per ConfigResource.  So if you try to modify
+     * several keys and one modification fails, the whole ConfigKey fails and nothing gets
+     * changed.
+     *
+     * @param configChanges     Maps each resource to a map from config keys to
+     *                          operation data.
+     * @return                  The result.
+     */
+    ControllerResult&lt;Map&lt;ConfigResource, ApiError&gt;&gt; incrementalAlterConfigs(
+        Map&lt;ConfigResource, Map&lt;String, Entry&lt;OpType, String&gt;&gt;&gt; configChanges,
+        boolean newlyCreatedResource
+    ) {
+<span class="nc" id="L215">        List&lt;ApiMessageAndVersion&gt; outputRecords =</span>
+<span class="nc" id="L216">                BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);</span>
+<span class="nc" id="L217">        Map&lt;ConfigResource, ApiError&gt; outputResults = new HashMap&lt;&gt;();</span>
+        for (Entry&lt;ConfigResource, Map&lt;String, Entry&lt;OpType, String&gt;&gt;&gt; resourceEntry :
+<span class="nc bnc" id="L219" title="All 2 branches missed.">                configChanges.entrySet()) {</span>
+<span class="nc" id="L220">            ApiError apiError = incrementalAlterConfigResource(resourceEntry.getKey(),</span>
+<span class="nc" id="L221">                resourceEntry.getValue(),</span>
+                newlyCreatedResource,
+                outputRecords);
+<span class="nc" id="L224">            outputResults.put(resourceEntry.getKey(), apiError);</span>
+<span class="nc" id="L225">        }</span>
+<span class="nc" id="L226">        outputRecords.addAll(createClearElrRecordsAsNeeded(outputRecords));</span>
+<span class="nc" id="L227">        return ControllerResult.atomicOf(outputRecords, outputResults);</span>
+    }
+
+    List&lt;ApiMessageAndVersion&gt; createClearElrRecordsAsNeeded(List&lt;ApiMessageAndVersion&gt; input) {
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">        if (!featureControl.isElrFeatureEnabled()) {</span>
+<span class="nc" id="L232">            return List.of();</span>
+        }
+<span class="fc" id="L234">        List&lt;ApiMessageAndVersion&gt; output = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L235" title="All 2 branches covered.">        for (ApiMessageAndVersion messageAndVersion : input) {</span>
+<span class="pc bpc" id="L236" title="1 of 2 branches missed.">            if (messageAndVersion.message().apiKey() == CONFIG_RECORD.id()) {</span>
+<span class="fc" id="L237">                ConfigRecord record = (ConfigRecord) messageAndVersion.message();</span>
+<span class="pc bpc" id="L238" title="1 of 2 branches missed.">                if (record.name().equals(MIN_IN_SYNC_REPLICAS_CONFIG)) {</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">                    if (Type.forId(record.resourceType()) == Type.TOPIC) {</span>
+<span class="nc" id="L240">                        output.add(new ApiMessageAndVersion(</span>
+                            new ClearElrRecord().
+<span class="nc" id="L242">                                setTopicName(record.resourceName()), (short) 0));</span>
+                    } else {
+<span class="nc" id="L244">                        output.add(new ApiMessageAndVersion(new ClearElrRecord(), (short) 0));</span>
+                    }
+                }
+            }
+<span class="fc" id="L248">        }</span>
+<span class="fc" id="L249">        return output;</span>
+    }
+
+    ControllerResult&lt;ApiError&gt; incrementalAlterConfig(
+        ConfigResource configResource,
+        Map&lt;String, Entry&lt;OpType, String&gt;&gt; keyToOps,
+        boolean newlyCreatedResource
+    ) {
+<span class="fc" id="L257">        List&lt;ApiMessageAndVersion&gt; outputRecords =</span>
+<span class="fc" id="L258">                BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);</span>
+<span class="fc" id="L259">        ApiError apiError = incrementalAlterConfigResource(configResource,</span>
+            keyToOps,
+            newlyCreatedResource,
+            outputRecords);
+
+<span class="fc" id="L264">        outputRecords.addAll(createClearElrRecordsAsNeeded(outputRecords));</span>
+<span class="fc" id="L265">        return ControllerResult.atomicOf(outputRecords, apiError);</span>
+    }
+
+    private ApiError incrementalAlterConfigResource(
+        ConfigResource configResource,
+        Map&lt;String, Entry&lt;OpType, String&gt;&gt; keysToOps,
+        boolean newlyCreatedResource,
+        List&lt;ApiMessageAndVersion&gt; outputRecords
+    ) {
+<span class="fc" id="L274">        List&lt;ApiMessageAndVersion&gt; newRecords = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L275" title="All 2 branches covered.">        for (Entry&lt;String, Entry&lt;OpType, String&gt;&gt; keysToOpsEntry : keysToOps.entrySet()) {</span>
+<span class="fc" id="L276">            String key = keysToOpsEntry.getKey();</span>
+<span class="fc" id="L277">            String currentValue = null;</span>
+<span class="fc" id="L278">            TimelineHashMap&lt;String, String&gt; currentConfigs = configData.get(configResource);</span>
+<span class="pc bpc" id="L279" title="1 of 2 branches missed.">            if (currentConfigs != null) {</span>
+<span class="nc" id="L280">                currentValue = currentConfigs.get(key);</span>
+            }
+<span class="fc" id="L282">            String newValue = currentValue;</span>
+<span class="fc" id="L283">            Entry&lt;OpType, String&gt; opTypeAndNewValue = keysToOpsEntry.getValue();</span>
+<span class="fc" id="L284">            OpType opType = opTypeAndNewValue.getKey();</span>
+<span class="fc" id="L285">            String opValue = opTypeAndNewValue.getValue();</span>
+<span class="pc bpc" id="L286" title="3 of 4 branches missed.">            switch (opType) {</span>
+                case SET:
+<span class="fc" id="L288">                    newValue = opValue;</span>
+<span class="fc" id="L289">                    break;</span>
+                case DELETE:
+<span class="nc" id="L291">                    newValue = null;</span>
+<span class="nc" id="L292">                    break;</span>
+                case APPEND:
+                case SUBTRACT:
+<span class="nc bnc" id="L295" title="All 2 branches missed.">                    if (!configSchema.isSplittable(configResource.type(), key)) {</span>
+<span class="nc" id="L296">                        return new ApiError(</span>
+                            INVALID_CONFIG, &quot;Can't &quot; + opType + &quot; to &quot; +
+                            &quot;key &quot; + key + &quot; because its type is not LIST.&quot;);
+                    }
+<span class="nc" id="L300">                    List&lt;String&gt; oldValueList = getParts(newValue, key, configResource);</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">                    if (opType == APPEND) {</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">                        for (String value : opValue.split(&quot;,&quot;)) {</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                            if (!oldValueList.contains(value)) {</span>
+<span class="nc" id="L304">                                oldValueList.add(value);</span>
+                            }
+                        }
+                    } else {
+<span class="nc bnc" id="L308" title="All 2 branches missed.">                        for (String value : opValue.split(&quot;,&quot;)) {</span>
+<span class="nc" id="L309">                            oldValueList.remove(value);</span>
+                        }
+                    }
+<span class="nc" id="L312">                    newValue = String.join(&quot;,&quot;, oldValueList);</span>
+                    break;
+            }
+<span class="pc bpc" id="L315" title="3 of 4 branches missed.">            if (!Objects.equals(currentValue, newValue) || configResource.type().equals(Type.BROKER)) {</span>
+                // KAFKA-14136 We need to generate records even if the value is unchanged to trigger reloads on the brokers
+<span class="fc" id="L317">                newRecords.add(new ApiMessageAndVersion(new ConfigRecord().</span>
+<span class="fc" id="L318">                    setResourceType(configResource.type().id()).</span>
+<span class="fc" id="L319">                    setResourceName(configResource.name()).</span>
+<span class="fc" id="L320">                    setName(key).</span>
+<span class="fc" id="L321">                    setValue(newValue), (short) 0));</span>
+            }
+<span class="fc" id="L323">        }</span>
+<span class="fc" id="L324">        ApiError error = validateAlterConfig(configResource, newRecords, List.of(), newlyCreatedResource);</span>
+<span class="pc bpc" id="L325" title="1 of 2 branches missed.">        if (error.isFailure()) {</span>
+<span class="nc" id="L326">            return error;</span>
+        }
+<span class="fc" id="L328">        outputRecords.addAll(newRecords);</span>
+<span class="fc" id="L329">        return ApiError.NONE;</span>
+    }
+
+    private ApiError validateAlterConfig(
+        ConfigResource configResource,
+        List&lt;ApiMessageAndVersion&gt; recordsExplicitlyAltered,
+        List&lt;ApiMessageAndVersion&gt; recordsImplicitlyDeleted,
+        boolean newlyCreatedResource
+    ) {
+<span class="fc" id="L338">        Map&lt;String, String&gt; allConfigs = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L339">        Map&lt;String, String&gt; existingConfigsMap = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L340">        Map&lt;String, String&gt; alteredConfigsForAlterConfigPolicyCheck = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L341">        TimelineHashMap&lt;String, String&gt; existingConfigsSnapshot = configData.get(configResource);</span>
+<span class="pc bpc" id="L342" title="1 of 2 branches missed.">        if (existingConfigsSnapshot != null) {</span>
+<span class="nc" id="L343">            allConfigs.putAll(existingConfigsSnapshot);</span>
+<span class="nc" id="L344">            existingConfigsMap.putAll(existingConfigsSnapshot);</span>
+        }
+<span class="fc bfc" id="L346" title="All 2 branches covered.">        for (ApiMessageAndVersion newRecord : recordsExplicitlyAltered) {</span>
+<span class="fc" id="L347">            ConfigRecord configRecord = (ConfigRecord) newRecord.message();</span>
+<span class="pc bpc" id="L348" title="1 of 2 branches missed.">            if (isDisallowedBrokerMinIsrTransition(configRecord)) {</span>
+<span class="nc" id="L349">                return DISALLOWED_BROKER_MIN_ISR_TRANSITION_ERROR;</span>
+<span class="pc bpc" id="L350" title="1 of 2 branches missed.">            } else if (isDisallowedClusterMinIsrTransition(configRecord)) {</span>
+<span class="nc" id="L351">                return DISALLOWED_CLUSTER_MIN_ISR_REMOVAL_ERROR;</span>
+<span class="pc bpc" id="L352" title="1 of 2 branches missed.">            } else if (isCordonedLogDirsDisallowed(configRecord)) {</span>
+<span class="nc" id="L353">                return DISALLOWED_CORDONED_LOG_DIRS_ERROR;</span>
+<span class="pc bpc" id="L354" title="1 of 2 branches missed.">            } else if (configRecord.value() == null) {</span>
+<span class="nc" id="L355">                allConfigs.remove(configRecord.name());</span>
+<span class="pc bpc" id="L356" title="1 of 2 branches missed.">            } else if (configRecord.value().length() &gt; Short.MAX_VALUE) {</span>
+                // In KRaft mode, large config values cannot be created by appending.
+                // If the size exceeds Short.MAX_VALUE, this error will be thrown to notify the user.
+<span class="nc" id="L359">                return DISALLOWED_CONFIG_VALUE_SIZE_ERROR;</span>
+            } else {
+<span class="fc" id="L361">                allConfigs.put(configRecord.name(), configRecord.value());</span>
+            }
+<span class="fc" id="L363">            alteredConfigsForAlterConfigPolicyCheck.put(configRecord.name(), configRecord.value());</span>
+<span class="fc" id="L364">        }</span>
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">        for (ApiMessageAndVersion recordImplicitlyDeleted : recordsImplicitlyDeleted) {</span>
+<span class="nc" id="L366">            ConfigRecord configRecord = (ConfigRecord) recordImplicitlyDeleted.message();</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">            if (isDisallowedBrokerMinIsrTransition(configRecord)) {</span>
+<span class="nc" id="L368">                return DISALLOWED_BROKER_MIN_ISR_TRANSITION_ERROR;</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">            } else if (isDisallowedClusterMinIsrTransition(configRecord)) {</span>
+<span class="nc" id="L370">                return DISALLOWED_CLUSTER_MIN_ISR_REMOVAL_ERROR;</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">            } else if (isCordonedLogDirsDisallowed(configRecord)) {</span>
+<span class="nc" id="L372">                return DISALLOWED_CORDONED_LOG_DIRS_ERROR;</span>
+            } else {
+<span class="nc" id="L374">                allConfigs.remove(configRecord.name());</span>
+            }
+            // As per KAFKA-14195, do not include implicit deletions caused by using the legacy AlterConfigs API
+            // in the list passed to the policy in order to maintain backwards compatibility
+<span class="nc" id="L378">        }</span>
+        try {
+<span class="fc" id="L380">            validator.validate(configResource, allConfigs, existingConfigsMap);</span>
+<span class="pc bpc" id="L381" title="1 of 2 branches missed.">            if (!newlyCreatedResource) {</span>
+<span class="nc" id="L382">                existenceChecker.accept(configResource);</span>
+            }
+<span class="pc" id="L384">            alterConfigPolicy.ifPresent(policy -&gt; policy.validate(new RequestMetadata(configResource, alteredConfigsForAlterConfigPolicyCheck)));</span>
+<span class="nc" id="L385">        } catch (ConfigException e) {</span>
+<span class="nc" id="L386">            return new ApiError(INVALID_CONFIG, e.getMessage());</span>
+<span class="nc" id="L387">        } catch (Throwable e) {</span>
+            // return the corresponding API error, but emit the stack trace first if it is an unknown server error
+<span class="nc" id="L389">            ApiError apiError = ApiError.fromThrowable(e);</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">            if (apiError.error() == Errors.UNKNOWN_SERVER_ERROR) {</span>
+<span class="nc" id="L391">                log.error(&quot;Unknown server error validating Alter Configs&quot;, e);</span>
+            }
+<span class="nc" id="L393">            return apiError;</span>
+<span class="fc" id="L394">        }</span>
+<span class="fc" id="L395">        return ApiError.NONE;</span>
+    }
+
+<span class="fc" id="L398">    private static final ApiError DISALLOWED_BROKER_MIN_ISR_TRANSITION_ERROR =</span>
+        new ApiError(INVALID_CONFIG, &quot;Broker-level &quot; + MIN_IN_SYNC_REPLICAS_CONFIG +
+            &quot; cannot be altered while ELR is enabled.&quot;);
+
+<span class="fc" id="L402">    private static final ApiError DISALLOWED_CLUSTER_MIN_ISR_REMOVAL_ERROR =</span>
+        new ApiError(INVALID_CONFIG, &quot;Cluster-level &quot; + MIN_IN_SYNC_REPLICAS_CONFIG +
+            &quot; cannot be removed while ELR is enabled.&quot;);
+
+<span class="fc" id="L406">    private static final ApiError DISALLOWED_CONFIG_VALUE_SIZE_ERROR =</span>
+        new ApiError(INVALID_CONFIG, &quot;The configuration value cannot be added because &quot; +
+            &quot;it exceeds the maximum value size of &quot; + Short.MAX_VALUE + &quot; bytes.&quot;);
+
+<span class="fc" id="L410">    static final ApiError DISALLOWED_CORDONED_LOG_DIRS_ERROR =</span>
+            new ApiError(INVALID_CONFIG, &quot;The &quot; + CORDONED_LOG_DIRS_CONFIG + &quot; configuration value cannot be &quot; +
+                    &quot;set because it requires metadata.version &gt;= &quot; + MetadataVersion.IBP_4_3_IV0);
+
+    boolean isDisallowedBrokerMinIsrTransition(ConfigRecord configRecord) {
+<span class="pc bpc" id="L415" title="1 of 2 branches missed.">        if (configRecord.name().equals(MIN_IN_SYNC_REPLICAS_CONFIG) &amp;&amp;</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">                configRecord.resourceType() == BROKER.id() &amp;&amp;</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">                !configRecord.resourceName().isEmpty()) {</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">            if (featureControl.isElrFeatureEnabled()) {</span>
+<span class="nc" id="L419">                return true;</span>
+            }
+        }
+<span class="fc" id="L422">        return false;</span>
+    }
+
+    boolean isCordonedLogDirsDisallowed(ConfigRecord configRecord) {
+<span class="pc bpc" id="L426" title="1 of 2 branches missed.">        if (configRecord.name().equals(CORDONED_LOG_DIRS_CONFIG) &amp;&amp;</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">                configRecord.resourceType() == BROKER.id()) {</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">            return !featureControl.metadataVersionOrThrow().isCordonedLogDirsSupported();</span>
+        }
+<span class="fc" id="L430">        return false;</span>
+    }
+
+    boolean isDisallowedClusterMinIsrTransition(ConfigRecord configRecord) {
+<span class="pc bpc" id="L434" title="1 of 2 branches missed.">        if (configRecord.name().equals(MIN_IN_SYNC_REPLICAS_CONFIG) &amp;&amp;</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">                configRecord.resourceType() == BROKER.id() &amp;&amp;</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">                configRecord.resourceName().isEmpty() &amp;&amp;</span>
+<span class="nc bnc" id="L437" title="All 2 branches missed.">                configRecord.value() == null) {</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">            if (featureControl.isElrFeatureEnabled()) {</span>
+<span class="nc" id="L439">                return true;</span>
+            }
+        }
+<span class="fc" id="L442">        return false;</span>
+    }
+
+    /**
+     * Determine the result of applying a batch of legacy configuration changes.  Note
+     * that this method does not change the contents of memory.  It just generates a
+     * result, that you can replay later if you wish using replay().
+     *
+     * @param newConfigs        The new configurations to install for each resource.
+     *                          All existing configurations will be overwritten.
+     * @return                  The result.
+     */
+    ControllerResult&lt;Map&lt;ConfigResource, ApiError&gt;&gt; legacyAlterConfigs(
+        Map&lt;ConfigResource, Map&lt;String, String&gt;&gt; newConfigs,
+        boolean newlyCreatedResource
+    ) {
+<span class="nc" id="L458">        List&lt;ApiMessageAndVersion&gt; outputRecords =</span>
+<span class="nc" id="L459">                BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);</span>
+<span class="nc" id="L460">        Map&lt;ConfigResource, ApiError&gt; outputResults = new HashMap&lt;&gt;();</span>
+        for (Entry&lt;ConfigResource, Map&lt;String, String&gt;&gt; resourceEntry :
+<span class="nc bnc" id="L462" title="All 2 branches missed.">            newConfigs.entrySet()) {</span>
+<span class="nc" id="L463">            legacyAlterConfigResource(resourceEntry.getKey(),</span>
+<span class="nc" id="L464">                resourceEntry.getValue(),</span>
+                newlyCreatedResource,
+                outputRecords,
+                outputResults);
+<span class="nc" id="L468">        }</span>
+<span class="nc" id="L469">        outputRecords.addAll(createClearElrRecordsAsNeeded(outputRecords));</span>
+<span class="nc" id="L470">        return ControllerResult.atomicOf(outputRecords, outputResults);</span>
+    }
+
+    private void legacyAlterConfigResource(ConfigResource configResource,
+                                           Map&lt;String, String&gt; newConfigs,
+                                           boolean newlyCreatedResource,
+                                           List&lt;ApiMessageAndVersion&gt; outputRecords,
+                                           Map&lt;ConfigResource, ApiError&gt; outputResults) {
+<span class="nc" id="L478">        List&lt;ApiMessageAndVersion&gt; recordsExplicitlyAltered = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L479">        Map&lt;String, String&gt; currentConfigs = configData.get(configResource);</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">        if (currentConfigs == null) {</span>
+<span class="nc" id="L481">            currentConfigs = Map.of();</span>
+        }
+<span class="nc bnc" id="L483" title="All 2 branches missed.">        for (Entry&lt;String, String&gt; entry : newConfigs.entrySet()) {</span>
+<span class="nc" id="L484">            String key = entry.getKey();</span>
+<span class="nc" id="L485">            String newValue = entry.getValue();</span>
+<span class="nc" id="L486">            String currentValue = currentConfigs.get(key);</span>
+<span class="nc bnc" id="L487" title="All 4 branches missed.">            if (!Objects.equals(currentValue, newValue) || configResource.type().equals(Type.BROKER)) {</span>
+                // KAFKA-14136 We need to generate records even if the value is unchanged to trigger reloads on the brokers
+<span class="nc" id="L489">                recordsExplicitlyAltered.add(new ApiMessageAndVersion(new ConfigRecord().</span>
+<span class="nc" id="L490">                    setResourceType(configResource.type().id()).</span>
+<span class="nc" id="L491">                    setResourceName(configResource.name()).</span>
+<span class="nc" id="L492">                    setName(key).</span>
+<span class="nc" id="L493">                    setValue(newValue), (short) 0));</span>
+            }
+<span class="nc" id="L495">        }</span>
+<span class="nc" id="L496">        List&lt;ApiMessageAndVersion&gt; recordsImplicitlyDeleted = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">        for (String key : currentConfigs.keySet()) {</span>
+<span class="nc bnc" id="L498" title="All 2 branches missed.">            if (!newConfigs.containsKey(key)) {</span>
+<span class="nc" id="L499">                recordsImplicitlyDeleted.add(new ApiMessageAndVersion(new ConfigRecord().</span>
+<span class="nc" id="L500">                    setResourceType(configResource.type().id()).</span>
+<span class="nc" id="L501">                    setResourceName(configResource.name()).</span>
+<span class="nc" id="L502">                    setName(key).</span>
+<span class="nc" id="L503">                    setValue(null), (short) 0));</span>
+            }
+<span class="nc" id="L505">        }</span>
+<span class="nc" id="L506">        ApiError error = validateAlterConfig(configResource, recordsExplicitlyAltered, recordsImplicitlyDeleted, newlyCreatedResource);</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">        if (error.isFailure()) {</span>
+<span class="nc" id="L508">            outputResults.put(configResource, error);</span>
+<span class="nc" id="L509">            return;</span>
+        }
+<span class="nc" id="L511">        outputRecords.addAll(recordsExplicitlyAltered);</span>
+<span class="nc" id="L512">        outputRecords.addAll(recordsImplicitlyDeleted);</span>
+<span class="nc" id="L513">        outputResults.put(configResource, ApiError.NONE);</span>
+<span class="nc" id="L514">    }</span>
+
+    private List&lt;String&gt; getParts(String value, String key, ConfigResource configResource) {
+<span class="nc bnc" id="L517" title="All 2 branches missed.">        if (value == null) {</span>
+<span class="nc" id="L518">            value = configSchema.getDefault(configResource.type(), key);</span>
+        }
+<span class="nc" id="L520">        List&lt;String&gt; parts = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">        if (value == null) {</span>
+<span class="nc" id="L522">            return parts;</span>
+        }
+<span class="nc" id="L524">        String[] splitValues = value.split(&quot;,&quot;);</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">        for (String splitValue : splitValues) {</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">            if (!splitValue.isEmpty()) {</span>
+<span class="nc" id="L527">                parts.add(splitValue);</span>
+            }
+        }
+<span class="nc" id="L530">        return parts;</span>
+    }
+
+    /**
+     * Apply a configuration record to the in-memory state.
+     *
+     * @param record            The ConfigRecord.
+     */
+    public void replay(ConfigRecord record) {
+<span class="fc" id="L539">        Type type = Type.forId(record.resourceType());</span>
+<span class="fc" id="L540">        ConfigResource configResource = new ConfigResource(type, record.resourceName());</span>
+
+<span class="pc bpc" id="L542" title="1 of 2 branches missed.">        if (!supportedConfigChecker.isSupported(configResource.type(), record.name())) {</span>
+            // We skip unsupported configs during replay. This can happen when the config was
+            // deprecated and removed, but old records still exist in the log.
+<span class="nc" id="L545">            log.info(&quot;Skipping unsupported config {} for resource {} during replay&quot;, record.name(), configResource);</span>
+<span class="nc" id="L546">            return;</span>
+        }
+<span class="fc" id="L548">        TimelineHashMap&lt;String, String&gt; configs = configData.get(configResource);</span>
+<span class="fc bfc" id="L549" title="All 2 branches covered.">        if (configs == null) {</span>
+<span class="fc" id="L550">            configs = new TimelineHashMap&lt;&gt;(snapshotRegistry, 0);</span>
+<span class="fc" id="L551">            configData.put(configResource, configs);</span>
+<span class="pc bpc" id="L552" title="1 of 4 branches missed.">            if (configResource.type().equals(BROKER) &amp;&amp; !configResource.name().isEmpty()) {</span>
+<span class="nc" id="L553">                brokersWithConfigs.add(Integer.parseInt(configResource.name()));</span>
+            }
+        }
+<span class="pc bpc" id="L556" title="1 of 2 branches missed.">        if (record.value() == null) {</span>
+<span class="nc" id="L557">            configs.remove(record.name());</span>
+        } else {
+<span class="fc" id="L559">            configs.put(record.name(), record.value());</span>
+        }
+<span class="pc bpc" id="L561" title="1 of 2 branches missed.">        if (configs.isEmpty()) {</span>
+<span class="nc" id="L562">            configData.remove(configResource);</span>
+<span class="nc bnc" id="L563" title="All 4 branches missed.">            if (configResource.type().equals(BROKER) &amp;&amp; !configResource.name().isEmpty()) {</span>
+<span class="nc" id="L564">                brokersWithConfigs.remove(Integer.parseInt(configResource.name()));</span>
+            }
+        }
+<span class="pc bpc" id="L567" title="1 of 2 branches missed.">        if (configSchema.isSensitive(record)) {</span>
+<span class="nc" id="L568">            log.info(&quot;Replayed ConfigRecord for {} which set configuration {} to {}&quot;,</span>
+<span class="nc" id="L569">                    configResource, record.name(), Password.HIDDEN);</span>
+        } else {
+<span class="fc" id="L571">            log.info(&quot;Replayed ConfigRecord for {} which set configuration {} to {}&quot;,</span>
+<span class="fc" id="L572">                    configResource, record.name(), record.value());</span>
+        }
+<span class="fc" id="L574">    }</span>
+
+    // VisibleForTesting
+    Map&lt;String, String&gt; getConfigs(ConfigResource configResource) {
+<span class="nc" id="L578">        Map&lt;String, String&gt; map = configData.get(configResource);</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">        if (map == null) {</span>
+<span class="nc" id="L580">            return Map.of();</span>
+        } else {
+<span class="nc" id="L582">            return Map.copyOf(map);</span>
+        }
+    }
+
+    /**
+     * Get the config value for the given topic and given config key.
+     * The check order is:
+     *   1. dynamic topic overridden configs
+     *   2. dynamic node overridden configs
+     *   3. dynamic cluster overridden configs
+     *   4. static configs
+     * If the config value is not found, return null.
+     *
+     * @param topicName            The topic name for the config.
+     * @param configKey            The key for the config.
+     * @return the config value for the provided config key in the topic
+     */
+    ConfigEntry getTopicConfig(String topicName, String configKey) throws NoSuchElementException {
+<span class="fc" id="L600">        return configSchema.resolveEffectiveTopicConfig(configKey,</span>
+            staticConfig,
+<span class="fc" id="L602">            clusterConfig(),</span>
+<span class="fc" id="L603">            currentControllerConfig(), currentTopicConfig(topicName));</span>
+    }
+
+    public Map&lt;ConfigResource, ResultOrError&lt;Map&lt;String, String&gt;&gt;&gt; describeConfigs(
+            long lastCommittedOffset, Map&lt;ConfigResource, Collection&lt;String&gt;&gt; resources) {
+<span class="nc" id="L608">        Map&lt;ConfigResource, ResultOrError&lt;Map&lt;String, String&gt;&gt;&gt; results = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L609" title="All 2 branches missed.">        for (Entry&lt;ConfigResource, Collection&lt;String&gt;&gt; resourceEntry : resources.entrySet()) {</span>
+<span class="nc" id="L610">            ConfigResource resource = resourceEntry.getKey();</span>
+            try {
+<span class="nc" id="L612">                validator.validate(resource);</span>
+<span class="nc" id="L613">            } catch (Throwable e) {</span>
+<span class="nc" id="L614">                results.put(resource, new ResultOrError&lt;&gt;(ApiError.fromThrowable(e)));</span>
+<span class="nc" id="L615">                continue;</span>
+<span class="nc" id="L616">            }</span>
+<span class="nc" id="L617">            Map&lt;String, String&gt; foundConfigs = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L618">            TimelineHashMap&lt;String, String&gt; configs =</span>
+<span class="nc" id="L619">                configData.get(resource, lastCommittedOffset);</span>
+<span class="nc bnc" id="L620" title="All 2 branches missed.">            if (configs != null) {</span>
+<span class="nc" id="L621">                Collection&lt;String&gt; targetConfigs = resourceEntry.getValue();</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">                if (targetConfigs.isEmpty()) {</span>
+<span class="nc bnc" id="L623" title="All 2 branches missed.">                    for (Entry&lt;String, String&gt; entry : configs.entrySet(lastCommittedOffset)) {</span>
+<span class="nc" id="L624">                        foundConfigs.put(entry.getKey(), entry.getValue());</span>
+<span class="nc" id="L625">                    }</span>
+                } else {
+<span class="nc bnc" id="L627" title="All 2 branches missed.">                    for (String key : targetConfigs) {</span>
+<span class="nc" id="L628">                        String value = configs.get(key, lastCommittedOffset);</span>
+<span class="nc bnc" id="L629" title="All 2 branches missed.">                        if (value != null) {</span>
+<span class="nc" id="L630">                            foundConfigs.put(key, value);</span>
+                        }
+<span class="nc" id="L632">                    }</span>
+                }
+            }
+<span class="nc" id="L635">            results.put(resource, new ResultOrError&lt;&gt;(foundConfigs));</span>
+<span class="nc" id="L636">        }</span>
+<span class="nc" id="L637">        return results;</span>
+    }
+
+    void deleteTopicConfigs(String name) {
+<span class="fc" id="L641">        configData.remove(new ConfigResource(Type.TOPIC, name));</span>
+<span class="fc" id="L642">    }</span>
+
+    int getStaticallyConfiguredMinInsyncReplicas() {
+<span class="fc" id="L645">        return configSchema.getStaticallyConfiguredMinInsyncReplicas(staticConfig);</span>
+    }
+
+    /**
+     * Generate any configuration records that are needed to make it safe to enable ELR.
+     * Specifically, we need to remove all broker-level configurations for min.insync.replicas,
+     * and create a cluster-level configuration for min.insync.replicas. It is always safe to call
+     * this function if ELR is already enabled; it will simply do nothing if the necessary
+     * configurations already exist.
+     *
+     * @param outputRecords     A list to add the new records to.
+     *
+     * @return                  The log message to generate.
+     */
+    String maybeGenerateElrSafetyRecords(List&lt;ApiMessageAndVersion&gt; outputRecords) {
+<span class="nc" id="L660">        StringBuilder bld = new StringBuilder();</span>
+<span class="nc" id="L661">        String prefix = &quot;&quot;;</span>
+<span class="nc bnc" id="L662" title="All 2 branches missed.">        if (!clusterConfig().containsKey(MIN_IN_SYNC_REPLICAS_CONFIG)) {</span>
+<span class="nc" id="L663">            int minInsyncReplicas = configSchema.getStaticallyConfiguredMinInsyncReplicas(staticConfig);</span>
+<span class="nc" id="L664">            outputRecords.add(new ApiMessageAndVersion(</span>
+                new ConfigRecord().
+<span class="nc" id="L666">                    setResourceType(BROKER.id()).</span>
+<span class="nc" id="L667">                    setResourceName(&quot;&quot;).</span>
+<span class="nc" id="L668">                    setName(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG).</span>
+<span class="nc" id="L669">                    setValue(Integer.toString(minInsyncReplicas)),</span>
+<span class="nc" id="L670">                CONFIG_RECORD.highestSupportedVersion()));</span>
+<span class="nc" id="L671">            bld.append(&quot;Generating cluster-level &quot;).append(MIN_IN_SYNC_REPLICAS_CONFIG).</span>
+<span class="nc" id="L672">                append(&quot; of &quot;).append(minInsyncReplicas);</span>
+<span class="nc" id="L673">            prefix = &quot;. &quot;;</span>
+        }
+<span class="nc" id="L675">        prefix = prefix + &quot;Removing broker-level &quot; + MIN_IN_SYNC_REPLICAS_CONFIG + &quot; for brokers: &quot;;</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">        for (Integer brokerId : brokersWithConfigs) {</span>
+<span class="nc" id="L677">            ConfigResource configResource = new ConfigResource(BROKER, brokerId.toString());</span>
+<span class="nc" id="L678">            Map&lt;String, String&gt; configs = configData.get(configResource);</span>
+<span class="nc bnc" id="L679" title="All 2 branches missed.">            if (configs.containsKey(MIN_IN_SYNC_REPLICAS_CONFIG)) {</span>
+<span class="nc" id="L680">                outputRecords.add(new ApiMessageAndVersion(</span>
+<span class="nc" id="L681">                    new ConfigRecord().setResourceType(BROKER.id()).setResourceName(configResource.name()).</span>
+<span class="nc" id="L682">                        setName(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG).setValue(null),</span>
+<span class="nc" id="L683">                    CONFIG_RECORD.highestSupportedVersion()));</span>
+<span class="nc" id="L684">                bld.append(prefix).append(brokerId);</span>
+<span class="nc" id="L685">                prefix = &quot;, &quot;;</span>
+            }
+<span class="nc" id="L687">        }</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">        if (bld.isEmpty()) {</span>
+<span class="nc" id="L689">            return &quot;&quot;;</span>
+        } else {
+<span class="nc" id="L691">            bld.append(&quot;.&quot;);</span>
+<span class="nc" id="L692">            return bld.toString();</span>
+        }
+    }
+
+    /**
+     * Update a Kafka feature, generating any configuration changes that are required.
+     *
+     * @param updates       The user-requested updates.
+     * @param upgradeTypes  The user-requested upgrade types.
+     * @param validateOnly  True if we should validate the request but not make changes.
+     * @param currentClaimEpoch the currently claimed epoch
+     *
+     * @return              The result.
+     */
+    ControllerResult&lt;ApiError&gt; updateFeatures(
+        Map&lt;String, Short&gt; updates,
+        Map&lt;String, FeatureUpdate.UpgradeType&gt; upgradeTypes,
+        boolean validateOnly,
+        int currentClaimEpoch
+    ) {
+<span class="nc" id="L712">        ControllerResult&lt;ApiError&gt; result = featureControl.updateFeatures(updates, upgradeTypes, validateOnly, currentClaimEpoch);</span>
+<span class="nc bnc" id="L713" title="All 4 branches missed.">        if (result.response().isSuccess() &amp;&amp;</span>
+            !validateOnly &amp;&amp;
+<span class="nc bnc" id="L715" title="All 2 branches missed.">            updates.getOrDefault(EligibleLeaderReplicasVersion.FEATURE_NAME, (short) 0) &gt; 0</span>
+        ) {
+<span class="nc" id="L717">            List&lt;ApiMessageAndVersion&gt; records = BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);</span>
+<span class="nc" id="L718">            String logMessage = maybeGenerateElrSafetyRecords(records);</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">            if (!logMessage.isEmpty()) {</span>
+<span class="nc" id="L720">                log.info(&quot;{}&quot;, logMessage);</span>
+            }
+<span class="nc" id="L722">            records.addAll(result.records());</span>
+<span class="nc" id="L723">            return ControllerResult.atomicOf(records, ApiError.NONE);</span>
+        }
+<span class="nc" id="L725">        return result;</span>
+    }
+
+    /**
+     * Check if this topic has &quot;unclean.leader.election.enable&quot; set to true.
+     *
+     * @param topicName            The topic name for the config.
+     * @return true if this topic has uncleanLeaderElection enabled
+     */
+    boolean uncleanLeaderElectionEnabledForTopic(String topicName) {
+<span class="fc" id="L735">        String uncleanLeaderElection = getTopicConfig(topicName, UNCLEAN_LEADER_ELECTION_ENABLE_CONFIG).value();</span>
+<span class="pc bpc" id="L736" title="1 of 2 branches missed.">        if (!uncleanLeaderElection.isEmpty()) {</span>
+<span class="fc" id="L737">            return Boolean.parseBoolean(uncleanLeaderElection);</span>
+        }
+<span class="nc" id="L739">        return false;</span>
+    }
+
+    Map&lt;String, ConfigEntry&gt; computeEffectiveTopicConfigs(Map&lt;String, String&gt; creationConfigs) {
+<span class="fc" id="L743">        return configSchema.resolveEffectiveTopicConfigs(staticConfig, clusterConfig(),</span>
+<span class="fc" id="L744">            currentControllerConfig(), creationConfigs);</span>
+    }
+
+    Map&lt;String, String&gt; clusterConfig() {
+<span class="fc" id="L748">        Map&lt;String, String&gt; result = configData.get(DEFAULT_NODE);</span>
+<span class="pc bpc" id="L749" title="1 of 2 branches missed.">        return (result == null) ? Map.of() : result;</span>
+    }
+
+    Map&lt;String, String&gt; currentControllerConfig() {
+<span class="fc" id="L753">        Map&lt;String, String&gt; result = configData.get(currentController);</span>
+<span class="pc bpc" id="L754" title="1 of 2 branches missed.">        return (result == null) ? Map.of() : result;</span>
+    }
+
+    Map&lt;String, String&gt; currentTopicConfig(String topicName) {
+<span class="fc" id="L758">        Map&lt;String, String&gt; result = configData.get(new ConfigResource(Type.TOPIC, topicName));</span>
+<span class="fc bfc" id="L759" title="All 2 branches covered.">        return (result == null) ? Map.of() : result;</span>
+    }
+
+    // Visible to test
+    TimelineHashSet&lt;Integer&gt; brokersWithConfigs() {
+<span class="nc" id="L764">        return brokersWithConfigs;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

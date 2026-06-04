@@ -1,0 +1,382 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TopologyConfig.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams</a> &gt; <span class="el_source">TopologyConfig.java</span></div><h1>TopologyConfig.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams;
+
+import org.apache.kafka.common.config.AbstractConfig;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigDef.Importance;
+import org.apache.kafka.common.config.ConfigDef.Type;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.streams.errors.DeserializationExceptionHandler;
+import org.apache.kafka.streams.errors.ProcessingExceptionHandler;
+import org.apache.kafka.streams.internals.StreamsConfigUtils;
+import org.apache.kafka.streams.kstream.Materialized;
+import org.apache.kafka.streams.kstream.internals.MaterializedInternal;
+import org.apache.kafka.streams.processor.TimestampExtractor;
+import org.apache.kafka.streams.processor.internals.NoOpProcessorWrapper;
+import org.apache.kafka.streams.processor.internals.namedtopology.KafkaStreamsNamedTopologyWrapper;
+import org.apache.kafka.streams.state.DslStoreSuppliers;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.function.Supplier;
+
+import static org.apache.kafka.common.config.ConfigDef.ValidString.in;
+import static org.apache.kafka.common.utils.Utils.mkObjectProperties;
+import static org.apache.kafka.streams.StreamsConfig.BUFFERED_RECORDS_PER_PARTITION_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.BUFFERED_RECORDS_PER_PARTITION_DOC;
+import static org.apache.kafka.streams.StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.CACHE_MAX_BYTES_BUFFERING_DOC;
+import static org.apache.kafka.streams.StreamsConfig.DEFAULT_DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.DEFAULT_DESERIALIZATION_EXCEPTION_HANDLER_CLASS_DOC;
+import static org.apache.kafka.streams.StreamsConfig.DEFAULT_DSL_STORE_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.DEFAULT_DSL_STORE_DOC;
+import static org.apache.kafka.streams.StreamsConfig.DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_DOC;
+import static org.apache.kafka.streams.StreamsConfig.DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.DESERIALIZATION_EXCEPTION_HANDLER_CLASS_DOC;
+import static org.apache.kafka.streams.StreamsConfig.DSL_STORE_SUPPLIERS_CLASS_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.DSL_STORE_SUPPLIERS_CLASS_DEFAULT;
+import static org.apache.kafka.streams.StreamsConfig.DSL_STORE_SUPPLIERS_CLASS_DOC;
+import static org.apache.kafka.streams.StreamsConfig.ENSURE_EXPLICIT_INTERNAL_RESOURCE_NAMING_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.ENSURE_EXPLICIT_INTERNAL_RESOURCE_NAMING_DOC;
+import static org.apache.kafka.streams.StreamsConfig.IN_MEMORY;
+import static org.apache.kafka.streams.StreamsConfig.MAX_TASK_IDLE_MS_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.MAX_TASK_IDLE_MS_DOC;
+import static org.apache.kafka.streams.StreamsConfig.PROCESSING_EXCEPTION_HANDLER_CLASS_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.PROCESSOR_WRAPPER_CLASS_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.PROCESSOR_WRAPPER_CLASS_DOC;
+import static org.apache.kafka.streams.StreamsConfig.ROCKS_DB;
+import static org.apache.kafka.streams.StreamsConfig.STATESTORE_CACHE_MAX_BYTES_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.STATESTORE_CACHE_MAX_BYTES_DOC;
+import static org.apache.kafka.streams.StreamsConfig.TASK_TIMEOUT_MS_CONFIG;
+import static org.apache.kafka.streams.StreamsConfig.TASK_TIMEOUT_MS_DOC;
+import static org.apache.kafka.streams.internals.StreamsConfigUtils.totalCacheSize;
+
+/**
+ * Streams configs that apply at the topology level. The values in the {@link StreamsConfig} parameter of the
+ * {@link org.apache.kafka.streams.KafkaStreams} constructor or the {@link KafkaStreamsNamedTopologyWrapper} constructor (deprecated)
+ * will determine the defaults, which can then be overridden for specific topologies by passing them in when creating the
+ * topology builders via the {@link StreamsBuilder#StreamsBuilder(TopologyConfig)} constructor for DSL applications,
+ * or the {@link Topology#Topology(TopologyConfig)} for PAPI applications.
+ * &lt;p&gt;
+ * Note that some configs, such as the {@code processor.wrapper.class} config, can only take effect while the
+ * topology is being built, which means they have to be passed in as a TopologyConfig to the
+ * {@link Topology#Topology(TopologyConfig)} constructor (PAPI) or the
+ * {@link StreamsBuilder#StreamsBuilder(TopologyConfig)} constructor (DSL).
+ * If they are only set in the configs passed in to the KafkaStreams constructor, it will be too late for them
+ * to be applied and the config will be ignored.
+ */
+@SuppressWarnings(&quot;deprecation&quot;)
+public final class TopologyConfig extends AbstractConfig {
+
+<span class="nc" id="L91">    public static class InternalConfig {</span>
+        // Cf https://issues.apache.org/jira/browse/KAFKA-19668
+        public static final String ENABLE_PROCESS_PROCESSVALUE_FIX = &quot;__enable.process.processValue.fix__&quot;;
+
+        public static boolean getBoolean(final Map&lt;String, Object&gt; configs, final String key, final boolean defaultValue) {
+<span class="nc" id="L96">            final Object value = configs.getOrDefault(key, defaultValue);</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">            if (value instanceof Boolean) {</span>
+<span class="nc" id="L98">                return (boolean) value;</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">            } else if (value instanceof String) {</span>
+<span class="nc" id="L100">                return Boolean.parseBoolean((String) value);</span>
+            } else {
+<span class="nc" id="L102">                log.warn(</span>
+                    &quot;Invalid value ({}) on internal configuration '{}'. Please specify a true/false value.&quot;,
+                    value,
+                    key
+                );
+<span class="nc" id="L107">                return defaultValue;</span>
+            }
+        }
+    }
+
+    private static final ConfigDef CONFIG;
+    static {
+<span class="nc" id="L114">        CONFIG = new ConfigDef()</span>
+<span class="nc" id="L115">            .define(PROCESSOR_WRAPPER_CLASS_CONFIG,</span>
+                    Type.CLASS,
+<span class="nc" id="L117">                    NoOpProcessorWrapper.class.getName(),</span>
+                    Importance.LOW,
+                    PROCESSOR_WRAPPER_CLASS_DOC)
+<span class="nc" id="L120">            .define(BUFFERED_RECORDS_PER_PARTITION_CONFIG,</span>
+                Type.INT,
+                null,
+                Importance.LOW,
+                BUFFERED_RECORDS_PER_PARTITION_DOC)
+<span class="nc" id="L125">            .define(CACHE_MAX_BYTES_BUFFERING_CONFIG,</span>
+                    Type.LONG,
+                    null,
+                    Importance.MEDIUM,
+                    CACHE_MAX_BYTES_BUFFERING_DOC)
+<span class="nc" id="L130">            .define(STATESTORE_CACHE_MAX_BYTES_CONFIG,</span>
+                Type.LONG,
+                null,
+                Importance.MEDIUM,
+                STATESTORE_CACHE_MAX_BYTES_DOC)
+<span class="nc" id="L135">            .define(DEFAULT_DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG,</span>
+                Type.CLASS,
+                null,
+                Importance.MEDIUM,
+                DEFAULT_DESERIALIZATION_EXCEPTION_HANDLER_CLASS_DOC)
+<span class="nc" id="L140">            .define(DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG,</span>
+                Type.CLASS,
+                null,
+                Importance.MEDIUM,
+                DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_DOC)
+<span class="nc" id="L145">            .define(DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG,</span>
+                Type.CLASS,
+                null,
+                Importance.MEDIUM,
+                DESERIALIZATION_EXCEPTION_HANDLER_CLASS_DOC)
+<span class="nc" id="L150">            .define(MAX_TASK_IDLE_MS_CONFIG,</span>
+                Type.LONG,
+                null,
+                Importance.MEDIUM,
+                MAX_TASK_IDLE_MS_DOC)
+<span class="nc" id="L155">            .define(TASK_TIMEOUT_MS_CONFIG,</span>
+                Type.LONG,
+                null,
+                Importance.MEDIUM,
+                TASK_TIMEOUT_MS_DOC)
+<span class="nc" id="L160">            .define(DEFAULT_DSL_STORE_CONFIG,</span>
+                Type.STRING,
+                ROCKS_DB,
+<span class="nc" id="L163">                in(ROCKS_DB, IN_MEMORY),</span>
+                Importance.LOW,
+                DEFAULT_DSL_STORE_DOC)
+<span class="nc" id="L166">            .define(DSL_STORE_SUPPLIERS_CLASS_CONFIG,</span>
+                Type.CLASS,
+                DSL_STORE_SUPPLIERS_CLASS_DEFAULT,
+                Importance.LOW,
+                DSL_STORE_SUPPLIERS_CLASS_DOC)
+<span class="nc" id="L171">            .define(ENSURE_EXPLICIT_INTERNAL_RESOURCE_NAMING_CONFIG,</span>
+                Type.BOOLEAN,
+<span class="nc" id="L173">                false,</span>
+                Importance.HIGH,
+                ENSURE_EXPLICIT_INTERNAL_RESOURCE_NAMING_DOC);
+    }
+<span class="nc" id="L177">    private static final Logger log = LoggerFactory.getLogger(TopologyConfig.class);</span>
+
+    private final StreamsConfig globalAppConfigs;
+
+    public final String topologyName;
+    public final boolean eosEnabled;
+
+    public final StreamsConfig applicationConfigs;
+    public final Properties topologyOverrides;
+
+    public final int maxBufferedSize;
+    public final long cacheSize;
+    public final long maxTaskIdleMs;
+    public final long taskTimeoutMs;
+    public final String storeType;
+    public final Class&lt;?&gt; dslStoreSuppliers;
+    public final Supplier&lt;TimestampExtractor&gt; timestampExtractorSupplier;
+    public final Supplier&lt;DeserializationExceptionHandler&gt; deserializationExceptionHandlerSupplier;
+    public final Supplier&lt;ProcessingExceptionHandler&gt; processingExceptionHandlerSupplier;
+
+    public final boolean ensureExplicitInternalResourceNaming;
+
+    public TopologyConfig(final StreamsConfig configs) {
+<span class="nc" id="L200">        this(null, configs, mkObjectProperties(configs.originals()));</span>
+<span class="nc" id="L201">    }</span>
+
+    public TopologyConfig(final String topologyName, final StreamsConfig globalAppConfigs, final Properties topologyOverrides) {
+<span class="nc" id="L204">        super(CONFIG, topologyOverrides, false);</span>
+
+<span class="nc" id="L206">        this.globalAppConfigs = globalAppConfigs;</span>
+<span class="nc" id="L207">        this.topologyName = topologyName;</span>
+<span class="nc" id="L208">        this.eosEnabled = StreamsConfigUtils.eosEnabled(globalAppConfigs);</span>
+
+<span class="nc" id="L210">        this.applicationConfigs = globalAppConfigs;</span>
+<span class="nc" id="L211">        this.topologyOverrides = topologyOverrides;</span>
+<span class="nc" id="L212">        this.processingExceptionHandlerSupplier = () -&gt; globalAppConfigs.getConfiguredInstance(PROCESSING_EXCEPTION_HANDLER_CLASS_CONFIG, ProcessingExceptionHandler.class);</span>
+
+<span class="nc bnc" id="L214" title="All 2 branches missed.">        if (isTopologyOverride(BUFFERED_RECORDS_PER_PARTITION_CONFIG, topologyOverrides)) {</span>
+<span class="nc" id="L215">            maxBufferedSize = getInt(BUFFERED_RECORDS_PER_PARTITION_CONFIG);</span>
+<span class="nc" id="L216">            log.info(&quot;Topology {} is overriding {} to {}&quot;, topologyName, BUFFERED_RECORDS_PER_PARTITION_CONFIG, maxBufferedSize);</span>
+        } else {
+<span class="nc" id="L218">            maxBufferedSize = globalAppConfigs.getInt(BUFFERED_RECORDS_PER_PARTITION_CONFIG);</span>
+        }
+
+<span class="nc" id="L221">        final boolean stateStoreCacheMaxBytesOverridden = isTopologyOverride(STATESTORE_CACHE_MAX_BYTES_CONFIG, topologyOverrides);</span>
+<span class="nc" id="L222">        final boolean cacheMaxBytesBufferingOverridden = isTopologyOverride(CACHE_MAX_BYTES_BUFFERING_CONFIG, topologyOverrides);</span>
+
+<span class="nc bnc" id="L224" title="All 4 branches missed.">        if (!stateStoreCacheMaxBytesOverridden &amp;&amp; !cacheMaxBytesBufferingOverridden) {</span>
+<span class="nc" id="L225">            cacheSize = totalCacheSize(globalAppConfigs);</span>
+        } else {
+<span class="nc bnc" id="L227" title="All 4 branches missed.">            if (stateStoreCacheMaxBytesOverridden &amp;&amp; cacheMaxBytesBufferingOverridden) {</span>
+<span class="nc" id="L228">                cacheSize = getLong(STATESTORE_CACHE_MAX_BYTES_CONFIG);</span>
+<span class="nc" id="L229">                log.info(&quot;Topology {} is using both deprecated config {} and new config {}, hence {} is ignored and the new config {} (value {}) is used&quot;,</span>
+                        topologyName,
+                        CACHE_MAX_BYTES_BUFFERING_CONFIG,
+                        STATESTORE_CACHE_MAX_BYTES_CONFIG,
+                        CACHE_MAX_BYTES_BUFFERING_CONFIG,
+                        STATESTORE_CACHE_MAX_BYTES_CONFIG,
+<span class="nc" id="L235">                        cacheSize);</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">            } else if (cacheMaxBytesBufferingOverridden) {</span>
+<span class="nc" id="L237">                cacheSize = getLong(CACHE_MAX_BYTES_BUFFERING_CONFIG);</span>
+<span class="nc" id="L238">                log.info(&quot;Topology {} is using only deprecated config {}, and will be used to set cache size to {}; &quot; +</span>
+                                &quot;we suggest setting the new config {} instead as deprecated {} would be removed in the future.&quot;,
+                        topologyName,
+                        CACHE_MAX_BYTES_BUFFERING_CONFIG,
+<span class="nc" id="L242">                        cacheSize,</span>
+                        STATESTORE_CACHE_MAX_BYTES_CONFIG,
+                        CACHE_MAX_BYTES_BUFFERING_CONFIG);
+            } else {
+<span class="nc" id="L246">                cacheSize = getLong(STATESTORE_CACHE_MAX_BYTES_CONFIG);</span>
+            }
+
+<span class="nc bnc" id="L249" title="All 2 branches missed.">            if (cacheSize != 0) {</span>
+<span class="nc" id="L250">                log.warn(&quot;Topology {} is overriding cache size to {} but this will not have any effect as the &quot;</span>
+                                + &quot;topology-level cache size config only controls whether record buffering is enabled &quot;
+                                + &quot;or disabled, thus the only valid override value is 0&quot;,
+<span class="nc" id="L253">                        topologyName, cacheSize);</span>
+            } else {
+<span class="nc" id="L255">                log.info(&quot;Topology {} is overriding cache size to {}, record buffering will be disabled&quot;,</span>
+<span class="nc" id="L256">                        topologyName, cacheSize);</span>
+            }
+        }
+
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (isTopologyOverride(MAX_TASK_IDLE_MS_CONFIG, topologyOverrides)) {</span>
+<span class="nc" id="L261">            maxTaskIdleMs = getLong(MAX_TASK_IDLE_MS_CONFIG);</span>
+<span class="nc" id="L262">            log.info(&quot;Topology {} is overriding {} to {}&quot;, topologyName, MAX_TASK_IDLE_MS_CONFIG, maxTaskIdleMs);</span>
+        } else {
+<span class="nc" id="L264">            maxTaskIdleMs = globalAppConfigs.getLong(MAX_TASK_IDLE_MS_CONFIG);</span>
+        }
+
+<span class="nc bnc" id="L267" title="All 2 branches missed.">        if (isTopologyOverride(TASK_TIMEOUT_MS_CONFIG, topologyOverrides)) {</span>
+<span class="nc" id="L268">            taskTimeoutMs = getLong(TASK_TIMEOUT_MS_CONFIG);</span>
+<span class="nc" id="L269">            log.info(&quot;Topology {} is overriding {} to {}&quot;, topologyName, TASK_TIMEOUT_MS_CONFIG, taskTimeoutMs);</span>
+        } else {
+<span class="nc" id="L271">            taskTimeoutMs = globalAppConfigs.getLong(TASK_TIMEOUT_MS_CONFIG);</span>
+        }
+
+<span class="nc bnc" id="L274" title="All 2 branches missed.">        if (isTopologyOverride(DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG, topologyOverrides)) {</span>
+<span class="nc" id="L275">            timestampExtractorSupplier = () -&gt; getConfiguredInstance(DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG, TimestampExtractor.class);</span>
+<span class="nc" id="L276">            log.info(&quot;Topology {} is overriding {} to {}&quot;, topologyName, DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG, getClass(DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG));</span>
+        } else {
+<span class="nc" id="L278">            timestampExtractorSupplier = () -&gt; globalAppConfigs.getConfiguredInstance(DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG, TimestampExtractor.class);</span>
+        }
+
+
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        final String deserializationExceptionHandlerKey = (globalAppConfigs.originals().containsKey(DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG)</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">            || originals().containsKey(DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG)) ?</span>
+<span class="nc" id="L284">            DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG :</span>
+<span class="nc" id="L285">            DEFAULT_DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG;</span>
+
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        if (isTopologyOverride(deserializationExceptionHandlerKey, topologyOverrides)) {</span>
+<span class="nc" id="L288">            deserializationExceptionHandlerSupplier = () -&gt; getConfiguredInstance(deserializationExceptionHandlerKey, DeserializationExceptionHandler.class);</span>
+<span class="nc" id="L289">            log.info(&quot;Topology {} is overriding {} to {}&quot;, topologyName, deserializationExceptionHandlerKey, getClass(deserializationExceptionHandlerKey));</span>
+        } else {
+<span class="nc" id="L291">            deserializationExceptionHandlerSupplier = () -&gt; globalAppConfigs.getConfiguredInstance(deserializationExceptionHandlerKey, DeserializationExceptionHandler.class);</span>
+        }
+
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        if (isTopologyOverride(DEFAULT_DSL_STORE_CONFIG, topologyOverrides)) {</span>
+<span class="nc" id="L295">            storeType = getString(DEFAULT_DSL_STORE_CONFIG);</span>
+<span class="nc" id="L296">            log.info(&quot;Topology {} is overriding {} to {}&quot;, topologyName, DEFAULT_DSL_STORE_CONFIG, storeType);</span>
+        } else {
+<span class="nc" id="L298">            storeType = globalAppConfigs.getString(DEFAULT_DSL_STORE_CONFIG);</span>
+        }
+
+<span class="nc bnc" id="L301" title="All 2 branches missed.">        if (isTopologyOverride(DSL_STORE_SUPPLIERS_CLASS_CONFIG, topologyOverrides)) {</span>
+<span class="nc" id="L302">            dslStoreSuppliers = getClass(DSL_STORE_SUPPLIERS_CLASS_CONFIG);</span>
+<span class="nc" id="L303">            log.info(&quot;Topology {} is overriding {} to {}&quot;, topologyName, DSL_STORE_SUPPLIERS_CLASS_CONFIG, dslStoreSuppliers);</span>
+        } else {
+<span class="nc" id="L305">            dslStoreSuppliers = globalAppConfigs.getClass(DSL_STORE_SUPPLIERS_CLASS_CONFIG);</span>
+        }
+
+<span class="nc" id="L308">        ensureExplicitInternalResourceNaming = globalAppConfigs.getBoolean(ENSURE_EXPLICIT_INTERNAL_RESOURCE_NAMING_CONFIG);</span>
+<span class="nc" id="L309">    }</span>
+
+    @Deprecated
+    public Materialized.StoreType parseStoreType() {
+<span class="nc" id="L313">        return MaterializedInternal.parse(storeType);</span>
+    }
+
+    /**
+     * @return the DslStoreSuppliers if the value was explicitly configured (either by
+     *         {@link StreamsConfig#DEFAULT_DSL_STORE} or {@link StreamsConfig#DSL_STORE_SUPPLIERS_CLASS_CONFIG})
+     */
+    public Optional&lt;DslStoreSuppliers&gt; resolveDslStoreSuppliers() {
+<span class="nc bnc" id="L321" title="All 4 branches missed.">        if (isTopologyOverride(DSL_STORE_SUPPLIERS_CLASS_CONFIG, topologyOverrides) || globalAppConfigs.originals().containsKey(DSL_STORE_SUPPLIERS_CLASS_CONFIG)) {</span>
+<span class="nc" id="L322">            return Optional.of(Utils.newInstance(dslStoreSuppliers, DslStoreSuppliers.class));</span>
+<span class="nc bnc" id="L323" title="All 4 branches missed.">        } else if (isTopologyOverride(DEFAULT_DSL_STORE_CONFIG, topologyOverrides) || globalAppConfigs.originals().containsKey(DEFAULT_DSL_STORE_CONFIG)) {</span>
+<span class="nc" id="L324">            return Optional.of(MaterializedInternal.parse(storeType));</span>
+        } else {
+<span class="nc" id="L326">            return Optional.empty();</span>
+        }
+    }
+
+    public boolean isNamedTopology() {
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        return topologyName != null;</span>
+    }
+
+    /**
+     * @return true if there is an override for this config in the properties of this NamedTopology. Applications that
+     *         don't use named topologies will just refer to the global defaults regardless of the topology properties
+     */
+    private boolean isTopologyOverride(final String config, final Properties topologyOverrides) {
+        // TODO KAFKA-13283: eventually we should always have the topology props override the global ones regardless
+        // of whether it's a named topology or not
+<span class="nc bnc" id="L341" title="All 4 branches missed.">        return topologyName != null &amp;&amp; topologyOverrides.containsKey(config);</span>
+    }
+
+    public TaskConfig getTaskConfig() {
+<span class="nc" id="L345">        return new TaskConfig(</span>
+            maxTaskIdleMs,
+            taskTimeoutMs,
+            maxBufferedSize,
+<span class="nc" id="L349">            timestampExtractorSupplier.get(),</span>
+<span class="nc" id="L350">            deserializationExceptionHandlerSupplier.get(),</span>
+<span class="nc" id="L351">            processingExceptionHandlerSupplier.get(),</span>
+            eosEnabled
+        );
+    }
+
+    public static class TaskConfig {
+        public final long maxTaskIdleMs;
+        public final long taskTimeoutMs;
+        public final int maxBufferedSize;
+        public final TimestampExtractor timestampExtractor;
+        public final DeserializationExceptionHandler deserializationExceptionHandler;
+        public final ProcessingExceptionHandler processingExceptionHandler;
+        public final boolean eosEnabled;
+
+        private TaskConfig(final long maxTaskIdleMs,
+                           final long taskTimeoutMs,
+                           final int maxBufferedSize,
+                           final TimestampExtractor timestampExtractor,
+                           final DeserializationExceptionHandler deserializationExceptionHandler,
+                           final ProcessingExceptionHandler processingExceptionHandler,
+<span class="nc" id="L371">                           final boolean eosEnabled) {</span>
+<span class="nc" id="L372">            this.maxTaskIdleMs = maxTaskIdleMs;</span>
+<span class="nc" id="L373">            this.taskTimeoutMs = taskTimeoutMs;</span>
+<span class="nc" id="L374">            this.maxBufferedSize = maxBufferedSize;</span>
+<span class="nc" id="L375">            this.timestampExtractor = timestampExtractor;</span>
+<span class="nc" id="L376">            this.deserializationExceptionHandler = deserializationExceptionHandler;</span>
+<span class="nc" id="L377">            this.processingExceptionHandler = processingExceptionHandler;</span>
+<span class="nc" id="L378">            this.eosEnabled = eosEnabled;</span>
+<span class="nc" id="L379">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

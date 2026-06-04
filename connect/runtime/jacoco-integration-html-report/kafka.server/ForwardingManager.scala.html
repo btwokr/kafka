@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ForwardingManager.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">kafka.server</a> &gt; <span class="el_source">ForwardingManager.scala</span></div><h1>ForwardingManager.scala</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package kafka.server
+
+import java.nio.ByteBuffer
+import kafka.network.RequestChannel
+import kafka.utils.Logging
+import org.apache.kafka.clients.{ClientResponse, NodeApiVersions}
+import org.apache.kafka.common.errors.TimeoutException
+import org.apache.kafka.common.metrics.Metrics
+import org.apache.kafka.common.protocol.Errors
+import org.apache.kafka.common.requests.{AbstractRequest, AbstractResponse, EnvelopeResponse, RequestContext, RequestHeader}
+import org.apache.kafka.server.ForwardingManagerUtil
+import org.apache.kafka.server.common.{ControllerRequestCompletionHandler, NodeToControllerChannelManager}
+import org.apache.kafka.server.metrics.ForwardingManagerMetrics
+
+import java.util.Optional
+import java.util.concurrent.TimeUnit
+
+<span class="nc" id="L35">trait ForwardingManager {</span>
+  def close(): Unit
+
+  def forwardRequest(
+    originalRequest: RequestChannel.Request,
+    responseCallback: Option[AbstractResponse] =&gt; Unit
+  ): Unit = {
+<span class="fc" id="L42">    val buffer = originalRequest.buffer.duplicate()</span>
+<span class="fc" id="L43">    buffer.flip()</span>
+<span class="fc" id="L44">    forwardRequest(originalRequest.context,</span>
+<span class="fc" id="L45">      buffer,</span>
+<span class="fc" id="L46">      originalRequest.startTimeNanos,</span>
+<span class="fc" id="L47">      originalRequest.body[AbstractRequest],</span>
+<span class="pc" id="L48">      () =&gt; originalRequest.toString,</span>
+<span class="fc" id="L49">      responseCallback)</span>
+  }
+
+  def forwardRequest(
+    originalRequest: RequestChannel.Request,
+    newRequestBody: AbstractRequest,
+    responseCallback: Option[AbstractResponse] =&gt; Unit
+  ): Unit = {
+<span class="nc" id="L57">    val buffer = newRequestBody.serializeWithHeader(originalRequest.header)</span>
+<span class="nc" id="L58">    forwardRequest(originalRequest.context,</span>
+<span class="nc" id="L59">      buffer,</span>
+<span class="nc" id="L60">      originalRequest.startTimeNanos,</span>
+<span class="nc" id="L61">      newRequestBody,</span>
+<span class="nc" id="L62">      () =&gt; originalRequest.toString,</span>
+<span class="nc" id="L63">      responseCallback)</span>
+  }
+
+  /**
+   * Forward given request to the active controller.
+   *
+   * @param requestContext      The request context of the original envelope request.
+   * @param requestBufferCopy   The request buffer we want to send. This should not be the original
+   *                            byte buffer from the envelope request, since we will be mutating
+   *                            the position and limit fields. It should be a copy.
+   * @param requestBody         The AbstractRequest we are sending.
+   * @param requestToString     A callback which can be invoked to produce a human-readable description
+   *                            of the request.
+   * @param responseCallback    A callback which takes in an `Option[AbstractResponse]`.
+   *                            We will call this function with Some(x) after the controller responds with x.
+   *                            Or, if the controller doesn't support the request version, we will complete
+   *                            the callback with None.
+   */
+  def forwardRequest(
+    requestContext: RequestContext,
+    requestBufferCopy: ByteBuffer,
+    requestCreationNs: Long,
+    requestBody: AbstractRequest,
+    requestToString: () =&gt; String,
+    responseCallback: Option[AbstractResponse] =&gt; Unit
+  ): Unit
+
+  def controllerApiVersions: Optional[NodeApiVersions]
+}
+
+<span class="pc bnc" id="L93" title="All 4 branches missed.">class ForwardingManagerImpl(</span>
+<span class="fc" id="L94">  channelManager: NodeToControllerChannelManager,</span>
+  metrics: Metrics
+<span class="fc" id="L96">) extends ForwardingManager with AutoCloseable with Logging {</span>
+
+<span class="fc" id="L98">  val forwardingManagerMetrics: ForwardingManagerMetrics = new ForwardingManagerMetrics(metrics, channelManager.getTimeoutMs)</span>
+
+  override def forwardRequest(
+<span class="fc" id="L101">    requestContext: RequestContext,</span>
+    requestBufferCopy: ByteBuffer,
+    requestCreationNs: Long,
+<span class="fc" id="L104">    requestBody: AbstractRequest,</span>
+<span class="fc" id="L105">    requestToString: () =&gt; String,</span>
+<span class="fc" id="L106">    responseCallback: Option[AbstractResponse] =&gt; Unit</span>
+  ): Unit = {
+<span class="fc" id="L108">    val envelopeRequest = ForwardingManagerUtil.buildEnvelopeRequest(requestContext, requestBufferCopy)</span>
+<span class="fc" id="L109">    val requestCreationTimeMs = TimeUnit.NANOSECONDS.toMillis(requestCreationNs)</span>
+
+<span class="pc bpc" id="L111" title="1 of 2 branches missed.">    class ForwardingResponseHandler extends ControllerRequestCompletionHandler {</span>
+      override def onComplete(clientResponse: ClientResponse): Unit = {
+
+<span class="fc" id="L114">        forwardingManagerMetrics.decrementQueueLength()</span>
+<span class="fc" id="L115">        forwardingManagerMetrics.remoteTimeMsHist.record(clientResponse.requestLatencyMs())</span>
+<span class="fc" id="L116">        forwardingManagerMetrics.queueTimeMsHist.record(clientResponse.receivedTimeMs() - clientResponse.requestLatencyMs() - requestCreationTimeMs)</span>
+
+<span class="pc bpc" id="L118" title="1 of 2 branches missed.">        if (clientResponse.versionMismatch != null) {</span>
+<span class="nc" id="L119">          debug(s&quot;Returning `UNKNOWN_SERVER_ERROR` in response to ${requestToString()} &quot; +</span>
+<span class="nc" id="L120">            s&quot;due to unexpected version error&quot;, clientResponse.versionMismatch)</span>
+<span class="nc" id="L121">          responseCallback(Some(requestBody.getErrorResponse(Errors.UNKNOWN_SERVER_ERROR.exception)))</span>
+<span class="pc bpc" id="L122" title="1 of 2 branches missed.">        } else if (clientResponse.authenticationException != null) {</span>
+<span class="nc" id="L123">          debug(s&quot;Returning `UNKNOWN_SERVER_ERROR` in response to ${requestToString()} &quot; +</span>
+<span class="nc" id="L124">            s&quot;due to authentication error&quot;, clientResponse.authenticationException)</span>
+<span class="nc" id="L125">          responseCallback(Some(requestBody.getErrorResponse(Errors.UNKNOWN_SERVER_ERROR.exception)))</span>
+        } else {
+<span class="fc" id="L127">          val envelopeResponse = clientResponse.responseBody.asInstanceOf[EnvelopeResponse]</span>
+<span class="fc" id="L128">          val envelopeError = envelopeResponse.error()</span>
+
+          // Unsupported version indicates an incompatibility between controller and client API versions. This
+          // could happen when the controller changed after the connection was established. The forwarding broker
+          // should close the connection with the client and let it reinitialize the connection and refresh
+          // the controller API versions.
+<span class="pc bpc" id="L134" title="4 of 6 branches missed.">          if (envelopeError == Errors.UNSUPPORTED_VERSION) {</span>
+<span class="nc" id="L135">            responseCallback(None)</span>
+          } else {
+<span class="pc bpc" id="L137" title="4 of 6 branches missed.">            val response = if (envelopeError != Errors.NONE) {</span>
+              // A general envelope error indicates broker misconfiguration (e.g. the principal serde
+              // might not be defined on the receiving broker). In this case, we do not return
+              // the error directly to the client since it would not be expected. Instead we
+              // return `UNKNOWN_SERVER_ERROR` so that the user knows that there is a problem
+              // on the broker.
+<span class="nc" id="L143">              debug(s&quot;Forwarded request ${requestToString()} failed with an error in the envelope response $envelopeError&quot;)</span>
+<span class="nc" id="L144">              requestBody.getErrorResponse(Errors.UNKNOWN_SERVER_ERROR.exception)</span>
+            } else {
+<span class="fc" id="L146">              parseResponse(envelopeResponse.responseData, requestBody, requestContext.header)</span>
+            }
+<span class="fc" id="L148">            responseCallback(Option(response))</span>
+          }
+        }
+      }
+
+      override def onTimeout(): Unit = {
+<span class="nc" id="L154">        debug(s&quot;Forwarding of the request ${requestToString()} failed due to timeout exception&quot;)</span>
+<span class="nc" id="L155">        forwardingManagerMetrics.decrementQueueLength()</span>
+<span class="nc" id="L156">        forwardingManagerMetrics.queueTimeMsHist.record(channelManager.getTimeoutMs)</span>
+<span class="nc" id="L157">        val response = requestBody.getErrorResponse(new TimeoutException())</span>
+<span class="nc" id="L158">        responseCallback(Option(response))</span>
+      }
+    }
+
+<span class="fc" id="L162">    forwardingManagerMetrics.incrementQueueLength()</span>
+<span class="fc" id="L163">    channelManager.sendRequest(envelopeRequest, new ForwardingResponseHandler)</span>
+  }
+
+  override def close(): Unit =
+<span class="fc" id="L167">    forwardingManagerMetrics.close()</span>
+
+  override def controllerApiVersions: Optional[NodeApiVersions] =
+<span class="fc" id="L170">    channelManager.controllerApiVersions</span>
+
+  private def parseResponse(
+    buffer: ByteBuffer,
+    request: AbstractRequest,
+    header: RequestHeader
+  ): AbstractResponse = {
+    try {
+<span class="pc" id="L178">      AbstractResponse.parseResponse(buffer, header)</span>
+    } catch {
+      case e: Exception =&gt;
+<span class="nc" id="L181">        error(s&quot;Failed to parse response from envelope for request with header $header&quot;, e)</span>
+<span class="nc" id="L182">        request.getErrorResponse(Errors.UNKNOWN_SERVER_ERROR.exception)</span>
+    }
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

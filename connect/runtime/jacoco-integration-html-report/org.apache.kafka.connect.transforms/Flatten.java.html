@@ -1,0 +1,300 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Flatten.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.transforms</a> &gt; <span class="el_source">Flatten.java</span></div><h1>Flatten.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.connect.transforms;
+
+import org.apache.kafka.common.cache.Cache;
+import org.apache.kafka.common.cache.LRUCache;
+import org.apache.kafka.common.cache.SynchronizedCache;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.utils.AppInfoParser;
+import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.data.ConnectSchema;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.transforms.util.SchemaUtil;
+import org.apache.kafka.connect.transforms.util.SimpleConfig;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+import static org.apache.kafka.connect.transforms.util.Requirements.requireMap;
+import static org.apache.kafka.connect.transforms.util.Requirements.requireStructOrNull;
+
+<span class="fc" id="L41">public abstract class Flatten&lt;R extends ConnectRecord&lt;R&gt;&gt; implements Transformation&lt;R&gt; {</span>
+
+<span class="fc" id="L43">    public static final String OVERVIEW_DOC =</span>
+            &quot;Flatten a nested data structure, generating names for each field by concatenating the field names at each &quot;
+                    + &quot;level with a configurable delimiter character. Applies to Struct when schema present, or a Map &quot;
+                    + &quot;in the case of schemaless data. Array fields and their contents are not modified. The default delimiter is '.'.&quot;
+<span class="fc" id="L47">                    + &quot;&lt;p/&gt;Use the concrete transformation type designed for the record key (&lt;code&gt;&quot; + Key.class.getName() + &quot;&lt;/code&gt;) &quot;</span>
+<span class="fc" id="L48">                    + &quot;or value (&lt;code&gt;&quot; + Value.class.getName() + &quot;&lt;/code&gt;).&quot;;</span>
+
+    private static final String DELIMITER_CONFIG = &quot;delimiter&quot;;
+    private static final String DELIMITER_DEFAULT = &quot;.&quot;;
+
+<span class="fc" id="L53">    public static final ConfigDef CONFIG_DEF = new ConfigDef()</span>
+<span class="fc" id="L54">            .define(DELIMITER_CONFIG, ConfigDef.Type.STRING, DELIMITER_DEFAULT, ConfigDef.Importance.MEDIUM,</span>
+                    &quot;Delimiter to insert between field names from the input record when generating field names for the &quot;
+                            + &quot;output record&quot;);
+
+    private static final String PURPOSE = &quot;flattening&quot;;
+
+    private String delimiter;
+
+    private Cache&lt;Schema, Schema&gt; schemaUpdateCache;
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; props) {
+<span class="nc" id="L66">        final SimpleConfig config = new SimpleConfig(CONFIG_DEF, props);</span>
+<span class="nc" id="L67">        delimiter = config.getString(DELIMITER_CONFIG);</span>
+<span class="nc" id="L68">        schemaUpdateCache = new SynchronizedCache&lt;&gt;(new LRUCache&lt;&gt;(16));</span>
+<span class="nc" id="L69">    }</span>
+
+    @Override
+    public R apply(R record) {
+<span class="nc bnc" id="L73" title="All 2 branches missed.">        if (operatingValue(record) == null) {</span>
+<span class="nc" id="L74">            return record;</span>
+<span class="nc bnc" id="L75" title="All 2 branches missed.">        } else if (operatingSchema(record) == null) {</span>
+<span class="nc" id="L76">            return applySchemaless(record);</span>
+        } else {
+<span class="nc" id="L78">            return applyWithSchema(record);</span>
+        }
+    }
+
+    @Override
+    public String version() {
+<span class="fc" id="L84">        return AppInfoParser.getVersion();</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L89">    }</span>
+
+    @Override
+    public ConfigDef config() {
+<span class="nc" id="L93">        return CONFIG_DEF;</span>
+    }
+
+    protected abstract Schema operatingSchema(R record);
+
+    protected abstract Object operatingValue(R record);
+
+    protected abstract R newRecord(R record, Schema updatedSchema, Object updatedValue);
+
+    private R applySchemaless(R record) {
+<span class="nc" id="L103">        final Map&lt;String, Object&gt; value = requireMap(operatingValue(record), PURPOSE);</span>
+<span class="nc" id="L104">        final Map&lt;String, Object&gt; newValue = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L105">        applySchemaless(value, &quot;&quot;, newValue);</span>
+<span class="nc" id="L106">        return newRecord(record, null, newValue);</span>
+    }
+
+    private void applySchemaless(Map&lt;String, Object&gt; originalRecord, String fieldNamePrefix, Map&lt;String, Object&gt; newRecord) {
+<span class="nc bnc" id="L110" title="All 2 branches missed.">        for (Map.Entry&lt;String, Object&gt; entry : originalRecord.entrySet()) {</span>
+<span class="nc" id="L111">            final String fieldName = fieldName(fieldNamePrefix, entry.getKey());</span>
+<span class="nc" id="L112">            Object value = entry.getValue();</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">            if (value == null) {</span>
+<span class="nc" id="L114">                newRecord.put(fieldName(fieldNamePrefix, entry.getKey()), null);</span>
+<span class="nc" id="L115">                continue;</span>
+            }
+
+<span class="nc" id="L118">            Schema.Type inferredType = ConnectSchema.schemaType(value.getClass());</span>
+<span class="nc bnc" id="L119" title="All 2 branches missed.">            if (inferredType == null) {</span>
+<span class="nc" id="L120">                throw new DataException(&quot;Flatten transformation was passed a value of type &quot; + value.getClass()</span>
+                        + &quot; which is not supported by Connect's data API&quot;);
+            }
+<span class="nc bnc" id="L123" title="All 3 branches missed.">            switch (inferredType) {</span>
+                case INT8:
+                case INT16:
+                case INT32:
+                case INT64:
+                case FLOAT32:
+                case FLOAT64:
+                case BOOLEAN:
+                case STRING:
+                case BYTES:
+                case ARRAY:
+<span class="nc" id="L134">                    newRecord.put(fieldName(fieldNamePrefix, entry.getKey()), entry.getValue());</span>
+<span class="nc" id="L135">                    break;</span>
+                case MAP:
+<span class="nc" id="L137">                    final Map&lt;String, Object&gt; fieldValue = requireMap(entry.getValue(), PURPOSE);</span>
+<span class="nc" id="L138">                    applySchemaless(fieldValue, fieldName, newRecord);</span>
+<span class="nc" id="L139">                    break;</span>
+                default:
+<span class="nc" id="L141">                    throw new DataException(&quot;Flatten transformation does not support &quot; + entry.getValue().getClass()</span>
+                            + &quot; for record without schemas (for field &quot; + fieldName + &quot;).&quot;);
+            }
+<span class="nc" id="L144">        }</span>
+<span class="nc" id="L145">    }</span>
+
+    private R applyWithSchema(R record) {
+<span class="nc" id="L148">        final Struct value = requireStructOrNull(operatingValue(record), PURPOSE);</span>
+
+<span class="nc" id="L150">        Schema schema = operatingSchema(record);</span>
+<span class="nc" id="L151">        Schema updatedSchema = schemaUpdateCache.get(schema);</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        if (updatedSchema == null) {</span>
+<span class="nc" id="L153">            final SchemaBuilder builder = SchemaUtil.copySchemaBasics(schema, SchemaBuilder.struct());</span>
+<span class="nc" id="L154">            Struct defaultValue = (Struct) schema.defaultValue();</span>
+<span class="nc" id="L155">            buildUpdatedSchema(schema, &quot;&quot;, builder, schema.isOptional(), defaultValue);</span>
+<span class="nc" id="L156">            updatedSchema = builder.build();</span>
+<span class="nc" id="L157">            schemaUpdateCache.put(schema, updatedSchema);</span>
+        }
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if (value == null) {</span>
+<span class="nc" id="L160">            return newRecord(record, updatedSchema, null);</span>
+        } else {
+<span class="nc" id="L162">            final Struct updatedValue = new Struct(updatedSchema);</span>
+<span class="nc" id="L163">            buildWithSchema(value, &quot;&quot;, updatedValue);</span>
+<span class="nc" id="L164">            return newRecord(record, updatedSchema, updatedValue);</span>
+        }
+    }
+
+    /**
+     * Build an updated Struct Schema which flattens all nested fields into a single struct, handling cases where
+     * optionality and default values of the flattened fields are affected by the optionality and default values of
+     * parent/ancestor schemas (e.g. flattened field is optional because the parent schema was optional, even if the
+     * schema itself is marked as required).
+     * @param schema the schema to translate
+     * @param fieldNamePrefix the prefix to use on field names, i.e. the delimiter-joined set of ancestor field names
+     * @param newSchema the flattened schema being built
+     * @param optional true if any ancestor schema is optional
+     * @param defaultFromParent the default value, if any, included via the parent/ancestor schemas
+     */
+    private void buildUpdatedSchema(Schema schema, String fieldNamePrefix, SchemaBuilder newSchema, boolean optional, Struct defaultFromParent) {
+<span class="nc bnc" id="L180" title="All 2 branches missed.">        for (Field field : schema.fields()) {</span>
+<span class="nc" id="L181">            final String fieldName = fieldName(fieldNamePrefix, field.name());</span>
+<span class="nc bnc" id="L182" title="All 4 branches missed.">            final boolean fieldIsOptional = optional || field.schema().isOptional();</span>
+<span class="nc" id="L183">            Object fieldDefaultValue = null;</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            if (field.schema().defaultValue() != null) {</span>
+<span class="nc" id="L185">                fieldDefaultValue = field.schema().defaultValue();</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">            } else if (defaultFromParent != null) {</span>
+<span class="nc" id="L187">                fieldDefaultValue = defaultFromParent.get(field);</span>
+            }
+<span class="nc bnc" id="L189" title="All 3 branches missed.">            switch (field.schema().type()) {</span>
+                case INT8:
+                case INT16:
+                case INT32:
+                case INT64:
+                case FLOAT32:
+                case FLOAT64:
+                case BOOLEAN:
+                case STRING:
+                case BYTES:
+                case ARRAY:
+<span class="nc" id="L200">                    newSchema.field(fieldName, convertFieldSchema(field.schema(), fieldIsOptional, fieldDefaultValue));</span>
+<span class="nc" id="L201">                    break;</span>
+                case STRUCT:
+<span class="nc" id="L203">                    buildUpdatedSchema(field.schema(), fieldName, newSchema, fieldIsOptional, (Struct) fieldDefaultValue);</span>
+<span class="nc" id="L204">                    break;</span>
+                default:
+<span class="nc" id="L206">                    throw new DataException(&quot;Flatten transformation does not support &quot; + field.schema().type()</span>
+                            + &quot; for record with schemas (for field &quot; + fieldName + &quot;).&quot;);
+            }
+<span class="nc" id="L209">        }</span>
+<span class="nc" id="L210">    }</span>
+
+    /**
+     * Convert the schema for a field of a Struct with a primitive schema to the schema to be used for the flattened
+     * version, taking into account that we may need to override optionality and default values in the flattened version
+     * to take into account the optionality and default values of parent/ancestor schemas
+     * @param orig the original schema for the field
+     * @param optional whether the new flattened field should be optional
+     * @param defaultFromParent the default value either taken from the existing field or provided by the parent
+     */
+    private Schema convertFieldSchema(Schema orig, boolean optional, Object defaultFromParent) {
+        // Note that we don't use the schema translation cache here. It might save us a bit of effort, but we really
+        // only care about caching top-level schema translations.
+
+<span class="nc" id="L224">        final SchemaBuilder builder = SchemaUtil.copySchemaBasics(orig);</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        if (optional)</span>
+<span class="nc" id="L226">            builder.optional();</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">        if (defaultFromParent != null)</span>
+<span class="nc" id="L228">            builder.defaultValue(defaultFromParent);</span>
+<span class="nc" id="L229">        return builder.build();</span>
+    }
+
+    private void buildWithSchema(Struct record, String fieldNamePrefix, Struct newRecord) {
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        if (record == null) {</span>
+<span class="nc" id="L234">            return;</span>
+        }
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        for (Field field : record.schema().fields()) {</span>
+<span class="nc" id="L237">            final String fieldName = fieldName(fieldNamePrefix, field.name());</span>
+<span class="nc bnc" id="L238" title="All 3 branches missed.">            switch (field.schema().type()) {</span>
+                case INT8:
+                case INT16:
+                case INT32:
+                case INT64:
+                case FLOAT32:
+                case FLOAT64:
+                case BOOLEAN:
+                case STRING:
+                case BYTES:
+                case ARRAY:
+<span class="nc" id="L249">                    newRecord.put(fieldName, record.get(field));</span>
+<span class="nc" id="L250">                    break;</span>
+                case STRUCT:
+<span class="nc" id="L252">                    buildWithSchema(record.getStruct(field.name()), fieldName, newRecord);</span>
+<span class="nc" id="L253">                    break;</span>
+                default:
+<span class="nc" id="L255">                    throw new DataException(&quot;Flatten transformation does not support &quot; + field.schema().type()</span>
+                            + &quot; for record with schemas (for field &quot; + fieldName + &quot;).&quot;);
+            }
+<span class="nc" id="L258">        }</span>
+<span class="nc" id="L259">    }</span>
+
+    private String fieldName(String prefix, String fieldName) {
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        return prefix.isEmpty() ? fieldName : (prefix + delimiter + fieldName);</span>
+    }
+
+<span class="fc" id="L265">    public static class Key&lt;R extends ConnectRecord&lt;R&gt;&gt; extends Flatten&lt;R&gt; {</span>
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L268">            return record.keySchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L273">            return record.key();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue) {
+<span class="nc" id="L278">            return record.newRecord(record.topic(), record.kafkaPartition(), updatedSchema, updatedValue, record.valueSchema(), record.value(), record.timestamp());</span>
+        }
+    }
+
+<span class="fc" id="L282">    public static class Value&lt;R extends ConnectRecord&lt;R&gt;&gt; extends Flatten&lt;R&gt; {</span>
+        @Override
+        protected Schema operatingSchema(R record) {
+<span class="nc" id="L285">            return record.valueSchema();</span>
+        }
+
+        @Override
+        protected Object operatingValue(R record) {
+<span class="nc" id="L290">            return record.value();</span>
+        }
+
+        @Override
+        protected R newRecord(R record, Schema updatedSchema, Object updatedValue) {
+<span class="nc" id="L295">            return record.newRecord(record.topic(), record.kafkaPartition(), record.keySchema(), record.key(), updatedSchema, updatedValue, record.timestamp());</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

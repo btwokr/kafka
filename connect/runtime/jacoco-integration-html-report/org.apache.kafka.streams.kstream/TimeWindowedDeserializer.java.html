@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TimeWindowedDeserializer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.kstream</a> &gt; <span class="el_source">TimeWindowedDeserializer.java</span></div><h1>TimeWindowedDeserializer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.kstream;
+
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.header.Headers;
+import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.serialization.Deserializer;
+import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.state.internals.WindowKeySchema;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Map;
+
+public class TimeWindowedDeserializer&lt;T&gt; implements Deserializer&lt;Windowed&lt;T&gt;&gt; {
+
+    /**
+     * Sets window size for the deserializer in order to calculate window end times.
+     */
+    public static final String WINDOW_SIZE_MS_CONFIG = &quot;window.size.ms&quot;;
+
+    /**
+     * Default deserializer for the inner deserializer class of a windowed record. Must implement the {@link Serde} interface.
+     */
+    public static final String WINDOWED_INNER_DESERIALIZER_CLASS = &quot;windowed.inner.deserializer.class&quot;;
+
+<span class="nc" id="L45">    private final Logger log = LoggerFactory.getLogger(TimeWindowedDeserializer.class);</span>
+
+    private Long windowSize;
+    private boolean isChangelogTopic;
+
+    private Deserializer&lt;T&gt; inner;
+
+    // Default constructor needed by Kafka
+    public TimeWindowedDeserializer() {
+<span class="nc" id="L54">        this(null, null);</span>
+<span class="nc" id="L55">    }</span>
+
+<span class="nc" id="L57">    public TimeWindowedDeserializer(final Deserializer&lt;T&gt; inner, final Long windowSize) {</span>
+<span class="nc" id="L58">        this.inner = inner;</span>
+<span class="nc" id="L59">        this.windowSize = windowSize;</span>
+<span class="nc" id="L60">        this.isChangelogTopic = false;</span>
+<span class="nc" id="L61">    }</span>
+
+    public Long getWindowSize() {
+<span class="nc" id="L64">        return this.windowSize;</span>
+    }
+
+    @Override
+    public void configure(final Map&lt;String, ?&gt; configs, final boolean isKey) {
+<span class="nc" id="L69">        configureWindowSizeMs(configs);</span>
+<span class="nc" id="L70">        configureWindowInnerDeserializerClass(configs);</span>
+<span class="nc" id="L71">    }</span>
+
+    @Override
+    public Windowed&lt;T&gt; deserialize(final String topic, final byte[] data) {
+<span class="nc" id="L75">        return deserialize(topic, new RecordHeaders(), data);</span>
+    }
+
+    @Override
+    public Windowed&lt;T&gt; deserialize(final String topic, final Headers headers, final byte[] data) {
+<span class="nc" id="L80">        WindowedSerdes.verifyInnerDeserializerNotNull(inner, this);</span>
+
+<span class="nc bnc" id="L82" title="All 4 branches missed.">        if (data == null || data.length == 0) {</span>
+<span class="nc" id="L83">            return null;</span>
+        }
+
+        // toStoreKeyBinary was used to serialize the data.
+<span class="nc bnc" id="L87" title="All 2 branches missed.">        if (this.isChangelogTopic) {</span>
+<span class="nc" id="L88">            return WindowKeySchema.fromStoreKey(data, windowSize, inner, headers, topic);</span>
+        }
+
+        // toBinary was used to serialize the data
+<span class="nc" id="L92">        return WindowKeySchema.from(data, windowSize, inner, headers, topic);</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc bnc" id="L97" title="All 2 branches missed.">        if (inner != null) {</span>
+<span class="nc" id="L98">            inner.close();</span>
+        }
+<span class="nc" id="L100">    }</span>
+
+    public void setIsChangelogTopic(final boolean isChangelogTopic) {
+<span class="nc" id="L103">        this.isChangelogTopic = isChangelogTopic;</span>
+<span class="nc" id="L104">    }</span>
+
+    // Only for testing
+    Deserializer&lt;T&gt; innerDeserializer() {
+<span class="nc" id="L108">        return inner;</span>
+    }
+
+    private void configureWindowSizeMs(final Map&lt;String, ?&gt; configs) {
+        //check to see if the window size config is set and the window size is already set from the constructor
+        final Long configWindowSize;
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        if (configs.get(WINDOW_SIZE_MS_CONFIG) instanceof String) {</span>
+<span class="nc" id="L115">            configWindowSize = Long.parseLong((String) configs.get(WINDOW_SIZE_MS_CONFIG));</span>
+        } else {
+<span class="nc" id="L117">            configWindowSize = (Long) configs.get(WINDOW_SIZE_MS_CONFIG);</span>
+        }
+<span class="nc bnc" id="L119" title="All 4 branches missed.">        if (windowSize != null &amp;&amp; configWindowSize != null) {</span>
+<span class="nc" id="L120">            throw new IllegalArgumentException(&quot;Window size should not be set in both the time windowed deserializer constructor and the window.size.ms config&quot;);</span>
+<span class="nc bnc" id="L121" title="All 4 branches missed.">        } else if (windowSize == null &amp;&amp; configWindowSize == null) {</span>
+<span class="nc" id="L122">            throw new IllegalArgumentException(&quot;Window size needs to be set either through the time windowed deserializer &quot; +</span>
+                &quot;constructor or the window.size.ms config but not both&quot;);
+        } else {
+<span class="nc bnc" id="L125" title="All 2 branches missed.">            windowSize = windowSize == null ? configWindowSize : windowSize;</span>
+        }
+<span class="nc" id="L127">    }</span>
+
+    @SuppressWarnings({&quot;deprecation&quot;, &quot;unchecked&quot;})
+    private void configureWindowInnerDeserializerClass(final Map&lt;String, ?&gt; configs) {
+<span class="nc" id="L131">        String deserializerConfigKey = WINDOWED_INNER_DESERIALIZER_CLASS;</span>
+<span class="nc" id="L132">        String deserializerConfigValue = (String) configs.get(WINDOWED_INNER_DESERIALIZER_CLASS);</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        if (deserializerConfigValue == null) {</span>
+<span class="nc" id="L134">            final String windowedInnerClassSerdeConfig = (String) configs.get(StreamsConfig.WINDOWED_INNER_CLASS_SERDE);</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">            if (windowedInnerClassSerdeConfig != null) {</span>
+<span class="nc" id="L136">                deserializerConfigKey = StreamsConfig.WINDOWED_INNER_CLASS_SERDE;</span>
+<span class="nc" id="L137">                deserializerConfigValue = windowedInnerClassSerdeConfig;</span>
+<span class="nc" id="L138">                log.warn(&quot;Config {} is deprecated. Please use {} instead.&quot;,</span>
+                    StreamsConfig.WINDOWED_INNER_CLASS_SERDE, WINDOWED_INNER_DESERIALIZER_CLASS);
+            }
+        }
+
+<span class="nc" id="L143">        Serde&lt;T&gt; windowedInnerDeserializerClass = null;</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        if (deserializerConfigValue != null) {</span>
+            try {
+<span class="nc" id="L146">                windowedInnerDeserializerClass = Utils.newInstance(deserializerConfigValue, Serde.class);</span>
+<span class="nc" id="L147">            } catch (final ClassNotFoundException e) {</span>
+<span class="nc" id="L148">                throw new ConfigException(deserializerConfigKey, deserializerConfigValue,</span>
+                    &quot;Serde class &quot; + deserializerConfigValue + &quot; could not be found.&quot;);
+<span class="nc" id="L150">            }</span>
+        }
+
+<span class="nc bnc" id="L153" title="All 4 branches missed.">        if (inner != null &amp;&amp; deserializerConfigValue != null) {</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">            if (!inner.getClass().getName().equals(windowedInnerDeserializerClass.deserializer().getClass().getName())) {</span>
+<span class="nc" id="L155">                throw new IllegalArgumentException(&quot;Inner class deserializer set using constructor &quot;</span>
+<span class="nc" id="L156">                    + &quot;(&quot; + inner.getClass().getName() + &quot;)&quot; +</span>
+                    &quot; is different from the one set in &quot; + deserializerConfigKey + &quot; config &quot; +
+<span class="nc" id="L158">                    &quot;(&quot; + windowedInnerDeserializerClass.deserializer().getClass().getName() + &quot;).&quot;);</span>
+            }
+<span class="nc bnc" id="L160" title="All 4 branches missed.">        } else if (inner == null &amp;&amp; deserializerConfigValue == null) {</span>
+<span class="nc" id="L161">            throw new IllegalArgumentException(&quot;Inner class deserializer should be set either via  constructor &quot; +</span>
+                &quot;or via the &quot; + WINDOWED_INNER_DESERIALIZER_CLASS + &quot; config&quot;);
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        } else if (inner == null)</span>
+<span class="nc" id="L164">            inner = windowedInnerDeserializerClass.deserializer();</span>
+<span class="nc" id="L165">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

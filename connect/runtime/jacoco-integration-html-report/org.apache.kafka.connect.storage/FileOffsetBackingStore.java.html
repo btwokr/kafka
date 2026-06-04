@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FileOffsetBackingStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.storage</a> &gt; <span class="el_source">FileOffsetBackingStore.java</span></div><h1>FileOffsetBackingStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.storage;
+
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.runtime.WorkerConfig;
+import org.apache.kafka.connect.runtime.standalone.StandaloneConfig;
+import org.apache.kafka.connect.util.SafeObjectInputStream;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.EOFException;
+import java.io.File;
+import java.io.IOException;
+import java.io.ObjectOutputStream;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Implementation of OffsetBackingStore that saves data locally to a file. To ensure this behaves
+ * similarly to a real backing store, operations are executed asynchronously on a background thread.
+ */
+public class FileOffsetBackingStore extends MemoryOffsetBackingStore {
+<span class="fc" id="L43">    private static final Logger log = LoggerFactory.getLogger(FileOffsetBackingStore.class);</span>
+
+    private File file;
+    private final Map&lt;String, Set&lt;Map&lt;String, Object&gt;&gt;&gt; connectorPartitions;
+    private final Converter keyConverter;
+
+<span class="fc" id="L49">    public FileOffsetBackingStore(Converter keyConverter) {</span>
+<span class="fc" id="L50">        connectorPartitions = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L51">        this.keyConverter = keyConverter;</span>
+<span class="fc" id="L52">    }</span>
+
+    @Override
+    public void configure(WorkerConfig config) {
+<span class="fc" id="L56">        super.configure(config);</span>
+<span class="fc" id="L57">        file = new File(config.getString(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG));</span>
+<span class="fc" id="L58">    }</span>
+
+    @Override
+    public synchronized void start() {
+<span class="fc" id="L62">        super.start();</span>
+<span class="fc" id="L63">        log.info(&quot;Starting FileOffsetBackingStore with file {}&quot;, file);</span>
+<span class="fc" id="L64">        load();</span>
+<span class="fc" id="L65">    }</span>
+
+    @Override
+    public synchronized void stop() {
+<span class="fc" id="L69">        super.stop();</span>
+        // Nothing to do since this doesn't maintain any outstanding connections/data
+<span class="fc" id="L71">        log.info(&quot;Stopped FileOffsetBackingStore&quot;);</span>
+<span class="fc" id="L72">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private void load() {
+<span class="nc" id="L76">        try (SafeObjectInputStream is = new SafeObjectInputStream(Files.newInputStream(file.toPath()))) {</span>
+<span class="nc" id="L77">            Object obj = is.readObject();</span>
+<span class="nc bnc" id="L78" title="All 2 branches missed.">            if (!(obj instanceof HashMap))</span>
+<span class="nc" id="L79">                throw new ConnectException(&quot;Expected HashMap but found &quot; + obj.getClass());</span>
+<span class="nc" id="L80">            Map&lt;byte[], byte[]&gt; raw = (Map&lt;byte[], byte[]&gt;) obj;</span>
+<span class="nc" id="L81">            data = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L82" title="All 2 branches missed.">            for (Map.Entry&lt;byte[], byte[]&gt; mapEntry : raw.entrySet()) {</span>
+<span class="nc bnc" id="L83" title="All 2 branches missed.">                ByteBuffer key = (mapEntry.getKey() != null) ? ByteBuffer.wrap(mapEntry.getKey()) : null;</span>
+<span class="nc bnc" id="L84" title="All 2 branches missed.">                ByteBuffer value = (mapEntry.getValue() != null) ? ByteBuffer.wrap(mapEntry.getValue()) : null;</span>
+<span class="nc" id="L85">                data.put(key, value);</span>
+<span class="nc" id="L86">                OffsetUtils.processPartitionKey(mapEntry.getKey(), mapEntry.getValue(), keyConverter, connectorPartitions);</span>
+<span class="nc" id="L87">            }</span>
+<span class="fc" id="L88">        } catch (NoSuchFileException | EOFException e) {</span>
+            // NoSuchFileException: Ignore, may be new.
+            // EOFException: Ignore, this means the file was missing or corrupt
+<span class="nc" id="L91">        } catch (IOException | ClassNotFoundException e) {</span>
+<span class="nc" id="L92">            throw new ConnectException(e);</span>
+<span class="pc" id="L93">        }</span>
+<span class="fc" id="L94">    }</span>
+
+    @Override
+    protected void save() {
+<span class="fc" id="L98">        try (ObjectOutputStream os = new ObjectOutputStream(Files.newOutputStream(file.toPath()))) {</span>
+<span class="fc" id="L99">            Map&lt;byte[], byte[]&gt; raw = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L100" title="All 2 branches covered.">            for (Map.Entry&lt;ByteBuffer, ByteBuffer&gt; mapEntry : data.entrySet()) {</span>
+<span class="pc bpc" id="L101" title="1 of 2 branches missed.">                byte[] key = (mapEntry.getKey() != null) ? mapEntry.getKey().array() : null;</span>
+<span class="pc bpc" id="L102" title="1 of 2 branches missed.">                byte[] value = (mapEntry.getValue() != null) ? mapEntry.getValue().array() : null;</span>
+<span class="fc" id="L103">                raw.put(key, value);</span>
+<span class="fc" id="L104">                OffsetUtils.processPartitionKey(key, value, keyConverter, connectorPartitions);</span>
+<span class="fc" id="L105">            }</span>
+<span class="fc" id="L106">            os.writeObject(raw);</span>
+<span class="nc" id="L107">        } catch (IOException e) {</span>
+<span class="nc" id="L108">            throw new ConnectException(e);</span>
+<span class="fc" id="L109">        }</span>
+<span class="fc" id="L110">    }</span>
+
+    @Override
+    public Set&lt;Map&lt;String, Object&gt;&gt; connectorPartitions(String connectorName) {
+<span class="nc" id="L114">        return connectorPartitions.getOrDefault(connectorName, Set.of());</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

@@ -1,0 +1,1622 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>NetworkClient.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients</a> &gt; <span class="el_source">NetworkClient.java</span></div><h1>NetworkClient.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.clients;
+
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.AuthenticationException;
+import org.apache.kafka.common.errors.DisconnectException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.message.ApiVersionsResponseData.ApiVersion;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.network.ChannelState;
+import org.apache.kafka.common.network.NetworkReceive;
+import org.apache.kafka.common.network.NetworkSend;
+import org.apache.kafka.common.network.Selectable;
+import org.apache.kafka.common.network.Send;
+import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.protocol.types.SchemaException;
+import org.apache.kafka.common.requests.AbstractRequest;
+import org.apache.kafka.common.requests.AbstractResponse;
+import org.apache.kafka.common.requests.ApiVersionsRequest;
+import org.apache.kafka.common.requests.ApiVersionsResponse;
+import org.apache.kafka.common.requests.CorrelationIdMismatchException;
+import org.apache.kafka.common.requests.GetTelemetrySubscriptionsResponse;
+import org.apache.kafka.common.requests.MetadataRequest;
+import org.apache.kafka.common.requests.MetadataResponse;
+import org.apache.kafka.common.requests.PushTelemetryResponse;
+import org.apache.kafka.common.requests.RequestHeader;
+import org.apache.kafka.common.security.authenticator.SaslClientAuthenticator;
+import org.apache.kafka.common.telemetry.internals.ClientTelemetrySender;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
+
+import org.slf4j.Logger;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.nio.BufferUnderflowException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Random;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+
+/**
+ * A network client for asynchronous request/response network i/o. This is an internal class used to implement the
+ * user-facing producer and consumer clients.
+ * &lt;p&gt;
+ * This class is not thread-safe!
+ */
+public class NetworkClient implements KafkaClient {
+
+<span class="fc" id="L79">    private enum State {</span>
+<span class="fc" id="L80">        ACTIVE,</span>
+<span class="fc" id="L81">        CLOSING,</span>
+<span class="fc" id="L82">        CLOSED</span>
+    }
+
+    private final Logger log;
+
+    /* the selector used to perform network i/o */
+    private final Selectable selector;
+
+    private final MetadataUpdater metadataUpdater;
+
+    private final Random randOffset;
+
+    /* the state of each node's connection */
+    private final ClusterConnectionStates connectionStates;
+
+    /* the set of requests currently being sent or awaiting a response */
+    private final InFlightRequests inFlightRequests;
+
+    /* the socket send buffer size in bytes */
+    private final int socketSendBuffer;
+
+    /* the socket receive size buffer in bytes */
+    private final int socketReceiveBuffer;
+
+    /* the client id used to identify this client in requests to the server */
+    private final String clientId;
+
+    /* the current correlation id to use when sending requests to servers */
+    private int correlation;
+
+    /* default timeout for individual requests to await acknowledgement from servers */
+    private final int defaultRequestTimeoutMs;
+
+    /* time in ms to wait before retrying to create connection to a server */
+    private final long reconnectBackoffMs;
+
+    /* Timeout starting from an attempt to fetch metadata after which client rebootstraps */
+    private final long rebootstrapTriggerMs;
+
+    private final MetadataRecoveryStrategy metadataRecoveryStrategy;
+
+    private final Time time;
+
+    /**
+     * True if we should send an ApiVersionRequest when first connecting to a broker.
+     */
+    private final boolean discoverBrokerVersions;
+
+    private final ApiVersions apiVersions;
+
+<span class="fc" id="L132">    private final Map&lt;String, ApiVersionsRequest.Builder&gt; nodesNeedingApiVersionsFetch = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L134">    private final List&lt;ClientResponse&gt; abortedSends = new LinkedList&lt;&gt;();</span>
+
+    private final Sensor throttleTimeSensor;
+
+    private final AtomicReference&lt;State&gt; state;
+
+    private final TelemetrySender telemetrySender;
+
+    public NetworkClient(Selectable selector,
+                         Metadata metadata,
+                         String clientId,
+                         int maxInFlightRequestsPerConnection,
+                         long reconnectBackoffMs,
+                         long reconnectBackoffMax,
+                         int socketSendBuffer,
+                         int socketReceiveBuffer,
+                         int defaultRequestTimeoutMs,
+                         long connectionSetupTimeoutMs,
+                         long connectionSetupTimeoutMaxMs,
+                         Time time,
+                         boolean discoverBrokerVersions,
+                         ApiVersions apiVersions,
+                         LogContext logContext,
+                         MetadataRecoveryStrategy metadataRecoveryStrategy) {
+<span class="nc" id="L158">        this(selector,</span>
+             metadata,
+             clientId,
+             maxInFlightRequestsPerConnection,
+             reconnectBackoffMs,
+             reconnectBackoffMax,
+             socketSendBuffer,
+             socketReceiveBuffer,
+             defaultRequestTimeoutMs,
+             connectionSetupTimeoutMs,
+             connectionSetupTimeoutMaxMs,
+             time,
+             discoverBrokerVersions,
+             apiVersions,
+             logContext,
+             Long.MAX_VALUE,
+             metadataRecoveryStrategy);
+<span class="nc" id="L175">    }</span>
+
+    public NetworkClient(Selectable selector,
+                         Metadata metadata,
+                         String clientId,
+                         int maxInFlightRequestsPerConnection,
+                         long reconnectBackoffMs,
+                         long reconnectBackoffMax,
+                         int socketSendBuffer,
+                         int socketReceiveBuffer,
+                         int defaultRequestTimeoutMs,
+                         long connectionSetupTimeoutMs,
+                         long connectionSetupTimeoutMaxMs,
+                         Time time,
+                         boolean discoverBrokerVersions,
+                         ApiVersions apiVersions,
+                         LogContext logContext,
+                         long rebootstrapTriggerMs,
+                         MetadataRecoveryStrategy metadataRecoveryStrategy) {
+<span class="fc" id="L194">        this(null,</span>
+                metadata,
+                selector,
+                clientId,
+                maxInFlightRequestsPerConnection,
+                reconnectBackoffMs,
+                reconnectBackoffMax,
+                socketSendBuffer,
+                socketReceiveBuffer,
+                defaultRequestTimeoutMs,
+                connectionSetupTimeoutMs,
+                connectionSetupTimeoutMaxMs,
+                time,
+                discoverBrokerVersions,
+                apiVersions,
+                null,
+                logContext,
+                new DefaultHostResolver(),
+                null,
+                rebootstrapTriggerMs,
+                metadataRecoveryStrategy);
+<span class="fc" id="L215">    }</span>
+
+    public NetworkClient(Selectable selector,
+                         Metadata metadata,
+                         String clientId,
+                         int maxInFlightRequestsPerConnection,
+                         long reconnectBackoffMs,
+                         long reconnectBackoffMax,
+                         int socketSendBuffer,
+                         int socketReceiveBuffer,
+                         int defaultRequestTimeoutMs,
+                         long connectionSetupTimeoutMs,
+                         long connectionSetupTimeoutMaxMs,
+                         Time time,
+                         boolean discoverBrokerVersions,
+                         ApiVersions apiVersions,
+                         Sensor throttleTimeSensor,
+                         LogContext logContext,
+                         MetadataRecoveryStrategy metadataRecoveryStrategy) {
+<span class="nc" id="L234">        this(null,</span>
+             metadata,
+             selector,
+             clientId,
+             maxInFlightRequestsPerConnection,
+             reconnectBackoffMs,
+             reconnectBackoffMax,
+             socketSendBuffer,
+             socketReceiveBuffer,
+             defaultRequestTimeoutMs,
+             connectionSetupTimeoutMs,
+             connectionSetupTimeoutMaxMs,
+             time,
+             discoverBrokerVersions,
+             apiVersions,
+             throttleTimeSensor,
+             logContext,
+             new DefaultHostResolver(),
+             null,
+             Long.MAX_VALUE,
+             metadataRecoveryStrategy);
+<span class="nc" id="L255">    }</span>
+
+    public NetworkClient(Selectable selector,
+                         MetadataUpdater metadataUpdater,
+                         String clientId,
+                         int maxInFlightRequestsPerConnection,
+                         long reconnectBackoffMs,
+                         long reconnectBackoffMax,
+                         int socketSendBuffer,
+                         int socketReceiveBuffer,
+                         int defaultRequestTimeoutMs,
+                         long connectionSetupTimeoutMs,
+                         long connectionSetupTimeoutMaxMs,
+                         Time time,
+                         boolean discoverBrokerVersions,
+                         ApiVersions apiVersions,
+                         LogContext logContext,
+                         MetadataRecoveryStrategy metadataRecoveryStrategy) {
+<span class="fc" id="L273">        this(metadataUpdater,</span>
+             null,
+             selector,
+             clientId,
+             maxInFlightRequestsPerConnection,
+             reconnectBackoffMs,
+             reconnectBackoffMax,
+             socketSendBuffer,
+             socketReceiveBuffer,
+             defaultRequestTimeoutMs,
+             connectionSetupTimeoutMs,
+             connectionSetupTimeoutMaxMs,
+             time,
+             discoverBrokerVersions,
+             apiVersions,
+             null,
+             logContext,
+             new DefaultHostResolver(),
+             null,
+             Long.MAX_VALUE,
+             metadataRecoveryStrategy);
+<span class="fc" id="L294">    }</span>
+
+    public NetworkClient(MetadataUpdater metadataUpdater,
+                         Metadata metadata,
+                         Selectable selector,
+                         String clientId,
+                         int maxInFlightRequestsPerConnection,
+                         long reconnectBackoffMs,
+                         long reconnectBackoffMax,
+                         int socketSendBuffer,
+                         int socketReceiveBuffer,
+                         int defaultRequestTimeoutMs,
+                         long connectionSetupTimeoutMs,
+                         long connectionSetupTimeoutMaxMs,
+                         Time time,
+                         boolean discoverBrokerVersions,
+                         ApiVersions apiVersions,
+                         Sensor throttleTimeSensor,
+                         LogContext logContext,
+                         HostResolver hostResolver,
+                         ClientTelemetrySender clientTelemetrySender,
+                         long rebootstrapTriggerMs,
+<span class="fc" id="L316">                         MetadataRecoveryStrategy metadataRecoveryStrategy) {</span>
+        /* It would be better if we could pass `DefaultMetadataUpdater` from the public constructor, but it's not
+         * possible because `DefaultMetadataUpdater` is an inner class and it can only be instantiated after the
+         * super constructor is invoked.
+         */
+<span class="fc bfc" id="L321" title="All 2 branches covered.">        if (metadataUpdater == null) {</span>
+<span class="pc bpc" id="L322" title="1 of 2 branches missed.">            if (metadata == null)</span>
+<span class="nc" id="L323">                throw new IllegalArgumentException(&quot;`metadata` must not be null&quot;);</span>
+<span class="fc" id="L324">            this.metadataUpdater = new DefaultMetadataUpdater(metadata);</span>
+        } else {
+<span class="fc" id="L326">            this.metadataUpdater = metadataUpdater;</span>
+        }
+<span class="fc" id="L328">        this.selector = selector;</span>
+<span class="fc" id="L329">        this.clientId = clientId;</span>
+<span class="fc" id="L330">        this.inFlightRequests = new InFlightRequests(maxInFlightRequestsPerConnection);</span>
+<span class="fc" id="L331">        this.connectionStates = new ClusterConnectionStates(</span>
+                reconnectBackoffMs, reconnectBackoffMax,
+                connectionSetupTimeoutMs, connectionSetupTimeoutMaxMs, logContext, hostResolver);
+<span class="fc" id="L334">        this.socketSendBuffer = socketSendBuffer;</span>
+<span class="fc" id="L335">        this.socketReceiveBuffer = socketReceiveBuffer;</span>
+<span class="fc" id="L336">        this.correlation = 0;</span>
+<span class="fc" id="L337">        this.randOffset = new Random();</span>
+<span class="fc" id="L338">        this.defaultRequestTimeoutMs = defaultRequestTimeoutMs;</span>
+<span class="fc" id="L339">        this.reconnectBackoffMs = reconnectBackoffMs;</span>
+<span class="fc" id="L340">        this.time = time;</span>
+<span class="fc" id="L341">        this.discoverBrokerVersions = discoverBrokerVersions;</span>
+<span class="fc" id="L342">        this.apiVersions = apiVersions;</span>
+<span class="fc" id="L343">        this.throttleTimeSensor = throttleTimeSensor;</span>
+<span class="fc" id="L344">        this.log = logContext.logger(NetworkClient.class);</span>
+<span class="fc" id="L345">        this.state = new AtomicReference&lt;&gt;(State.ACTIVE);</span>
+<span class="fc bfc" id="L346" title="All 2 branches covered.">        this.telemetrySender = (clientTelemetrySender != null) ? new TelemetrySender(clientTelemetrySender) : null;</span>
+<span class="fc" id="L347">        this.rebootstrapTriggerMs = rebootstrapTriggerMs;</span>
+<span class="fc" id="L348">        this.metadataRecoveryStrategy = metadataRecoveryStrategy;</span>
+<span class="fc" id="L349">    }</span>
+
+    /**
+     * Begin connecting to the given node, return true if we are already connected and ready to send to that node.
+     *
+     * @param node The node to check
+     * @param now The current timestamp
+     * @return True if we are ready to send to the given node
+     */
+    @Override
+    public boolean ready(Node node, long now) {
+<span class="pc bpc" id="L360" title="1 of 2 branches missed.">        if (node.isEmpty())</span>
+<span class="nc" id="L361">            throw new IllegalArgumentException(&quot;Cannot connect to empty node &quot; + node);</span>
+
+<span class="fc bfc" id="L363" title="All 2 branches covered.">        if (isReady(node, now))</span>
+<span class="fc" id="L364">            return true;</span>
+
+<span class="fc bfc" id="L366" title="All 2 branches covered.">        if (connectionStates.canConnect(node.idString(), now))</span>
+            // if we are interested in sending to a node and we don't have a connection to it, initiate one
+<span class="fc" id="L368">            initiateConnect(node, now);</span>
+
+<span class="fc" id="L370">        return false;</span>
+    }
+
+    // Visible for testing
+    boolean canConnect(Node node, long now) {
+<span class="fc" id="L375">        return connectionStates.canConnect(node.idString(), now);</span>
+    }
+
+    /**
+     * Disconnects the connection to a particular node, if there is one.
+     * Any pending ClientRequests for this connection will receive disconnections.
+     *
+     * @param nodeId The id of the node
+     */
+    @Override
+    public void disconnect(String nodeId) {
+<span class="fc bfc" id="L386" title="All 2 branches covered.">        if (connectionStates.isDisconnected(nodeId)) {</span>
+<span class="fc" id="L387">            log.debug(&quot;Client requested disconnect from node {}, which is already disconnected&quot;, nodeId);</span>
+<span class="fc" id="L388">            return;</span>
+        }
+
+<span class="fc" id="L391">        log.info(&quot;Client requested disconnect from node {}&quot;, nodeId);</span>
+<span class="fc" id="L392">        selector.close(nodeId);</span>
+<span class="fc" id="L393">        long now = time.milliseconds();</span>
+<span class="fc" id="L394">        cancelInFlightRequests(nodeId, now, abortedSends, false);</span>
+<span class="fc" id="L395">        connectionStates.disconnected(nodeId, now);</span>
+<span class="fc" id="L396">    }</span>
+
+    private void cancelInFlightRequests(String nodeId,
+                                        long now,
+                                        Collection&lt;ClientResponse&gt; responses,
+                                        boolean timedOut) {
+<span class="fc" id="L402">        Iterable&lt;InFlightRequest&gt; inFlightRequests = this.inFlightRequests.clearAll(nodeId);</span>
+<span class="fc bfc" id="L403" title="All 2 branches covered.">        for (InFlightRequest request : inFlightRequests) {</span>
+<span class="pc bpc" id="L404" title="1 of 2 branches missed.">            if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L405">                log.debug(&quot;Cancelled in-flight {} request with correlation id {} due to node {} being disconnected &quot; +</span>
+                        &quot;(elapsed time since creation: {}ms, elapsed time since send: {}ms, throttle time: {}ms, request timeout: {}ms): {}&quot;,
+<span class="nc" id="L407">                    request.header.apiKey(), request.header.correlationId(), nodeId,</span>
+<span class="nc" id="L408">                    request.timeElapsedSinceCreateMs(now), request.timeElapsedSinceSendMs(now),</span>
+<span class="nc" id="L409">                    request.throttleTimeMs(), request.requestTimeoutMs, request.request);</span>
+            } else {
+<span class="fc" id="L411">                log.info(&quot;Cancelled in-flight {} request with correlation id {} due to node {} being disconnected &quot; +</span>
+                        &quot;(elapsed time since creation: {}ms, elapsed time since send: {}ms, throttle time: {}ms, request timeout: {}ms)&quot;,
+<span class="fc" id="L413">                    request.header.apiKey(), request.header.correlationId(), nodeId,</span>
+<span class="fc" id="L414">                    request.timeElapsedSinceCreateMs(now), request.timeElapsedSinceSendMs(now),</span>
+<span class="fc" id="L415">                    request.throttleTimeMs(), request.requestTimeoutMs);</span>
+            }
+
+<span class="fc bfc" id="L418" title="All 2 branches covered.">            if (!request.isInternalRequest) {</span>
+<span class="pc bpc" id="L419" title="1 of 2 branches missed.">                if (responses != null) {</span>
+                    ClientResponse clientResponse;
+
+<span class="pc bpc" id="L422" title="1 of 2 branches missed.">                    if (timedOut)</span>
+<span class="nc" id="L423">                        clientResponse = request.timedOut(now);</span>
+                    else
+<span class="fc" id="L425">                        clientResponse = request.disconnected(now);</span>
+
+<span class="fc" id="L427">                    responses.add(clientResponse);</span>
+<span class="fc" id="L428">                }</span>
+<span class="pc bpc" id="L429" title="1 of 2 branches missed.">            } else if (request.header.apiKey() == ApiKeys.METADATA) {</span>
+<span class="fc" id="L430">                metadataUpdater.handleFailedRequest(now, Optional.empty());</span>
+<span class="nc bnc" id="L431" title="All 4 branches missed.">            } else if (isTelemetryApi(request.header.apiKey()) &amp;&amp; telemetrySender != null) {</span>
+<span class="nc" id="L432">                telemetrySender.handleFailedRequest(request.header.apiKey(), null);</span>
+            }
+<span class="fc" id="L434">        }</span>
+<span class="fc" id="L435">    }</span>
+
+    /**
+     * Closes the connection to a particular node (if there is one).
+     * All requests on the connection will be cleared.  ClientRequest callbacks will not be invoked
+     * for the cleared requests, nor will they be returned from poll().
+     *
+     * @param nodeId The id of the node
+     */
+    @Override
+    public void close(String nodeId) {
+<span class="nc" id="L446">        log.info(&quot;Client requested connection close from node {}&quot;, nodeId);</span>
+<span class="nc" id="L447">        selector.close(nodeId);</span>
+<span class="nc" id="L448">        long now = time.milliseconds();</span>
+<span class="nc" id="L449">        cancelInFlightRequests(nodeId, now, null, false);</span>
+<span class="nc" id="L450">        connectionStates.remove(nodeId);</span>
+<span class="nc" id="L451">        apiVersions.remove(nodeId);</span>
+<span class="nc" id="L452">        nodesNeedingApiVersionsFetch.remove(nodeId);</span>
+<span class="nc" id="L453">    }</span>
+
+    /**
+     * Returns the number of milliseconds to wait, based on the connection state, before attempting to send data. When
+     * disconnected, this respects the reconnect backoff time. When connecting or connected, this handles slow/stalled
+     * connections.
+     *
+     * @param node The node to check
+     * @param now The current timestamp
+     * @return The number of milliseconds to wait.
+     */
+    @Override
+    public long connectionDelay(Node node, long now) {
+<span class="fc" id="L466">        return connectionStates.connectionDelay(node.idString(), now);</span>
+    }
+
+    // Return the remaining throttling delay in milliseconds if throttling is in progress. Return 0, otherwise.
+    // This is for testing.
+    public long throttleDelayMs(Node node, long now) {
+<span class="nc" id="L472">        return connectionStates.throttleDelayMs(node.idString(), now);</span>
+    }
+
+    /**
+     * Return the poll delay in milliseconds based on both connection and throttle delay.
+     * @param node the connection to check
+     * @param now the current time in ms
+     */
+    @Override
+    public long pollDelayMs(Node node, long now) {
+<span class="fc" id="L482">        return connectionStates.pollDelayMs(node.idString(), now);</span>
+    }
+
+    /**
+     * Check if the connection of the node has failed, based on the connection state. Such connection failure are
+     * usually transient and can be resumed in the next {@link #ready(org.apache.kafka.common.Node, long)} }
+     * call, but there are cases where transient failures needs to be caught and re-acted upon.
+     *
+     * @param node the node to check
+     * @return true iff the connection has failed and the node is disconnected
+     */
+    @Override
+    public boolean connectionFailed(Node node) {
+<span class="fc" id="L495">        return connectionStates.isDisconnected(node.idString());</span>
+    }
+
+    /**
+     * Check if authentication to this node has failed, based on the connection state. Authentication failures are
+     * propagated without any retries.
+     *
+     * @param node the node to check
+     * @return an AuthenticationException iff authentication has failed, null otherwise
+     */
+    @Override
+    public AuthenticationException authenticationException(Node node) {
+<span class="fc" id="L507">        return connectionStates.authenticationException(node.idString());</span>
+    }
+
+    /**
+     * Check if the node with the given id is ready to send more requests.
+     *
+     * @param node The node
+     * @param now The current time in ms
+     * @return true if the node is ready
+     */
+    @Override
+    public boolean isReady(Node node, long now) {
+        // if we need to update our metadata now declare all requests unready to make metadata requests first
+        // priority
+<span class="fc bfc" id="L521" title="All 4 branches covered.">        return !metadataUpdater.isUpdateDue(now) &amp;&amp; canSendRequest(node.idString(), now);</span>
+    }
+
+    /**
+     * Are we connected and ready and able to send more requests to the given connection?
+     *
+     * @param node The node
+     * @param now the current timestamp
+     */
+    private boolean canSendRequest(String node, long now) {
+<span class="pc bpc" id="L531" title="1 of 4 branches missed.">        return connectionStates.isReady(node, now) &amp;&amp; selector.isChannelReady(node) &amp;&amp;</span>
+<span class="fc bfc" id="L532" title="All 2 branches covered.">            inFlightRequests.canSendMore(node);</span>
+    }
+
+    /**
+     * Queue up the given request for sending. Requests can only be sent out to ready nodes.
+     * @param request The request
+     * @param now The current timestamp
+     */
+    @Override
+    public void send(ClientRequest request, long now) {
+<span class="fc" id="L542">        doSend(request, false, now);</span>
+<span class="fc" id="L543">    }</span>
+
+    // package-private for testing
+    void sendInternalMetadataRequest(MetadataRequest.Builder builder, String nodeConnectionId, long now) {
+<span class="fc" id="L547">        ClientRequest clientRequest = newClientRequest(nodeConnectionId, builder, now, true);</span>
+<span class="fc" id="L548">        doSend(clientRequest, true, now);</span>
+<span class="fc" id="L549">    }</span>
+
+    private void doSend(ClientRequest clientRequest, boolean isInternalRequest, long now) {
+<span class="fc" id="L552">        ensureActive();</span>
+<span class="fc" id="L553">        String nodeId = clientRequest.destination();</span>
+<span class="fc bfc" id="L554" title="All 2 branches covered.">        if (!isInternalRequest) {</span>
+            // If this request came from outside the NetworkClient, validate
+            // that we can send data.  If the request is internal, we trust
+            // that internal code has done this validation.  Validation
+            // will be slightly different for some internal requests (for
+            // example, ApiVersionsRequests can be sent prior to being in
+            // READY state.)
+<span class="pc bpc" id="L561" title="1 of 2 branches missed.">            if (!canSendRequest(nodeId, now))</span>
+<span class="nc" id="L562">                throw new IllegalStateException(&quot;Attempt to send a request to node &quot; + nodeId + &quot; which is not ready.&quot;);</span>
+        }
+<span class="fc" id="L564">        AbstractRequest.Builder&lt;?&gt; builder = clientRequest.requestBuilder();</span>
+        try {
+<span class="fc" id="L566">            NodeApiVersions versionInfo = apiVersions.get(nodeId);</span>
+            short version;
+            // Note: if versionInfo is null, we have no server version information. This would be
+            // the case when sending the initial ApiVersionRequest which fetches the version
+            // information itself.  It is also the case when discoverBrokerVersions is set to false.
+<span class="fc bfc" id="L571" title="All 2 branches covered.">            if (versionInfo == null) {</span>
+<span class="fc" id="L572">                version = builder.latestAllowedVersion();</span>
+<span class="pc bpc" id="L573" title="2 of 4 branches missed.">                if (discoverBrokerVersions &amp;&amp; log.isTraceEnabled())</span>
+<span class="nc" id="L574">                    log.trace(&quot;No version information found when sending {} with correlation id {} to node {}. &quot; +</span>
+<span class="nc" id="L575">                            &quot;Assuming version {}.&quot;, clientRequest.apiKey(), clientRequest.correlationId(), nodeId, version);</span>
+            } else {
+<span class="fc" id="L577">                version = versionInfo.latestUsableVersion(clientRequest.apiKey(), builder.oldestAllowedVersion(),</span>
+<span class="fc" id="L578">                        builder.latestAllowedVersion());</span>
+            }
+            // The call to build may also throw UnsupportedVersionException, if there are essential
+            // fields that cannot be represented in the chosen version.
+<span class="fc" id="L582">            doSend(clientRequest, isInternalRequest, now, builder.build(version));</span>
+<span class="fc" id="L583">        } catch (UnsupportedVersionException unsupportedVersionException) {</span>
+            // If the version is not supported, skip sending the request over the wire.
+            // Instead, simply add it to the local queue of aborted requests.
+<span class="fc" id="L586">            log.debug(&quot;Version mismatch when attempting to send {} with correlation id {} to {}&quot;, builder,</span>
+<span class="fc" id="L587">                    clientRequest.correlationId(), clientRequest.destination(), unsupportedVersionException);</span>
+<span class="fc" id="L588">            ClientResponse clientResponse = new ClientResponse(clientRequest.makeHeader(builder.latestAllowedVersion()),</span>
+<span class="fc" id="L589">                    clientRequest.callback(), clientRequest.destination(), now, now,</span>
+                    false, unsupportedVersionException, null, null);
+
+<span class="pc bpc" id="L592" title="1 of 2 branches missed.">            if (!isInternalRequest)</span>
+<span class="nc" id="L593">                abortedSends.add(clientResponse);</span>
+<span class="pc bpc" id="L594" title="1 of 2 branches missed.">            else if (clientRequest.apiKey() == ApiKeys.METADATA)</span>
+<span class="nc" id="L595">                metadataUpdater.handleFailedRequest(now, Optional.of(unsupportedVersionException));</span>
+<span class="pc bpc" id="L596" title="2 of 4 branches missed.">            else if (isTelemetryApi(clientRequest.apiKey()) &amp;&amp; telemetrySender != null)</span>
+<span class="fc" id="L597">                telemetrySender.handleFailedRequest(clientRequest.apiKey(), unsupportedVersionException);</span>
+<span class="fc" id="L598">        }</span>
+<span class="fc" id="L599">    }</span>
+
+    private void doSend(ClientRequest clientRequest, boolean isInternalRequest, long now, AbstractRequest request) {
+<span class="fc" id="L602">        String destination = clientRequest.destination();</span>
+<span class="fc" id="L603">        RequestHeader header = clientRequest.makeHeader(request.version());</span>
+<span class="pc bpc" id="L604" title="1 of 2 branches missed.">        if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L605">            log.debug(&quot;Sending {} request with header {} and timeout {} to node {}: {}&quot;,</span>
+<span class="nc" id="L606">                clientRequest.apiKey(), header, clientRequest.requestTimeoutMs(), destination, request);</span>
+        }
+<span class="fc" id="L608">        Send send = request.toSend(header);</span>
+<span class="fc" id="L609">        InFlightRequest inFlightRequest = new InFlightRequest(</span>
+                clientRequest,
+                header,
+                isInternalRequest,
+                request,
+                send,
+                now);
+<span class="fc" id="L616">        this.inFlightRequests.add(inFlightRequest);</span>
+<span class="fc" id="L617">        selector.send(new NetworkSend(clientRequest.destination(), send));</span>
+<span class="fc" id="L618">    }</span>
+
+    /**
+     * Do actual reads and writes to sockets.
+     *
+     * @param timeout The maximum amount of time to wait (in ms) for responses if there are none immediately,
+     *                must be non-negative. The actual timeout will be the minimum of timeout, request timeout and
+     *                metadata timeout
+     * @param now The current time in milliseconds
+     * @return The list of responses received
+     */
+    @Override
+    public List&lt;ClientResponse&gt; poll(long timeout, long now) {
+<span class="fc" id="L631">        ensureActive();</span>
+
+<span class="pc bpc" id="L633" title="1 of 2 branches missed.">        if (!abortedSends.isEmpty()) {</span>
+            // If there are aborted sends because of unsupported version exceptions or disconnects,
+            // handle them immediately without waiting for Selector#poll.
+<span class="nc" id="L636">            List&lt;ClientResponse&gt; responses = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L637">            handleAbortedSends(responses);</span>
+<span class="nc" id="L638">            completeResponses(responses);</span>
+<span class="nc" id="L639">            return responses;</span>
+        }
+
+<span class="fc" id="L642">        long metadataTimeout = metadataUpdater.maybeUpdate(now);</span>
+<span class="fc bfc" id="L643" title="All 2 branches covered.">        long telemetryTimeout = telemetrySender != null ? telemetrySender.maybeUpdate(now) : Integer.MAX_VALUE;</span>
+        try {
+<span class="fc" id="L645">            this.selector.poll(Utils.min(timeout, metadataTimeout, telemetryTimeout, defaultRequestTimeoutMs));</span>
+<span class="nc" id="L646">        } catch (IOException e) {</span>
+<span class="nc" id="L647">            log.error(&quot;Unexpected error during I/O&quot;, e);</span>
+<span class="fc" id="L648">        }</span>
+
+        // process completed actions
+<span class="fc" id="L651">        long updatedNow = this.time.milliseconds();</span>
+<span class="fc" id="L652">        List&lt;ClientResponse&gt; responses = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L653">        handleCompletedSends(responses, updatedNow);</span>
+<span class="fc" id="L654">        handleCompletedReceives(responses, updatedNow);</span>
+<span class="fc" id="L655">        handleDisconnections(responses, updatedNow);</span>
+<span class="fc" id="L656">        handleConnections();</span>
+<span class="fc" id="L657">        handleInitiateApiVersionRequests(updatedNow);</span>
+<span class="fc" id="L658">        handleTimedOutConnections(responses, updatedNow);</span>
+<span class="fc" id="L659">        handleTimedOutRequests(responses, updatedNow);</span>
+<span class="fc" id="L660">        handleRebootstrap(responses, updatedNow);</span>
+<span class="fc" id="L661">        completeResponses(responses);</span>
+
+<span class="fc" id="L663">        return responses;</span>
+    }
+
+    private void completeResponses(List&lt;ClientResponse&gt; responses) {
+<span class="fc bfc" id="L667" title="All 2 branches covered.">        for (ClientResponse response : responses) {</span>
+            try {
+<span class="fc" id="L669">                response.onComplete();</span>
+<span class="nc" id="L670">            } catch (Exception e) {</span>
+<span class="nc" id="L671">                log.error(&quot;Uncaught error in request completion:&quot;, e);</span>
+<span class="fc" id="L672">            }</span>
+<span class="fc" id="L673">        }</span>
+<span class="fc" id="L674">    }</span>
+
+    /**
+     * Get the number of in-flight requests
+     */
+    @Override
+    public int inFlightRequestCount() {
+<span class="fc" id="L681">        return this.inFlightRequests.count();</span>
+    }
+
+    @Override
+    public boolean hasInFlightRequests() {
+<span class="pc bpc" id="L686" title="1 of 2 branches missed.">        return !this.inFlightRequests.isEmpty();</span>
+    }
+
+    /**
+     * Get the number of in-flight requests for a given node
+     */
+    @Override
+    public int inFlightRequestCount(String node) {
+<span class="fc" id="L694">        return this.inFlightRequests.count(node);</span>
+    }
+
+    @Override
+    public boolean hasInFlightRequests(String node) {
+<span class="fc bfc" id="L699" title="All 2 branches covered.">        return !this.inFlightRequests.isEmpty(node);</span>
+    }
+
+    @Override
+    public boolean hasReadyNodes(long now) {
+<span class="fc" id="L704">        return connectionStates.hasReadyNodes(now);</span>
+    }
+
+    /**
+     * Interrupt the client if it is blocked waiting on I/O.
+     */
+    @Override
+    public void wakeup() {
+<span class="fc" id="L712">        this.selector.wakeup();</span>
+<span class="fc" id="L713">    }</span>
+
+    @Override
+    public void initiateClose() {
+<span class="fc bfc" id="L717" title="All 2 branches covered.">        if (state.compareAndSet(State.ACTIVE, State.CLOSING)) {</span>
+<span class="fc" id="L718">            wakeup();</span>
+        }
+<span class="fc" id="L720">    }</span>
+
+    @Override
+    public boolean active() {
+<span class="pc bpc" id="L724" title="1 of 2 branches missed.">        return state.get() == State.ACTIVE;</span>
+    }
+
+    private void ensureActive() {
+<span class="pc bpc" id="L728" title="1 of 2 branches missed.">        if (!active())</span>
+<span class="nc" id="L729">            throw new DisconnectException(&quot;NetworkClient is no longer active, state is &quot; + state);</span>
+<span class="fc" id="L730">    }</span>
+
+    /**
+     * Close the network client
+     */
+    @Override
+    public void close() {
+<span class="fc" id="L737">        state.compareAndSet(State.ACTIVE, State.CLOSING);</span>
+<span class="fc bfc" id="L738" title="All 2 branches covered.">        if (state.compareAndSet(State.CLOSING, State.CLOSED)) {</span>
+<span class="fc" id="L739">            this.selector.close();</span>
+<span class="fc" id="L740">            this.metadataUpdater.close();</span>
+<span class="fc bfc" id="L741" title="All 2 branches covered.">            if (telemetrySender != null)</span>
+<span class="fc" id="L742">                telemetrySender.close();</span>
+        } else {
+<span class="fc" id="L744">            log.warn(&quot;Attempting to close NetworkClient that has already been closed.&quot;);</span>
+        }
+<span class="fc" id="L746">    }</span>
+
+    /**
+     * Choose the node with the fewest outstanding requests which is at least eligible for connection. This method will
+     * prefer a node with an existing connection, but will potentially choose a node for which we don't yet have a
+     * connection if all existing connections are in use. If no connection exists, this method will prefer a node
+     * with least recent connection attempts. This method will never choose a node for which there is no
+     * existing connection and from which we have disconnected within the reconnect backoff period, or an active
+     * connection which is being throttled.
+     *
+     * @return The node with the fewest in-flight requests.
+     */
+    @Override
+    public LeastLoadedNode leastLoadedNode(long now) {
+<span class="fc" id="L760">        List&lt;Node&gt; nodes = this.metadataUpdater.fetchNodes();</span>
+<span class="pc bpc" id="L761" title="1 of 2 branches missed.">        if (nodes.isEmpty())</span>
+<span class="nc" id="L762">            throw new IllegalStateException(&quot;There are no nodes in the Kafka cluster&quot;);</span>
+<span class="fc" id="L763">        int inflight = Integer.MAX_VALUE;</span>
+
+<span class="fc" id="L765">        Node foundConnecting = null;</span>
+<span class="fc" id="L766">        Node foundCanConnect = null;</span>
+<span class="fc" id="L767">        Node foundReady = null;</span>
+
+<span class="fc" id="L769">        boolean atLeastOneConnectionReady = false;</span>
+
+<span class="fc" id="L771">        int offset = this.randOffset.nextInt(nodes.size());</span>
+<span class="fc bfc" id="L772" title="All 2 branches covered.">        for (int i = 0; i &lt; nodes.size(); i++) {</span>
+<span class="fc" id="L773">            int idx = (offset + i) % nodes.size();</span>
+<span class="fc" id="L774">            Node node = nodes.get(idx);</span>
+
+<span class="pc bpc" id="L776" title="1 of 2 branches missed.">            if (!atLeastOneConnectionReady</span>
+<span class="fc bfc" id="L777" title="All 2 branches covered.">                    &amp;&amp; connectionStates.isReady(node.idString(), now)</span>
+<span class="pc bpc" id="L778" title="1 of 2 branches missed.">                    &amp;&amp; selector.isChannelReady(node.idString())) {</span>
+<span class="fc" id="L779">                atLeastOneConnectionReady = true;</span>
+            }
+
+<span class="fc bfc" id="L782" title="All 2 branches covered.">            if (canSendRequest(node.idString(), now)) {</span>
+<span class="fc" id="L783">                int currInflight = this.inFlightRequests.count(node.idString());</span>
+<span class="fc bfc" id="L784" title="All 2 branches covered.">                if (currInflight == 0) {</span>
+                    // if we find an established connection with no in-flight requests we can stop right away
+<span class="fc" id="L786">                    log.trace(&quot;Found least loaded node {} connected with no in-flight requests&quot;, node);</span>
+<span class="fc" id="L787">                    return new LeastLoadedNode(node, true);</span>
+<span class="pc bpc" id="L788" title="1 of 2 branches missed.">                } else if (currInflight &lt; inflight) {</span>
+                    // otherwise if this is the best we have found so far, record that
+<span class="fc" id="L790">                    inflight = currInflight;</span>
+<span class="fc" id="L791">                    foundReady = node;</span>
+                }
+<span class="fc bfc" id="L793" title="All 2 branches covered.">            } else if (connectionStates.isPreparingConnection(node.idString())) {</span>
+<span class="fc" id="L794">                foundConnecting = node;</span>
+<span class="fc bfc" id="L795" title="All 2 branches covered.">            } else if (canConnect(node, now)) {</span>
+<span class="pc bpc" id="L796" title="1 of 2 branches missed.">                if (foundCanConnect == null ||</span>
+<span class="nc" id="L797">                        this.connectionStates.lastConnectAttemptMs(foundCanConnect.idString()) &gt;</span>
+<span class="nc bnc" id="L798" title="All 2 branches missed.">                                this.connectionStates.lastConnectAttemptMs(node.idString())) {</span>
+<span class="fc" id="L799">                    foundCanConnect = node;</span>
+                }
+            } else {
+<span class="fc" id="L802">                log.trace(&quot;Removing node {} from least loaded node selection since it is neither ready &quot; +</span>
+                        &quot;for sending or connecting&quot;, node);
+            }
+        }
+
+        // We prefer established connections if possible. Otherwise, we will wait for connections
+        // which are being established before connecting to new nodes.
+<span class="fc bfc" id="L809" title="All 2 branches covered.">        if (foundReady != null) {</span>
+<span class="fc" id="L810">            log.trace(&quot;Found least loaded node {} with {} inflight requests&quot;, foundReady, inflight);</span>
+<span class="fc" id="L811">            return new LeastLoadedNode(foundReady, atLeastOneConnectionReady);</span>
+<span class="fc bfc" id="L812" title="All 2 branches covered.">        } else if (foundConnecting != null) {</span>
+<span class="fc" id="L813">            log.trace(&quot;Found least loaded connecting node {}&quot;, foundConnecting);</span>
+<span class="fc" id="L814">            return new LeastLoadedNode(foundConnecting, atLeastOneConnectionReady);</span>
+<span class="fc bfc" id="L815" title="All 2 branches covered.">        } else if (foundCanConnect != null) {</span>
+<span class="fc" id="L816">            log.trace(&quot;Found least loaded node {} with no active connection&quot;, foundCanConnect);</span>
+<span class="fc" id="L817">            return new LeastLoadedNode(foundCanConnect, atLeastOneConnectionReady);</span>
+        } else {
+<span class="fc" id="L819">            log.trace(&quot;Least loaded node selection failed to find an available node&quot;);</span>
+<span class="fc" id="L820">            return new LeastLoadedNode(null, atLeastOneConnectionReady);</span>
+        }
+    }
+
+    public static AbstractResponse parseResponse(ByteBuffer responseBuffer, RequestHeader requestHeader) {
+        try {
+<span class="fc" id="L826">            return AbstractResponse.parseResponse(responseBuffer, requestHeader);</span>
+<span class="nc" id="L827">        } catch (BufferUnderflowException e) {</span>
+<span class="nc" id="L828">            throw new SchemaException(&quot;Buffer underflow while parsing response for request with header &quot; + requestHeader, e);</span>
+<span class="nc" id="L829">        } catch (CorrelationIdMismatchException e) {</span>
+<span class="nc bnc" id="L830" title="All 2 branches missed.">            if (SaslClientAuthenticator.isReserved(requestHeader.correlationId())</span>
+<span class="nc bnc" id="L831" title="All 2 branches missed.">                &amp;&amp; !SaslClientAuthenticator.isReserved(e.responseCorrelationId()))</span>
+<span class="nc" id="L832">                throw new SchemaException(&quot;The response is unrelated to Sasl request since its correlation id is &quot;</span>
+<span class="nc" id="L833">                    + e.responseCorrelationId() + &quot; and the reserved range for Sasl request is [ &quot;</span>
+                    + SaslClientAuthenticator.MIN_RESERVED_CORRELATION_ID + &quot;,&quot;
+                    + SaslClientAuthenticator.MAX_RESERVED_CORRELATION_ID + &quot;]&quot;);
+            else {
+<span class="nc" id="L837">                throw e;</span>
+            }
+        }
+    }
+
+    /**
+     * Post process disconnection of a node
+     *
+     * @param responses The list of responses to update
+     * @param nodeId Id of the node to be disconnected
+     * @param now The current time
+     * @param disconnectState The state of the disconnected channel
+     */
+    private void processDisconnection(List&lt;ClientResponse&gt; responses,
+                                      String nodeId,
+                                      long now,
+                                      ChannelState disconnectState) {
+<span class="fc" id="L854">        processDisconnection(responses, nodeId, now, disconnectState, false);</span>
+<span class="fc" id="L855">    }</span>
+
+    /**
+     * Post process disconnection of a node
+     *
+     * @param responses The list of responses to update
+     * @param nodeId Id of the node to be disconnected
+     * @param now The current time
+     */
+    private void processTimeoutDisconnection(List&lt;ClientResponse&gt; responses, String nodeId, long now) {
+<span class="nc" id="L865">        processDisconnection(responses, nodeId, now, ChannelState.LOCAL_CLOSE, true);</span>
+<span class="nc" id="L866">    }</span>
+
+    /**
+     * Post process disconnection of a node
+     *
+     * @param responses The list of responses to update
+     * @param nodeId Id of the node to be disconnected
+     * @param now The current time
+     * @param disconnectState The state of the disconnected channel
+     * @param timedOut {@code true} if the connection is disconnected because of a timeout (request or connection)
+     */
+    private void processDisconnection(List&lt;ClientResponse&gt; responses,
+                                      String nodeId,
+                                      long now,
+                                      ChannelState disconnectState,
+                                      boolean timedOut) {
+<span class="fc" id="L882">        connectionStates.disconnected(nodeId, now);</span>
+<span class="fc" id="L883">        apiVersions.remove(nodeId);</span>
+<span class="fc" id="L884">        nodesNeedingApiVersionsFetch.remove(nodeId);</span>
+<span class="pc bpc" id="L885" title="2 of 4 branches missed.">        switch (disconnectState.state()) {</span>
+            case AUTHENTICATION_FAILED:
+<span class="nc" id="L887">                AuthenticationException exception = disconnectState.exception();</span>
+<span class="nc" id="L888">                connectionStates.authenticationFailed(nodeId, now, exception);</span>
+<span class="nc" id="L889">                log.error(&quot;Connection to node {} ({}) failed authentication due to: {}&quot;, nodeId,</span>
+<span class="nc" id="L890">                    disconnectState.remoteAddress(), exception.getMessage());</span>
+<span class="nc" id="L891">                break;</span>
+            case AUTHENTICATE:
+<span class="nc" id="L893">                log.warn(&quot;Connection to node {} ({}) terminated during authentication. This may happen &quot; +</span>
+                    &quot;due to any of the following reasons: (1) Firewall blocking Kafka TLS &quot; +
+                    &quot;traffic (eg it may only allow HTTPS traffic), (2) Transient network issue.&quot;,
+<span class="nc" id="L896">                    nodeId, disconnectState.remoteAddress());</span>
+<span class="nc" id="L897">                break;</span>
+            case NOT_CONNECTED:
+<span class="fc" id="L899">                log.warn(&quot;Connection to node {} ({}) could not be established. Node may not be available.&quot;, nodeId, disconnectState.remoteAddress());</span>
+<span class="fc" id="L900">                break;</span>
+            default:
+                break; // Disconnections in other states are logged at debug level in Selector
+        }
+
+<span class="fc" id="L905">        cancelInFlightRequests(nodeId, now, responses, timedOut);</span>
+<span class="fc" id="L906">        metadataUpdater.handleServerDisconnect(now, nodeId, Optional.ofNullable(disconnectState.exception()));</span>
+<span class="fc" id="L907">    }</span>
+
+    /**
+     * Iterate over all the inflight requests and expire any requests that have exceeded the configured requestTimeout.
+     * The connection to the node associated with the request will be terminated and will be treated as a disconnection.
+     *
+     * @param responses The list of responses to update
+     * @param now The current time
+     */
+    private void handleTimedOutRequests(List&lt;ClientResponse&gt; responses, long now) {
+<span class="fc" id="L917">        List&lt;String&gt; nodeIds = this.inFlightRequests.nodesWithTimedOutRequests(now);</span>
+<span class="pc bpc" id="L918" title="1 of 2 branches missed.">        for (String nodeId : nodeIds) {</span>
+            // close connection to the node
+<span class="nc" id="L920">            this.selector.close(nodeId);</span>
+<span class="nc" id="L921">            log.info(&quot;Disconnecting from node {} due to request timeout.&quot;, nodeId);</span>
+<span class="nc" id="L922">            processTimeoutDisconnection(responses, nodeId, now);</span>
+<span class="nc" id="L923">        }</span>
+<span class="fc" id="L924">    }</span>
+
+    private void handleAbortedSends(List&lt;ClientResponse&gt; responses) {
+<span class="nc" id="L927">        responses.addAll(abortedSends);</span>
+<span class="nc" id="L928">        abortedSends.clear();</span>
+<span class="nc" id="L929">    }</span>
+
+    /**
+     * Handle socket channel connection timeout. The timeout will hit iff a connection
+     * stays at the ConnectionState.CONNECTING state longer than the timeout value,
+     * as indicated by ClusterConnectionStates.NodeConnectionState.
+     *
+     * @param responses The list of responses to update
+     * @param now The current time
+     */
+    private void handleTimedOutConnections(List&lt;ClientResponse&gt; responses, long now) {
+<span class="fc" id="L940">        List&lt;String&gt; nodes = connectionStates.nodesWithConnectionSetupTimeout(now);</span>
+<span class="pc bpc" id="L941" title="1 of 2 branches missed.">        for (String nodeId : nodes) {</span>
+<span class="nc" id="L942">            this.selector.close(nodeId);</span>
+<span class="nc" id="L943">            log.info(</span>
+                &quot;Disconnecting from node {} due to socket connection setup timeout. &quot; +
+                &quot;The timeout value is {} ms.&quot;,
+                nodeId,
+<span class="nc" id="L947">                connectionStates.connectionSetupTimeoutMs(nodeId));</span>
+<span class="nc" id="L948">            processTimeoutDisconnection(responses, nodeId, now);</span>
+<span class="nc" id="L949">        }</span>
+<span class="fc" id="L950">    }</span>
+
+    /**
+     * Handle any completed request send. In particular if no response is expected consider the request complete.
+     *
+     * @param responses The list of responses to update
+     * @param now The current time
+     */
+    private void handleCompletedSends(List&lt;ClientResponse&gt; responses, long now) {
+        // if no response is expected then when the send is completed, return it
+<span class="fc bfc" id="L960" title="All 2 branches covered.">        for (NetworkSend send : this.selector.completedSends()) {</span>
+<span class="fc" id="L961">            InFlightRequest request = this.inFlightRequests.lastSent(send.destinationId());</span>
+<span class="pc bpc" id="L962" title="1 of 2 branches missed.">            if (!request.expectResponse) {</span>
+<span class="nc" id="L963">                this.inFlightRequests.completeLastSent(send.destinationId());</span>
+<span class="nc" id="L964">                responses.add(request.completed(null, now));</span>
+            }
+<span class="fc" id="L966">        }</span>
+<span class="fc" id="L967">    }</span>
+
+    /**
+     * If a response from a node includes a non-zero throttle delay and client-side throttling has been enabled for
+     * the connection to the node, throttle the connection for the specified delay.
+     *
+     * @param response the response
+     * @param apiVersion the API version of the response
+     * @param nodeId the id of the node
+     * @param now The current time
+     */
+    private void maybeThrottle(AbstractResponse response, short apiVersion, String nodeId, long now) {
+<span class="fc" id="L979">        int throttleTimeMs = response.throttleTimeMs();</span>
+<span class="pc bpc" id="L980" title="3 of 4 branches missed.">        if (throttleTimeMs &gt; 0 &amp;&amp; response.shouldClientThrottle(apiVersion)) {</span>
+<span class="nc" id="L981">            inFlightRequests.incrementThrottleTime(nodeId, throttleTimeMs);</span>
+<span class="nc" id="L982">            connectionStates.throttle(nodeId, now + throttleTimeMs);</span>
+<span class="nc" id="L983">            log.trace(&quot;Connection to node {} is throttled for {} ms until timestamp {}&quot;, nodeId, throttleTimeMs,</span>
+<span class="nc" id="L984">                      now + throttleTimeMs);</span>
+        }
+<span class="fc" id="L986">    }</span>
+
+    /**
+     * Handle any completed receives and update the response list with the responses received.
+     *
+     * @param responses The list of responses to update
+     * @param now The current time
+     */
+    private void handleCompletedReceives(List&lt;ClientResponse&gt; responses, long now) {
+<span class="fc bfc" id="L995" title="All 2 branches covered.">        for (NetworkReceive receive : this.selector.completedReceives()) {</span>
+<span class="fc" id="L996">            String source = receive.source();</span>
+<span class="fc" id="L997">            InFlightRequest req = inFlightRequests.completeNext(source);</span>
+
+<span class="fc" id="L999">            AbstractResponse response = parseResponse(receive.payload(), req.header);</span>
+<span class="fc bfc" id="L1000" title="All 2 branches covered.">            if (throttleTimeSensor != null)</span>
+<span class="fc" id="L1001">                throttleTimeSensor.record(response.throttleTimeMs(), now);</span>
+
+<span class="pc bpc" id="L1003" title="1 of 2 branches missed.">            if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L1004">                log.debug(&quot;Received {} response from node {} for request with header {}: {}&quot;,</span>
+<span class="nc" id="L1005">                    req.header.apiKey(), req.destination, req.header, response);</span>
+            }
+
+            // If the received response includes a throttle delay, throttle the connection.
+<span class="fc" id="L1009">            maybeThrottle(response, req.header.apiVersion(), req.destination, now);</span>
+<span class="fc bfc" id="L1010" title="All 4 branches covered.">            if (req.isInternalRequest &amp;&amp; response instanceof MetadataResponse)</span>
+<span class="fc" id="L1011">                metadataUpdater.handleSuccessfulResponse(req.header, now, (MetadataResponse) response);</span>
+<span class="pc bpc" id="L1012" title="1 of 4 branches missed.">            else if (req.isInternalRequest &amp;&amp; response instanceof ApiVersionsResponse)</span>
+<span class="fc" id="L1013">                handleApiVersionsResponse(responses, req, now, (ApiVersionsResponse) response);</span>
+<span class="pc bpc" id="L1014" title="3 of 4 branches missed.">            else if (req.isInternalRequest &amp;&amp; response instanceof GetTelemetrySubscriptionsResponse)</span>
+<span class="nc" id="L1015">                telemetrySender.handleResponse((GetTelemetrySubscriptionsResponse) response);</span>
+<span class="pc bpc" id="L1016" title="3 of 4 branches missed.">            else if (req.isInternalRequest &amp;&amp; response instanceof PushTelemetryResponse)</span>
+<span class="nc" id="L1017">                telemetrySender.handleResponse((PushTelemetryResponse) response);</span>
+            else
+<span class="fc" id="L1019">                responses.add(req.completed(response, now));</span>
+<span class="fc" id="L1020">        }</span>
+<span class="fc" id="L1021">    }</span>
+
+    private void handleApiVersionsResponse(List&lt;ClientResponse&gt; responses,
+                                           InFlightRequest req, long now, ApiVersionsResponse apiVersionsResponse) {
+<span class="fc" id="L1025">        final String node = req.destination;</span>
+<span class="pc bpc" id="L1026" title="1 of 2 branches missed.">        if (apiVersionsResponse.data().errorCode() != Errors.NONE.code()) {</span>
+<span class="nc bnc" id="L1027" title="All 4 branches missed.">            if (req.request.version() == 0 || apiVersionsResponse.data().errorCode() != Errors.UNSUPPORTED_VERSION.code()) {</span>
+<span class="nc" id="L1028">                log.warn(&quot;Received error {} from node {} when making an ApiVersionsRequest with correlation id {}. Disconnecting.&quot;,</span>
+<span class="nc" id="L1029">                        Errors.forCode(apiVersionsResponse.data().errorCode()), node, req.header.correlationId());</span>
+<span class="nc" id="L1030">                this.selector.close(node);</span>
+<span class="nc" id="L1031">                processDisconnection(responses, node, now, ChannelState.LOCAL_CLOSE);</span>
+            } else {
+                // Starting from Apache Kafka 2.4, ApiKeys field is populated with the supported versions of
+                // the ApiVersionsRequest when an UNSUPPORTED_VERSION error is returned.
+                // If not provided, the client falls back to version 0.
+<span class="nc" id="L1036">                short maxApiVersion = 0;</span>
+<span class="nc bnc" id="L1037" title="All 2 branches missed.">                if (apiVersionsResponse.data().apiKeys().size() &gt; 0) {</span>
+<span class="nc" id="L1038">                    ApiVersion apiVersion = apiVersionsResponse.data().apiKeys().find(ApiKeys.API_VERSIONS.id);</span>
+<span class="nc bnc" id="L1039" title="All 2 branches missed.">                    if (apiVersion != null) {</span>
+<span class="nc" id="L1040">                        maxApiVersion = apiVersion.maxVersion();</span>
+                    }
+                }
+<span class="nc" id="L1043">                nodesNeedingApiVersionsFetch.put(node, new ApiVersionsRequest.Builder(maxApiVersion));</span>
+            }
+<span class="nc" id="L1045">            return;</span>
+        }
+<span class="fc" id="L1047">        NodeApiVersions nodeVersionInfo = new NodeApiVersions(</span>
+<span class="fc" id="L1048">            apiVersionsResponse.data().apiKeys(),</span>
+<span class="fc" id="L1049">            apiVersionsResponse.data().supportedFeatures(),</span>
+<span class="fc" id="L1050">            apiVersionsResponse.data().finalizedFeatures(),</span>
+<span class="fc" id="L1051">            apiVersionsResponse.data().finalizedFeaturesEpoch());</span>
+<span class="fc" id="L1052">        apiVersions.update(node, nodeVersionInfo);</span>
+<span class="fc" id="L1053">        this.connectionStates.ready(node);</span>
+<span class="fc" id="L1054">        log.debug(&quot;Node {} has finalized features epoch: {}, finalized features: {}, supported features: {}, API versions: {}.&quot;,</span>
+<span class="fc" id="L1055">                node, apiVersionsResponse.data().finalizedFeaturesEpoch(), apiVersionsResponse.data().finalizedFeatures(),</span>
+<span class="fc" id="L1056">                apiVersionsResponse.data().supportedFeatures(), nodeVersionInfo);</span>
+<span class="fc" id="L1057">    }</span>
+
+    /**
+     * Handle any disconnected connections
+     *
+     * @param responses The list of responses that completed with the disconnection
+     * @param now The current time
+     */
+    private void handleDisconnections(List&lt;ClientResponse&gt; responses, long now) {
+<span class="fc bfc" id="L1066" title="All 2 branches covered.">        for (Map.Entry&lt;String, ChannelState&gt; entry : this.selector.disconnected().entrySet()) {</span>
+<span class="fc" id="L1067">            String node = entry.getKey();</span>
+<span class="fc" id="L1068">            ChannelState channelState = entry.getValue();</span>
+<span class="pc bpc" id="L1069" title="1 of 2 branches missed.">            if (channelState == ChannelState.EXPIRED) {</span>
+<span class="nc" id="L1070">                log.debug(&quot;Idle connection to node {} disconnected.&quot;, node);</span>
+            } else {
+<span class="fc" id="L1072">                log.info(&quot;Node {} disconnected.&quot;, node);</span>
+            }
+<span class="fc" id="L1074">            processDisconnection(responses, node, now, channelState);</span>
+<span class="fc" id="L1075">        }</span>
+<span class="fc" id="L1076">    }</span>
+
+    /**
+     * Record any newly completed connections
+     */
+    private void handleConnections() {
+<span class="fc bfc" id="L1082" title="All 2 branches covered.">        for (String node : this.selector.connected()) {</span>
+            // We are now connected.  Note that we might not still be able to send requests. For instance,
+            // if SSL is enabled, the SSL handshake happens after the connection is established.
+            // Therefore, it is still necessary to check isChannelReady before attempting to send on this
+            // connection.
+<span class="pc bpc" id="L1087" title="1 of 2 branches missed.">            if (discoverBrokerVersions) {</span>
+<span class="fc" id="L1088">                nodesNeedingApiVersionsFetch.put(node, new ApiVersionsRequest.Builder());</span>
+<span class="fc" id="L1089">                log.debug(&quot;Completed connection to node {}. Fetching API versions.&quot;, node);</span>
+            } else {
+<span class="nc" id="L1091">                this.connectionStates.ready(node);</span>
+<span class="nc" id="L1092">                log.debug(&quot;Completed connection to node {}. Ready.&quot;, node);</span>
+            }
+<span class="fc" id="L1094">        }</span>
+<span class="fc" id="L1095">    }</span>
+
+    private void handleInitiateApiVersionRequests(long now) {
+<span class="fc" id="L1098">        Iterator&lt;Map.Entry&lt;String, ApiVersionsRequest.Builder&gt;&gt; iter = nodesNeedingApiVersionsFetch.entrySet().iterator();</span>
+<span class="fc bfc" id="L1099" title="All 2 branches covered.">        while (iter.hasNext()) {</span>
+<span class="fc" id="L1100">            Map.Entry&lt;String, ApiVersionsRequest.Builder&gt; entry = iter.next();</span>
+<span class="fc" id="L1101">            String node = entry.getKey();</span>
+<span class="pc bpc" id="L1102" title="2 of 4 branches missed.">            if (selector.isChannelReady(node) &amp;&amp; inFlightRequests.canSendMore(node)) {</span>
+<span class="fc" id="L1103">                log.debug(&quot;Initiating API versions fetch from node {}.&quot;, node);</span>
+                // We transition the connection to the CHECKING_API_VERSIONS state only when
+                // the ApiVersionsRequest is queued up to be sent out. Without this, the client
+                // could remain in the CHECKING_API_VERSIONS state forever if the channel does
+                // not before ready.
+<span class="fc" id="L1108">                this.connectionStates.checkingApiVersions(node);</span>
+<span class="fc" id="L1109">                ApiVersionsRequest.Builder apiVersionRequestBuilder = entry.getValue();</span>
+<span class="fc" id="L1110">                ClientRequest clientRequest = newClientRequest(node, apiVersionRequestBuilder, now, true);</span>
+<span class="fc" id="L1111">                doSend(clientRequest, true, now);</span>
+<span class="fc" id="L1112">                iter.remove();</span>
+            }
+<span class="fc" id="L1114">        }</span>
+<span class="fc" id="L1115">    }</span>
+
+    private void handleRebootstrap(List&lt;ClientResponse&gt; responses, long now) {
+<span class="pc bpc" id="L1118" title="1 of 4 branches missed.">        if (metadataRecoveryStrategy == MetadataRecoveryStrategy.REBOOTSTRAP &amp;&amp; metadataUpdater.needsRebootstrap(now, rebootstrapTriggerMs)) {</span>
+<span class="nc" id="L1119">            this.metadataUpdater.fetchNodes().forEach(node -&gt; {</span>
+<span class="nc" id="L1120">                String nodeId = node.idString();</span>
+<span class="nc" id="L1121">                this.selector.close(nodeId);</span>
+<span class="nc bnc" id="L1122" title="All 4 branches missed.">                if (connectionStates.isConnecting(nodeId) || connectionStates.isConnected(nodeId)) {</span>
+<span class="nc" id="L1123">                    log.info(&quot;Disconnecting from node {} due to client rebootstrap.&quot;, nodeId);</span>
+<span class="nc" id="L1124">                    processDisconnection(responses, nodeId, now, ChannelState.LOCAL_CLOSE);</span>
+                }
+<span class="nc" id="L1126">            });</span>
+<span class="nc" id="L1127">            metadataUpdater.rebootstrap(now);</span>
+        }
+<span class="fc" id="L1129">    }</span>
+
+    /**
+     * Initiate a connection to the given node
+     * @param node the node to connect to
+     * @param now current time in epoch milliseconds
+     */
+    private void initiateConnect(Node node, long now) {
+<span class="fc" id="L1137">        String nodeConnectionId = node.idString();</span>
+        try {
+<span class="fc" id="L1139">            connectionStates.connecting(nodeConnectionId, now, node.host());</span>
+<span class="fc" id="L1140">            InetAddress address = connectionStates.currentAddress(nodeConnectionId);</span>
+<span class="fc" id="L1141">            log.debug(&quot;Initiating connection to node {} using address {}&quot;, node, address);</span>
+<span class="fc" id="L1142">            selector.connect(nodeConnectionId,</span>
+<span class="fc" id="L1143">                    new InetSocketAddress(address, node.port()),</span>
+                    this.socketSendBuffer,
+                    this.socketReceiveBuffer);
+<span class="nc" id="L1146">        } catch (IOException e) {</span>
+<span class="nc" id="L1147">            log.warn(&quot;Error connecting to node {}&quot;, node, e);</span>
+            // Attempt failed, we'll try again after the backoff
+<span class="nc" id="L1149">            connectionStates.disconnected(nodeConnectionId, now);</span>
+            // Notify metadata updater of the connection failure
+<span class="nc" id="L1151">            metadataUpdater.handleServerDisconnect(now, nodeConnectionId, Optional.empty());</span>
+<span class="fc" id="L1152">        }</span>
+<span class="fc" id="L1153">    }</span>
+
+    /**
+     * Return true if there's at least one connection establishment is currently underway
+     */
+    private boolean isAnyNodeConnecting() {
+<span class="fc bfc" id="L1159" title="All 2 branches covered.">        for (Node node : metadataUpdater.fetchNodes()) {</span>
+<span class="fc bfc" id="L1160" title="All 2 branches covered.">            if (connectionStates.isConnecting(node.idString())) {</span>
+<span class="fc" id="L1161">                return true;</span>
+            }
+<span class="fc" id="L1163">        }</span>
+<span class="fc" id="L1164">        return false;</span>
+    }
+
+    /**
+     * Return true if the ApiKey belongs to the Telemetry API.
+     */
+    private boolean isTelemetryApi(ApiKeys apiKey) {
+<span class="pc bpc" id="L1171" title="3 of 4 branches missed.">        return apiKey == ApiKeys.GET_TELEMETRY_SUBSCRIPTIONS || apiKey == ApiKeys.PUSH_TELEMETRY;</span>
+    }
+
+    class DefaultMetadataUpdater implements MetadataUpdater {
+
+        /* the current cluster metadata */
+        private final Metadata metadata;
+
+        // Defined if there is a request in progress, null otherwise
+        private InProgressData inProgress;
+
+        /*
+         * The time in wall-clock milliseconds when we started attempts to fetch metadata. If empty,
+         * metadata has not been requested. This is the start time based on which rebootstrap is
+         * triggered if metadata is not obtained for the configured rebootstrap trigger interval.
+         * Set to Optional.of(0L) to force rebootstrap immediately.
+         */
+<span class="fc" id="L1188">        private Optional&lt;Long&gt; metadataAttemptStartMs = Optional.empty();</span>
+
+
+<span class="fc" id="L1191">        DefaultMetadataUpdater(Metadata metadata) {</span>
+<span class="fc" id="L1192">            this.metadata = metadata;</span>
+<span class="fc" id="L1193">            this.inProgress = null;</span>
+<span class="fc" id="L1194">        }</span>
+
+        @Override
+        public List&lt;Node&gt; fetchNodes() {
+<span class="fc" id="L1198">            return metadata.fetch().nodes();</span>
+        }
+
+        @Override
+        public boolean isUpdateDue(long now) {
+<span class="fc bfc" id="L1203" title="All 4 branches covered.">            return !hasFetchInProgress() &amp;&amp; this.metadata.timeToNextUpdate(now) == 0;</span>
+        }
+
+        private boolean hasFetchInProgress() {
+<span class="fc bfc" id="L1207" title="All 2 branches covered.">            return inProgress != null;</span>
+        }
+
+        @Override
+        public long maybeUpdate(long now) {
+            // should we update our metadata?
+<span class="fc" id="L1213">            long timeToNextMetadataUpdate = metadata.timeToNextUpdate(now);</span>
+<span class="fc bfc" id="L1214" title="All 2 branches covered.">            long waitForMetadataFetch = hasFetchInProgress() ? defaultRequestTimeoutMs : 0;</span>
+
+<span class="fc" id="L1216">            long metadataTimeout = Math.max(timeToNextMetadataUpdate, waitForMetadataFetch);</span>
+<span class="fc bfc" id="L1217" title="All 2 branches covered.">            if (metadataTimeout &gt; 0) {</span>
+<span class="fc" id="L1218">                return metadataTimeout;</span>
+            }
+
+<span class="fc bfc" id="L1221" title="All 2 branches covered.">            if (metadataAttemptStartMs.isEmpty())</span>
+<span class="fc" id="L1222">                metadataAttemptStartMs = Optional.of(now);</span>
+
+            // Beware that the behavior of this method and the computation of timeouts for poll() are
+            // highly dependent on the behavior of leastLoadedNode.
+<span class="fc" id="L1226">            LeastLoadedNode leastLoadedNode = leastLoadedNode(now);</span>
+
+            // Rebootstrap if needed and configured.
+<span class="fc bfc" id="L1229" title="All 2 branches covered.">            if (metadataRecoveryStrategy == MetadataRecoveryStrategy.REBOOTSTRAP</span>
+<span class="fc bfc" id="L1230" title="All 2 branches covered.">                    &amp;&amp; !leastLoadedNode.hasNodeAvailableOrConnectionReady()) {</span>
+<span class="fc" id="L1231">                rebootstrap(now);</span>
+
+<span class="fc" id="L1233">                leastLoadedNode = leastLoadedNode(now);</span>
+            }
+
+<span class="fc bfc" id="L1236" title="All 2 branches covered.">            if (leastLoadedNode.node() == null) {</span>
+<span class="fc" id="L1237">                log.debug(&quot;Give up sending metadata request since no node is available&quot;);</span>
+<span class="fc" id="L1238">                return reconnectBackoffMs;</span>
+            }
+
+<span class="fc" id="L1241">            return maybeUpdate(now, leastLoadedNode.node());</span>
+        }
+
+        @Override
+        public void handleServerDisconnect(long now, String destinationId, Optional&lt;AuthenticationException&gt; maybeFatalException) {
+<span class="fc" id="L1246">            Cluster cluster = metadata.fetch();</span>
+            // 'processDisconnection' generates warnings for misconfigured bootstrap server configuration
+            // resulting in 'Connection Refused' and misconfigured security resulting in authentication failures.
+            // The warning below handles the case where a connection to a broker was established, but was disconnected
+            // before metadata could be obtained.
+<span class="fc bfc" id="L1251" title="All 2 branches covered.">            if (cluster.isBootstrapConfigured()) {</span>
+<span class="fc" id="L1252">                int nodeId = Integer.parseInt(destinationId);</span>
+<span class="fc" id="L1253">                Node node = cluster.nodeById(nodeId);</span>
+<span class="fc bfc" id="L1254" title="All 2 branches covered.">                if (node != null)</span>
+<span class="fc" id="L1255">                    log.warn(&quot;Bootstrap broker {} disconnected&quot;, node);</span>
+            }
+
+            // If we have a disconnect while an update is due, we treat it as a failed update
+            // so that we can backoff properly
+<span class="fc bfc" id="L1260" title="All 2 branches covered.">            if (isUpdateDue(now))</span>
+<span class="fc" id="L1261">                handleFailedRequest(now, Optional.empty());</span>
+
+<span class="fc" id="L1263">            maybeFatalException.ifPresent(metadata::fatalError);</span>
+
+            // The disconnect may be the result of stale metadata, so request an update
+<span class="fc" id="L1266">            metadata.requestUpdate(false);</span>
+<span class="fc" id="L1267">        }</span>
+
+        @Override
+        public void handleFailedRequest(long now, Optional&lt;KafkaException&gt; maybeFatalException) {
+<span class="fc" id="L1271">            maybeFatalException.ifPresent(metadata::fatalError);</span>
+<span class="fc" id="L1272">            metadata.failedUpdate(now);</span>
+<span class="fc" id="L1273">            inProgress = null;</span>
+<span class="fc" id="L1274">        }</span>
+
+        @Override
+        public void handleSuccessfulResponse(RequestHeader requestHeader, long now, MetadataResponse response) {
+            // If any partition has leader with missing listeners, log up to ten of these partitions
+            // for diagnosing broker configuration issues.
+            // This could be a transient issue if listeners were added dynamically to brokers.
+<span class="fc" id="L1281">            List&lt;TopicPartition&gt; missingListenerPartitions = response.topicMetadata().stream().flatMap(topicMetadata -&gt;</span>
+<span class="fc" id="L1282">                topicMetadata.partitionMetadata().stream()</span>
+<span class="pc bpc" id="L1283" title="1 of 2 branches missed.">                    .filter(partitionMetadata -&gt; partitionMetadata.error == Errors.LISTENER_NOT_FOUND)</span>
+<span class="pc" id="L1284">                    .map(partitionMetadata -&gt; new TopicPartition(topicMetadata.topic(), partitionMetadata.partition())))</span>
+<span class="fc" id="L1285">                .collect(Collectors.toList());</span>
+<span class="pc bpc" id="L1286" title="1 of 2 branches missed.">            if (!missingListenerPartitions.isEmpty()) {</span>
+<span class="nc" id="L1287">                int count = missingListenerPartitions.size();</span>
+<span class="nc" id="L1288">                log.warn(&quot;{} partitions have leader brokers without a matching listener, including {}&quot;,</span>
+<span class="nc" id="L1289">                        count, missingListenerPartitions.subList(0, Math.min(10, count)));</span>
+            }
+
+            // Check if any topic's metadata failed to get updated
+<span class="fc" id="L1293">            Map&lt;String, Errors&gt; errors = response.errors();</span>
+<span class="fc bfc" id="L1294" title="All 2 branches covered.">            if (!errors.isEmpty())</span>
+<span class="fc" id="L1295">                log.warn(&quot;The metadata response from the cluster reported a recoverable issue with correlation id {} : {}&quot;, requestHeader.correlationId(), errors);</span>
+
+<span class="pc bpc" id="L1297" title="1 of 4 branches missed.">            if (metadataRecoveryStrategy == MetadataRecoveryStrategy.REBOOTSTRAP &amp;&amp; response.topLevelError() == Errors.REBOOTSTRAP_REQUIRED) {</span>
+<span class="nc" id="L1298">                log.info(&quot;Rebootstrap requested by server.&quot;);</span>
+<span class="nc" id="L1299">                initiateRebootstrap();</span>
+<span class="pc bpc" id="L1300" title="1 of 2 branches missed.">            } else if (response.brokers().isEmpty()) {</span>
+                // When talking to the startup phase of a broker, it is possible to receive an empty metadata set, which
+                // we should retry later.
+<span class="nc" id="L1303">                log.trace(&quot;Ignoring empty metadata response with correlation id {}.&quot;, requestHeader.correlationId());</span>
+<span class="nc" id="L1304">                this.metadata.failedUpdate(now);</span>
+            } else {
+<span class="fc" id="L1306">                this.metadata.update(inProgress.requestVersion, response, inProgress.isPartialUpdate, now);</span>
+<span class="fc" id="L1307">                metadataAttemptStartMs = Optional.empty();</span>
+            }
+
+<span class="fc" id="L1310">            inProgress = null;</span>
+<span class="fc" id="L1311">        }</span>
+
+        @Override
+        public boolean needsRebootstrap(long now, long rebootstrapTriggerMs) {
+<span class="pc bpc" id="L1315" title="1 of 2 branches missed.">            return metadataAttemptStartMs.filter(startMs -&gt; now - startMs &gt; rebootstrapTriggerMs).isPresent();</span>
+        }
+
+        @Override
+        public void rebootstrap(long now) {
+<span class="fc" id="L1320">            metadata.rebootstrap();</span>
+<span class="fc" id="L1321">            metadataAttemptStartMs = Optional.of(now);</span>
+<span class="fc" id="L1322">        }</span>
+
+        @Override
+        public void close() {
+<span class="fc" id="L1326">            this.metadata.close();</span>
+<span class="fc" id="L1327">        }</span>
+
+        private void initiateRebootstrap() {
+<span class="nc" id="L1330">            metadataAttemptStartMs = Optional.of(0L); // to force rebootstrap</span>
+<span class="nc" id="L1331">        }</span>
+
+        /**
+         * Add a metadata request to the list of sends if we can make one
+         */
+        private long maybeUpdate(long now, Node node) {
+<span class="fc" id="L1337">            String nodeConnectionId = node.idString();</span>
+
+<span class="fc bfc" id="L1339" title="All 2 branches covered.">            if (canSendRequest(nodeConnectionId, now)) {</span>
+<span class="fc" id="L1340">                Metadata.MetadataRequestAndVersion requestAndVersion = metadata.newMetadataRequestAndVersion(now);</span>
+<span class="fc" id="L1341">                MetadataRequest.Builder metadataRequest = requestAndVersion.requestBuilder;</span>
+<span class="fc" id="L1342">                log.debug(&quot;Sending metadata request {} to node {}&quot;, metadataRequest, node);</span>
+<span class="fc" id="L1343">                sendInternalMetadataRequest(metadataRequest, nodeConnectionId, now);</span>
+<span class="fc" id="L1344">                inProgress = new InProgressData(requestAndVersion.requestVersion, requestAndVersion.isPartialUpdate);</span>
+<span class="fc" id="L1345">                return defaultRequestTimeoutMs;</span>
+            }
+
+            // If there's any connection establishment underway, wait until it completes. This prevents
+            // the client from unnecessarily connecting to additional nodes while a previous connection
+            // attempt has not been completed.
+<span class="fc bfc" id="L1351" title="All 2 branches covered.">            if (isAnyNodeConnecting()) {</span>
+                // Strictly the timeout we should return here is &quot;connect timeout&quot;, but as we don't
+                // have such application level configuration, using reconnect backoff instead.
+<span class="fc" id="L1354">                return reconnectBackoffMs;</span>
+            }
+
+<span class="fc bfc" id="L1357" title="All 2 branches covered.">            if (connectionStates.canConnect(nodeConnectionId, now)) {</span>
+                // We don't have a connection to this node right now, make one
+<span class="fc" id="L1359">                log.debug(&quot;Initialize connection to node {} for sending metadata request&quot;, node);</span>
+<span class="fc" id="L1360">                initiateConnect(node, now);</span>
+<span class="fc" id="L1361">                return reconnectBackoffMs;</span>
+            }
+
+            // connected, but can't send more OR connecting
+            // In either case, we just need to wait for a network event to let us know the selected
+            // connection might be usable again.
+<span class="fc" id="L1367">            return Long.MAX_VALUE;</span>
+        }
+
+        public class InProgressData {
+            public final int requestVersion;
+            public final boolean isPartialUpdate;
+
+<span class="fc" id="L1374">            private InProgressData(int requestVersion, boolean isPartialUpdate) {</span>
+<span class="fc" id="L1375">                this.requestVersion = requestVersion;</span>
+<span class="fc" id="L1376">                this.isPartialUpdate = isPartialUpdate;</span>
+<span class="fc" id="L1377">            }</span>
+        }
+
+    }
+
+    class TelemetrySender {
+
+        private final ClientTelemetrySender clientTelemetrySender;
+        private Node stickyNode;
+
+<span class="fc" id="L1387">        public TelemetrySender(ClientTelemetrySender clientTelemetrySender) {</span>
+<span class="fc" id="L1388">            this.clientTelemetrySender = clientTelemetrySender;</span>
+<span class="fc" id="L1389">        }</span>
+
+        public long maybeUpdate(long now) {
+<span class="fc" id="L1392">            long timeToNextUpdate = clientTelemetrySender.timeToNextUpdate(defaultRequestTimeoutMs);</span>
+<span class="fc bfc" id="L1393" title="All 2 branches covered.">            if (timeToNextUpdate &gt; 0)</span>
+<span class="fc" id="L1394">                return timeToNextUpdate;</span>
+
+            // The node connection params can change while having the same node id hence check if the cached
+            // sticky node has not changed, if changed then reset the sticky node.
+<span class="pc bpc" id="L1398" title="3 of 4 branches missed.">            if (stickyNode != null &amp;&amp; isNodeChanged(stickyNode)) {</span>
+<span class="nc" id="L1399">                log.debug(&quot;Telemetry stickyNode {} either is no longer in metadata or changed, clearing it.&quot;, stickyNode);</span>
+<span class="nc" id="L1400">                stickyNode = null;</span>
+            }
+
+            // Per KIP-714, let's continue to re-use the same broker for as long as possible.
+<span class="pc bpc" id="L1404" title="1 of 2 branches missed.">            if (stickyNode == null) {</span>
+<span class="fc" id="L1405">                stickyNode = leastLoadedNode(now).node();</span>
+<span class="fc bfc" id="L1406" title="All 2 branches covered.">                if (stickyNode == null) {</span>
+<span class="fc" id="L1407">                    log.debug(&quot;Give up sending telemetry request since no node is available&quot;);</span>
+<span class="fc" id="L1408">                    return reconnectBackoffMs;</span>
+                }
+            }
+
+<span class="fc" id="L1412">            return maybeUpdate(now, stickyNode);</span>
+        }
+
+        private long maybeUpdate(long now, Node node) {
+<span class="fc" id="L1416">            String nodeConnectionId = node.idString();</span>
+
+<span class="fc bfc" id="L1418" title="All 2 branches covered.">            if (canSendRequest(nodeConnectionId, now)) {</span>
+<span class="fc" id="L1419">                Optional&lt;AbstractRequest.Builder&lt;?&gt;&gt; requestOpt = clientTelemetrySender.createRequest();</span>
+
+<span class="pc bpc" id="L1421" title="1 of 2 branches missed.">                if (requestOpt.isEmpty())</span>
+<span class="nc" id="L1422">                    return Long.MAX_VALUE;</span>
+
+<span class="fc" id="L1424">                AbstractRequest.Builder&lt;?&gt; request = requestOpt.get();</span>
+<span class="fc" id="L1425">                ClientRequest clientRequest = newClientRequest(nodeConnectionId, request, now, true);</span>
+<span class="fc" id="L1426">                doSend(clientRequest, true, now);</span>
+<span class="fc" id="L1427">                return defaultRequestTimeoutMs;</span>
+            } else {
+                // Per KIP-714, if we can't issue a request to this broker node, let's clear it out
+                // and try another broker on the next loop.
+<span class="fc" id="L1431">                stickyNode = null;</span>
+            }
+
+            // If there's any connection establishment underway, wait until it completes. This prevents
+            // the client from unnecessarily connecting to additional nodes while a previous connection
+            // attempt has not been completed.
+<span class="fc bfc" id="L1437" title="All 2 branches covered.">            if (isAnyNodeConnecting())</span>
+<span class="fc" id="L1438">                return reconnectBackoffMs;</span>
+
+<span class="fc bfc" id="L1440" title="All 2 branches covered.">            if (connectionStates.canConnect(nodeConnectionId, now)) {</span>
+                // We don't have a connection to this node right now, make one
+<span class="fc" id="L1442">                log.debug(&quot;Initialize connection to node {} for sending telemetry request&quot;, node);</span>
+<span class="fc" id="L1443">                initiateConnect(node, now);</span>
+<span class="fc" id="L1444">                return reconnectBackoffMs;</span>
+            }
+
+            // In either case, we just need to wait for a network event to let us know the selected
+            // connection might be usable again.
+<span class="fc" id="L1449">            return Long.MAX_VALUE;</span>
+        }
+
+        private boolean isNodeChanged(Node node) {
+<span class="nc" id="L1453">            Node newNode = metadataUpdater.fetchNodes().stream()</span>
+<span class="nc bnc" id="L1454" title="All 2 branches missed.">                    .filter(n -&gt; n.id() == node.id())</span>
+<span class="nc" id="L1455">                    .findFirst().orElse(null);</span>
+<span class="nc bnc" id="L1456" title="All 4 branches missed.">            return newNode == null || !newNode.equals(node);</span>
+        }
+
+        public void handleResponse(GetTelemetrySubscriptionsResponse response) {
+<span class="nc" id="L1460">            clientTelemetrySender.handleResponse(response);</span>
+<span class="nc" id="L1461">        }</span>
+
+        public void handleResponse(PushTelemetryResponse response) {
+<span class="nc" id="L1464">            clientTelemetrySender.handleResponse(response);</span>
+<span class="nc" id="L1465">        }</span>
+
+        public void handleFailedRequest(ApiKeys apiKey, KafkaException maybeFatalException) {
+<span class="pc bpc" id="L1468" title="1 of 2 branches missed.">            if (apiKey == ApiKeys.GET_TELEMETRY_SUBSCRIPTIONS)</span>
+<span class="fc" id="L1469">                clientTelemetrySender.handleFailedGetTelemetrySubscriptionsRequest(maybeFatalException);</span>
+<span class="nc bnc" id="L1470" title="All 2 branches missed.">            else if (apiKey == ApiKeys.PUSH_TELEMETRY)</span>
+<span class="nc" id="L1471">                clientTelemetrySender.handleFailedPushTelemetryRequest(maybeFatalException);</span>
+            else
+<span class="nc" id="L1473">                throw new IllegalStateException(&quot;Invalid api key for failed telemetry request&quot;);</span>
+<span class="fc" id="L1474">        }</span>
+
+        public void close() {
+            try {
+<span class="fc" id="L1478">                clientTelemetrySender.close();</span>
+<span class="nc" id="L1479">            } catch (Exception exception) {</span>
+<span class="nc" id="L1480">                log.error(&quot;Failed to close client telemetry sender&quot;, exception);</span>
+<span class="fc" id="L1481">            }</span>
+<span class="fc" id="L1482">        }</span>
+    }
+
+    @Override
+    public ClientRequest newClientRequest(String nodeId,
+                                          AbstractRequest.Builder&lt;?&gt; requestBuilder,
+                                          long createdTimeMs,
+                                          boolean expectResponse) {
+<span class="fc" id="L1490">        return newClientRequest(nodeId, requestBuilder, createdTimeMs, expectResponse, defaultRequestTimeoutMs, null);</span>
+    }
+
+    // visible for testing
+    int nextCorrelationId() {
+<span class="pc bpc" id="L1495" title="1 of 2 branches missed.">        if (SaslClientAuthenticator.isReserved(correlation)) {</span>
+            // the numeric overflow is fine as negative values is acceptable
+<span class="nc" id="L1497">            correlation = SaslClientAuthenticator.MAX_RESERVED_CORRELATION_ID + 1;</span>
+        }
+<span class="fc" id="L1499">        return correlation++;</span>
+    }
+
+    // visible for testing
+    Node telemetryConnectedNode() {
+<span class="nc" id="L1504">        return telemetrySender.stickyNode;</span>
+    }
+
+    @Override
+    public ClientRequest newClientRequest(String nodeId,
+                                          AbstractRequest.Builder&lt;?&gt; requestBuilder,
+                                          long createdTimeMs,
+                                          boolean expectResponse,
+                                          int requestTimeoutMs,
+                                          RequestCompletionHandler callback) {
+<span class="fc" id="L1514">        return new ClientRequest(nodeId, requestBuilder, nextCorrelationId(), clientId, createdTimeMs, expectResponse,</span>
+                requestTimeoutMs, callback);
+    }
+
+    public boolean discoverBrokerVersions() {
+<span class="nc" id="L1519">        return discoverBrokerVersions;</span>
+    }
+
+    static class InFlightRequest {
+        final RequestHeader header;
+        final String destination;
+        final RequestCompletionHandler callback;
+        final boolean expectResponse;
+        final AbstractRequest request;
+        final boolean isInternalRequest; // used to flag requests which are initiated internally by NetworkClient
+        final Send send;
+        final long sendTimeMs;
+        final long createdTimeMs;
+        final long requestTimeoutMs;
+        long throttleTimeMs;
+
+        public InFlightRequest(ClientRequest clientRequest,
+                               RequestHeader header,
+                               boolean isInternalRequest,
+                               AbstractRequest request,
+                               Send send,
+                               long sendTimeMs) {
+<span class="fc" id="L1541">            this(header,</span>
+<span class="fc" id="L1542">                 clientRequest.requestTimeoutMs(),</span>
+<span class="fc" id="L1543">                 clientRequest.createdTimeMs(),</span>
+<span class="fc" id="L1544">                 clientRequest.destination(),</span>
+<span class="fc" id="L1545">                 clientRequest.callback(),</span>
+<span class="fc" id="L1546">                 clientRequest.expectResponse(),</span>
+                 isInternalRequest,
+                 request,
+                 send,
+                 sendTimeMs);
+<span class="fc" id="L1551">        }</span>
+
+        public InFlightRequest(RequestHeader header,
+                               int requestTimeoutMs,
+                               long createdTimeMs,
+                               String destination,
+                               RequestCompletionHandler callback,
+                               boolean expectResponse,
+                               boolean isInternalRequest,
+                               AbstractRequest request,
+                               Send send,
+<span class="fc" id="L1562">                               long sendTimeMs) {</span>
+<span class="fc" id="L1563">            this.header = header;</span>
+<span class="fc" id="L1564">            this.requestTimeoutMs = requestTimeoutMs;</span>
+<span class="fc" id="L1565">            this.createdTimeMs = createdTimeMs;</span>
+<span class="fc" id="L1566">            this.destination = destination;</span>
+<span class="fc" id="L1567">            this.callback = callback;</span>
+<span class="fc" id="L1568">            this.expectResponse = expectResponse;</span>
+<span class="fc" id="L1569">            this.isInternalRequest = isInternalRequest;</span>
+<span class="fc" id="L1570">            this.request = request;</span>
+<span class="fc" id="L1571">            this.send = send;</span>
+<span class="fc" id="L1572">            this.sendTimeMs = sendTimeMs;</span>
+<span class="fc" id="L1573">        }</span>
+
+        public long timeElapsedSinceSendMs(long currentTimeMs) {
+<span class="fc" id="L1576">            return Math.max(0, currentTimeMs - sendTimeMs);</span>
+        }
+
+        public long throttleTimeMs() {
+<span class="fc" id="L1580">            return throttleTimeMs;</span>
+        }
+
+        public long timeElapsedSinceCreateMs(long currentTimeMs) {
+<span class="fc" id="L1584">            return Math.max(0, currentTimeMs - createdTimeMs);</span>
+        }
+
+        public ClientResponse completed(AbstractResponse response, long timeMs) {
+<span class="fc" id="L1588">            return new ClientResponse(header, callback, destination, createdTimeMs, timeMs,</span>
+                    false, null, null, response);
+        }
+
+        public ClientResponse timedOut(long timeMs) {
+            // A timed out request is considered disconnected as well
+<span class="nc" id="L1594">            return new ClientResponse(header, callback, destination, createdTimeMs, timeMs,</span>
+                    true, true, null, null, null);
+        }
+
+        public ClientResponse disconnected(long timeMs) {
+<span class="fc" id="L1599">            return new ClientResponse(header, callback, destination, createdTimeMs, timeMs,</span>
+                    true, null, null, null);
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1605">            return &quot;InFlightRequest(header=&quot; + header +</span>
+                    &quot;, destination=&quot; + destination +
+                    &quot;, expectResponse=&quot; + expectResponse +
+                    &quot;, createdTimeMs=&quot; + createdTimeMs +
+                    &quot;, sendTimeMs=&quot; + sendTimeMs +
+                    &quot;, isInternalRequest=&quot; + isInternalRequest +
+                    &quot;, request=&quot; + request +
+                    &quot;, callback=&quot; + callback +
+                    &quot;, send=&quot; + send + &quot;)&quot;;
+        }
+
+        public void incrementThrottleTime(long throttleTimeMs) {
+<span class="nc" id="L1617">            this.throttleTimeMs = throttleTimeMs + this.throttleTimeMs;</span>
+<span class="nc" id="L1618">        }</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

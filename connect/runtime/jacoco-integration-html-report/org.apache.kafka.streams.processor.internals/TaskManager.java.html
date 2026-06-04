@@ -1,0 +1,2094 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TaskManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.processor.internals</a> &gt; <span class="el_source">TaskManager.java</span></div><h1>TaskManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.processor.internals;
+
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.DeleteRecordsResult;
+import org.apache.kafka.clients.admin.RecordsToDelete;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Metric;
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.ExponentialBackoff;
+import org.apache.kafka.streams.errors.LockException;
+import org.apache.kafka.streams.errors.StreamsException;
+import org.apache.kafka.streams.errors.TaskCorruptedException;
+import org.apache.kafka.streams.errors.TaskIdFormatException;
+import org.apache.kafka.streams.errors.TaskMigratedException;
+import org.apache.kafka.streams.internals.StreamsConfigUtils.ProcessingMode;
+import org.apache.kafka.streams.processor.StandbyUpdateListener;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.assignment.ProcessId;
+import org.apache.kafka.streams.processor.internals.Task.State;
+import org.apache.kafka.streams.processor.internals.tasks.DefaultTaskManager;
+
+import org.slf4j.Logger;
+
+import java.io.File;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static org.apache.kafka.common.utils.Utils.intersection;
+import static org.apache.kafka.common.utils.Utils.union;
+import static org.apache.kafka.streams.internals.StreamsConfigUtils.ProcessingMode.EXACTLY_ONCE_V2;
+import static org.apache.kafka.streams.processor.internals.StateManagerUtil.parseTaskDirectoryName;
+
+public class TaskManager {
+
+    private static final String BUG_ERROR_MESSAGE = &quot;This indicates a bug. &quot; +
+        &quot;Please report at https://issues.apache.org/jira/projects/KAFKA/issues or to the dev-mailing list (https://kafka.apache.org/contact).&quot;;
+    private static final String INTERRUPTED_ERROR_MESSAGE = &quot;Thread got interrupted. &quot; + BUG_ERROR_MESSAGE;
+
+    // initialize the task list
+    // activeTasks needs to be concurrent as it can be accessed
+    // by QueryableState
+    private final Logger log;
+    private final Time time;
+    private final TasksRegistry tasks;
+    private final ProcessId processId;
+    private final String logPrefix;
+    private final Admin adminClient;
+    private final StateDirectory stateDirectory;
+    private final ProcessingMode processingMode;
+    private final ChangelogReader changelogReader;
+    private final TopologyMetadata topologyMetadata;
+
+    private final TaskExecutor taskExecutor;
+
+    private Consumer&lt;byte[], byte[]&gt; mainConsumer;
+
+    private DeleteRecordsResult deleteRecordsResult;
+
+<span class="nc" id="L102">    private boolean rebalanceInProgress = false;  // if we are in the middle of a rebalance, it is not safe to commit</span>
+
+    // includes assigned &amp; initialized tasks and unassigned tasks we locked temporarily during rebalance
+<span class="nc" id="L105">    private final Set&lt;TaskId&gt; lockedTaskDirectories = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L107">    private final Map&lt;TaskId, BackoffRecord&gt; taskIdToBackoffRecord = new HashMap&lt;&gt;();</span>
+
+    private final ActiveTaskCreator activeTaskCreator;
+    private final StandbyTaskCreator standbyTaskCreator;
+    private final StateUpdater stateUpdater;
+    private final DefaultTaskManager schedulingTaskManager;
+    TaskManager(final Time time,
+                final ChangelogReader changelogReader,
+                final ProcessId processId,
+                final String logPrefix,
+                final ActiveTaskCreator activeTaskCreator,
+                final StandbyTaskCreator standbyTaskCreator,
+                final TasksRegistry tasks,
+                final TopologyMetadata topologyMetadata,
+                final Admin adminClient,
+                final StateDirectory stateDirectory,
+                final StateUpdater stateUpdater,
+                final DefaultTaskManager schedulingTaskManager
+<span class="nc" id="L125">                ) {</span>
+<span class="nc" id="L126">        this.time = time;</span>
+<span class="nc" id="L127">        this.processId = processId;</span>
+<span class="nc" id="L128">        this.logPrefix = logPrefix;</span>
+<span class="nc" id="L129">        this.adminClient = adminClient;</span>
+<span class="nc" id="L130">        this.stateDirectory = stateDirectory;</span>
+<span class="nc" id="L131">        this.changelogReader = changelogReader;</span>
+<span class="nc" id="L132">        this.topologyMetadata = topologyMetadata;</span>
+<span class="nc" id="L133">        this.activeTaskCreator = activeTaskCreator;</span>
+<span class="nc" id="L134">        this.standbyTaskCreator = standbyTaskCreator;</span>
+<span class="nc" id="L135">        this.processingMode = topologyMetadata.processingMode();</span>
+
+<span class="nc" id="L137">        final LogContext logContext = new LogContext(logPrefix);</span>
+<span class="nc" id="L138">        this.log = logContext.logger(getClass());</span>
+
+<span class="nc" id="L140">        this.stateUpdater = stateUpdater;</span>
+<span class="nc" id="L141">        this.schedulingTaskManager = schedulingTaskManager;</span>
+<span class="nc" id="L142">        this.tasks = tasks;</span>
+<span class="nc" id="L143">        this.taskExecutor = new TaskExecutor(</span>
+            this.tasks,
+            this,
+<span class="nc" id="L146">            topologyMetadata.taskExecutionMetadata(),</span>
+            logContext
+        );
+<span class="nc" id="L149">    }</span>
+
+    void init() {
+<span class="nc" id="L152">        this.stateUpdater.start();</span>
+<span class="nc" id="L153">    }</span>
+    void setMainConsumer(final Consumer&lt;byte[], byte[]&gt; mainConsumer) {
+<span class="nc" id="L155">        this.mainConsumer = mainConsumer;</span>
+<span class="nc" id="L156">    }</span>
+
+    public double totalProducerBlockedTime() {
+<span class="nc" id="L159">        return activeTaskCreator.totalProducerBlockedTime();</span>
+    }
+
+    public ProcessId processId() {
+<span class="nc" id="L163">        return processId;</span>
+    }
+
+    public TopologyMetadata topologyMetadata() {
+<span class="nc" id="L167">        return topologyMetadata;</span>
+    }
+
+    ConsumerGroupMetadata consumerGroupMetadata() {
+<span class="nc" id="L171">        return mainConsumer.groupMetadata();</span>
+    }
+
+    void consumerCommitSync(final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets) {
+<span class="nc" id="L175">        mainConsumer.commitSync(offsets);</span>
+<span class="nc" id="L176">    }</span>
+
+    StreamsProducer streamsProducer() {
+<span class="nc" id="L179">        return activeTaskCreator.streamsProducer();</span>
+    }
+
+    boolean rebalanceInProgress() {
+<span class="nc" id="L183">        return rebalanceInProgress;</span>
+    }
+
+    void handleRebalanceStart(final Set&lt;String&gt; subscribedTopics) {
+<span class="nc" id="L187">        topologyMetadata.addSubscribedTopicsFromMetadata(subscribedTopics, logPrefix);</span>
+
+<span class="nc" id="L189">        tryToLockAllNonEmptyTaskDirectories();</span>
+
+<span class="nc" id="L191">        rebalanceInProgress = true;</span>
+<span class="nc" id="L192">    }</span>
+
+    void handleRebalanceComplete() {
+        // we should pause consumer only within the listener since
+        // before then the assignment has not been updated yet.
+        // All tasks that are owned by the task manager are ready and do not need to be paused
+<span class="nc" id="L198">        final Set&lt;TopicPartition&gt; partitionsNotToPause = tasks.allNonFailedInitializedTasks()</span>
+<span class="nc" id="L199">            .stream()</span>
+<span class="nc" id="L200">            .flatMap(task -&gt; task.inputPartitions().stream())</span>
+<span class="nc" id="L201">            .collect(Collectors.toSet());</span>
+<span class="nc" id="L202">        final Set&lt;TopicPartition&gt; partitionsToPause = new HashSet&lt;&gt;(mainConsumer.assignment());</span>
+<span class="nc" id="L203">        partitionsToPause.removeAll(partitionsNotToPause);</span>
+<span class="nc" id="L204">        mainConsumer.pause(partitionsToPause);</span>
+
+<span class="nc" id="L206">        releaseLockedUnassignedTaskDirectories();</span>
+
+<span class="nc" id="L208">        rebalanceInProgress = false;</span>
+<span class="nc" id="L209">    }</span>
+
+    /**
+     * @throws TaskMigratedException
+     */
+    boolean handleCorruption(final Set&lt;TaskId&gt; corruptedTasks) {
+<span class="nc" id="L215">        final Set&lt;TaskId&gt; activeTasks = new HashSet&lt;&gt;(tasks.activeInitializedTaskIds());</span>
+
+        // We need to stop all processing, since we need to commit non-corrupted tasks as well.
+<span class="nc" id="L218">        maybeLockTasks(activeTasks);</span>
+
+<span class="nc" id="L220">        final Set&lt;Task&gt; corruptedActiveTasks = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc" id="L221">        final Set&lt;Task&gt; corruptedStandbyTasks = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        for (final TaskId taskId : corruptedTasks) {</span>
+<span class="nc" id="L224">            final Task task = tasks.initializedTask(taskId);</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">            if (task.isActive()) {</span>
+<span class="nc" id="L226">                corruptedActiveTasks.add(task);</span>
+            } else {
+<span class="nc" id="L228">                corruptedStandbyTasks.add(task);</span>
+            }
+<span class="nc" id="L230">        }</span>
+
+        // Make sure to clean up any corrupted standby tasks in their entirety before committing
+        // since TaskMigrated can be thrown and the resulting handleLostAll will only clean up active tasks
+<span class="nc" id="L234">        closeDirtyAndRevive(corruptedStandbyTasks, true);</span>
+
+        // We need to commit before closing the corrupted active tasks since this will force the ongoing txn to abort
+        try {
+<span class="nc" id="L238">            final Collection&lt;Task&gt; tasksToCommit = tasks.allInitializedTasksPerId()</span>
+<span class="nc" id="L239">                .values()</span>
+<span class="nc" id="L240">                .stream()</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">                .filter(t -&gt; t.state() == Task.State.RUNNING)</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">                .filter(t -&gt; !corruptedTasks.contains(t.id()))</span>
+<span class="nc" id="L243">                .collect(Collectors.toSet());</span>
+<span class="nc" id="L244">            commitTasksAndMaybeUpdateCommittableOffsets(tasksToCommit, new HashMap&lt;&gt;());</span>
+<span class="nc" id="L245">        } catch (final TaskCorruptedException e) {</span>
+<span class="nc" id="L246">            log.info(&quot;Some additional tasks were found corrupted while trying to commit, these will be added to the &quot; +</span>
+<span class="nc" id="L247">                         &quot;tasks to clean and revive: {}&quot;, e.corruptedTasks());</span>
+<span class="nc" id="L248">            corruptedActiveTasks.addAll(tasks.initializedTasks(e.corruptedTasks()));</span>
+<span class="nc" id="L249">        } catch (final TimeoutException e) {</span>
+<span class="nc" id="L250">            log.info(&quot;Hit TimeoutException when committing all non-corrupted tasks, these will be closed and revived&quot;);</span>
+<span class="nc" id="L251">            final Collection&lt;Task&gt; uncorruptedTasks = new HashSet&lt;&gt;(tasks.activeInitializedTasks());</span>
+<span class="nc" id="L252">            uncorruptedTasks.removeAll(corruptedActiveTasks);</span>
+            // Those tasks which just timed out can just be closed dirty without marking changelogs as corrupted
+<span class="nc" id="L254">            closeDirtyAndRevive(uncorruptedTasks, false);</span>
+<span class="nc" id="L255">        }</span>
+
+<span class="nc" id="L257">        closeDirtyAndRevive(corruptedActiveTasks, true);</span>
+
+<span class="nc" id="L259">        maybeUnlockTasks(activeTasks);</span>
+
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        return !corruptedActiveTasks.isEmpty();</span>
+    }
+
+    private void closeDirtyAndRevive(final Collection&lt;Task&gt; taskWithChangelogs, final boolean markAsCorrupted) {
+<span class="nc bnc" id="L265" title="All 2 branches missed.">        for (final Task task : taskWithChangelogs) {</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">            if (task.state() != State.CLOSED) {</span>
+                try {
+                    // we do not need to take the returned offsets since we are not going to commit anyways;
+                    // this call is only used for active tasks to flush the cache before suspending and
+                    // closing the topology
+<span class="nc" id="L271">                    task.prepareCommit(false);</span>
+<span class="nc" id="L272">                } catch (final RuntimeException swallow) {</span>
+<span class="nc" id="L273">                    log.warn(&quot;Error flushing cache for corrupted task {}. &quot; +</span>
+                        &quot;Since the task is closing dirty, the following exception is swallowed: {}&quot;,
+<span class="nc" id="L275">                        task.id(), swallow.getMessage());</span>
+<span class="nc" id="L276">                }</span>
+
+                try {
+<span class="nc" id="L279">                    task.suspend();</span>
+
+                    // we need to enforce a checkpoint that removes the corrupted partitions
+<span class="nc bnc" id="L282" title="All 2 branches missed.">                    if (markAsCorrupted) {</span>
+<span class="nc" id="L283">                        task.postCommit(true);</span>
+                    }
+<span class="nc" id="L285">                } catch (final RuntimeException swallow) {</span>
+<span class="nc" id="L286">                    log.warn(&quot;Error suspending corrupted task {}. &quot; +</span>
+                        &quot;Since the task is closing dirty, the following exception is swallowed: {}&quot;,
+<span class="nc" id="L288">                        task.id(), swallow.getMessage());</span>
+<span class="nc" id="L289">                }</span>
+<span class="nc" id="L290">                task.closeDirty();</span>
+            }
+            // For active tasks pause their input partitions so we won't poll any more records
+            // for this task until it has been re-initialized;
+            // Note, closeDirty already clears the partition-group for the task.
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            if (task.isActive()) {</span>
+<span class="nc" id="L296">                final Set&lt;TopicPartition&gt; currentAssignment = mainConsumer.assignment();</span>
+<span class="nc" id="L297">                final Set&lt;TopicPartition&gt; taskInputPartitions = task.inputPartitions();</span>
+<span class="nc" id="L298">                final Set&lt;TopicPartition&gt; assignedToPauseAndReset =</span>
+<span class="nc" id="L299">                    intersection(HashSet::new, currentAssignment, taskInputPartitions);</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">                if (!assignedToPauseAndReset.equals(taskInputPartitions)) {</span>
+<span class="nc" id="L301">                    log.warn(</span>
+                        &quot;Expected the current consumer assignment {} to contain the input partitions {}. &quot; +
+                            &quot;Will proceed to recover.&quot;,
+                        currentAssignment,
+                        taskInputPartitions
+                    );
+                }
+
+<span class="nc" id="L309">                task.addPartitionsForOffsetReset(assignedToPauseAndReset);</span>
+            }
+
+<span class="nc" id="L312">            tasks.removeTask(task);</span>
+<span class="nc" id="L313">            task.revive();</span>
+<span class="nc" id="L314">            tasks.addPendingTasksToInit(Collections.singleton(task));</span>
+<span class="nc" id="L315">        }</span>
+<span class="nc" id="L316">    }</span>
+
+    private Collection&lt;? extends Task&gt; assignActiveTaskFromStartupState(final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; tasksToAssign) {
+<span class="nc bnc" id="L319" title="All 2 branches missed.">        if (stateDirectory.hasStartupTasks()) {</span>
+<span class="nc" id="L320">            final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; assignedTasks = new HashMap&lt;&gt;(tasksToAssign.size());</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            for (final Map.Entry&lt;TaskId, Set&lt;TopicPartition&gt;&gt; entry : tasksToAssign.entrySet()) {</span>
+<span class="nc" id="L322">                final TaskId taskId = entry.getKey();</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">                if (stateDirectory.removeStartupState(taskId)) {</span>
+<span class="nc" id="L324">                    assignedTasks.put(taskId, entry.getValue());</span>
+                }
+<span class="nc" id="L326">            }</span>
+<span class="nc" id="L327">            return activeTaskCreator.createTasks(mainConsumer, assignedTasks);</span>
+        } else {
+<span class="nc" id="L329">            return Collections.emptySet();</span>
+        }
+    }
+
+    private Collection&lt;? extends Task&gt; assignStartupTasks(final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; tasksToAssign) {
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        if (stateDirectory.hasStartupTasks()) {</span>
+<span class="nc" id="L335">            final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; assignedTasks = new HashMap&lt;&gt;(tasksToAssign.size());</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">            for (final Map.Entry&lt;TaskId, Set&lt;TopicPartition&gt;&gt; entry : tasksToAssign.entrySet()) {</span>
+<span class="nc" id="L337">                final TaskId taskId = entry.getKey();</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">                if (stateDirectory.removeStartupState(taskId)) {</span>
+<span class="nc" id="L339">                    final Set&lt;TopicPartition&gt; inputPartitions = entry.getValue();</span>
+<span class="nc" id="L340">                    assignedTasks.put(taskId, inputPartitions);</span>
+                }
+<span class="nc" id="L342">            }</span>
+<span class="nc" id="L343">            return standbyTaskCreator.createTasks(assignedTasks);</span>
+        } else {
+<span class="nc" id="L345">            return Collections.emptySet();</span>
+        }
+    }
+
+    /**
+     * @throws TaskMigratedException if the task producer got fenced (EOS only)
+     * @throws StreamsException fatal error while creating / initializing the task
+     *
+     * public for upgrade testing only
+     */
+    public void handleAssignment(final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasks,
+                                 final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyTasks) {
+<span class="nc" id="L357">        log.info(&quot;Handle new assignment with:\n&quot; +</span>
+                     &quot;\tNew active tasks: {}\n&quot; +
+                     &quot;\tNew standby tasks: {}\n&quot; +
+                     &quot;\tExisting active tasks: {}\n&quot; +
+                     &quot;\tExisting standby tasks: {}&quot;,
+<span class="nc" id="L362">                 activeTasks.keySet(), standbyTasks.keySet(), activeTaskIds(), standbyTaskIds());</span>
+
+<span class="nc" id="L364">        topologyMetadata.addSubscribedTopicsFromAssignment(</span>
+<span class="nc" id="L365">            activeTasks.values().stream().flatMap(Collection::stream).collect(Collectors.toSet()),</span>
+            logPrefix
+        );
+
+<span class="nc" id="L369">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasksToCreate = new HashMap&lt;&gt;(activeTasks);</span>
+<span class="nc" id="L370">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyTasksToCreate = new HashMap&lt;&gt;(standbyTasks);</span>
+<span class="nc" id="L371">        final Map&lt;Task, Set&lt;TopicPartition&gt;&gt; tasksToRecycle = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L372">        final Set&lt;Task&gt; tasksToCloseClean = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+
+<span class="nc" id="L374">        final Set&lt;TaskId&gt; tasksToLock =</span>
+<span class="nc" id="L375">            tasks.allInitializedTaskIds().stream()</span>
+<span class="nc bnc" id="L376" title="All 4 branches missed.">                .filter(x -&gt; activeTasksToCreate.containsKey(x) || standbyTasksToCreate.containsKey(x))</span>
+<span class="nc" id="L377">                .collect(Collectors.toSet());</span>
+
+<span class="nc" id="L379">        maybeLockTasks(tasksToLock);</span>
+
+        // first put aside those unrecognized tasks because of unknown named-topologies
+<span class="nc" id="L382">        tasks.clearPendingTasksToCreate();</span>
+<span class="nc" id="L383">        tasks.addPendingActiveTasksToCreate(pendingTasksToCreate(activeTasksToCreate));</span>
+<span class="nc" id="L384">        tasks.addPendingStandbyTasksToCreate(pendingTasksToCreate(standbyTasksToCreate));</span>
+        
+        // first rectify all existing tasks:
+        // 1. for tasks that are already owned, just update input partitions / resume and skip re-creating them
+        // 2. for tasks that have changed active/standby status, just recycle and skip re-creating them
+        // 3. otherwise, close them since they are no longer owned
+<span class="nc" id="L390">        final Map&lt;TaskId, RuntimeException&gt; failedTasks = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L391">        handleTasks(</span>
+            activeTasksToCreate,
+            standbyTasksToCreate,
+            tasksToRecycle,
+            tasksToCloseClean,
+            failedTasks
+        );
+<span class="nc" id="L398">        failedTasks.putAll(collectExceptionsAndFailedTasksFromStateUpdater());</span>
+
+<span class="nc" id="L400">        final Map&lt;TaskId, RuntimeException&gt; taskCloseExceptions = closeAndRecycleTasks(tasksToRecycle, tasksToCloseClean);</span>
+
+<span class="nc" id="L402">        maybeUnlockTasks(tasksToLock);</span>
+
+<span class="nc" id="L404">        failedTasks.putAll(taskCloseExceptions);</span>
+<span class="nc" id="L405">        maybeThrowTaskExceptions(failedTasks);</span>
+
+<span class="nc" id="L407">        createNewTasks(activeTasksToCreate, standbyTasksToCreate);</span>
+<span class="nc" id="L408">    }</span>
+
+    // Wrap and throw the exception in the following order
+    // if at least one of the exception is a non-streams exception, then wrap and throw since it should be handled by thread's handler
+    // if at least one of the exception is a streams exception, then directly throw since it should be handled by thread's handler
+    // if at least one of the exception is a task-migrated exception, then directly throw since it indicates all tasks are lost
+    // otherwise, all the exceptions are task-corrupted, then merge their tasks and throw a single one
+    // TODO: move task-corrupted and task-migrated out of the public errors package since they are internal errors and always be
+    //       handled by Streams library itself
+    private void maybeThrowTaskExceptions(final Map&lt;TaskId, RuntimeException&gt; taskExceptions) {
+<span class="nc bnc" id="L418" title="All 2 branches missed.">        if (!taskExceptions.isEmpty()) {</span>
+<span class="nc" id="L419">            log.error(&quot;Get exceptions for the following tasks: {}&quot;, taskExceptions);</span>
+
+<span class="nc" id="L421">            final Set&lt;TaskId&gt; aggregatedCorruptedTaskIds = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L422">            StreamsException lastFatal = null;</span>
+<span class="nc" id="L423">            TaskMigratedException lastTaskMigrated = null;</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">            for (final Map.Entry&lt;TaskId, RuntimeException&gt; entry : taskExceptions.entrySet()) {</span>
+<span class="nc" id="L425">                final TaskId taskId = entry.getKey();</span>
+<span class="nc" id="L426">                final RuntimeException exception = entry.getValue();</span>
+
+<span class="nc bnc" id="L428" title="All 2 branches missed.">                if (exception instanceof StreamsException) {</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">                    if (exception instanceof TaskMigratedException) {</span>
+<span class="nc" id="L430">                        lastTaskMigrated = (TaskMigratedException) exception;</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">                    } else if (exception instanceof TaskCorruptedException) {</span>
+<span class="nc" id="L432">                        log.warn(&quot;Encounter corrupted task &quot; + taskId + &quot;, will group it with other corrupted tasks &quot; +</span>
+                            &quot;and handle together&quot;, exception);
+<span class="nc" id="L434">                        aggregatedCorruptedTaskIds.add(taskId);</span>
+                    } else {
+<span class="nc" id="L436">                        ((StreamsException) exception).setTaskId(taskId);</span>
+<span class="nc" id="L437">                        lastFatal = (StreamsException) exception;</span>
+                    }
+<span class="nc bnc" id="L439" title="All 2 branches missed.">                } else if (exception instanceof KafkaException) {</span>
+<span class="nc" id="L440">                    lastFatal = new StreamsException(exception, taskId);</span>
+                } else {
+<span class="nc" id="L442">                    lastFatal = new StreamsException(&quot;Encounter unexpected fatal error for task &quot; + taskId, exception, taskId);</span>
+                }
+<span class="nc" id="L444">            }</span>
+
+<span class="nc bnc" id="L446" title="All 2 branches missed.">            if (lastFatal != null) {</span>
+<span class="nc" id="L447">                throw lastFatal;</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            } else if (lastTaskMigrated != null) {</span>
+<span class="nc" id="L449">                throw lastTaskMigrated;</span>
+            } else {
+<span class="nc" id="L451">                throw new TaskCorruptedException(aggregatedCorruptedTaskIds);</span>
+            }
+        }
+<span class="nc" id="L454">    }</span>
+
+    private void createNewTasks(final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasksToCreate,
+                                final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyTasksToCreate) {
+<span class="nc" id="L458">        final Collection&lt;StreamTask&gt; newActiveTasks = activeTaskCreator.createTasks(mainConsumer, activeTasksToCreate);</span>
+<span class="nc" id="L459">        final Collection&lt;StandbyTask&gt; newStandbyTasks = standbyTaskCreator.createTasks(standbyTasksToCreate);</span>
+
+<span class="nc" id="L461">        tasks.addPendingTasksToInit(newActiveTasks);</span>
+<span class="nc" id="L462">        tasks.addPendingTasksToInit(newStandbyTasks);</span>
+<span class="nc" id="L463">    }</span>
+
+    private void updateInputPartitionsOfStandbyTaskIfTheyChanged(final Task task,
+                                                                 final Set&lt;TopicPartition&gt; inputPartitions) {
+        /*
+        We should only update input partitions of a standby task if the input partitions really changed. Updating the
+        input partitions of tasks also updates the mapping from source nodes to input topics in the processor topology
+        within the task. The mapping is updated with the topics from the topology metadata. The topology metadata does
+        not prefix intermediate internal topics with the application ID. Thus, if a standby task has input partitions
+        from an intermediate internal topic the update of the mapping in the processor topology leads to an invalid
+        topology exception during recycling of a standby task to an active task when the input queues are created. This
+        is because the input topics in the processor topology and the input partitions of the task do not match because
+        the former miss the application ID prefix.
+        For standby task that have only input partitions from intermediate internal topics this check avoids the invalid
+        topology exception. Unfortunately, a subtopology might have input partitions subscribed to with a regex
+        additionally intermediate internal topics which might still lead to an invalid topology exception during recycling
+        irrespectively of this check here. Thus, there is still a bug to fix here.
+         */
+<span class="nc bnc" id="L481" title="All 2 branches missed.">        if (!task.inputPartitions().equals(inputPartitions)) {</span>
+<span class="nc" id="L482">            task.updateInputPartitions(inputPartitions, topologyMetadata.nodeToSourceTopics(task.id()));</span>
+        }
+<span class="nc" id="L484">    }</span>
+
+    private void handleTasks(final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasksToCreate,
+                             final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyTasksToCreate,
+                             final Map&lt;Task, Set&lt;TopicPartition&gt;&gt; tasksToRecycle,
+                             final Set&lt;Task&gt; tasksToCloseClean,
+                             final Map&lt;TaskId, RuntimeException&gt; failedTasks) {
+<span class="nc" id="L491">        handleTasksPendingInitialization();</span>
+<span class="nc" id="L492">        handleExistingStateForTasks(activeTasksToCreate, standbyTasksToCreate);</span>
+<span class="nc" id="L493">        handleRestoringAndUpdatingTasks(activeTasksToCreate, standbyTasksToCreate, failedTasks);</span>
+<span class="nc" id="L494">        handleRunningAndSuspendedTasks(activeTasksToCreate, standbyTasksToCreate, tasksToRecycle, tasksToCloseClean);</span>
+<span class="nc" id="L495">    }</span>
+
+    private void handleTasksPendingInitialization() {
+        // All tasks pending initialization are not part of the usual bookkeeping
+
+<span class="nc" id="L500">        final Set&lt;Task&gt; tasksToCloseDirty = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+
+<span class="nc bnc" id="L502" title="All 2 branches missed.">        for (final Task task : tasks.drainPendingTasksToInit()) {</span>
+<span class="nc" id="L503">            closeTaskClean(task, tasksToCloseDirty, new HashMap&lt;&gt;());</span>
+<span class="nc" id="L504">        }</span>
+<span class="nc bnc" id="L505" title="All 2 branches missed.">        for (final Task task : tasksToCloseDirty) {</span>
+<span class="nc" id="L506">            closeTaskDirty(task, false);</span>
+<span class="nc" id="L507">        }</span>
+<span class="nc" id="L508">    }</span>
+
+    private void handleExistingStateForTasks(final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasksToCreate,
+                                             final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyTasksToCreate) {
+<span class="nc" id="L512">        final Collection&lt;? extends Task&gt; activeTasks = assignActiveTaskFromStartupState(activeTasksToCreate);</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">        for (final Task activeTask : activeTasks) {</span>
+<span class="nc" id="L514">            activeTasksToCreate.remove(activeTask.id());</span>
+<span class="nc" id="L515">        }</span>
+<span class="nc" id="L516">        final Collection&lt;? extends Task&gt; standbyTasks = assignStartupTasks(standbyTasksToCreate);</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">        for (final Task standbyTask : standbyTasks) {</span>
+<span class="nc" id="L518">            standbyTasksToCreate.remove(standbyTask.id());</span>
+<span class="nc" id="L519">        }</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">        if (!activeTasks.isEmpty()) {</span>
+<span class="nc" id="L521">            tasks.addPendingTasksToInit(activeTasks);</span>
+        }
+<span class="nc bnc" id="L523" title="All 2 branches missed.">        if (!standbyTasks.isEmpty()) {</span>
+<span class="nc" id="L524">            tasks.addPendingTasksToInit(standbyTasks);</span>
+        }
+<span class="nc" id="L526">    }</span>
+
+    private void handleRunningAndSuspendedTasks(final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasksToCreate,
+                                                final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyTasksToCreate,
+                                                final Map&lt;Task, Set&lt;TopicPartition&gt;&gt; tasksToRecycle,
+                                                final Set&lt;Task&gt; tasksToCloseClean) {
+<span class="nc bnc" id="L532" title="All 2 branches missed.">        for (final Task task : tasks.allNonFailedInitializedTasks()) {</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">            if (!task.isActive()) {</span>
+<span class="nc" id="L534">                throw new IllegalStateException(&quot;Standby tasks should only be managed by the state updater, &quot; +</span>
+<span class="nc" id="L535">                    &quot;but standby task &quot; + task.id() + &quot; is managed by the stream thread&quot;);</span>
+            }
+<span class="nc" id="L537">            final TaskId taskId = task.id();</span>
+<span class="nc bnc" id="L538" title="All 2 branches missed.">            if (activeTasksToCreate.containsKey(taskId)) {</span>
+<span class="nc" id="L539">                handleReassignedActiveTask((StreamTask) task, activeTasksToCreate.get(taskId));</span>
+<span class="nc" id="L540">                activeTasksToCreate.remove(taskId);</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">            } else if (standbyTasksToCreate.containsKey(taskId)) {</span>
+<span class="nc" id="L542">                tasksToRecycle.put(task, standbyTasksToCreate.get(taskId));</span>
+<span class="nc" id="L543">                standbyTasksToCreate.remove(taskId);</span>
+            } else {
+<span class="nc" id="L545">                tasksToCloseClean.add(task);</span>
+            }
+<span class="nc" id="L547">        }</span>
+<span class="nc" id="L548">    }</span>
+
+    private void handleReassignedActiveTask(final StreamTask task,
+                                            final Set&lt;TopicPartition&gt; inputPartitions) {
+<span class="nc bnc" id="L552" title="All 2 branches missed.">        if (tasks.updateActiveTaskInputPartitions(task, inputPartitions)) {</span>
+<span class="nc" id="L553">            task.updateInputPartitions(inputPartitions, topologyMetadata.nodeToSourceTopics(task.id()));</span>
+        }
+<span class="nc bnc" id="L555" title="All 2 branches missed.">        if (task.state() == State.SUSPENDED) {</span>
+<span class="nc" id="L556">            tasks.removeTask(task);</span>
+<span class="nc" id="L557">            task.resume();</span>
+<span class="nc" id="L558">            stateUpdater.add(task);</span>
+        }
+<span class="nc" id="L560">    }</span>
+
+    private void handleRestoringAndUpdatingTasks(final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasksToCreate,
+                                                 final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyTasksToCreate,
+                                                 final Map&lt;TaskId, RuntimeException&gt; failedTasks) {
+<span class="nc" id="L565">        final Map&lt;Task, Set&lt;TopicPartition&gt;&gt; tasksToRecycleFromStateUpdater = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L566">        final Set&lt;Task&gt; tasksToCloseCleanFromStateUpdater = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc" id="L567">        final Set&lt;Task&gt; tasksToCloseDirtyFromStateUpdater = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc" id="L568">        handleTasksInStateUpdater(</span>
+            activeTasksToCreate,
+            standbyTasksToCreate,
+            tasksToRecycleFromStateUpdater,
+            tasksToCloseCleanFromStateUpdater,
+            tasksToCloseDirtyFromStateUpdater,
+            failedTasks
+        );
+<span class="nc" id="L576">        tasksToRecycleFromStateUpdater.forEach((task, inputPartitions) -&gt;</span>
+<span class="nc" id="L577">            recycleTaskFromStateUpdater(</span>
+                task,
+                inputPartitions,
+                tasksToCloseDirtyFromStateUpdater,
+                failedTasks
+            )
+        );
+<span class="nc" id="L584">        tasksToCloseCleanFromStateUpdater.forEach(task -&gt;</span>
+<span class="nc" id="L585">            closeTaskClean(task, tasksToCloseDirtyFromStateUpdater, failedTasks)</span>
+        );
+<span class="nc" id="L587">        tasksToCloseDirtyFromStateUpdater.forEach(task -&gt;</span>
+<span class="nc" id="L588">            closeTaskDirty(task, false)</span>
+        );
+<span class="nc" id="L590">    }</span>
+
+    private void handleTasksInStateUpdater(final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasksToCreate,
+                                           final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyTasksToCreate,
+                                           final Map&lt;Task, Set&lt;TopicPartition&gt;&gt; tasksToRecycle,
+                                           final Set&lt;Task&gt; tasksToCloseCleanFromStateUpdater,
+                                           final Set&lt;Task&gt; tasksToCloseDirtyFromStateUpdater,
+                                           final Map&lt;TaskId, RuntimeException&gt; failedTasks) {
+<span class="nc" id="L598">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; newInputPartitions = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L599">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyInputPartitions = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L600">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeInputPartitions = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L601">        final Map&lt;TaskId, CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt;&gt; futuresForUpdatingInputPartitions = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L602">        final Map&lt;TaskId, CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt;&gt; futuresForActiveTasksToRecycle = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L603">        final Map&lt;TaskId, CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt;&gt; futuresForStandbyTasksToRecycle = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L604">        final Map&lt;TaskId, CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt;&gt; futuresForTasksToClose = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L605" title="All 2 branches missed.">        for (final Task task : stateUpdater.tasks()) {</span>
+<span class="nc" id="L606">            final TaskId taskId = task.id();</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">            if (activeTasksToCreate.containsKey(taskId)) {</span>
+<span class="nc bnc" id="L608" title="All 2 branches missed.">                if (task.isActive()) {</span>
+<span class="nc bnc" id="L609" title="All 2 branches missed.">                    if (!task.inputPartitions().equals(activeTasksToCreate.get(taskId))) {</span>
+<span class="nc" id="L610">                        final CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt; future =</span>
+<span class="nc" id="L611">                            stateUpdater.remove(taskId, StandbyUpdateListener.SuspendReason.MIGRATED);</span>
+<span class="nc" id="L612">                        futuresForUpdatingInputPartitions.put(taskId, future);</span>
+<span class="nc" id="L613">                        newInputPartitions.put(taskId, activeTasksToCreate.get(taskId));</span>
+<span class="nc" id="L614">                    }</span>
+                } else {
+<span class="nc" id="L616">                    final CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt; future =</span>
+<span class="nc" id="L617">                        stateUpdater.remove(taskId, StandbyUpdateListener.SuspendReason.PROMOTED);</span>
+<span class="nc" id="L618">                    futuresForStandbyTasksToRecycle.put(taskId, future);</span>
+<span class="nc" id="L619">                    activeInputPartitions.put(taskId, activeTasksToCreate.get(taskId));</span>
+                }
+<span class="nc" id="L621">                activeTasksToCreate.remove(taskId);</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">            } else if (standbyTasksToCreate.containsKey(taskId)) {</span>
+<span class="nc bnc" id="L623" title="All 2 branches missed.">                if (task.isActive()) {</span>
+<span class="nc" id="L624">                    final CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt; future =</span>
+<span class="nc" id="L625">                        stateUpdater.remove(taskId, StandbyUpdateListener.SuspendReason.MIGRATED);</span>
+<span class="nc" id="L626">                    futuresForActiveTasksToRecycle.put(taskId, future);</span>
+<span class="nc" id="L627">                    standbyInputPartitions.put(taskId, standbyTasksToCreate.get(taskId));</span>
+                }
+<span class="nc" id="L629">                standbyTasksToCreate.remove(taskId);</span>
+            } else {
+<span class="nc" id="L631">                final CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt; future =</span>
+<span class="nc" id="L632">                    stateUpdater.remove(taskId, StandbyUpdateListener.SuspendReason.MIGRATED);</span>
+<span class="nc" id="L633">                futuresForTasksToClose.put(taskId, future);</span>
+            }
+<span class="nc" id="L635">        }</span>
+<span class="nc" id="L636">        updateInputPartitions(futuresForUpdatingInputPartitions, newInputPartitions, failedTasks);</span>
+<span class="nc" id="L637">        addToActiveTasksToRecycle(futuresForActiveTasksToRecycle, standbyInputPartitions, tasksToRecycle, failedTasks);</span>
+<span class="nc" id="L638">        addToStandbyTasksToRecycle(futuresForStandbyTasksToRecycle, activeInputPartitions, tasksToRecycle, failedTasks);</span>
+<span class="nc" id="L639">        addToTasksToClose(futuresForTasksToClose, tasksToCloseCleanFromStateUpdater, tasksToCloseDirtyFromStateUpdater);</span>
+<span class="nc" id="L640">    }</span>
+
+    private void updateInputPartitions(final Map&lt;TaskId, CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt;&gt; futures,
+                                       final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; newInputPartitions,
+                                       final Map&lt;TaskId, RuntimeException&gt; failedTasks) {
+<span class="nc" id="L645">        getNonFailedTasks(futures, failedTasks).forEach(task -&gt; {</span>
+<span class="nc" id="L646">            task.updateInputPartitions(</span>
+<span class="nc" id="L647">                newInputPartitions.get(task.id()),</span>
+<span class="nc" id="L648">                topologyMetadata.nodeToSourceTopics(task.id())</span>
+            );
+<span class="nc" id="L650">            stateUpdater.add(task);</span>
+<span class="nc" id="L651">        });</span>
+<span class="nc" id="L652">    }</span>
+
+    private void addToActiveTasksToRecycle(final Map&lt;TaskId, CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt;&gt; futures,
+                                           final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyInputPartitions,
+                                           final Map&lt;Task, Set&lt;TopicPartition&gt;&gt; tasksToRecycle,
+                                           final Map&lt;TaskId, RuntimeException&gt; failedTasks) {
+<span class="nc" id="L658">        getNonFailedTasks(futures, failedTasks).forEach(task -&gt; tasksToRecycle.put(task, standbyInputPartitions.get(task.id())));</span>
+<span class="nc" id="L659">    }</span>
+
+    private void addToStandbyTasksToRecycle(final Map&lt;TaskId, CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt;&gt; futures,
+                                            final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeInputPartitions,
+                                            final Map&lt;Task, Set&lt;TopicPartition&gt;&gt; tasksToRecycle,
+                                            final Map&lt;TaskId, RuntimeException&gt; failedTasks) {
+<span class="nc" id="L665">        getNonFailedTasks(futures, failedTasks).forEach(task -&gt; tasksToRecycle.put(task, activeInputPartitions.get(task.id())));</span>
+<span class="nc" id="L666">    }</span>
+
+    private Stream&lt;Task&gt; getNonFailedTasks(final Map&lt;TaskId, CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt;&gt; futures,
+                                           final Map&lt;TaskId, RuntimeException&gt; failedTasks) {
+<span class="nc" id="L670">        return futures.entrySet().stream()</span>
+<span class="nc" id="L671">            .map(entry -&gt; waitForFuture(entry.getKey(), entry.getValue()))</span>
+<span class="nc" id="L672">            .filter(Objects::nonNull)</span>
+<span class="nc" id="L673">            .map(removedTaskResult -&gt; checkIfTaskFailed(removedTaskResult, failedTasks))</span>
+<span class="nc" id="L674">            .filter(Objects::nonNull);</span>
+    }
+
+
+    private void addToTasksToClose(final Map&lt;TaskId, CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt;&gt; futures,
+                                   final Set&lt;Task&gt; tasksToCloseCleanFromStateUpdater,
+                                   final Set&lt;Task&gt; tasksToCloseDirtyFromStateUpdater) {
+<span class="nc" id="L681">        futures.entrySet().stream()</span>
+<span class="nc" id="L682">            .map(entry -&gt; waitForFuture(entry.getKey(), entry.getValue()))</span>
+<span class="nc" id="L683">            .filter(Objects::nonNull)</span>
+<span class="nc" id="L684">            .forEach(removedTaskResult -&gt; {</span>
+<span class="nc bnc" id="L685" title="All 2 branches missed.">                if (removedTaskResult.exception().isPresent()) {</span>
+<span class="nc" id="L686">                    tasksToCloseDirtyFromStateUpdater.add(removedTaskResult.task());</span>
+                } else {
+<span class="nc" id="L688">                    tasksToCloseCleanFromStateUpdater.add(removedTaskResult.task());</span>
+                }
+<span class="nc" id="L690">            });</span>
+<span class="nc" id="L691">    }</span>
+
+    private Task checkIfTaskFailed(final StateUpdater.RemovedTaskResult removedTaskResult,
+                                   final Map&lt;TaskId, RuntimeException&gt; failedTasks) {
+<span class="nc" id="L695">        final Task task = removedTaskResult.task();</span>
+<span class="nc bnc" id="L696" title="All 2 branches missed.">        if (removedTaskResult.exception().isPresent()) {</span>
+<span class="nc" id="L697">            failedTasks.put(task.id(), removedTaskResult.exception().get());</span>
+<span class="nc" id="L698">            tasks.addFailedTask(task);</span>
+<span class="nc" id="L699">            return null;</span>
+        }
+<span class="nc" id="L701">        return task;</span>
+    }
+
+    private StateUpdater.RemovedTaskResult waitForFuture(final TaskId taskId,
+                                                         final CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt; future) {
+        final StateUpdater.RemovedTaskResult removedTaskResult;
+        try {
+<span class="nc" id="L708">            removedTaskResult = future.get(5, TimeUnit.MINUTES);</span>
+<span class="nc bnc" id="L709" title="All 2 branches missed.">            if (removedTaskResult == null) {</span>
+<span class="nc" id="L710">                throw new IllegalStateException(&quot;Task &quot; + taskId + &quot; was not found in the state updater. &quot;</span>
+                    + BUG_ERROR_MESSAGE);
+            }
+<span class="nc" id="L713">            return removedTaskResult;</span>
+<span class="nc" id="L714">        } catch (final ExecutionException executionException) {</span>
+<span class="nc" id="L715">            log.warn(&quot;An exception happened when removing task {} from the state updater. The task was added to the &quot; +</span>
+                    &quot;failed task in the state updater: &quot;,
+                taskId, executionException);
+<span class="nc" id="L718">            return null;</span>
+<span class="nc" id="L719">        } catch (final InterruptedException shouldNotHappen) {</span>
+<span class="nc" id="L720">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L721">            log.error(INTERRUPTED_ERROR_MESSAGE, shouldNotHappen);</span>
+<span class="nc" id="L722">            throw new IllegalStateException(INTERRUPTED_ERROR_MESSAGE, shouldNotHappen);</span>
+<span class="nc" id="L723">        } catch (final java.util.concurrent.TimeoutException timeoutException) {</span>
+<span class="nc" id="L724">            log.warn(&quot;The state updater wasn't able to remove task {} in time. The state updater thread may be dead. &quot;</span>
+                    + BUG_ERROR_MESSAGE, taskId, timeoutException);
+<span class="nc" id="L726">            return null;</span>
+        }
+    }
+
+    private Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; pendingTasksToCreate(final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; tasksToCreate) {
+<span class="nc" id="L731">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; pendingTasks = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L732">        final Iterator&lt;Map.Entry&lt;TaskId, Set&lt;TopicPartition&gt;&gt;&gt; iter = tasksToCreate.entrySet().iterator();</span>
+<span class="nc bnc" id="L733" title="All 2 branches missed.">        while (iter.hasNext()) {</span>
+<span class="nc" id="L734">            final Map.Entry&lt;TaskId, Set&lt;TopicPartition&gt;&gt; entry = iter.next();</span>
+<span class="nc" id="L735">            final TaskId taskId = entry.getKey();</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">            final boolean taskIsOwned = tasks.allInitializedTaskIds().contains(taskId)</span>
+<span class="nc bnc" id="L737" title="All 2 branches missed.">                || (stateUpdater.tasks().stream().anyMatch(task -&gt; task.id().equals(taskId)));</span>
+<span class="nc bnc" id="L738" title="All 6 branches missed.">            if (taskId.topologyName() != null &amp;&amp; !taskIsOwned &amp;&amp; !topologyMetadata.namedTopologiesView().contains(taskId.topologyName())) {</span>
+<span class="nc" id="L739">                log.info(&quot;Cannot create the assigned task {} since it's topology name cannot be recognized, will put it &quot; +</span>
+                        &quot;aside as pending for now and create later when topology metadata gets refreshed&quot;, taskId);
+<span class="nc" id="L741">                pendingTasks.put(taskId, entry.getValue());</span>
+<span class="nc" id="L742">                iter.remove();</span>
+            }
+<span class="nc" id="L744">        }</span>
+<span class="nc" id="L745">        return pendingTasks;</span>
+    }
+
+    private Map&lt;TaskId, RuntimeException&gt; closeAndRecycleTasks(final Map&lt;Task, Set&lt;TopicPartition&gt;&gt; tasksToRecycle,
+                                                               final Set&lt;Task&gt; tasksToCloseClean) {
+<span class="nc" id="L750">        final Map&lt;TaskId, RuntimeException&gt; taskCloseExceptions = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L751">        final Set&lt;Task&gt; tasksToCloseDirty = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+
+        // for all tasks to close or recycle, we should first write a checkpoint as in post-commit
+<span class="nc" id="L754">        final List&lt;Task&gt; tasksToCheckpoint = new ArrayList&lt;&gt;(tasksToCloseClean);</span>
+<span class="nc" id="L755">        tasksToCheckpoint.addAll(tasksToRecycle.keySet());</span>
+<span class="nc bnc" id="L756" title="All 2 branches missed.">        for (final Task task : tasksToCheckpoint) {</span>
+            try {
+                // Note that we are not actually committing here but just check if we need to write checkpoint file:
+                // 1) for active tasks prepareCommit should return empty if it has committed during suspension successfully,
+                //    and their changelog positions should not change at all postCommit would not write the checkpoint again.
+                // 2) for standby tasks prepareCommit should always return empty, and then in postCommit we would probably
+                //    write the checkpoint file.
+<span class="nc" id="L763">                final Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets = task.prepareCommit(true);</span>
+<span class="nc bnc" id="L764" title="All 2 branches missed.">                if (!offsets.isEmpty()) {</span>
+<span class="nc" id="L765">                    log.error(&quot;Task {} should have been committed when it was suspended, but it reports non-empty &quot; +</span>
+                                    &quot;offsets {} to commit; this means it failed during last commit and hence should be closed dirty&quot;,
+<span class="nc" id="L767">                            task.id(), offsets);</span>
+
+<span class="nc" id="L769">                    tasksToCloseDirty.add(task);</span>
+<span class="nc bnc" id="L770" title="All 2 branches missed.">                } else if (!task.isActive()) {</span>
+                    // For standby tasks, always try to first suspend before committing (checkpointing) it;
+                    // Since standby tasks do not actually need to commit offsets but only need to
+                    // flush / checkpoint state stores, so we only need to call postCommit here.
+<span class="nc" id="L774">                    task.suspend();</span>
+
+<span class="nc" id="L776">                    task.postCommit(true);</span>
+                }
+<span class="nc" id="L778">            } catch (final RuntimeException e) {</span>
+<span class="nc" id="L779">                final String uncleanMessage = String.format(</span>
+                        &quot;Failed to checkpoint task %s. Attempting to close remaining tasks before re-throwing:&quot;,
+<span class="nc" id="L781">                        task.id());</span>
+<span class="nc" id="L782">                log.error(uncleanMessage, e);</span>
+<span class="nc" id="L783">                taskCloseExceptions.putIfAbsent(task.id(), e);</span>
+                // We've already recorded the exception (which is the point of clean).
+                // Now, we should go ahead and complete the close because a half-closed task is no good to anyone.
+<span class="nc" id="L786">                tasksToCloseDirty.add(task);</span>
+<span class="nc" id="L787">            }</span>
+<span class="nc" id="L788">        }</span>
+
+<span class="nc" id="L790">        tasksToCloseClean.removeAll(tasksToCloseDirty);</span>
+<span class="nc bnc" id="L791" title="All 2 branches missed.">        for (final Task task : tasksToCloseClean) {</span>
+            try {
+<span class="nc" id="L793">                closeTaskClean(task);</span>
+<span class="nc" id="L794">            } catch (final RuntimeException closeTaskException) {</span>
+<span class="nc" id="L795">                final String uncleanMessage = String.format(</span>
+                    &quot;Failed to close task %s cleanly. Attempting to close remaining tasks before re-throwing:&quot;,
+<span class="nc" id="L797">                    task.id());</span>
+<span class="nc" id="L798">                log.error(uncleanMessage, closeTaskException);</span>
+
+<span class="nc bnc" id="L800" title="All 2 branches missed.">                if (task.state() != State.CLOSED) {</span>
+<span class="nc" id="L801">                    tasksToCloseDirty.add(task);</span>
+                }
+
+<span class="nc" id="L804">                taskCloseExceptions.putIfAbsent(task.id(), closeTaskException);</span>
+<span class="nc" id="L805">            }</span>
+<span class="nc" id="L806">        }</span>
+
+<span class="nc" id="L808">        tasksToRecycle.keySet().removeAll(tasksToCloseDirty);</span>
+<span class="nc bnc" id="L809" title="All 2 branches missed.">        for (final Map.Entry&lt;Task, Set&lt;TopicPartition&gt;&gt; entry : tasksToRecycle.entrySet()) {</span>
+<span class="nc" id="L810">            final Task oldTask = entry.getKey();</span>
+<span class="nc" id="L811">            final Set&lt;TopicPartition&gt; inputPartitions = entry.getValue();</span>
+            try {
+<span class="nc bnc" id="L813" title="All 2 branches missed.">                if (oldTask.isActive()) {</span>
+<span class="nc" id="L814">                    final StandbyTask standbyTask = convertActiveToStandby((StreamTask) oldTask, inputPartitions);</span>
+<span class="nc" id="L815">                    tasks.removeTask(oldTask);</span>
+<span class="nc" id="L816">                    tasks.addPendingTasksToInit(Collections.singleton(standbyTask));</span>
+<span class="nc" id="L817">                } else {</span>
+<span class="nc" id="L818">                    final StreamTask activeTask = convertStandbyToActive((StandbyTask) oldTask, inputPartitions);</span>
+<span class="nc" id="L819">                    tasks.replaceStandbyWithActive(activeTask);</span>
+                }
+<span class="nc" id="L821">            } catch (final RuntimeException e) {</span>
+<span class="nc" id="L822">                final String uncleanMessage = String.format(&quot;Failed to recycle task %s cleanly. &quot; +</span>
+<span class="nc" id="L823">                    &quot;Attempting to close remaining tasks before re-throwing:&quot;, oldTask.id());</span>
+<span class="nc" id="L824">                log.error(uncleanMessage, e);</span>
+<span class="nc" id="L825">                taskCloseExceptions.putIfAbsent(oldTask.id(), e);</span>
+<span class="nc" id="L826">                tasksToCloseDirty.add(oldTask);</span>
+<span class="nc" id="L827">            }</span>
+<span class="nc" id="L828">        }</span>
+
+        // for tasks that cannot be cleanly closed or recycled, close them dirty
+<span class="nc bnc" id="L831" title="All 2 branches missed.">        for (final Task task : tasksToCloseDirty) {</span>
+<span class="nc" id="L832">            closeTaskDirty(task, true);</span>
+<span class="nc" id="L833">        }</span>
+
+<span class="nc" id="L835">        return taskCloseExceptions;</span>
+    }
+
+    private StandbyTask convertActiveToStandby(final StreamTask activeTask, final Set&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L839">        return standbyTaskCreator.createStandbyTaskFromActive(activeTask, partitions);</span>
+    }
+
+    private StreamTask convertStandbyToActive(final StandbyTask standbyTask, final Set&lt;TopicPartition&gt; partitions) {
+<span class="nc" id="L843">        return activeTaskCreator.createActiveTaskFromStandby(standbyTask, partitions, mainConsumer);</span>
+    }
+
+    public boolean checkStateUpdater(final long now,
+                                     final java.util.function.Consumer&lt;Set&lt;TopicPartition&gt;&gt; offsetResetter) {
+<span class="nc" id="L848">        addTasksToStateUpdater();</span>
+<span class="nc bnc" id="L849" title="All 2 branches missed.">        if (stateUpdater.hasExceptionsAndFailedTasks()) {</span>
+<span class="nc" id="L850">            handleExceptionsFromStateUpdater();</span>
+        }
+<span class="nc bnc" id="L852" title="All 2 branches missed.">        if (stateUpdater.restoresActiveTasks()) {</span>
+<span class="nc" id="L853">            handleRestoredTasksFromStateUpdater(now, offsetResetter);</span>
+        }
+<span class="nc bnc" id="L855" title="All 2 branches missed.">        return !stateUpdater.restoresActiveTasks()</span>
+<span class="nc bnc" id="L856" title="All 2 branches missed.">            &amp;&amp; !tasks.hasPendingTasksToInit();</span>
+    }
+
+    private void recycleTaskFromStateUpdater(final Task task,
+                                             final Set&lt;TopicPartition&gt; inputPartitions,
+                                             final Set&lt;Task&gt; tasksToCloseDirty,
+                                             final Map&lt;TaskId, RuntimeException&gt; taskExceptions) {
+<span class="nc" id="L863">        Task newTask = null;</span>
+        try {
+<span class="nc" id="L865">            task.suspend();</span>
+<span class="nc bnc" id="L866" title="All 2 branches missed.">            newTask = task.isActive() ?</span>
+<span class="nc" id="L867">                convertActiveToStandby((StreamTask) task, inputPartitions) :</span>
+<span class="nc" id="L868">                convertStandbyToActive((StandbyTask) task, inputPartitions);</span>
+<span class="nc" id="L869">            tasks.addPendingTasksToInit(Collections.singleton(newTask));</span>
+<span class="nc" id="L870">        } catch (final RuntimeException e) {</span>
+<span class="nc" id="L871">            final TaskId taskId = task.id();</span>
+<span class="nc" id="L872">            final String uncleanMessage = String.format(&quot;Failed to recycle task %s cleanly. &quot; +</span>
+                &quot;Attempting to close remaining tasks before re-throwing:&quot;, taskId);
+<span class="nc" id="L874">            log.error(uncleanMessage, e);</span>
+
+<span class="nc bnc" id="L876" title="All 2 branches missed.">            if (task.state() != State.CLOSED) {</span>
+<span class="nc" id="L877">                tasksToCloseDirty.add(task);</span>
+            }
+<span class="nc bnc" id="L879" title="All 4 branches missed.">            if (newTask != null &amp;&amp; newTask.state() != State.CLOSED) {</span>
+<span class="nc" id="L880">                tasksToCloseDirty.add(newTask);</span>
+            }
+
+<span class="nc" id="L883">            taskExceptions.putIfAbsent(taskId, e);</span>
+<span class="nc" id="L884">        }</span>
+<span class="nc" id="L885">    }</span>
+
+    private void closeTaskClean(final Task task,
+                                final Set&lt;Task&gt; tasksToCloseDirty,
+                                final Map&lt;TaskId, RuntimeException&gt; taskExceptions) {
+        try {
+<span class="nc" id="L891">            task.suspend();</span>
+<span class="nc" id="L892">            task.closeClean();</span>
+<span class="nc" id="L893">        } catch (final RuntimeException e) {</span>
+<span class="nc" id="L894">            final String uncleanMessage = String.format(&quot;Failed to close task %s cleanly. &quot; +</span>
+<span class="nc" id="L895">                &quot;Attempting to close remaining tasks before re-throwing:&quot;, task.id());</span>
+<span class="nc" id="L896">            log.error(uncleanMessage, e);</span>
+
+<span class="nc bnc" id="L898" title="All 2 branches missed.">            if (task.state() != State.CLOSED) {</span>
+<span class="nc" id="L899">                tasksToCloseDirty.add(task);</span>
+            }
+
+<span class="nc" id="L902">            taskExceptions.putIfAbsent(task.id(), e);</span>
+<span class="nc" id="L903">        }</span>
+<span class="nc" id="L904">    }</span>
+
+    /**
+     * @throws StreamsException if fetching committed offsets timed out often enough to exceed task timeout
+     */
+    private void transitRestoredTaskToRunning(final StreamTask task,
+                                              final long now,
+                                              final java.util.function.Consumer&lt;Set&lt;TopicPartition&gt;&gt; offsetResetter) throws StreamsException {
+        try {
+<span class="nc" id="L913">            task.completeRestoration(offsetResetter);</span>
+<span class="nc" id="L914">            tasks.addActiveTask(task);</span>
+<span class="nc" id="L915">            mainConsumer.resume(task.inputPartitions());</span>
+<span class="nc" id="L916">            task.clearTaskTimeout();</span>
+<span class="nc" id="L917">        } catch (final TimeoutException timeoutException) {</span>
+<span class="nc" id="L918">            task.maybeInitTaskTimeoutOrThrow(now, timeoutException);</span>
+<span class="nc" id="L919">            stateUpdater.add(task);</span>
+<span class="nc" id="L920">            log.debug(</span>
+<span class="nc" id="L921">                String.format(</span>
+                    &quot;Could not complete restoration for %s due to the following exception; adding the task &quot; +
+                        &quot;back to the state updater and will retry&quot;,
+<span class="nc" id="L924">                    task.id()),</span>
+                timeoutException
+            );
+<span class="nc" id="L927">        }</span>
+<span class="nc" id="L928">    }</span>
+
+    private void addTasksToStateUpdater() {
+<span class="nc" id="L931">        final Map&lt;TaskId, RuntimeException&gt; taskExceptions = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L932" title="All 2 branches missed.">        for (final Task task : tasks.drainPendingTasksToInit()) {</span>
+            try {
+<span class="nc" id="L934">                addTaskToStateUpdater(task);</span>
+<span class="nc" id="L935">            } catch (final RuntimeException e) {</span>
+                // need to add task back to the bookkeeping to be handled by the stream thread
+<span class="nc" id="L937">                tasks.addFailedTask(task);</span>
+<span class="nc" id="L938">                taskExceptions.put(task.id(), e);</span>
+<span class="nc" id="L939">            }</span>
+<span class="nc" id="L940">        }</span>
+
+<span class="nc" id="L942">        maybeThrowTaskExceptions(taskExceptions);</span>
+<span class="nc" id="L943">    }</span>
+
+    private void addTaskToStateUpdater(final Task task) {
+<span class="nc" id="L946">        final long nowMs = time.milliseconds();</span>
+        try {
+<span class="nc bnc" id="L948" title="All 2 branches missed.">            if (canTryInitializeTask(task.id(), nowMs)) {</span>
+<span class="nc" id="L949">                task.initializeIfNeeded();</span>
+<span class="nc" id="L950">                task.clearTaskTimeout();</span>
+<span class="nc" id="L951">                taskIdToBackoffRecord.remove(task.id());</span>
+<span class="nc" id="L952">                stateUpdater.add(task);</span>
+            } else {
+<span class="nc" id="L954">                log.trace(&quot;Task {} is still not allowed to retry acquiring the state directory lock&quot;, task.id());</span>
+<span class="nc" id="L955">                tasks.addPendingTasksToInit(Collections.singleton(task));</span>
+            }
+<span class="nc" id="L957">        } catch (final LockException lockException) {</span>
+            // The state directory may still be locked by another thread, when the rebalance just happened.
+            // Retry in the next iteration.
+<span class="nc" id="L960">            log.info(&quot;Encountered lock exception. Reattempting locking the state in the next iteration. Error message was: {}&quot;,</span>
+<span class="nc" id="L961">                     lockException.getMessage());</span>
+<span class="nc" id="L962">            tasks.addPendingTasksToInit(Collections.singleton(task));</span>
+<span class="nc" id="L963">            updateOrCreateBackoffRecord(task.id(), nowMs);</span>
+<span class="nc" id="L964">        } catch (final TimeoutException timeoutException) {</span>
+            // A timeout can occur either during producer initialization OR while fetching committed offsets.
+            // Retry in the next iteration.
+<span class="nc" id="L967">            task.maybeInitTaskTimeoutOrThrow(nowMs, timeoutException);</span>
+<span class="nc" id="L968">            tasks.addPendingTasksToInit(Collections.singleton(task));</span>
+<span class="nc" id="L969">            updateOrCreateBackoffRecord(task.id(), nowMs);</span>
+<span class="nc" id="L970">            log.info(&quot;Encountered timeout exception. Reattempting initialization in the next iteration. Error message was: {}&quot;,</span>
+<span class="nc" id="L971">                     timeoutException.getMessage());</span>
+<span class="nc" id="L972">        }</span>
+<span class="nc" id="L973">    }</span>
+
+    public void handleExceptionsFromStateUpdater() {
+<span class="nc" id="L976">        final Map&lt;TaskId, RuntimeException&gt; taskExceptions = collectExceptionsAndFailedTasksFromStateUpdater();</span>
+<span class="nc" id="L977">        maybeThrowTaskExceptions(taskExceptions);</span>
+<span class="nc" id="L978">    }</span>
+
+    public Map&lt;TaskId, RuntimeException&gt; collectExceptionsAndFailedTasksFromStateUpdater() {
+<span class="nc" id="L981">        final Map&lt;TaskId, RuntimeException&gt; taskExceptions = new LinkedHashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L983" title="All 2 branches missed.">        for (final StateUpdater.ExceptionAndTask exceptionAndTask : stateUpdater.drainExceptionsAndFailedTasks()) {</span>
+<span class="nc" id="L984">            final RuntimeException exception = exceptionAndTask.exception();</span>
+<span class="nc" id="L985">            final Task failedTask = exceptionAndTask.task();</span>
+            // need to add task back to the bookkeeping to be handled by the stream thread
+<span class="nc" id="L987">            tasks.addFailedTask(failedTask);</span>
+<span class="nc" id="L988">            taskExceptions.put(failedTask.id(), exception);</span>
+<span class="nc" id="L989">        }</span>
+
+<span class="nc" id="L991">        return taskExceptions;</span>
+    }
+
+    private void handleRestoredTasksFromStateUpdater(final long now,
+                                                     final java.util.function.Consumer&lt;Set&lt;TopicPartition&gt;&gt; offsetResetter) {
+<span class="nc" id="L996">        final Duration timeout = Duration.ZERO;</span>
+        // Create a mutable copy to support iterator.remove()
+<span class="nc" id="L998">        final Set&lt;StreamTask&gt; restoredTasks = new LinkedHashSet&lt;&gt;(stateUpdater.drainRestoredActiveTasks(timeout));</span>
+<span class="nc" id="L999">        final Iterator&lt;StreamTask&gt; iterator = restoredTasks.iterator();</span>
+
+        try {
+<span class="nc bnc" id="L1002" title="All 2 branches missed.">            while (iterator.hasNext()) {</span>
+<span class="nc" id="L1003">                final StreamTask task = iterator.next();</span>
+<span class="nc" id="L1004">                transitRestoredTaskToRunning(task, now, offsetResetter);</span>
+<span class="nc" id="L1005">                iterator.remove(); // Remove successfully transitioned tasks</span>
+<span class="nc" id="L1006">            }</span>
+        } finally {
+            // Add back any tasks that we drained but didn't successfully transition
+            // from the state updater, so that they are closed during shutdown.
+<span class="nc bnc" id="L1010" title="All 2 branches missed.">            for (final Task task : restoredTasks) {</span>
+<span class="nc" id="L1011">                stateUpdater.add(task);</span>
+<span class="nc" id="L1012">            }</span>
+        }
+<span class="nc" id="L1014">    }</span>
+
+    /**
+     * Handle the revoked partitions and prepare for closing the associated tasks in {@link #handleAssignment(Map, Map)}
+     * We should commit the revoking tasks first before suspending them as we will not officially own them anymore when
+     * {@link #handleAssignment(Map, Map)} is called. Note that only active task partitions are passed in from the
+     * rebalance listener, so we only need to consider/commit active tasks here
+     *
+     * If eos-v2 is used, we must commit ALL tasks. Otherwise, we can just commit those (active) tasks which are revoked
+     *
+     * @throws TaskMigratedException if the task producer got fenced (EOS only)
+     */
+    void handleRevocation(final Collection&lt;TopicPartition&gt; revokedPartitions) {
+<span class="nc" id="L1027">        final Set&lt;TopicPartition&gt; remainingRevokedPartitions = new HashSet&lt;&gt;(revokedPartitions);</span>
+
+<span class="nc" id="L1029">        final Set&lt;StreamTask&gt; revokedActiveTasks = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc" id="L1030">        final Set&lt;StreamTask&gt; commitNeededActiveTasks = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc" id="L1031">        final Map&lt;Task, Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; consumedOffsetsPerTask = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1032">        final AtomicReference&lt;RuntimeException&gt; firstException = new AtomicReference&lt;&gt;(null);</span>
+
+<span class="nc" id="L1034">        final Set&lt;TaskId&gt; lockedTaskIds = activeRunningTaskIterable().stream().map(Task::id).collect(Collectors.toSet());</span>
+<span class="nc" id="L1035">        maybeLockTasks(lockedTaskIds);</span>
+
+<span class="nc" id="L1037">        boolean revokedTasksNeedCommit = false;</span>
+<span class="nc bnc" id="L1038" title="All 2 branches missed.">        for (final StreamTask task : activeRunningTaskIterable()) {</span>
+<span class="nc bnc" id="L1039" title="All 2 branches missed.">            if (remainingRevokedPartitions.containsAll(task.inputPartitions())) {</span>
+                // when the task input partitions are included in the revoked list,
+                // this is an active task and should be revoked
+
+<span class="nc" id="L1043">                revokedActiveTasks.add(task);</span>
+<span class="nc" id="L1044">                remainingRevokedPartitions.removeAll(task.inputPartitions());</span>
+
+<span class="nc" id="L1046">                revokedTasksNeedCommit |= task.commitNeeded();</span>
+<span class="nc bnc" id="L1047" title="All 2 branches missed.">            } else if (task.commitNeeded()) {</span>
+<span class="nc" id="L1048">                commitNeededActiveTasks.add(task);</span>
+            }
+<span class="nc" id="L1050">        }</span>
+
+<span class="nc" id="L1052">        revokeTasksInStateUpdater(remainingRevokedPartitions);</span>
+
+<span class="nc bnc" id="L1054" title="All 2 branches missed.">        if (!remainingRevokedPartitions.isEmpty()) {</span>
+<span class="nc" id="L1055">            log.debug(&quot;The following revoked partitions {} are missing from the current task partitions. It could &quot;</span>
+                          + &quot;potentially be due to race condition of consumer detecting the heartbeat failure, or the tasks &quot; +
+                         &quot;have been cleaned up by the handleAssignment callback.&quot;, remainingRevokedPartitions);
+        }
+
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">        if (revokedTasksNeedCommit) {</span>
+<span class="nc" id="L1061">            prepareCommitAndAddOffsetsToMap(revokedActiveTasks, consumedOffsetsPerTask);</span>
+            // if we need to commit any revoking task then we just commit all of those needed committing together
+<span class="nc" id="L1063">            prepareCommitAndAddOffsetsToMap(commitNeededActiveTasks, consumedOffsetsPerTask);</span>
+        }
+
+        // even if commit failed, we should still continue and complete suspending those tasks, so we would capture
+        // any exception and rethrow it at the end. some exceptions may be handled immediately and then swallowed,
+        // as such we just need to skip those dirty tasks in the checkpoint
+<span class="nc" id="L1069">        final Set&lt;Task&gt; dirtyTasks = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+        try {
+<span class="nc bnc" id="L1071" title="All 2 branches missed.">            if (revokedTasksNeedCommit) {</span>
+                // in handleRevocation we must call commitOffsetsOrTransaction() directly rather than
+                // commitAndFillInConsumedOffsetsAndMetadataPerTaskMap() to make sure we don't skip the
+                // offset commit because we are in a rebalance
+<span class="nc" id="L1075">                taskExecutor.commitOffsetsOrTransaction(consumedOffsetsPerTask);</span>
+            }
+<span class="nc" id="L1077">        } catch (final TaskCorruptedException e) {</span>
+<span class="nc" id="L1078">            log.warn(&quot;Some tasks were corrupted when trying to commit offsets, these will be cleaned and revived: {}&quot;,</span>
+<span class="nc" id="L1079">                     e.corruptedTasks());</span>
+
+            // If we hit a TaskCorruptedException it must be EOS, just handle the cleanup for those corrupted tasks right here
+<span class="nc" id="L1082">            dirtyTasks.addAll(tasks.initializedTasks(e.corruptedTasks()));</span>
+<span class="nc" id="L1083">            closeDirtyAndRevive(dirtyTasks, true);</span>
+<span class="nc" id="L1084">        } catch (final TimeoutException e) {</span>
+<span class="nc" id="L1085">            log.warn(&quot;Timed out while trying to commit all tasks during revocation, these will be cleaned and revived&quot;);</span>
+
+            // If we hit a TimeoutException it must be ALOS, just close dirty and revive without wiping the state
+<span class="nc" id="L1088">            dirtyTasks.addAll(consumedOffsetsPerTask.keySet());</span>
+<span class="nc" id="L1089">            closeDirtyAndRevive(dirtyTasks, false);</span>
+<span class="nc" id="L1090">        } catch (final RuntimeException e) {</span>
+<span class="nc" id="L1091">            log.error(&quot;Exception caught while committing those revoked tasks &quot; + revokedActiveTasks, e);</span>
+<span class="nc" id="L1092">            firstException.compareAndSet(null, e);</span>
+<span class="nc" id="L1093">            dirtyTasks.addAll(consumedOffsetsPerTask.keySet());</span>
+<span class="nc" id="L1094">        }</span>
+
+        // we enforce checkpointing upon suspending a task: if it is resumed later we just proceed normally, if it is
+        // going to be closed we would checkpoint by then
+<span class="nc bnc" id="L1098" title="All 2 branches missed.">        for (final Task task : revokedActiveTasks) {</span>
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">            if (!dirtyTasks.contains(task)) {</span>
+                try {
+<span class="nc" id="L1101">                    task.postCommit(true);</span>
+<span class="nc" id="L1102">                } catch (final RuntimeException e) {</span>
+<span class="nc" id="L1103">                    log.error(&quot;Exception caught while post-committing task &quot; + task.id(), e);</span>
+<span class="nc" id="L1104">                    maybeSetFirstException(false, maybeWrapTaskException(e, task.id()), firstException);</span>
+<span class="nc" id="L1105">                }</span>
+            }
+<span class="nc" id="L1107">        }</span>
+
+<span class="nc bnc" id="L1109" title="All 2 branches missed.">        if (revokedTasksNeedCommit) {</span>
+<span class="nc bnc" id="L1110" title="All 2 branches missed.">            for (final Task task : commitNeededActiveTasks) {</span>
+<span class="nc bnc" id="L1111" title="All 2 branches missed.">                if (!dirtyTasks.contains(task)) {</span>
+                    try {
+                        // for non-revoking active tasks, we should not enforce checkpoint
+                        // since if it is EOS enabled, no checkpoint should be written while
+                        // the task is in RUNNING tate
+<span class="nc" id="L1116">                        task.postCommit(false);</span>
+<span class="nc" id="L1117">                    } catch (final RuntimeException e) {</span>
+<span class="nc" id="L1118">                        log.error(&quot;Exception caught while post-committing task &quot; + task.id(), e);</span>
+<span class="nc" id="L1119">                        maybeSetFirstException(false, maybeWrapTaskException(e, task.id()), firstException);</span>
+<span class="nc" id="L1120">                    }</span>
+                }
+<span class="nc" id="L1122">            }</span>
+        }
+
+<span class="nc bnc" id="L1125" title="All 2 branches missed.">        for (final Task task : revokedActiveTasks) {</span>
+            try {
+<span class="nc" id="L1127">                task.suspend();</span>
+<span class="nc" id="L1128">            } catch (final RuntimeException e) {</span>
+<span class="nc" id="L1129">                log.error(&quot;Caught the following exception while trying to suspend revoked task &quot; + task.id(), e);</span>
+<span class="nc" id="L1130">                maybeSetFirstException(false, maybeWrapTaskException(e, task.id()), firstException);</span>
+<span class="nc" id="L1131">            }</span>
+<span class="nc" id="L1132">        }</span>
+
+<span class="nc" id="L1134">        maybeUnlockTasks(lockedTaskIds);</span>
+
+<span class="nc bnc" id="L1136" title="All 2 branches missed.">        if (firstException.get() != null) {</span>
+<span class="nc" id="L1137">            throw firstException.get();</span>
+        }
+<span class="nc" id="L1139">    }</span>
+
+    private void revokeTasksInStateUpdater(final Set&lt;TopicPartition&gt; remainingRevokedPartitions) {
+<span class="nc" id="L1142">        final Map&lt;TaskId, CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt;&gt; futures = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L1143">        final Map&lt;TaskId, RuntimeException&gt; failedTasksFromStateUpdater = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1144" title="All 2 branches missed.">        for (final Task restoringTask : stateUpdater.tasks()) {</span>
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">            if (restoringTask.isActive()) {</span>
+<span class="nc bnc" id="L1146" title="All 2 branches missed.">                if (remainingRevokedPartitions.containsAll(restoringTask.inputPartitions())) {</span>
+<span class="nc" id="L1147">                    futures.put(restoringTask.id(), stateUpdater.remove(restoringTask.id(), StandbyUpdateListener.SuspendReason.MIGRATED));</span>
+<span class="nc" id="L1148">                    remainingRevokedPartitions.removeAll(restoringTask.inputPartitions());</span>
+                }
+            }
+<span class="nc" id="L1151">        }</span>
+<span class="nc" id="L1152">        getNonFailedTasks(futures, failedTasksFromStateUpdater).forEach(task -&gt; {</span>
+<span class="nc" id="L1153">            task.suspend();</span>
+<span class="nc" id="L1154">            tasks.addActiveTask((StreamTask) task);</span>
+<span class="nc" id="L1155">        });</span>
+
+<span class="nc" id="L1157">        maybeThrowTaskExceptions(failedTasksFromStateUpdater);</span>
+<span class="nc" id="L1158">    }</span>
+
+    private void prepareCommitAndAddOffsetsToMap(final Set&lt;StreamTask&gt; tasksToPrepare,
+                                                 final Map&lt;Task, Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; consumedOffsetsPerTask) {
+<span class="nc bnc" id="L1162" title="All 2 branches missed.">        for (final StreamTask task : tasksToPrepare) {</span>
+            try {
+<span class="nc" id="L1164">                final Map&lt;TopicPartition, OffsetAndMetadata&gt; committableOffsets = task.prepareCommit(true);</span>
+<span class="nc bnc" id="L1165" title="All 2 branches missed.">                if (!committableOffsets.isEmpty()) {</span>
+<span class="nc" id="L1166">                    consumedOffsetsPerTask.put(task, committableOffsets);</span>
+                }
+<span class="nc" id="L1168">            } catch (final StreamsException e) {</span>
+<span class="nc" id="L1169">                e.setTaskId(task.id());</span>
+<span class="nc" id="L1170">                throw e;</span>
+<span class="nc" id="L1171">            } catch (final Exception e) {</span>
+<span class="nc" id="L1172">                throw new StreamsException(e, task.id());</span>
+<span class="nc" id="L1173">            }</span>
+<span class="nc" id="L1174">        }</span>
+<span class="nc" id="L1175">    }</span>
+
+    /**
+     * Closes active tasks as zombies, as these partitions have been lost and are no longer owned.
+     * NOTE this method assumes that when it is called, EVERY task/partition has been lost and must
+     * be closed as a zombie.
+     *
+     * @throws TaskMigratedException if the task producer got fenced (EOS only)
+     */
+    void handleLostAll() {
+<span class="nc" id="L1185">        log.debug(&quot;Closing lost active tasks as zombies.&quot;);</span>
+
+<span class="nc" id="L1187">        closeRunningTasksDirty();</span>
+<span class="nc" id="L1188">        removeLostActiveTasksFromStateUpdaterAndPendingTasksToInit();</span>
+
+<span class="nc bnc" id="L1190" title="All 2 branches missed.">        if (processingMode == EXACTLY_ONCE_V2) {</span>
+<span class="nc" id="L1191">            activeTaskCreator.reInitializeProducer();</span>
+        }
+<span class="nc" id="L1193">    }</span>
+
+    private void closeRunningTasksDirty() {
+<span class="nc" id="L1196">        final Set&lt;Task&gt; allTask = tasks.allInitializedTasks();</span>
+<span class="nc" id="L1197">        final Set&lt;TaskId&gt; allTaskIds = tasks.allInitializedTaskIds();</span>
+<span class="nc" id="L1198">        maybeLockTasks(allTaskIds);</span>
+<span class="nc bnc" id="L1199" title="All 2 branches missed.">        for (final Task task : allTask) {</span>
+            // Even though we've apparently dropped out of the group, we can continue safely to maintain our
+            // standby tasks while we rejoin.
+<span class="nc bnc" id="L1202" title="All 2 branches missed.">            if (task.isActive()) {</span>
+<span class="nc" id="L1203">                closeTaskDirty(task, true);</span>
+            }
+<span class="nc" id="L1205">        }</span>
+<span class="nc" id="L1206">        maybeUnlockTasks(allTaskIds);</span>
+<span class="nc" id="L1207">    }</span>
+
+    private void removeLostActiveTasksFromStateUpdaterAndPendingTasksToInit() {
+<span class="nc" id="L1210">        final Map&lt;TaskId, CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt;&gt; futures = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L1211">        final Set&lt;Task&gt; tasksToCloseClean = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc" id="L1212">        tasksToCloseClean.addAll(tasks.drainPendingActiveTasksToInit());</span>
+<span class="nc" id="L1213">        final Set&lt;Task&gt; tasksToCloseDirty = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc bnc" id="L1214" title="All 2 branches missed.">        for (final Task restoringTask : stateUpdater.tasks()) {</span>
+<span class="nc bnc" id="L1215" title="All 2 branches missed.">            if (restoringTask.isActive()) {</span>
+<span class="nc" id="L1216">                futures.put(restoringTask.id(), stateUpdater.remove(restoringTask.id(), StandbyUpdateListener.SuspendReason.MIGRATED));</span>
+            }
+<span class="nc" id="L1218">        }</span>
+
+<span class="nc" id="L1220">        addToTasksToClose(futures, tasksToCloseClean, tasksToCloseDirty);</span>
+<span class="nc bnc" id="L1221" title="All 2 branches missed.">        for (final Task task : tasksToCloseClean) {</span>
+<span class="nc" id="L1222">            closeTaskClean(task, tasksToCloseDirty, new HashMap&lt;&gt;());</span>
+<span class="nc" id="L1223">        }</span>
+<span class="nc bnc" id="L1224" title="All 2 branches missed.">        for (final Task task : tasksToCloseDirty) {</span>
+<span class="nc" id="L1225">            closeTaskDirty(task, false);</span>
+<span class="nc" id="L1226">        }</span>
+<span class="nc" id="L1227">    }</span>
+
+    public void signalResume() {
+<span class="nc" id="L1230">        stateUpdater.signalResume();</span>
+<span class="nc bnc" id="L1231" title="All 2 branches missed.">        if (schedulingTaskManager != null) {</span>
+<span class="nc" id="L1232">            schedulingTaskManager.signalTaskExecutors();</span>
+        }
+<span class="nc" id="L1234">    }</span>
+
+    /**
+     * Compute the offset total summed across all stores in a task. Includes offset sum for any tasks we own the
+     * lock for, which includes assigned and unassigned tasks we locked in {@link #tryToLockAllNonEmptyTaskDirectories()}.
+     * Does not include stateless or non-logged tasks.
+     */
+    public Map&lt;TaskId, Long&gt; taskOffsetSums() {
+
+        // Not all tasks will create directories, and there may be directories for tasks we don't currently own,
+        // so we consider all tasks that are either owned or on disk. This includes stateless tasks, which should
+        // just have an empty changelogOffsets map.
+<span class="nc" id="L1246">        final Map&lt;TaskId, Task&gt; tasks = allTasks();</span>
+<span class="nc" id="L1247">        final Set&lt;TaskId&gt; lockedTaskDirectoriesOfNonOwnedTasksAndClosedAndCreatedTasks =</span>
+<span class="nc" id="L1248">            union(HashSet::new, lockedTaskDirectories, tasks.keySet());</span>
+
+<span class="nc" id="L1250">        final Map&lt;TaskId, Long&gt; taskOffsetSums = stateDirectory.taskOffsetSums(lockedTaskDirectoriesOfNonOwnedTasksAndClosedAndCreatedTasks);</span>
+
+        // overlay latest offsets from assigned tasks
+<span class="nc bnc" id="L1253" title="All 2 branches missed.">        for (final Task task : tasks.values()) {</span>
+            // exclude stateless and non-logged tasks
+<span class="nc bnc" id="L1255" title="All 6 branches missed.">            if (task.isActive() &amp;&amp; task.state() == State.RUNNING &amp;&amp; !task.changelogPartitions().isEmpty()) {</span>
+<span class="nc" id="L1256">                taskOffsetSums.put(task.id(), Task.LATEST_OFFSET);</span>
+            }
+<span class="nc" id="L1258">        }</span>
+
+<span class="nc" id="L1260">        return taskOffsetSums;</span>
+    }
+
+    /**
+     * Makes a weak attempt to lock all non-empty task directories in the state dir. We are responsible for computing and
+     * reporting the offset sum for any unassigned tasks we obtain the lock for in the upcoming rebalance. Tasks
+     * that we locked but didn't own will be released at the end of the rebalance (unless of course we were
+     * assigned the task as a result of the rebalance). This method should be idempotent.
+     */
+    private void tryToLockAllNonEmptyTaskDirectories() {
+        // Always clear the set at the beginning as we're always dealing with the
+        // current set of actually-locked tasks.
+<span class="nc" id="L1272">        lockedTaskDirectories.clear();</span>
+
+<span class="nc" id="L1274">        final Map&lt;TaskId, Task&gt; allTasks = allTasks();</span>
+<span class="nc bnc" id="L1275" title="All 2 branches missed.">        for (final StateDirectory.TaskDirectory taskDir : stateDirectory.listNonEmptyTaskDirectories()) {</span>
+<span class="nc" id="L1276">            final File dir = taskDir.file();</span>
+<span class="nc" id="L1277">            final String namedTopology = taskDir.namedTopology();</span>
+            try {
+<span class="nc" id="L1279">                final TaskId id = parseTaskDirectoryName(dir.getName(), namedTopology);</span>
+<span class="nc bnc" id="L1280" title="All 2 branches missed.">                if (stateDirectory.lock(id)) {</span>
+                    // Check again in case the cleaner thread ran and emptied the directory
+<span class="nc bnc" id="L1282" title="All 2 branches missed.">                    if (stateDirectory.directoryForTaskIsEmpty(id)) {</span>
+<span class="nc" id="L1283">                        log.debug(&quot;Releasing lock on empty directory for task {}&quot;, id);</span>
+<span class="nc" id="L1284">                        stateDirectory.unlock(id);</span>
+                    } else {
+<span class="nc" id="L1286">                        lockedTaskDirectories.add(id);</span>
+<span class="nc bnc" id="L1287" title="All 2 branches missed.">                        if (!allTasks.containsKey(id)) {</span>
+<span class="nc" id="L1288">                            log.debug(&quot;Temporarily locked unassigned task {} for the upcoming rebalance&quot;, id);</span>
+                        }
+                    }
+                }
+<span class="nc" id="L1292">            } catch (final TaskIdFormatException e) {</span>
+                // ignore any unknown files that sit in the same directory
+<span class="nc" id="L1294">            }</span>
+<span class="nc" id="L1295">        }</span>
+<span class="nc" id="L1296">    }</span>
+
+    /**
+     * Clean up after closed or removed tasks by making sure to unlock any remaining locked directories for them, for
+     * example unassigned tasks or those in the CREATED state when closed, since Task#close will not unlock them
+     */
+    private void releaseLockedDirectoriesForTasks(final Set&lt;TaskId&gt; tasksToUnlock) {
+<span class="nc" id="L1303">        final Iterator&lt;TaskId&gt; taskIdIterator = lockedTaskDirectories.iterator();</span>
+<span class="nc bnc" id="L1304" title="All 2 branches missed.">        while (taskIdIterator.hasNext()) {</span>
+<span class="nc" id="L1305">            final TaskId id = taskIdIterator.next();</span>
+<span class="nc bnc" id="L1306" title="All 2 branches missed.">            if (tasksToUnlock.contains(id)) {</span>
+<span class="nc" id="L1307">                stateDirectory.unlock(id);</span>
+<span class="nc" id="L1308">                taskIdIterator.remove();</span>
+            }
+<span class="nc" id="L1310">        }</span>
+<span class="nc" id="L1311">    }</span>
+
+    /**
+     * We must release the lock for any unassigned tasks that we temporarily locked in preparation for a
+     * rebalance in {@link #tryToLockAllNonEmptyTaskDirectories()}.
+     */
+    private void releaseLockedUnassignedTaskDirectories() {
+<span class="nc" id="L1318">        final Iterator&lt;TaskId&gt; taskIdIterator = lockedTaskDirectories.iterator();</span>
+<span class="nc" id="L1319">        final Map&lt;TaskId, Task&gt; allTasks = allTasks();</span>
+<span class="nc bnc" id="L1320" title="All 2 branches missed.">        while (taskIdIterator.hasNext()) {</span>
+<span class="nc" id="L1321">            final TaskId id = taskIdIterator.next();</span>
+<span class="nc bnc" id="L1322" title="All 2 branches missed.">            if (!allTasks.containsKey(id)) {</span>
+<span class="nc" id="L1323">                stateDirectory.unlock(id);</span>
+<span class="nc" id="L1324">                taskIdIterator.remove();</span>
+            }
+<span class="nc" id="L1326">        }</span>
+<span class="nc" id="L1327">    }</span>
+
+    private void closeTaskDirty(final Task task, final boolean removeFromTasksRegistry) {
+        try {
+            // we call this function only to flush the case if necessary
+            // before suspending and closing the topology
+<span class="nc" id="L1333">            task.prepareCommit(false);</span>
+<span class="nc" id="L1334">        } catch (final RuntimeException swallow) {</span>
+<span class="nc" id="L1335">            log.warn(&quot;Error flushing cache of dirty task {}. &quot; +</span>
+                &quot;Since the task is closing dirty, the following exception is swallowed: {}&quot;,
+<span class="nc" id="L1337">                task.id(), swallow.getMessage());</span>
+<span class="nc" id="L1338">        }</span>
+
+        try {
+<span class="nc" id="L1341">            task.suspend();</span>
+<span class="nc" id="L1342">        } catch (final RuntimeException swallow) {</span>
+<span class="nc" id="L1343">            log.warn(&quot;Error suspending dirty task {}. &quot; +</span>
+                &quot;Since the task is closing dirty, the following exception is swallowed: {}&quot;,
+<span class="nc" id="L1345">                task.id(), swallow.getMessage());</span>
+<span class="nc" id="L1346">        }</span>
+
+<span class="nc" id="L1348">        task.closeDirty();</span>
+
+        try {
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">            if (removeFromTasksRegistry) {</span>
+<span class="nc" id="L1352">                tasks.removeTask(task);</span>
+            }
+<span class="nc" id="L1354">        } catch (final RuntimeException swallow) {</span>
+<span class="nc" id="L1355">            log.warn(&quot;Error removing dirty task {}. &quot; +</span>
+                &quot;Since the task is closing dirty, the following exception is swallowed: {}&quot;,
+<span class="nc" id="L1357">                task.id(), swallow);</span>
+<span class="nc" id="L1358">        }</span>
+<span class="nc" id="L1359">    }</span>
+
+    private void closeTaskClean(final Task task) {
+<span class="nc" id="L1362">        task.closeClean();</span>
+<span class="nc" id="L1363">        tasks.removeTask(task);</span>
+<span class="nc" id="L1364">    }</span>
+
+    void shutdown(final boolean clean) {
+<span class="nc" id="L1367">        shutdownStateUpdater();</span>
+<span class="nc" id="L1368">        shutdownSchedulingTaskManager();</span>
+
+<span class="nc" id="L1370">        final AtomicReference&lt;RuntimeException&gt; firstException = new AtomicReference&lt;&gt;(null);</span>
+
+<span class="nc" id="L1372">        final Set&lt;StreamTask&gt; activeTasks = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc" id="L1373">        activeTasks.addAll(tasks.activeInitializedTasks());</span>
+<span class="nc" id="L1374">        final Set&lt;StandbyTask&gt; standbyTasks = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc" id="L1375">        standbyTasks.addAll(tasks.standbyInitializedTasks());</span>
+
+<span class="nc" id="L1377">        final Set&lt;StreamTask&gt; pendingActiveTasks = tasks.drainPendingActiveTasksToInit();</span>
+<span class="nc" id="L1378">        activeTasks.addAll(pendingActiveTasks);</span>
+<span class="nc" id="L1379">        tasks.addPendingTasksToClose(pendingActiveTasks);</span>
+<span class="nc" id="L1380">        final Set&lt;StandbyTask&gt; pendingStandbyTasks = tasks.drainPendingStandbyTasksToInit();</span>
+<span class="nc" id="L1381">        standbyTasks.addAll(pendingStandbyTasks);</span>
+<span class="nc" id="L1382">        tasks.addPendingTasksToClose(pendingStandbyTasks);</span>
+
+<span class="nc" id="L1384">        executeAndMaybeSwallow(</span>
+            clean,
+<span class="nc" id="L1386">            () -&gt; closeAndCleanUpTasks(activeTasks, standbyTasks, clean),</span>
+<span class="nc" id="L1387">            e -&gt; firstException.compareAndSet(null, e),</span>
+<span class="nc" id="L1388">            e -&gt; log.warn(&quot;Ignoring an exception while unlocking remaining task directories.&quot;, e)</span>
+        );
+
+<span class="nc" id="L1391">        executeAndMaybeSwallow(</span>
+            clean,
+<span class="nc" id="L1393">            activeTaskCreator::close,</span>
+<span class="nc" id="L1394">            e -&gt; firstException.compareAndSet(null, e),</span>
+<span class="nc" id="L1395">            e -&gt; log.warn(&quot;Ignoring an exception while closing thread producer.&quot;, e)</span>
+        );
+
+<span class="nc" id="L1398">        tasks.clear();</span>
+
+        // this should be called after closing all tasks and clearing them from `tasks` to make sure we unlock the dir
+        // for any tasks that may have still been in CREATED at the time of shutdown, since Task#close will not do so
+<span class="nc" id="L1402">        executeAndMaybeSwallow(</span>
+            clean,
+            this::releaseLockedUnassignedTaskDirectories,
+<span class="nc" id="L1405">            e -&gt; firstException.compareAndSet(null, e),</span>
+<span class="nc" id="L1406">            e -&gt; log.warn(&quot;Ignoring an exception while unlocking remaining task directories.&quot;, e)</span>
+        );
+
+<span class="nc" id="L1409">        final RuntimeException fatalException = firstException.get();</span>
+<span class="nc bnc" id="L1410" title="All 2 branches missed.">        if (fatalException != null) {</span>
+<span class="nc" id="L1411">            throw fatalException;</span>
+        }
+
+<span class="nc" id="L1414">        log.info(&quot;Shutdown complete&quot;);</span>
+<span class="nc" id="L1415">    }</span>
+
+    private void shutdownStateUpdater() {
+        // If there are failed tasks handling them first
+<span class="nc bnc" id="L1419" title="All 2 branches missed.">        for (final StateUpdater.ExceptionAndTask exceptionAndTask : stateUpdater.drainExceptionsAndFailedTasks()) {</span>
+<span class="nc" id="L1420">            final Task failedTask = exceptionAndTask.task();</span>
+<span class="nc" id="L1421">            closeTaskDirty(failedTask, false);</span>
+<span class="nc" id="L1422">        }</span>
+
+<span class="nc" id="L1424">        final Map&lt;TaskId, CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt;&gt; futures = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1425" title="All 2 branches missed.">        for (final Task task : stateUpdater.tasks()) {</span>
+<span class="nc" id="L1426">            final CompletableFuture&lt;StateUpdater.RemovedTaskResult&gt; future = stateUpdater.remove(task.id(), StandbyUpdateListener.SuspendReason.MIGRATED);</span>
+<span class="nc" id="L1427">            futures.put(task.id(), future);</span>
+<span class="nc" id="L1428">        }</span>
+<span class="nc" id="L1429">        final Set&lt;Task&gt; tasksToCloseClean = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc" id="L1430">        final Set&lt;Task&gt; tasksToCloseDirty = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc" id="L1431">        addToTasksToClose(futures, tasksToCloseClean, tasksToCloseDirty);</span>
+        // at this point we removed all tasks, so the shutdown should not take a lot of time
+<span class="nc" id="L1433">        stateUpdater.shutdown(Duration.ofMinutes(1L));</span>
+
+<span class="nc bnc" id="L1435" title="All 2 branches missed.">        for (final Task task : tasksToCloseClean) {</span>
+<span class="nc" id="L1436">            tasks.addTask(task);</span>
+<span class="nc" id="L1437">        }</span>
+<span class="nc bnc" id="L1438" title="All 2 branches missed.">        for (final Task task : tasksToCloseDirty) {</span>
+<span class="nc" id="L1439">            closeTaskDirty(task, false);</span>
+<span class="nc" id="L1440">        }</span>
+        // Handling all failures that occurred during the remove process
+<span class="nc bnc" id="L1442" title="All 2 branches missed.">        for (final StateUpdater.ExceptionAndTask exceptionAndTask : stateUpdater.drainExceptionsAndFailedTasks()) {</span>
+<span class="nc" id="L1443">            final Task failedTask = exceptionAndTask.task();</span>
+<span class="nc" id="L1444">            closeTaskDirty(failedTask, false);</span>
+<span class="nc" id="L1445">        }</span>
+
+        // If there is anything left unhandled due to timeouts, handling now
+<span class="nc bnc" id="L1448" title="All 2 branches missed.">        for (final Task task : stateUpdater.tasks()) {</span>
+<span class="nc" id="L1449">            closeTaskDirty(task, false);</span>
+<span class="nc" id="L1450">        }</span>
+<span class="nc" id="L1451">    }</span>
+
+    private void shutdownSchedulingTaskManager() {
+<span class="nc bnc" id="L1454" title="All 2 branches missed.">        if (schedulingTaskManager != null) {</span>
+<span class="nc" id="L1455">            schedulingTaskManager.shutdown(Duration.ofMinutes(5L));</span>
+        }
+<span class="nc" id="L1457">    }</span>
+
+    /**
+     * Closes and cleans up after the provided tasks, including closing their corresponding task producers
+     */
+    void closeAndCleanUpTasks(final Collection&lt;StreamTask&gt; activeTasks, final Collection&lt;StandbyTask&gt; standbyTasks, final boolean clean) {
+<span class="nc" id="L1463">        final AtomicReference&lt;RuntimeException&gt; firstException = new AtomicReference&lt;&gt;(null);</span>
+
+<span class="nc" id="L1465">        final Set&lt;TaskId&gt; ids =</span>
+<span class="nc" id="L1466">            activeTasks.stream()</span>
+<span class="nc" id="L1467">                .map(Task::id)</span>
+<span class="nc" id="L1468">                .collect(Collectors.toSet());</span>
+<span class="nc" id="L1469">        maybeLockTasks(ids);</span>
+
+<span class="nc" id="L1471">        final Set&lt;Task&gt; tasksToCloseDirty = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc" id="L1472">        tasksToCloseDirty.addAll(tryCloseCleanActiveTasks(activeTasks, clean, firstException));</span>
+<span class="nc" id="L1473">        tasksToCloseDirty.addAll(tryCloseCleanStandbyTasks(standbyTasks, clean, firstException));</span>
+
+<span class="nc bnc" id="L1475" title="All 2 branches missed.">        for (final Task task : tasksToCloseDirty) {</span>
+<span class="nc" id="L1476">            closeTaskDirty(task, true);</span>
+<span class="nc" id="L1477">        }</span>
+
+<span class="nc" id="L1479">        maybeUnlockTasks(ids);</span>
+
+<span class="nc" id="L1481">        final RuntimeException exception = firstException.get();</span>
+<span class="nc bnc" id="L1482" title="All 2 branches missed.">        if (exception != null) {</span>
+<span class="nc" id="L1483">            throw exception;</span>
+        }
+<span class="nc" id="L1485">    }</span>
+
+    // Returns the set of active tasks that must be closed dirty
+    private Collection&lt;StreamTask&gt; tryCloseCleanActiveTasks(final Collection&lt;StreamTask&gt; activeTasksToClose,
+                                                            final boolean clean,
+                                                            final AtomicReference&lt;RuntimeException&gt; firstException) {
+<span class="nc bnc" id="L1491" title="All 2 branches missed.">        if (!clean) {</span>
+<span class="nc" id="L1492">            return activeTasksToClose;</span>
+        }
+<span class="nc" id="L1494">        final Comparator&lt;StreamTask&gt; byId = Comparator.comparing(Task::id);</span>
+<span class="nc" id="L1495">        final Set&lt;StreamTask&gt; tasksToCommit = new TreeSet&lt;&gt;(byId);</span>
+<span class="nc" id="L1496">        final Set&lt;StreamTask&gt; tasksToCloseDirty = new TreeSet&lt;&gt;(byId);</span>
+<span class="nc" id="L1497">        final Set&lt;StreamTask&gt; tasksToCloseClean = new TreeSet&lt;&gt;(byId);</span>
+<span class="nc" id="L1498">        final Map&lt;Task, Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; consumedOffsetsAndMetadataPerTask = new HashMap&lt;&gt;();</span>
+
+        // first committing all tasks and then suspend and close them clean
+<span class="nc bnc" id="L1501" title="All 2 branches missed.">        for (final StreamTask task : activeTasksToClose) {</span>
+            try {
+<span class="nc" id="L1503">                final Map&lt;TopicPartition, OffsetAndMetadata&gt; committableOffsets = task.prepareCommit(true);</span>
+<span class="nc" id="L1504">                tasksToCommit.add(task);</span>
+<span class="nc bnc" id="L1505" title="All 2 branches missed.">                if (!committableOffsets.isEmpty()) {</span>
+<span class="nc" id="L1506">                    consumedOffsetsAndMetadataPerTask.put(task, committableOffsets);</span>
+                }
+<span class="nc" id="L1508">                tasksToCloseClean.add(task);</span>
+<span class="nc" id="L1509">            } catch (final TaskMigratedException e) {</span>
+                // just ignore the exception as it doesn't matter during shutdown
+<span class="nc" id="L1511">                tasksToCloseDirty.add(task);</span>
+<span class="nc" id="L1512">            } catch (final StreamsException e) {</span>
+<span class="nc" id="L1513">                e.setTaskId(task.id());</span>
+<span class="nc" id="L1514">                firstException.compareAndSet(null, e);</span>
+<span class="nc" id="L1515">                tasksToCloseDirty.add(task);</span>
+<span class="nc" id="L1516">            } catch (final RuntimeException e) {</span>
+<span class="nc" id="L1517">                firstException.compareAndSet(null, new StreamsException(e, task.id()));</span>
+<span class="nc" id="L1518">                tasksToCloseDirty.add(task);</span>
+<span class="nc" id="L1519">            }</span>
+<span class="nc" id="L1520">        }</span>
+
+        // If any active tasks can't be committed, none of them can be, and all that need a commit must be closed dirty
+<span class="nc bnc" id="L1523" title="All 4 branches missed.">        if (processingMode == EXACTLY_ONCE_V2 &amp;&amp; !tasksToCloseDirty.isEmpty()) {</span>
+<span class="nc" id="L1524">            tasksToCloseClean.removeAll(tasksToCommit);</span>
+<span class="nc" id="L1525">            tasksToCloseDirty.addAll(tasksToCommit);</span>
+        } else {
+            try {
+<span class="nc" id="L1528">                taskExecutor.commitOffsetsOrTransaction(consumedOffsetsAndMetadataPerTask);</span>
+<span class="nc" id="L1529">            } catch (final RuntimeException e) {</span>
+<span class="nc" id="L1530">                log.error(&quot;Exception caught while committing tasks &quot; + consumedOffsetsAndMetadataPerTask.keySet(), e);</span>
+                // TODO: should record the task ids when handling this exception
+<span class="nc" id="L1532">                maybeSetFirstException(false, e, firstException);</span>
+
+<span class="nc bnc" id="L1534" title="All 2 branches missed.">                if (e instanceof TaskCorruptedException) {</span>
+<span class="nc" id="L1535">                    final TaskCorruptedException taskCorruptedException = (TaskCorruptedException) e;</span>
+<span class="nc" id="L1536">                    final Set&lt;TaskId&gt; corruptedTaskIds = taskCorruptedException.corruptedTasks();</span>
+<span class="nc" id="L1537">                    final Set&lt;StreamTask&gt; corruptedTasks = tasksToCommit</span>
+<span class="nc" id="L1538">                        .stream()</span>
+<span class="nc" id="L1539">                        .filter(task -&gt; corruptedTaskIds.contains(task.id()))</span>
+<span class="nc" id="L1540">                        .collect(Collectors.toSet());</span>
+<span class="nc" id="L1541">                    tasksToCloseClean.removeAll(corruptedTasks);</span>
+<span class="nc" id="L1542">                    tasksToCloseDirty.addAll(corruptedTasks);</span>
+<span class="nc" id="L1543">                } else {</span>
+                    // If the commit fails, everyone who participated in it must be closed dirty
+<span class="nc" id="L1545">                    tasksToCloseClean.removeAll(tasksToCommit);</span>
+<span class="nc" id="L1546">                    tasksToCloseDirty.addAll(tasksToCommit);</span>
+                }
+<span class="nc" id="L1548">            }</span>
+
+<span class="nc bnc" id="L1550" title="All 2 branches missed.">            for (final StreamTask task : activeTasksToClose) {</span>
+                try {
+<span class="nc" id="L1552">                    task.postCommit(true);</span>
+<span class="nc" id="L1553">                } catch (final RuntimeException e) {</span>
+<span class="nc" id="L1554">                    log.error(&quot;Exception caught while post-committing task &quot; + task.id(), e);</span>
+<span class="nc" id="L1555">                    maybeSetFirstException(false, maybeWrapTaskException(e, task.id()), firstException);</span>
+<span class="nc" id="L1556">                    tasksToCloseDirty.add(task);</span>
+<span class="nc" id="L1557">                    tasksToCloseClean.remove(task);</span>
+<span class="nc" id="L1558">                }</span>
+<span class="nc" id="L1559">            }</span>
+        }
+
+<span class="nc bnc" id="L1562" title="All 2 branches missed.">        for (final StreamTask task : tasksToCloseClean) {</span>
+            try {
+<span class="nc" id="L1564">                task.suspend();</span>
+<span class="nc" id="L1565">                closeTaskClean(task);</span>
+<span class="nc" id="L1566">            } catch (final RuntimeException e) {</span>
+<span class="nc" id="L1567">                log.error(&quot;Exception caught while clean-closing active task {}: {}&quot;, task.id(), e.getMessage());</span>
+
+<span class="nc bnc" id="L1569" title="All 2 branches missed.">                if (task.state() != State.CLOSED) {</span>
+<span class="nc" id="L1570">                    tasksToCloseDirty.add(task);</span>
+                }
+                // ignore task migrated exception as it doesn't matter during shutdown
+<span class="nc" id="L1573">                maybeSetFirstException(true, maybeWrapTaskException(e, task.id()), firstException);</span>
+<span class="nc" id="L1574">            }</span>
+<span class="nc" id="L1575">        }</span>
+
+<span class="nc" id="L1577">        return tasksToCloseDirty;</span>
+    }
+
+    // Returns the set of standby tasks that must be closed dirty
+    private Collection&lt;StandbyTask&gt; tryCloseCleanStandbyTasks(final Collection&lt;StandbyTask&gt; standbyTasksToClose,
+                                                              final boolean clean,
+                                                              final AtomicReference&lt;RuntimeException&gt; firstException) {
+<span class="nc bnc" id="L1584" title="All 2 branches missed.">        if (!clean) {</span>
+<span class="nc" id="L1585">            return standbyTasksToClose;</span>
+        }
+<span class="nc" id="L1587">        final Set&lt;StandbyTask&gt; tasksToCloseDirty = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+
+        // first committing and then suspend / close clean
+<span class="nc bnc" id="L1590" title="All 2 branches missed.">        for (final StandbyTask task : standbyTasksToClose) {</span>
+            try {
+<span class="nc" id="L1592">                task.prepareCommit(true);</span>
+<span class="nc" id="L1593">                task.postCommit(true);</span>
+<span class="nc" id="L1594">                task.suspend();</span>
+<span class="nc" id="L1595">                closeTaskClean(task);</span>
+<span class="nc" id="L1596">            } catch (final RuntimeException e) {</span>
+<span class="nc" id="L1597">                log.error(&quot;Exception caught while clean-closing standby task {}: {}&quot;, task.id(), e.getMessage());</span>
+
+<span class="nc bnc" id="L1599" title="All 2 branches missed.">                if (task.state() != State.CLOSED) {</span>
+<span class="nc" id="L1600">                    tasksToCloseDirty.add(task);</span>
+                }
+                // ignore task migrated exception as it doesn't matter during shutdown
+<span class="nc" id="L1603">                maybeSetFirstException(true, maybeWrapTaskException(e, task.id()), firstException);</span>
+<span class="nc" id="L1604">            }</span>
+<span class="nc" id="L1605">        }</span>
+<span class="nc" id="L1606">        return tasksToCloseDirty;</span>
+    }
+
+    Set&lt;TaskId&gt; activeTaskIds() {
+<span class="nc" id="L1610">        return activeTaskStream()</span>
+<span class="nc" id="L1611">            .map(Task::id)</span>
+<span class="nc" id="L1612">            .collect(Collectors.toSet());</span>
+    }
+
+    Set&lt;TaskId&gt; activeRunningTaskIds() {
+<span class="nc" id="L1616">        return activeRunningTaskStream()</span>
+<span class="nc" id="L1617">            .map(Task::id)</span>
+<span class="nc" id="L1618">            .collect(Collectors.toSet());</span>
+    }
+
+    Set&lt;TaskId&gt; standbyTaskIds() {
+<span class="nc" id="L1622">        return standbyTaskStream().map(Task::id).collect(Collectors.toSet());</span>
+    }
+
+    Map&lt;TaskId, Task&gt; allTasks() {
+        // not bothering with an unmodifiable map, since the tasks themselves are mutable, but
+        // if any outside code modifies the map or the tasks, it would be a severe transgression.
+<span class="nc" id="L1628">        final Map&lt;TaskId, Task&gt; ret = stateUpdater.tasks().stream().collect(Collectors.toMap(Task::id, x -&gt; x));</span>
+<span class="nc" id="L1629">        ret.putAll(tasks.allInitializedTasksPerId());</span>
+<span class="nc" id="L1630">        ret.putAll(tasks.pendingTasksToInit().stream().collect(Collectors.toMap(Task::id, x -&gt; x)));</span>
+<span class="nc" id="L1631">        return ret;</span>
+    }
+
+    /**
+     * Returns tasks owned by the stream thread.
+     * This does not return any tasks currently owned by the state updater.
+     *
+     */
+    Map&lt;TaskId, Task&gt; allRunningTasks() {
+        // not bothering with an unmodifiable map, since the tasks themselves are mutable, but
+        // if any outside code modifies the map or the tasks, it would be a severe transgression.
+<span class="nc" id="L1642">        return tasks.allInitializedTasksPerId();</span>
+    }
+
+    Set&lt;Task&gt; readOnlyAllTasks() {
+        // not bothering with an unmodifiable map, since the tasks themselves are mutable, but
+        // if any outside code modifies the map or the tasks, it would be a severe transgression.
+<span class="nc" id="L1648">        final HashSet&lt;Task&gt; ret = new HashSet&lt;&gt;(stateUpdater.tasks());</span>
+<span class="nc" id="L1649">        ret.addAll(tasks.allInitializedTasks());</span>
+<span class="nc" id="L1650">        return Collections.unmodifiableSet(ret);</span>
+    }
+
+    Map&lt;TaskId, Task&gt; notPausedTasks() {
+<span class="nc" id="L1654">        return Collections.unmodifiableMap(tasks.allInitializedTasks()</span>
+<span class="nc" id="L1655">            .stream()</span>
+<span class="nc bnc" id="L1656" title="All 2 branches missed.">            .filter(t -&gt; !topologyMetadata.isPaused(t.id().topologyName()))</span>
+<span class="nc" id="L1657">            .collect(Collectors.toMap(Task::id, v -&gt; v)));</span>
+    }
+
+    Map&lt;TaskId, Task&gt; activeTaskMap() {
+<span class="nc" id="L1661">        return activeTaskStream().collect(Collectors.toMap(Task::id, t -&gt; t));</span>
+    }
+
+    List&lt;Task&gt; activeTaskIterable() {
+<span class="nc" id="L1665">        return activeTaskStream().collect(Collectors.toList());</span>
+    }
+
+    List&lt;StreamTask&gt; activeRunningTaskIterable() {
+<span class="nc" id="L1669">        return activeRunningTaskStream().collect(Collectors.toList());</span>
+    }
+
+    private Stream&lt;Task&gt; activeTaskStream() {
+<span class="nc" id="L1673">        return Stream.concat(</span>
+<span class="nc" id="L1674">            activeRunningTaskStream(),</span>
+<span class="nc" id="L1675">            stateUpdater.tasks().stream().filter(Task::isActive)</span>
+        );
+    }
+
+    private Stream&lt;StreamTask&gt; activeRunningTaskStream() {
+<span class="nc" id="L1680">        return tasks.allInitializedTasks().stream().filter(Task::isActive).map(StreamTask.class::cast);</span>
+    }
+
+    Map&lt;TaskId, StandbyTask&gt; standbyTaskMap() {
+<span class="nc" id="L1684">        return standbyTaskStream().collect(Collectors.toMap(Task::id, t -&gt; t));</span>
+    }
+
+    private List&lt;StandbyTask&gt; standbyTaskIterable() {
+<span class="nc" id="L1688">        return standbyTaskStream().collect(Collectors.toList());</span>
+    }
+
+    private Stream&lt;StandbyTask&gt; standbyTaskStream() {
+<span class="nc bnc" id="L1692" title="All 2 branches missed.">        final Stream&lt;StandbyTask&gt; standbyTasksInTaskRegistry = tasks.allInitializedTasks().stream().filter(t -&gt; !t.isActive())</span>
+<span class="nc" id="L1693">                .map(StandbyTask.class::cast);</span>
+<span class="nc" id="L1694">        return Stream.concat(</span>
+<span class="nc" id="L1695">            stateUpdater.standbyTasks().stream(),</span>
+            standbyTasksInTaskRegistry
+        );
+    }
+    // For testing only.
+    int commitAll() {
+<span class="nc" id="L1701">        return commit(tasks.allInitializedTasks());</span>
+    }
+
+    /**
+     * Resumes polling in the main consumer for all partitions for which
+     * the corresponding record queues have capacity (again).
+     */
+    public void resumePollingForPartitionsWithAvailableSpace() {
+<span class="nc bnc" id="L1709" title="All 2 branches missed.">        for (final StreamTask t: tasks.activeInitializedTasks()) {</span>
+<span class="nc" id="L1710">            t.resumePollingForPartitionsWithAvailableSpace();</span>
+<span class="nc" id="L1711">        }</span>
+<span class="nc" id="L1712">    }</span>
+
+    /**
+     * Fetches up-to-date lag information from the consumer.
+     */
+    public void updateLags() {
+<span class="nc bnc" id="L1718" title="All 2 branches missed.">        for (final StreamTask t: tasks.activeInitializedTasks()) {</span>
+<span class="nc" id="L1719">            t.updateLags();</span>
+<span class="nc" id="L1720">        }</span>
+<span class="nc" id="L1721">    }</span>
+
+    /**
+     * Wake-up any sleeping processing threads.
+     */
+    public void signalTaskExecutors() {
+<span class="nc bnc" id="L1727" title="All 2 branches missed.">        if (schedulingTaskManager != null) {</span>
+            // Wake up sleeping task executors after every poll, in case there is processing or punctuation to-do.
+<span class="nc" id="L1729">            schedulingTaskManager.signalTaskExecutors();</span>
+        }
+<span class="nc" id="L1731">    }</span>
+
+    /**
+     * Take records and add them to each respective task
+     *
+     * @param records Records, can be null
+     */
+    void addRecordsToTasks(final ConsumerRecords&lt;byte[], byte[]&gt; records) {
+<span class="nc bnc" id="L1739" title="All 2 branches missed.">        for (final TopicPartition partition : records.partitions()) {</span>
+<span class="nc" id="L1740">            final Task activeTask = getActiveTask(partition);</span>
+<span class="nc" id="L1741">            activeTask.addRecords(partition, records.records(partition));</span>
+<span class="nc" id="L1742">        }</span>
+<span class="nc" id="L1743">    }</span>
+
+    /**
+     * Update the next offsets for each task
+     *
+     * @param nextOffsets A map of offsets keyed by partition
+     */
+    void updateNextOffsets(final Map&lt;TopicPartition, OffsetAndMetadata&gt; nextOffsets) {
+<span class="nc bnc" id="L1751" title="All 2 branches missed.">        for (final Map.Entry&lt;TopicPartition, OffsetAndMetadata&gt; entry : nextOffsets.entrySet()) {</span>
+<span class="nc" id="L1752">            final Task activeTask = getActiveTask(entry.getKey());</span>
+<span class="nc" id="L1753">            activeTask.updateNextOffsets(entry.getKey(), entry.getValue());</span>
+<span class="nc" id="L1754">        }</span>
+<span class="nc" id="L1755">    }</span>
+
+    void maybeInitTaskTimeoutsOrThrow(
+        final Collection&lt;TopicPartition&gt; partitions,
+        final TimeoutException timeoutException,
+        final long nowMs
+    ) {
+<span class="nc bnc" id="L1762" title="All 2 branches missed.">        for (final TopicPartition partition : partitions) {</span>
+<span class="nc" id="L1763">            getActiveTask(partition).maybeInitTaskTimeoutOrThrow(nowMs, timeoutException);</span>
+<span class="nc" id="L1764">        }</span>
+<span class="nc" id="L1765">    }</span>
+
+    private Task getActiveTask(final TopicPartition partition) {
+<span class="nc" id="L1768">        final Task activeTask = tasks.activeInitializedTasksForInputPartition(partition);</span>
+
+<span class="nc bnc" id="L1770" title="All 2 branches missed.">        if (activeTask == null) {</span>
+<span class="nc" id="L1771">            log.error(&quot;Unable to locate active task for received-record partition {}. Current tasks: {}&quot;,</span>
+<span class="nc" id="L1772">                partition, toString(&quot;&gt;&quot;));</span>
+<span class="nc" id="L1773">            throw new NullPointerException(&quot;Task was unexpectedly missing for partition &quot; + partition);</span>
+        }
+<span class="nc" id="L1775">        return activeTask;</span>
+    }
+
+    private void maybeLockTasks(final Set&lt;TaskId&gt; ids) {
+<span class="nc bnc" id="L1779" title="All 4 branches missed.">        if (schedulingTaskManager != null &amp;&amp; !ids.isEmpty()) {</span>
+<span class="nc bnc" id="L1780" title="All 2 branches missed.">            if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L1781">                log.debug(&quot;Locking tasks {}&quot;, ids.stream().map(TaskId::toString).collect(Collectors.joining(&quot;, &quot;)));</span>
+            }
+<span class="nc" id="L1783">            boolean locked = false;</span>
+<span class="nc bnc" id="L1784" title="All 2 branches missed.">            while (!locked) {</span>
+                try {
+<span class="nc" id="L1786">                    schedulingTaskManager.lockTasks(ids).get();</span>
+<span class="nc" id="L1787">                    locked = true;</span>
+<span class="nc" id="L1788">                } catch (final InterruptedException e) {</span>
+<span class="nc" id="L1789">                    log.warn(&quot;Interrupted while waiting for tasks {} to be locked&quot;,</span>
+<span class="nc" id="L1790">                        ids.stream().map(TaskId::toString).collect(Collectors.joining(&quot;,&quot;)));</span>
+<span class="nc" id="L1791">                } catch (final ExecutionException e) {</span>
+<span class="nc" id="L1792">                    log.info(&quot;Failed to lock tasks&quot;);</span>
+<span class="nc" id="L1793">                    throw new RuntimeException(e);</span>
+<span class="nc" id="L1794">                }</span>
+            }
+        }
+<span class="nc" id="L1797">    }</span>
+
+    private void maybeUnlockTasks(final Set&lt;TaskId&gt; ids) {
+<span class="nc bnc" id="L1800" title="All 4 branches missed.">        if (schedulingTaskManager != null &amp;&amp; !ids.isEmpty()) {</span>
+<span class="nc bnc" id="L1801" title="All 2 branches missed.">            if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L1802">                log.debug(&quot;Unlocking tasks {}&quot;, ids.stream().map(TaskId::toString).collect(Collectors.joining(&quot;, &quot;)));</span>
+            }
+<span class="nc" id="L1804">            schedulingTaskManager.unlockTasks(ids);</span>
+        }
+<span class="nc" id="L1806">    }</span>
+
+    public void maybeThrowTaskExceptionsFromProcessingThreads() {
+<span class="nc bnc" id="L1809" title="All 2 branches missed.">        if (schedulingTaskManager != null) {</span>
+<span class="nc" id="L1810">            maybeThrowTaskExceptions(schedulingTaskManager.drainUncaughtExceptions());</span>
+        }
+<span class="nc" id="L1812">    }</span>
+
+    /**
+     * @throws TaskMigratedException if committing offsets failed (non-EOS)
+     *                               or if the task producer got fenced (EOS)
+     * @throws TimeoutException if task.timeout.ms has been exceeded (non-EOS)
+     * @throws TaskCorruptedException if committing offsets failed due to TimeoutException (EOS)
+     * @return number of committed offsets, or -1 if we are in the middle of a rebalance and cannot commit
+     */
+    int commit(final Collection&lt;? extends Task&gt; tasksToCommit) {
+<span class="nc" id="L1822">        int committed = 0;</span>
+<span class="nc" id="L1823">        final Set&lt;TaskId&gt; ids =</span>
+<span class="nc" id="L1824">            tasksToCommit.stream()</span>
+<span class="nc" id="L1825">                .map(Task::id)</span>
+<span class="nc" id="L1826">                .collect(Collectors.toSet());</span>
+<span class="nc" id="L1827">        maybeLockTasks(ids);</span>
+
+        // We have to throw the first uncaught exception after locking the tasks, to not attempt to commit failure records.
+<span class="nc" id="L1830">        maybeThrowTaskExceptionsFromProcessingThreads();</span>
+
+<span class="nc" id="L1832">        final Map&lt;Task, Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; consumedOffsetsAndMetadataPerTask = new HashMap&lt;&gt;();</span>
+        try {
+<span class="nc" id="L1834">            committed = commitTasksAndMaybeUpdateCommittableOffsets(tasksToCommit, consumedOffsetsAndMetadataPerTask);</span>
+<span class="nc" id="L1835">        } catch (final TimeoutException timeoutException) {</span>
+<span class="nc" id="L1836">            consumedOffsetsAndMetadataPerTask</span>
+<span class="nc" id="L1837">                .keySet()</span>
+<span class="nc" id="L1838">                .forEach(t -&gt; t.maybeInitTaskTimeoutOrThrow(time.milliseconds(), timeoutException));</span>
+<span class="nc" id="L1839">        }</span>
+
+<span class="nc" id="L1841">        maybeUnlockTasks(ids);</span>
+<span class="nc" id="L1842">        return committed;</span>
+    }
+
+    /**
+     * @throws TaskMigratedException if committing offsets failed (non-EOS)
+     *                               or if the task producer got fenced (EOS)
+     */
+    int maybeCommitActiveTasksPerUserRequested() {
+<span class="nc bnc" id="L1850" title="All 2 branches missed.">        if (rebalanceInProgress) {</span>
+<span class="nc" id="L1851">            return -1;</span>
+        } else {
+<span class="nc bnc" id="L1853" title="All 2 branches missed.">            for (final StreamTask task : activeRunningTaskIterable()) {</span>
+<span class="nc bnc" id="L1854" title="All 4 branches missed.">                if (task.commitRequested() &amp;&amp; task.commitNeeded()) {</span>
+<span class="nc" id="L1855">                    return commit(activeRunningTaskIterable());</span>
+                }
+<span class="nc" id="L1857">            }</span>
+<span class="nc" id="L1858">            return 0;</span>
+        }
+    }
+
+    private int commitTasksAndMaybeUpdateCommittableOffsets(final Collection&lt;? extends Task&gt; tasksToCommit,
+                                                            final Map&lt;Task, Map&lt;TopicPartition, OffsetAndMetadata&gt;&gt; consumedOffsetsAndMetadata) {
+<span class="nc bnc" id="L1864" title="All 2 branches missed.">        if (rebalanceInProgress) {</span>
+<span class="nc" id="L1865">            return -1;</span>
+        } else {
+<span class="nc" id="L1867">            return taskExecutor.commitTasksAndMaybeUpdateCommittableOffsets(tasksToCommit, consumedOffsetsAndMetadata);</span>
+        }
+    }
+
+    public void updateTaskEndMetadata(final TopicPartition topicPartition, final Long offset) {
+<span class="nc bnc" id="L1872" title="All 2 branches missed.">        for (final StreamTask task : tasks.activeInitializedTasks()) {</span>
+<span class="nc bnc" id="L1873" title="All 2 branches missed.">            if (task.inputPartitions().contains(topicPartition)) {</span>
+<span class="nc" id="L1874">                task.updateEndOffsets(topicPartition, offset);</span>
+            }
+<span class="nc" id="L1876">        }</span>
+<span class="nc" id="L1877">    }</span>
+
+    /**
+     * Handle any added or removed NamedTopologies. Check if any uncreated assigned tasks belong to a newly
+     * added NamedTopology and create them if so, then close any tasks whose named topology no longer exists
+     */
+    void handleTopologyUpdates() {
+<span class="nc" id="L1884">        topologyMetadata.executeTopologyUpdatesAndBumpThreadVersion(</span>
+            this::createPendingTasks,
+            this::maybeCloseTasksFromRemovedTopologies
+        );
+
+<span class="nc bnc" id="L1889" title="All 2 branches missed.">        if (topologyMetadata.isEmpty()) {</span>
+<span class="nc" id="L1890">            log.info(&quot;Proactively unsubscribing from all topics due to empty topology&quot;);</span>
+<span class="nc" id="L1891">            mainConsumer.unsubscribe();</span>
+        }
+
+<span class="nc" id="L1894">        topologyMetadata.maybeNotifyTopologyVersionListeners();</span>
+<span class="nc" id="L1895">    }</span>
+
+    void maybeCloseTasksFromRemovedTopologies(final Set&lt;String&gt; currentNamedTopologies) {
+        try {
+<span class="nc" id="L1899">            final Set&lt;StreamTask&gt; activeTasksToRemove = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc" id="L1900">            final Set&lt;StandbyTask&gt; standbyTasksToRemove = new TreeSet&lt;&gt;(Comparator.comparing(Task::id));</span>
+<span class="nc bnc" id="L1901" title="All 2 branches missed.">            for (final Task task : tasks.allInitializedTasks()) {</span>
+<span class="nc bnc" id="L1902" title="All 2 branches missed.">                if (!currentNamedTopologies.contains(task.id().topologyName())) {</span>
+<span class="nc bnc" id="L1903" title="All 2 branches missed.">                    if (task.isActive()) {</span>
+<span class="nc" id="L1904">                        activeTasksToRemove.add((StreamTask) task);</span>
+                    } else {
+<span class="nc" id="L1906">                        standbyTasksToRemove.add((StandbyTask) task);</span>
+                    }
+                }
+<span class="nc" id="L1909">            }</span>
+
+<span class="nc" id="L1911">            final Set&lt;TaskId&gt; allTaskIdsToRemove = Stream.concat(activeTasksToRemove.stream(), standbyTasksToRemove.stream()).map(Task::id).collect(Collectors.toSet());</span>
+<span class="nc" id="L1912">            closeAndCleanUpTasks(activeTasksToRemove, standbyTasksToRemove, true);</span>
+<span class="nc" id="L1913">            releaseLockedDirectoriesForTasks(allTaskIdsToRemove);</span>
+<span class="nc" id="L1914">        } catch (final Exception e) {</span>
+            // TODO KAFKA-12648: for now just swallow the exception to avoid interfering with the other topologies
+            //  that are running alongside, but eventually we should be able to rethrow up to the handler to inform
+            //  the user of an error in this named topology without killing the thread and delaying the others
+<span class="nc" id="L1918">            log.error(&quot;Caught the following exception while closing tasks from a removed topology:&quot;, e);</span>
+<span class="nc" id="L1919">        }</span>
+<span class="nc" id="L1920">    }</span>
+
+    void createPendingTasks(final Set&lt;String&gt; currentNamedTopologies) {
+<span class="nc" id="L1923">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; activeTasksToCreate = tasks.drainPendingActiveTasksForTopologies(currentNamedTopologies);</span>
+<span class="nc" id="L1924">        final Map&lt;TaskId, Set&lt;TopicPartition&gt;&gt; standbyTasksToCreate = tasks.drainPendingStandbyTasksForTopologies(currentNamedTopologies);</span>
+
+<span class="nc" id="L1926">        createNewTasks(activeTasksToCreate, standbyTasksToCreate);</span>
+<span class="nc" id="L1927">    }</span>
+
+    /**
+     * @throws TaskMigratedException if the task producer got fenced (EOS only)
+     * @throws StreamsException      if any task threw an exception while processing
+     */
+    int process(final int maxNumRecords, final Time time) {
+<span class="nc" id="L1934">        return taskExecutor.process(maxNumRecords, time);</span>
+    }
+
+    void recordTaskProcessRatio(final long totalProcessLatencyMs, final long now) {
+<span class="nc bnc" id="L1938" title="All 2 branches missed.">        for (final StreamTask task : activeRunningTaskIterable()) {</span>
+<span class="nc" id="L1939">            task.recordProcessTimeRatioAndBufferSize(totalProcessLatencyMs, now);</span>
+<span class="nc" id="L1940">        }</span>
+<span class="nc" id="L1941">    }</span>
+
+    /**
+     * @throws TaskMigratedException if the task producer got fenced (EOS only)
+     */
+    int punctuate() {
+<span class="nc" id="L1947">        return  taskExecutor.punctuate();</span>
+    }
+
+    void maybePurgeCommittedRecords() {
+        // we do not check any possible exceptions since none of them are fatal
+        // that should cause the application to fail, and we will try delete with
+        // newer offsets anyways.
+<span class="nc bnc" id="L1954" title="All 4 branches missed.">        if (deleteRecordsResult == null || deleteRecordsResult.all().isDone()) {</span>
+
+<span class="nc bnc" id="L1956" title="All 4 branches missed.">            if (deleteRecordsResult != null &amp;&amp; deleteRecordsResult.all().isCompletedExceptionally()) {</span>
+<span class="nc" id="L1957">                log.debug(&quot;Previous delete-records request has failed: {}. Try sending the new request now&quot;,</span>
+<span class="nc" id="L1958">                          deleteRecordsResult.lowWatermarks());</span>
+            }
+
+<span class="nc" id="L1961">            final Map&lt;TopicPartition, RecordsToDelete&gt; recordsToDelete = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L1962" title="All 2 branches missed.">            for (final StreamTask task : activeRunningTaskIterable()) {</span>
+<span class="nc bnc" id="L1963" title="All 2 branches missed.">                for (final Map.Entry&lt;TopicPartition, Long&gt; entry : task.purgeableOffsets().entrySet()) {</span>
+<span class="nc" id="L1964">                    recordsToDelete.put(entry.getKey(), RecordsToDelete.beforeOffset(entry.getValue()));</span>
+<span class="nc" id="L1965">                }</span>
+<span class="nc" id="L1966">            }</span>
+<span class="nc bnc" id="L1967" title="All 2 branches missed.">            if (!recordsToDelete.isEmpty()) {</span>
+<span class="nc" id="L1968">                deleteRecordsResult = adminClient.deleteRecords(recordsToDelete);</span>
+<span class="nc" id="L1969">                log.trace(&quot;Sent delete-records request: {}&quot;, recordsToDelete);</span>
+            }
+        }
+<span class="nc" id="L1972">    }</span>
+
+    /**
+     * Produces a string representation containing useful information about the TaskManager.
+     * This is useful in debugging scenarios.
+     *
+     * @return A string representation of the TaskManager instance.
+     */
+    @Override
+    public String toString() {
+<span class="nc" id="L1982">        return toString(&quot;&quot;);</span>
+    }
+
+    public String toString(final String indent) {
+<span class="nc" id="L1986">        final StringBuilder stringBuilder = new StringBuilder();</span>
+<span class="nc" id="L1987">        stringBuilder.append(&quot;TaskManager\n&quot;);</span>
+<span class="nc" id="L1988">        stringBuilder.append(indent).append(&quot;\tMetadataState:\n&quot;);</span>
+<span class="nc" id="L1989">        stringBuilder.append(indent).append(&quot;\tTasks:\n&quot;);</span>
+<span class="nc bnc" id="L1990" title="All 2 branches missed.">        for (final Task task : tasks.allInitializedTasks()) {</span>
+<span class="nc" id="L1991">            stringBuilder.append(indent)</span>
+<span class="nc" id="L1992">                         .append(&quot;\t\t&quot;)</span>
+<span class="nc" id="L1993">                         .append(task.id())</span>
+<span class="nc" id="L1994">                         .append(&quot; &quot;)</span>
+<span class="nc" id="L1995">                         .append(task.state())</span>
+<span class="nc" id="L1996">                         .append(&quot; &quot;)</span>
+<span class="nc" id="L1997">                         .append(task.getClass().getSimpleName())</span>
+<span class="nc bnc" id="L1998" title="All 2 branches missed.">                         .append('(').append(task.isActive() ? &quot;active&quot; : &quot;standby&quot;).append(')');</span>
+<span class="nc" id="L1999">        }</span>
+<span class="nc" id="L2000">        return stringBuilder.toString();</span>
+    }
+
+    Map&lt;MetricName, Metric&gt; producerMetrics() {
+<span class="nc" id="L2004">        return activeTaskCreator.producerMetrics();</span>
+    }
+
+    String producerClientIds() {
+<span class="nc" id="L2008">        return activeTaskCreator.producerClientIds();</span>
+    }
+
+    Set&lt;TaskId&gt; lockedTaskDirectories() {
+<span class="nc" id="L2012">        return Collections.unmodifiableSet(lockedTaskDirectories);</span>
+    }
+
+    private void maybeSetFirstException(final boolean ignoreTaskMigrated,
+                                        final RuntimeException exception,
+                                        final AtomicReference&lt;RuntimeException&gt; firstException) {
+<span class="nc bnc" id="L2018" title="All 4 branches missed.">        if (!ignoreTaskMigrated || !(exception instanceof TaskMigratedException)) {</span>
+<span class="nc" id="L2019">            firstException.compareAndSet(null, exception);</span>
+        }
+<span class="nc" id="L2021">    }</span>
+
+    private StreamsException maybeWrapTaskException(final RuntimeException exception, final TaskId taskId) {
+<span class="nc bnc" id="L2024" title="All 2 branches missed.">        if (exception instanceof StreamsException) {</span>
+<span class="nc" id="L2025">            final StreamsException streamsException = (StreamsException) exception;</span>
+<span class="nc" id="L2026">            streamsException.setTaskId(taskId);</span>
+<span class="nc" id="L2027">            return streamsException;</span>
+        } else {
+<span class="nc" id="L2029">            return new StreamsException(exception, taskId);</span>
+        }
+    }
+
+    public static void executeAndMaybeSwallow(final boolean clean,
+                                              final Runnable runnable,
+                                              final java.util.function.Consumer&lt;RuntimeException&gt; actionIfClean,
+                                              final java.util.function.Consumer&lt;RuntimeException&gt; actionIfNotClean) {
+        try {
+<span class="nc" id="L2038">            runnable.run();</span>
+<span class="nc" id="L2039">        } catch (final RuntimeException e) {</span>
+<span class="nc bnc" id="L2040" title="All 2 branches missed.">            if (clean) {</span>
+<span class="nc" id="L2041">                actionIfClean.accept(e);</span>
+            } else {
+<span class="nc" id="L2043">                actionIfNotClean.accept(e);</span>
+            }
+<span class="nc" id="L2045">        }</span>
+<span class="nc" id="L2046">    }</span>
+
+    public static void executeAndMaybeSwallow(final boolean clean,
+                                              final Runnable runnable,
+                                              final String name,
+                                              final Logger log) {
+<span class="nc" id="L2052">        executeAndMaybeSwallow(</span>
+            clean,
+            runnable,
+            e -&gt; {
+<span class="nc" id="L2056">                throw e;</span>
+            },
+<span class="nc" id="L2058">            e -&gt; log.debug(&quot;Ignoring error in unclean {}&quot;, name));</span>
+<span class="nc" id="L2059">    }</span>
+
+    private boolean canTryInitializeTask(final TaskId taskId, final long nowMs) {
+<span class="nc bnc" id="L2062" title="All 4 branches missed.">        return !taskIdToBackoffRecord.containsKey(taskId) || taskIdToBackoffRecord.get(taskId).canAttempt(nowMs);</span>
+    }
+
+    private void updateOrCreateBackoffRecord(final TaskId taskId, final long nowMs) {
+<span class="nc bnc" id="L2066" title="All 2 branches missed.">        if (taskIdToBackoffRecord.containsKey(taskId)) {</span>
+<span class="nc" id="L2067">            taskIdToBackoffRecord.get(taskId).recordAttempt(nowMs);</span>
+        } else {
+<span class="nc" id="L2069">            taskIdToBackoffRecord.put(taskId, new BackoffRecord(nowMs));</span>
+        }
+<span class="nc" id="L2071">    }</span>
+
+    public static class BackoffRecord {
+        private long attempts;
+        private long lastAttemptMs;
+<span class="nc" id="L2076">        private static final ExponentialBackoff EXPONENTIAL_BACKOFF = new ExponentialBackoff(1000, 2, 10000, 0.5);</span>
+
+
+<span class="nc" id="L2079">        public BackoffRecord(final long nowMs) {</span>
+<span class="nc" id="L2080">            this.attempts = 1;</span>
+<span class="nc" id="L2081">            this.lastAttemptMs = nowMs;</span>
+<span class="nc" id="L2082">        }</span>
+
+        public void recordAttempt(final long nowMs) {
+<span class="nc" id="L2085">            this.attempts++;</span>
+<span class="nc" id="L2086">            this.lastAttemptMs = nowMs;</span>
+<span class="nc" id="L2087">        }</span>
+
+        public boolean canAttempt(final long nowMs) {
+<span class="nc bnc" id="L2090" title="All 2 branches missed.">            return nowMs - lastAttemptMs &gt;= EXPONENTIAL_BACKOFF.backoff(attempts);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

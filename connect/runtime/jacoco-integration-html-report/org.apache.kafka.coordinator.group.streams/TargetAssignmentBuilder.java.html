@@ -1,0 +1,373 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TargetAssignmentBuilder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.coordinator.group.streams</a> &gt; <span class="el_source">TargetAssignmentBuilder.java</span></div><h1>TargetAssignmentBuilder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.coordinator.group.streams;
+
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorMetadataImage;
+import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
+import org.apache.kafka.coordinator.group.streams.assignor.AssignmentMemberSpec;
+import org.apache.kafka.coordinator.group.streams.assignor.GroupAssignment;
+import org.apache.kafka.coordinator.group.streams.assignor.GroupSpecImpl;
+import org.apache.kafka.coordinator.group.streams.assignor.MemberAssignment;
+import org.apache.kafka.coordinator.group.streams.assignor.TaskAssignor;
+import org.apache.kafka.coordinator.group.streams.assignor.TaskAssignorException;
+import org.apache.kafka.coordinator.group.streams.topics.ConfiguredTopology;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+/**
+ * Build the new target member assignments based on the provided parameters by calling the task assignor.
+ * As a result,
+ * it yields the records that must be persisted to the log and the new member assignments as a map from member ID to tasks tuple.
+ * &lt;p&gt;
+ * Records are only created for members which have a new target assignment. If their assignment did not change, no new record is needed.
+ * &lt;p&gt;
+ * When a member is deleted, it is assumed that its target assignment record is deleted as part of the member deletion process. In other
+ * words, this class does not yield a tombstone for removed members.
+ */
+public class TargetAssignmentBuilder {
+
+    /**
+     * The time.
+     */
+    private Time time;
+
+    /**
+     * The group ID.
+     */
+    private final String groupId;
+    /**
+     * The group epoch.
+     */
+    private final int groupEpoch;
+
+    /**
+     * The partition assignor used to compute the assignment.
+     */
+    private final TaskAssignor assignor;
+
+    /**
+     * The assignment configs.
+     */
+    private final Map&lt;String, String&gt; assignmentConfigs;
+
+    /**
+     * The members which have been updated or deleted. A null value signals deleted members.
+     */
+<span class="nc" id="L77">    private final Map&lt;String, StreamsGroupMember&gt; updatedMembers = new HashMap&lt;&gt;();</span>
+
+    /**
+     * The members in the group.
+     */
+<span class="nc" id="L82">    private Map&lt;String, StreamsGroupMember&gt; members = Map.of();</span>
+
+    /**
+     * The metadata image.
+     */
+<span class="nc" id="L87">    private CoordinatorMetadataImage metadataImage = CoordinatorMetadataImage.EMPTY;</span>
+
+    /**
+     * The existing target assignment.
+     */
+<span class="nc" id="L92">    private Map&lt;String, org.apache.kafka.coordinator.group.streams.TasksTuple&gt; targetAssignment = Map.of();</span>
+
+    /**
+     * The topology.
+     */
+    private ConfiguredTopology topology;
+
+    /**
+     * The static members in the group.
+     */
+<span class="nc" id="L102">    private Map&lt;String, String&gt; staticMembers = Map.of();</span>
+
+    /**
+     * Constructs the object.
+     *
+     * @param groupId    The group ID.
+     * @param groupEpoch The group epoch to compute a target assignment for.
+     * @param assignor   The assignor to use to compute the target assignment.
+     */
+    public TargetAssignmentBuilder(
+        String groupId,
+        int groupEpoch,
+        TaskAssignor assignor,
+        Map&lt;String, String&gt; assignmentConfigs
+<span class="nc" id="L116">    ) {</span>
+<span class="nc" id="L117">        this.groupId = Objects.requireNonNull(groupId);</span>
+<span class="nc" id="L118">        this.groupEpoch = groupEpoch;</span>
+<span class="nc" id="L119">        this.assignor = Objects.requireNonNull(assignor);</span>
+<span class="nc" id="L120">        this.assignmentConfigs = Objects.requireNonNull(assignmentConfigs);</span>
+<span class="nc" id="L121">    }</span>
+
+    static AssignmentMemberSpec createAssignmentMemberSpec(
+        StreamsGroupMember member,
+        TasksTuple targetAssignment
+    ) {
+<span class="nc" id="L127">        return new AssignmentMemberSpec(</span>
+<span class="nc" id="L128">            member.instanceId(),</span>
+<span class="nc" id="L129">            member.rackId(),</span>
+<span class="nc" id="L130">            targetAssignment.activeTasks(),</span>
+<span class="nc" id="L131">            targetAssignment.standbyTasks(),</span>
+<span class="nc" id="L132">            targetAssignment.warmupTasks(),</span>
+<span class="nc" id="L133">            member.processId(),</span>
+<span class="nc" id="L134">            member.clientTags(),</span>
+<span class="nc" id="L135">            Map.of(),</span>
+<span class="nc" id="L136">            Map.of()</span>
+        );
+    }
+
+    /**
+     * Sets the time.
+     *
+     * @param time The time.
+     * @return This object.
+     */
+    public TargetAssignmentBuilder withTime(Time time) {
+<span class="nc" id="L147">        this.time = time;</span>
+<span class="nc" id="L148">        return this;</span>
+    }
+
+    /**
+     * Adds all the existing members.
+     *
+     * @param members The existing members in the streams group.
+     * @return This object.
+     */
+    public TargetAssignmentBuilder withMembers(
+        Map&lt;String, StreamsGroupMember&gt; members
+    ) {
+<span class="nc" id="L160">        this.members = members;</span>
+<span class="nc" id="L161">        return this;</span>
+    }
+
+    /**
+     * Adds all the existing static members.
+     *
+     * @param staticMembers The existing static members in the streams group.
+     * @return This object.
+     */
+    public TargetAssignmentBuilder withStaticMembers(
+        Map&lt;String, String&gt; staticMembers
+    ) {
+<span class="nc" id="L173">        this.staticMembers = staticMembers;</span>
+<span class="nc" id="L174">        return this;</span>
+    }
+
+    /**
+     * Adds the metadata image to use.
+     *
+     * @param metadataImage The metadata image.
+     * @return This object.
+     */
+    public TargetAssignmentBuilder withMetadataImage(
+        CoordinatorMetadataImage metadataImage
+    ) {
+<span class="nc" id="L186">        this.metadataImage = metadataImage;</span>
+<span class="nc" id="L187">        return this;</span>
+    }
+
+    /**
+     * Adds the existing target assignment.
+     *
+     * @param targetAssignment The existing target assignment.
+     * @return This object.
+     */
+    public TargetAssignmentBuilder withTargetAssignment(
+        Map&lt;String, org.apache.kafka.coordinator.group.streams.TasksTuple&gt; targetAssignment
+    ) {
+<span class="nc" id="L199">        this.targetAssignment = targetAssignment;</span>
+<span class="nc" id="L200">        return this;</span>
+    }
+
+    /**
+     * Adds the topology image.
+     *
+     * @param topology The topology.
+     * @return This object.
+     */
+    public TargetAssignmentBuilder withTopology(
+        ConfiguredTopology topology
+    ) {
+<span class="nc" id="L212">        this.topology = topology;</span>
+<span class="nc" id="L213">        return this;</span>
+    }
+
+    /**
+     * Adds or updates a member. This is useful when the updated member is not yet materialized in memory.
+     *
+     * @param memberId The member ID.
+     * @param member   The member to add or update.
+     * @return This object.
+     */
+    public TargetAssignmentBuilder addOrUpdateMember(
+        String memberId,
+        StreamsGroupMember member
+    ) {
+<span class="nc" id="L227">        this.updatedMembers.put(memberId, member);</span>
+<span class="nc" id="L228">        return this;</span>
+    }
+
+    /**
+     * Removes a member. This is useful when the removed member is not yet materialized in memory.
+     *
+     * @param memberId The member ID.
+     * @return This object.
+     */
+    public TargetAssignmentBuilder removeMember(
+        String memberId
+    ) {
+<span class="nc" id="L240">        return addOrUpdateMember(memberId, null);</span>
+    }
+
+    /**
+     * Builds the new target assignment.
+     *
+     * @return A TargetAssignmentResult which contains the records to update the existing target assignment.
+     * @throws TaskAssignorException if the target assignment cannot be computed.
+     */
+    public TargetAssignmentResult build() throws TaskAssignorException {
+<span class="nc" id="L250">        Map&lt;String, AssignmentMemberSpec&gt; memberSpecs = new HashMap&lt;&gt;();</span>
+
+        // Prepare the member spec for all members.
+<span class="nc" id="L253">        members.forEach((memberId, member) -&gt; memberSpecs.put(memberId, createAssignmentMemberSpec(</span>
+            member,
+<span class="nc" id="L255">            targetAssignment.getOrDefault(memberId, org.apache.kafka.coordinator.group.streams.TasksTuple.EMPTY)</span>
+        )));
+
+        // Update the member spec if updated or deleted members.
+<span class="nc" id="L259">        updatedMembers.forEach((memberId, updatedMemberOrNull) -&gt; {</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">            if (updatedMemberOrNull == null) {</span>
+<span class="nc" id="L261">                memberSpecs.remove(memberId);</span>
+            } else {
+<span class="nc" id="L263">                org.apache.kafka.coordinator.group.streams.TasksTuple assignment = targetAssignment.getOrDefault(memberId,</span>
+                    org.apache.kafka.coordinator.group.streams.TasksTuple.EMPTY);
+
+                // A new static member joins and needs to replace an existing departed one.
+<span class="nc bnc" id="L267" title="All 2 branches missed.">                if (updatedMemberOrNull.instanceId().isPresent()) {</span>
+<span class="nc" id="L268">                    String previousMemberId = staticMembers.get(updatedMemberOrNull.instanceId().get());</span>
+<span class="nc bnc" id="L269" title="All 4 branches missed.">                    if (previousMemberId != null &amp;&amp; !previousMemberId.equals(memberId)) {</span>
+<span class="nc" id="L270">                        assignment = targetAssignment.getOrDefault(previousMemberId,</span>
+                            org.apache.kafka.coordinator.group.streams.TasksTuple.EMPTY);
+                    }
+                }
+
+<span class="nc" id="L275">                memberSpecs.put(memberId, createAssignmentMemberSpec(</span>
+                    updatedMemberOrNull,
+                    assignment
+                ));
+            }
+<span class="nc" id="L280">        });</span>
+
+        // Compute the assignment.
+        GroupAssignment newGroupAssignment;
+<span class="nc bnc" id="L284" title="All 2 branches missed.">        if (topology.isReady()) {</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            if (topology.subtopologies().isEmpty()) {</span>
+<span class="nc" id="L286">                throw new IllegalStateException(&quot;Subtopologies must be present if topology is ready.&quot;);</span>
+            }
+<span class="nc" id="L288">            newGroupAssignment = assignor.assign(</span>
+                new GroupSpecImpl(
+<span class="nc" id="L290">                    Collections.unmodifiableMap(memberSpecs),</span>
+                    assignmentConfigs
+                ),
+<span class="nc" id="L293">                new TopologyMetadata(metadataImage, topology.subtopologies().get())</span>
+            );
+        } else {
+<span class="nc" id="L296">            newGroupAssignment = new GroupAssignment(</span>
+<span class="nc" id="L297">                memberSpecs.keySet().stream().collect(Collectors.toMap(x -&gt; x, x -&gt; MemberAssignment.empty())));</span>
+        }
+
+        // Compute delta from previous to new target assignment and create the
+        // relevant records.
+<span class="nc" id="L302">        List&lt;CoordinatorRecord&gt; records = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L303">        Map&lt;String, org.apache.kafka.coordinator.group.streams.TasksTuple&gt; newTargetAssignment = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L305">        memberSpecs.keySet().forEach(memberId -&gt; {</span>
+<span class="nc" id="L306">            org.apache.kafka.coordinator.group.streams.TasksTuple oldMemberAssignment = targetAssignment.get(memberId);</span>
+<span class="nc" id="L307">            org.apache.kafka.coordinator.group.streams.TasksTuple newMemberAssignment = newMemberAssignment(newGroupAssignment, memberId);</span>
+
+<span class="nc" id="L309">            newTargetAssignment.put(memberId, newMemberAssignment);</span>
+
+<span class="nc bnc" id="L311" title="All 2 branches missed.">            if (oldMemberAssignment == null) {</span>
+                // If the member had no assignment, we always create a record for it.
+<span class="nc" id="L313">                records.add(StreamsCoordinatorRecordHelpers.newStreamsGroupTargetAssignmentRecord(</span>
+                    groupId,
+                    memberId,
+                    newMemberAssignment
+                ));
+            } else {
+                // If the member had an assignment, we only create a record if the
+                // new assignment is different.
+<span class="nc bnc" id="L321" title="All 2 branches missed.">                if (!newMemberAssignment.equals(oldMemberAssignment)) {</span>
+<span class="nc" id="L322">                    records.add(StreamsCoordinatorRecordHelpers.newStreamsGroupTargetAssignmentRecord(</span>
+                        groupId,
+                        memberId,
+                        newMemberAssignment
+                    ));
+                }
+            }
+<span class="nc" id="L329">        });</span>
+
+        // Bump the target assignment epoch.
+<span class="nc" id="L332">        records.add(StreamsCoordinatorRecordHelpers.newStreamsGroupTargetAssignmentMetadataRecord(</span>
+            groupId,
+            groupEpoch,
+<span class="nc" id="L335">            time.milliseconds()</span>
+        ));
+
+<span class="nc" id="L338">        return new TargetAssignmentResult(records, newTargetAssignment);</span>
+    }
+
+    private TasksTuple newMemberAssignment(
+        GroupAssignment newGroupAssignment,
+        String memberId
+    ) {
+<span class="nc" id="L345">        MemberAssignment newMemberAssignment = newGroupAssignment.members().get(memberId);</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (newMemberAssignment != null) {</span>
+<span class="nc" id="L347">            return new TasksTuple(</span>
+<span class="nc" id="L348">                newMemberAssignment.activeTasks(),</span>
+<span class="nc" id="L349">                newMemberAssignment.standbyTasks(),</span>
+<span class="nc" id="L350">                newMemberAssignment.warmupTasks()</span>
+            );
+        } else {
+<span class="nc" id="L353">            return TasksTuple.EMPTY;</span>
+        }
+    }
+
+    /**
+     * The assignment result returned by {{@link TargetAssignmentBuilder#build()}}.
+     *
+     * @param records          The records that must be applied to the __consumer_offsets topics to persist the new target assignment.
+     * @param targetAssignment The new target assignment for the group.
+     */
+    public record TargetAssignmentResult(
+        List&lt;CoordinatorRecord&gt; records,
+        Map&lt;String, TasksTuple&gt; targetAssignment
+    ) {
+<span class="nc" id="L367">        public TargetAssignmentResult {</span>
+<span class="nc" id="L368">            Objects.requireNonNull(records);</span>
+<span class="nc" id="L369">            Objects.requireNonNull(targetAssignment);</span>
+<span class="nc" id="L370">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

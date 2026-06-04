@@ -1,0 +1,767 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>JsonConverter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.json</a> &gt; <span class="el_source">JsonConverter.java</span></div><h1>JsonConverter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.json;
+
+import org.apache.kafka.common.cache.Cache;
+import org.apache.kafka.common.cache.LRUCache;
+import org.apache.kafka.common.cache.SynchronizedCache;
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.errors.SerializationException;
+import org.apache.kafka.common.utils.AppInfoParser;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.data.ConnectSchema;
+import org.apache.kafka.connect.data.Date;
+import org.apache.kafka.connect.data.Decimal;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaAndValue;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.data.Time;
+import org.apache.kafka.connect.data.Timestamp;
+import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.storage.Converter;
+import org.apache.kafka.connect.storage.ConverterType;
+import org.apache.kafka.connect.storage.HeaderConverter;
+import org.apache.kafka.connect.storage.StringConverterConfig;
+
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.EnumMap;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Implementation of {@link Converter} and {@link HeaderConverter} that uses JSON to store schemas and objects. By
+ * default this converter will serialize Connect keys, values, and headers with schemas, although this can be disabled with
+ * the {@link JsonConverterConfig#SCHEMAS_ENABLE_CONFIG schemas.enable} configuration option.
+ * &lt;p&gt;
+ * This implementation currently does nothing with the topic names or header keys.
+ */
+public class JsonConverter implements Converter, HeaderConverter {
+
+<span class="fc" id="L67">    private static final Map&lt;Schema.Type, JsonToConnectTypeConverter&gt; TO_CONNECT_CONVERTERS = new EnumMap&lt;&gt;(Schema.Type.class);</span>
+
+    static {
+<span class="pc" id="L70">        TO_CONNECT_CONVERTERS.put(Schema.Type.BOOLEAN, (schema, value, config) -&gt; value.booleanValue());</span>
+<span class="pc" id="L71">        TO_CONNECT_CONVERTERS.put(Schema.Type.INT8, (schema, value, config) -&gt; (byte) value.intValue());</span>
+<span class="pc" id="L72">        TO_CONNECT_CONVERTERS.put(Schema.Type.INT16, (schema, value, config) -&gt; (short) value.intValue());</span>
+<span class="pc" id="L73">        TO_CONNECT_CONVERTERS.put(Schema.Type.INT32, (schema, value, config) -&gt; value.intValue());</span>
+<span class="fc" id="L74">        TO_CONNECT_CONVERTERS.put(Schema.Type.INT64, (schema, value, config) -&gt; value.longValue());</span>
+<span class="pc" id="L75">        TO_CONNECT_CONVERTERS.put(Schema.Type.FLOAT32, (schema, value, config) -&gt; value.floatValue());</span>
+<span class="pc" id="L76">        TO_CONNECT_CONVERTERS.put(Schema.Type.FLOAT64, (schema, value, config) -&gt; value.doubleValue());</span>
+<span class="fc" id="L77">        TO_CONNECT_CONVERTERS.put(Schema.Type.BYTES, (schema, value, config) -&gt; {</span>
+            try {
+<span class="nc" id="L79">                return value.binaryValue();</span>
+<span class="nc" id="L80">            } catch (IOException e) {</span>
+<span class="nc" id="L81">                throw new DataException(&quot;Invalid bytes field&quot;, e);</span>
+            }
+        });
+<span class="fc" id="L84">        TO_CONNECT_CONVERTERS.put(Schema.Type.STRING, (schema, value, config) -&gt; value.textValue());</span>
+<span class="fc" id="L85">        TO_CONNECT_CONVERTERS.put(Schema.Type.ARRAY, (schema, value, config) -&gt; {</span>
+<span class="pc bpc" id="L86" title="1 of 2 branches missed.">            Schema elemSchema = schema == null ? null : schema.valueSchema();</span>
+<span class="fc" id="L87">            ArrayList&lt;Object&gt; result = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L88" title="All 2 branches covered.">            for (JsonNode elem : value) {</span>
+<span class="fc" id="L89">                result.add(convertToConnect(elemSchema, elem, config));</span>
+<span class="fc" id="L90">            }</span>
+<span class="fc" id="L91">            return result;</span>
+        });
+<span class="fc" id="L93">        TO_CONNECT_CONVERTERS.put(Schema.Type.MAP, (schema, value, config) -&gt; {</span>
+<span class="pc bpc" id="L94" title="1 of 2 branches missed.">            Schema keySchema = schema == null ? null : schema.keySchema();</span>
+<span class="pc bpc" id="L95" title="1 of 2 branches missed.">            Schema valueSchema = schema == null ? null : schema.valueSchema();</span>
+
+            // If the map uses strings for keys, it should be encoded in the natural JSON format. If it uses other
+            // primitive types or a complex type as a key, it will be encoded as a list of pairs. If we don't have a
+            // schema, we default to encoding in a Map.
+<span class="fc" id="L100">            Map&lt;Object, Object&gt; result = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L101" title="3 of 4 branches missed.">            if (schema == null || keySchema.type() == Schema.Type.STRING) {</span>
+<span class="pc bpc" id="L102" title="1 of 2 branches missed.">                if (!value.isObject())</span>
+<span class="nc" id="L103">                    throw new DataException(&quot;Maps with string fields should be encoded as JSON objects, but found &quot; + value.getNodeType());</span>
+<span class="fc bfc" id="L104" title="All 2 branches covered.">                for (Map.Entry&lt;String, JsonNode&gt; entry : value.properties()) {</span>
+<span class="fc" id="L105">                    result.put(entry.getKey(), convertToConnect(valueSchema, entry.getValue(), config));</span>
+<span class="fc" id="L106">                }</span>
+            } else {
+<span class="nc bnc" id="L108" title="All 2 branches missed.">                if (!value.isArray())</span>
+<span class="nc" id="L109">                    throw new DataException(&quot;Maps with non-string fields should be encoded as JSON array of tuples, but found &quot; + value.getNodeType());</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">                for (JsonNode entry : value) {</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">                    if (!entry.isArray())</span>
+<span class="nc" id="L112">                        throw new DataException(&quot;Found invalid map entry instead of array tuple: &quot; + entry.getNodeType());</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">                    if (entry.size() != 2)</span>
+<span class="nc" id="L114">                        throw new DataException(&quot;Found invalid map entry, expected length 2 but found :&quot; + entry.size());</span>
+<span class="nc" id="L115">                    result.put(convertToConnect(keySchema, entry.get(0), config),</span>
+<span class="nc" id="L116">                            convertToConnect(valueSchema, entry.get(1), config));</span>
+<span class="nc" id="L117">                }</span>
+            }
+<span class="fc" id="L119">            return result;</span>
+        });
+<span class="fc" id="L121">        TO_CONNECT_CONVERTERS.put(Schema.Type.STRUCT, (schema, value, config) -&gt; {</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">            if (!value.isObject())</span>
+<span class="nc" id="L123">                throw new DataException(&quot;Structs should be encoded as JSON objects, but found &quot; + value.getNodeType());</span>
+
+            // We only have ISchema here but need Schema, so we need to materialize the actual schema. Using ISchema
+            // avoids having to materialize the schema for non-Struct types but it cannot be avoided for Structs since
+            // they require a schema to be provided at construction. However, the schema is only a SchemaBuilder during
+            // translation of schemas to JSON; during the more common translation of data to JSON, the call to schema.schema()
+            // just returns the schema Object and has no overhead.
+<span class="nc" id="L130">            Struct result = new Struct(schema.schema());</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">            for (Field field : schema.fields())</span>
+<span class="nc" id="L132">                result.put(field, convertToConnect(field.schema(), value.get(field.name()), config));</span>
+
+<span class="nc" id="L134">            return result;</span>
+        });
+    }
+
+    // Convert values in Kafka Connect form into/from their logical types. These logical converters are discovered by logical type
+    // names specified in the field
+<span class="fc" id="L140">    private static final HashMap&lt;String, LogicalTypeConverter&gt; LOGICAL_CONVERTERS = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L142">    private static final JsonNodeFactory JSON_NODE_FACTORY = new JsonNodeFactory(true);</span>
+
+    static {
+<span class="fc" id="L145">        LOGICAL_CONVERTERS.put(Decimal.LOGICAL_NAME, new LogicalTypeConverter() {</span>
+            @Override
+            public JsonNode toJson(final Schema schema, final Object value, final JsonConverterConfig config) {
+<span class="nc bnc" id="L148" title="All 2 branches missed.">                if (!(value instanceof BigDecimal decimal))</span>
+<span class="nc" id="L149">                    throw new DataException(&quot;Invalid type for Decimal, expected BigDecimal but was &quot; + value.getClass());</span>
+
+<span class="nc bnc" id="L151" title="All 2 branches missed.">                return switch (config.decimalFormat()) {</span>
+<span class="nc" id="L152">                    case NUMERIC -&gt; JSON_NODE_FACTORY.numberNode(decimal);</span>
+<span class="nc" id="L153">                    case BASE64 -&gt; JSON_NODE_FACTORY.binaryNode(Decimal.fromLogical(schema, decimal));</span>
+                };
+            }
+
+            @Override
+            public Object toConnect(final Schema schema, final JsonNode value) {
+<span class="nc bnc" id="L159" title="All 2 branches missed.">                if (value.isNumber()) return value.decimalValue();</span>
+<span class="nc bnc" id="L160" title="All 4 branches missed.">                if (value.isBinary() || value.isTextual()) {</span>
+                    try {
+<span class="nc" id="L162">                        return Decimal.toLogical(schema, value.binaryValue());</span>
+<span class="nc" id="L163">                    } catch (Exception e) {</span>
+<span class="nc" id="L164">                        throw new DataException(&quot;Invalid bytes for Decimal field&quot;, e);</span>
+                    }
+                }
+
+<span class="nc" id="L168">                throw new DataException(&quot;Invalid type for Decimal, underlying representation should be numeric or bytes but was &quot; + value.getNodeType());</span>
+            }
+        });
+
+<span class="fc" id="L172">        LOGICAL_CONVERTERS.put(Date.LOGICAL_NAME, new LogicalTypeConverter() {</span>
+            @Override
+            public JsonNode toJson(final Schema schema, final Object value, final JsonConverterConfig config) {
+<span class="nc bnc" id="L175" title="All 2 branches missed.">                if (!(value instanceof java.util.Date))</span>
+<span class="nc" id="L176">                    throw new DataException(&quot;Invalid type for Date, expected Date but was &quot; + value.getClass());</span>
+<span class="nc" id="L177">                return JSON_NODE_FACTORY.numberNode(Date.fromLogical(schema, (java.util.Date) value));</span>
+            }
+
+            @Override
+            public Object toConnect(final Schema schema, final JsonNode value) {
+<span class="nc bnc" id="L182" title="All 2 branches missed.">                if (!(value.isInt()))</span>
+<span class="nc" id="L183">                    throw new DataException(&quot;Invalid type for Date, underlying representation should be integer but was &quot; + value.getNodeType());</span>
+<span class="nc" id="L184">                return Date.toLogical(schema, value.intValue());</span>
+            }
+        });
+
+<span class="fc" id="L188">        LOGICAL_CONVERTERS.put(Time.LOGICAL_NAME, new LogicalTypeConverter() {</span>
+            @Override
+            public JsonNode toJson(final Schema schema, final Object value, final JsonConverterConfig config) {
+<span class="nc bnc" id="L191" title="All 2 branches missed.">                if (!(value instanceof java.util.Date))</span>
+<span class="nc" id="L192">                    throw new DataException(&quot;Invalid type for Time, expected Date but was &quot; + value.getClass());</span>
+<span class="nc" id="L193">                return JSON_NODE_FACTORY.numberNode(Time.fromLogical(schema, (java.util.Date) value));</span>
+            }
+
+            @Override
+            public Object toConnect(final Schema schema, final JsonNode value) {
+<span class="nc bnc" id="L198" title="All 2 branches missed.">                if (!(value.isInt()))</span>
+<span class="nc" id="L199">                    throw new DataException(&quot;Invalid type for Time, underlying representation should be integer but was &quot; + value.getNodeType());</span>
+<span class="nc" id="L200">                return Time.toLogical(schema, value.intValue());</span>
+            }
+        });
+
+<span class="fc" id="L204">        LOGICAL_CONVERTERS.put(Timestamp.LOGICAL_NAME, new LogicalTypeConverter() {</span>
+            @Override
+            public JsonNode toJson(final Schema schema, final Object value, final JsonConverterConfig config) {
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                if (!(value instanceof java.util.Date))</span>
+<span class="nc" id="L208">                    throw new DataException(&quot;Invalid type for Timestamp, expected Date but was &quot; + value.getClass());</span>
+<span class="nc" id="L209">                return JSON_NODE_FACTORY.numberNode(Timestamp.fromLogical(schema, (java.util.Date) value));</span>
+            }
+
+            @Override
+            public Object toConnect(final Schema schema, final JsonNode value) {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">                if (!(value.isIntegralNumber()))</span>
+<span class="nc" id="L215">                    throw new DataException(&quot;Invalid type for Timestamp, underlying representation should be integral but was &quot; + value.getNodeType());</span>
+<span class="nc" id="L216">                return Timestamp.toLogical(schema, value.longValue());</span>
+            }
+        });
+<span class="fc" id="L219">    }</span>
+
+    private JsonConverterConfig config;
+    private Cache&lt;Schema, ObjectNode&gt; fromConnectSchemaCache;
+    private Cache&lt;JsonNode, Schema&gt; toConnectSchemaCache;
+<span class="fc" id="L224">    private Schema schema = null;     // if a schema is provided in config, this schema will be used for all messages for sink connector</span>
+
+    private final JsonSerializer serializer;
+    private final JsonDeserializer deserializer;
+
+    public JsonConverter() {
+<span class="fc" id="L230">        this(true);</span>
+<span class="fc" id="L231">    }</span>
+
+    /**
+     * Creates a JsonConvert initializing serializer and deserializer.
+     *
+     * @param enableBlackbird permits to enable/disable the registration of Jackson Blackbird module.
+     * &lt;p&gt;
+     * NOTE: This is visible only for testing
+     */
+<span class="fc" id="L240">    public JsonConverter(boolean enableBlackbird) {</span>
+<span class="fc" id="L241">        serializer = new JsonSerializer(</span>
+<span class="fc" id="L242">            Set.of(),</span>
+            JSON_NODE_FACTORY,
+            enableBlackbird
+        );
+
+<span class="fc" id="L247">        deserializer = new JsonDeserializer(</span>
+<span class="fc" id="L248">            Set.of(</span>
+                // this ensures that the JsonDeserializer maintains full precision on
+                // floating point numbers that cannot fit into float64
+                DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS
+            ),
+            JSON_NODE_FACTORY,
+            enableBlackbird
+        );
+<span class="fc" id="L256">    }</span>
+
+    // visible for testing
+    long sizeOfFromConnectSchemaCache() {
+<span class="nc" id="L260">        return fromConnectSchemaCache.size();</span>
+    }
+
+    // visible for testing
+    long sizeOfToConnectSchemaCache() {
+<span class="nc" id="L265">        return toConnectSchemaCache.size();</span>
+    }
+
+    @Override
+    public String version() {
+<span class="fc" id="L270">        return AppInfoParser.getVersion();</span>
+    }
+
+    @Override
+    public ConfigDef config() {
+<span class="fc" id="L275">        return JsonConverterConfig.configDef();</span>
+    }
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs) {
+<span class="fc" id="L280">        config = new JsonConverterConfig(configs);</span>
+
+<span class="fc bfc" id="L282" title="All 2 branches covered.">        serializer.configure(configs, config.type() == ConverterType.KEY);</span>
+<span class="fc bfc" id="L283" title="All 2 branches covered.">        deserializer.configure(configs, config.type() == ConverterType.KEY);</span>
+
+<span class="fc" id="L285">        fromConnectSchemaCache = new SynchronizedCache&lt;&gt;(new LRUCache&lt;&gt;(config.schemaCacheSize()));</span>
+<span class="fc" id="L286">        toConnectSchemaCache = new SynchronizedCache&lt;&gt;(new LRUCache&lt;&gt;(config.schemaCacheSize()));</span>
+
+        try {
+<span class="fc" id="L289">            final byte[] schemaContent = config.schemaContent();</span>
+<span class="pc bpc" id="L290" title="1 of 2 branches missed.">            if (schemaContent != null) {</span>
+<span class="nc" id="L291">                final JsonNode schemaNode = deserializer.deserialize(&quot;&quot;, schemaContent);</span>
+<span class="nc" id="L292">                this.schema = asConnectSchema(schemaNode);</span>
+            }
+<span class="nc" id="L294">        } catch (SerializationException e) {</span>
+<span class="nc" id="L295">            throw new DataException(&quot;Failed to parse schema in converter config due to serialization error: &quot;, e);</span>
+<span class="fc" id="L296">        }</span>
+<span class="fc" id="L297">    }</span>
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs, boolean isKey) {
+<span class="fc" id="L301">        Map&lt;String, Object&gt; conf = new HashMap&lt;&gt;(configs);</span>
+<span class="fc bfc" id="L302" title="All 2 branches covered.">        conf.put(StringConverterConfig.TYPE_CONFIG, isKey ? ConverterType.KEY.getName() : ConverterType.VALUE.getName());</span>
+<span class="fc" id="L303">        configure(conf);</span>
+<span class="fc" id="L304">    }</span>
+
+    @Override
+    public void close() {
+<span class="fc" id="L308">        Utils.closeQuietly(this.serializer, &quot;JSON converter serializer&quot;);</span>
+<span class="fc" id="L309">        Utils.closeQuietly(this.deserializer, &quot;JSON converter deserializer&quot;);</span>
+<span class="fc" id="L310">    }</span>
+
+    @Override
+    public byte[] fromConnectHeader(String topic, String headerKey, Schema schema, Object value) {
+<span class="nc" id="L314">        return fromConnectData(topic, schema, value);</span>
+    }
+
+    @Override
+    public SchemaAndValue toConnectHeader(String topic, String headerKey, byte[] value) {
+<span class="nc" id="L319">        return toConnectData(topic, value);</span>
+    }
+
+    @Override
+    public byte[] fromConnectData(String topic, Schema schema, Object value) {
+<span class="pc bpc" id="L324" title="1 of 4 branches missed.">        if (schema == null &amp;&amp; value == null) {</span>
+<span class="nc" id="L325">            return null;</span>
+        }
+
+<span class="pc bpc" id="L328" title="1 of 2 branches missed.">        JsonNode jsonValue = config.schemasEnabled() ? convertToJsonWithEnvelope(schema, value) : convertToJsonWithoutEnvelope(schema, value);</span>
+        try {
+<span class="fc" id="L330">            return serializer.serialize(topic, jsonValue);</span>
+<span class="nc" id="L331">        } catch (SerializationException e) {</span>
+<span class="nc" id="L332">            throw new DataException(&quot;Converting Kafka Connect data to byte[] failed due to serialization error: &quot;, e);</span>
+        }
+    }
+
+    @Override
+    public SchemaAndValue toConnectData(String topic, byte[] value) {
+        JsonNode jsonValue;
+
+        // This handles a tombstone message
+<span class="fc bfc" id="L341" title="All 2 branches covered.">        if (value == null) {</span>
+<span class="fc" id="L342">            return SchemaAndValue.NULL;</span>
+        }
+
+        try {
+<span class="fc" id="L346">            jsonValue = deserializer.deserialize(topic, value);</span>
+<span class="fc" id="L347">        } catch (SerializationException e) {</span>
+<span class="fc" id="L348">            throw new DataException(&quot;Converting byte[] to Kafka Connect data failed due to serialization error: &quot;, e);</span>
+<span class="fc" id="L349">        }</span>
+
+<span class="pc bpc" id="L351" title="1 of 2 branches missed.">        if (config.schemasEnabled()) {</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">            if (schema != null) {</span>
+<span class="nc" id="L353">                return new SchemaAndValue(schema, convertToConnect(schema, jsonValue, config));</span>
+<span class="nc bnc" id="L354" title="All 8 branches missed.">            } else if (!jsonValue.isObject() || jsonValue.size() != 2 || !jsonValue.has(JsonSchema.ENVELOPE_SCHEMA_FIELD_NAME) || !jsonValue.has(JsonSchema.ENVELOPE_PAYLOAD_FIELD_NAME)) {</span>
+<span class="nc" id="L355">                throw new DataException(&quot;JsonConverter with schemas.enable requires \&quot;schema\&quot; and \&quot;payload\&quot; fields and may not contain additional fields.&quot; +</span>
+                    &quot; If you are trying to deserialize plain JSON data, set schemas.enable=false in your converter configuration.&quot;);
+            }
+        } else {
+            // The deserialized data should either be an envelope object containing the schema and the payload or the schema
+            // was stripped during serialization and we need to fill in an all-encompassing schema.
+<span class="fc" id="L361">            ObjectNode envelope = JSON_NODE_FACTORY.objectNode();</span>
+<span class="fc" id="L362">            envelope.set(JsonSchema.ENVELOPE_SCHEMA_FIELD_NAME, null);</span>
+<span class="fc" id="L363">            envelope.set(JsonSchema.ENVELOPE_PAYLOAD_FIELD_NAME, jsonValue);</span>
+<span class="fc" id="L364">            jsonValue = envelope;</span>
+        }
+
+<span class="fc" id="L367">        Schema schema = asConnectSchema(jsonValue.get(JsonSchema.ENVELOPE_SCHEMA_FIELD_NAME));</span>
+<span class="fc" id="L368">        return new SchemaAndValue(</span>
+                schema,
+<span class="fc" id="L370">                convertToConnect(schema, jsonValue.get(JsonSchema.ENVELOPE_PAYLOAD_FIELD_NAME), config)</span>
+        );
+    }
+
+    public ObjectNode asJsonSchema(Schema schema) {
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        if (schema == null)</span>
+<span class="nc" id="L376">            return null;</span>
+
+<span class="nc" id="L378">        ObjectNode cached = fromConnectSchemaCache.get(schema);</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        if (cached != null)</span>
+<span class="nc" id="L380">            return cached;</span>
+
+        final ObjectNode jsonSchema;
+<span class="nc bnc" id="L383" title="All 13 branches missed.">        switch (schema.type()) {</span>
+            case BOOLEAN:
+<span class="nc" id="L385">                jsonSchema = JsonSchema.BOOLEAN_SCHEMA.deepCopy();</span>
+<span class="nc" id="L386">                break;</span>
+            case BYTES:
+<span class="nc" id="L388">                jsonSchema = JsonSchema.BYTES_SCHEMA.deepCopy();</span>
+<span class="nc" id="L389">                break;</span>
+            case FLOAT64:
+<span class="nc" id="L391">                jsonSchema = JsonSchema.DOUBLE_SCHEMA.deepCopy();</span>
+<span class="nc" id="L392">                break;</span>
+            case FLOAT32:
+<span class="nc" id="L394">                jsonSchema = JsonSchema.FLOAT_SCHEMA.deepCopy();</span>
+<span class="nc" id="L395">                break;</span>
+            case INT8:
+<span class="nc" id="L397">                jsonSchema = JsonSchema.INT8_SCHEMA.deepCopy();</span>
+<span class="nc" id="L398">                break;</span>
+            case INT16:
+<span class="nc" id="L400">                jsonSchema = JsonSchema.INT16_SCHEMA.deepCopy();</span>
+<span class="nc" id="L401">                break;</span>
+            case INT32:
+<span class="nc" id="L403">                jsonSchema = JsonSchema.INT32_SCHEMA.deepCopy();</span>
+<span class="nc" id="L404">                break;</span>
+            case INT64:
+<span class="nc" id="L406">                jsonSchema = JsonSchema.INT64_SCHEMA.deepCopy();</span>
+<span class="nc" id="L407">                break;</span>
+            case STRING:
+<span class="nc" id="L409">                jsonSchema = JsonSchema.STRING_SCHEMA.deepCopy();</span>
+<span class="nc" id="L410">                break;</span>
+            case ARRAY:
+<span class="nc" id="L412">                jsonSchema = JSON_NODE_FACTORY.objectNode().put(JsonSchema.SCHEMA_TYPE_FIELD_NAME, JsonSchema.ARRAY_TYPE_NAME);</span>
+<span class="nc" id="L413">                jsonSchema.set(JsonSchema.ARRAY_ITEMS_FIELD_NAME, asJsonSchema(schema.valueSchema()));</span>
+<span class="nc" id="L414">                break;</span>
+            case MAP:
+<span class="nc" id="L416">                jsonSchema = JSON_NODE_FACTORY.objectNode().put(JsonSchema.SCHEMA_TYPE_FIELD_NAME, JsonSchema.MAP_TYPE_NAME);</span>
+<span class="nc" id="L417">                jsonSchema.set(JsonSchema.MAP_KEY_FIELD_NAME, asJsonSchema(schema.keySchema()));</span>
+<span class="nc" id="L418">                jsonSchema.set(JsonSchema.MAP_VALUE_FIELD_NAME, asJsonSchema(schema.valueSchema()));</span>
+<span class="nc" id="L419">                break;</span>
+            case STRUCT:
+<span class="nc" id="L421">                jsonSchema = JSON_NODE_FACTORY.objectNode().put(JsonSchema.SCHEMA_TYPE_FIELD_NAME, JsonSchema.STRUCT_TYPE_NAME);</span>
+<span class="nc" id="L422">                ArrayNode fields = JSON_NODE_FACTORY.arrayNode();</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">                for (Field field : schema.fields()) {</span>
+<span class="nc" id="L424">                    ObjectNode fieldJsonSchema = asJsonSchema(field.schema()).deepCopy();</span>
+<span class="nc" id="L425">                    fieldJsonSchema.put(JsonSchema.STRUCT_FIELD_NAME_FIELD_NAME, field.name());</span>
+<span class="nc" id="L426">                    fields.add(fieldJsonSchema);</span>
+<span class="nc" id="L427">                }</span>
+<span class="nc" id="L428">                jsonSchema.set(JsonSchema.STRUCT_FIELDS_FIELD_NAME, fields);</span>
+<span class="nc" id="L429">                break;</span>
+            default:
+<span class="nc" id="L431">                throw new DataException(&quot;Couldn't translate unsupported schema type &quot; + schema + &quot;.&quot;);</span>
+        }
+
+<span class="nc" id="L434">        jsonSchema.put(JsonSchema.SCHEMA_OPTIONAL_FIELD_NAME, schema.isOptional());</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">        if (schema.name() != null)</span>
+<span class="nc" id="L436">            jsonSchema.put(JsonSchema.SCHEMA_NAME_FIELD_NAME, schema.name());</span>
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        if (schema.version() != null)</span>
+<span class="nc" id="L438">            jsonSchema.put(JsonSchema.SCHEMA_VERSION_FIELD_NAME, schema.version());</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">        if (schema.doc() != null)</span>
+<span class="nc" id="L440">            jsonSchema.put(JsonSchema.SCHEMA_DOC_FIELD_NAME, schema.doc());</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">        if (schema.parameters() != null) {</span>
+<span class="nc" id="L442">            ObjectNode jsonSchemaParams = JSON_NODE_FACTORY.objectNode();</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">            for (Map.Entry&lt;String, String&gt; prop : schema.parameters().entrySet())</span>
+<span class="nc" id="L444">                jsonSchemaParams.put(prop.getKey(), prop.getValue());</span>
+<span class="nc" id="L445">            jsonSchema.set(JsonSchema.SCHEMA_PARAMETERS_FIELD_NAME, jsonSchemaParams);</span>
+        }
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        if (schema.defaultValue() != null)</span>
+<span class="nc" id="L448">            jsonSchema.set(JsonSchema.SCHEMA_DEFAULT_FIELD_NAME, convertToJson(schema, schema.defaultValue()));</span>
+
+<span class="nc" id="L450">        fromConnectSchemaCache.put(schema, jsonSchema);</span>
+<span class="nc" id="L451">        return jsonSchema;</span>
+    }
+
+
+    public Schema asConnectSchema(JsonNode jsonSchema) {
+<span class="pc bpc" id="L456" title="1 of 2 branches missed.">        if (jsonSchema.isNull())</span>
+<span class="fc" id="L457">            return null;</span>
+
+<span class="nc" id="L459">        Schema cached = toConnectSchemaCache.get(jsonSchema);</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">        if (cached != null)</span>
+<span class="nc" id="L461">            return cached;</span>
+
+<span class="nc" id="L463">        JsonNode schemaTypeNode = jsonSchema.get(JsonSchema.SCHEMA_TYPE_FIELD_NAME);</span>
+<span class="nc bnc" id="L464" title="All 4 branches missed.">        if (schemaTypeNode == null || !schemaTypeNode.isTextual())</span>
+<span class="nc" id="L465">            throw new DataException(&quot;Schema must contain 'type' field&quot;);</span>
+
+        final SchemaBuilder builder;
+<span class="nc bnc" id="L468" title="All 13 branches missed.">        switch (schemaTypeNode.textValue()) {</span>
+            case JsonSchema.BOOLEAN_TYPE_NAME:
+<span class="nc" id="L470">                builder = SchemaBuilder.bool();</span>
+<span class="nc" id="L471">                break;</span>
+            case JsonSchema.INT8_TYPE_NAME:
+<span class="nc" id="L473">                builder = SchemaBuilder.int8();</span>
+<span class="nc" id="L474">                break;</span>
+            case JsonSchema.INT16_TYPE_NAME:
+<span class="nc" id="L476">                builder = SchemaBuilder.int16();</span>
+<span class="nc" id="L477">                break;</span>
+            case JsonSchema.INT32_TYPE_NAME:
+<span class="nc" id="L479">                builder = SchemaBuilder.int32();</span>
+<span class="nc" id="L480">                break;</span>
+            case JsonSchema.INT64_TYPE_NAME:
+<span class="nc" id="L482">                builder = SchemaBuilder.int64();</span>
+<span class="nc" id="L483">                break;</span>
+            case JsonSchema.FLOAT_TYPE_NAME:
+<span class="nc" id="L485">                builder = SchemaBuilder.float32();</span>
+<span class="nc" id="L486">                break;</span>
+            case JsonSchema.DOUBLE_TYPE_NAME:
+<span class="nc" id="L488">                builder = SchemaBuilder.float64();</span>
+<span class="nc" id="L489">                break;</span>
+            case JsonSchema.BYTES_TYPE_NAME:
+<span class="nc" id="L491">                builder = SchemaBuilder.bytes();</span>
+<span class="nc" id="L492">                break;</span>
+            case JsonSchema.STRING_TYPE_NAME:
+<span class="nc" id="L494">                builder = SchemaBuilder.string();</span>
+<span class="nc" id="L495">                break;</span>
+            case JsonSchema.ARRAY_TYPE_NAME:
+<span class="nc" id="L497">                JsonNode elemSchema = jsonSchema.get(JsonSchema.ARRAY_ITEMS_FIELD_NAME);</span>
+<span class="nc bnc" id="L498" title="All 4 branches missed.">                if (elemSchema == null || elemSchema.isNull())</span>
+<span class="nc" id="L499">                    throw new DataException(&quot;Array schema did not specify the element type&quot;);</span>
+<span class="nc" id="L500">                builder = SchemaBuilder.array(asConnectSchema(elemSchema));</span>
+<span class="nc" id="L501">                break;</span>
+            case JsonSchema.MAP_TYPE_NAME:
+<span class="nc" id="L503">                JsonNode keySchema = jsonSchema.get(JsonSchema.MAP_KEY_FIELD_NAME);</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">                if (keySchema == null)</span>
+<span class="nc" id="L505">                    throw new DataException(&quot;Map schema did not specify the key type&quot;);</span>
+<span class="nc" id="L506">                JsonNode valueSchema = jsonSchema.get(JsonSchema.MAP_VALUE_FIELD_NAME);</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">                if (valueSchema == null)</span>
+<span class="nc" id="L508">                    throw new DataException(&quot;Map schema did not specify the value type&quot;);</span>
+<span class="nc" id="L509">                builder = SchemaBuilder.map(asConnectSchema(keySchema), asConnectSchema(valueSchema));</span>
+<span class="nc" id="L510">                break;</span>
+            case JsonSchema.STRUCT_TYPE_NAME:
+<span class="nc" id="L512">                builder = SchemaBuilder.struct();</span>
+<span class="nc" id="L513">                JsonNode fields = jsonSchema.get(JsonSchema.STRUCT_FIELDS_FIELD_NAME);</span>
+<span class="nc bnc" id="L514" title="All 4 branches missed.">                if (fields == null || !fields.isArray())</span>
+<span class="nc" id="L515">                    throw new DataException(&quot;Struct schema's \&quot;fields\&quot; argument is not an array.&quot;);</span>
+<span class="nc bnc" id="L516" title="All 2 branches missed.">                for (JsonNode field : fields) {</span>
+<span class="nc" id="L517">                    JsonNode jsonFieldName = field.get(JsonSchema.STRUCT_FIELD_NAME_FIELD_NAME);</span>
+<span class="nc bnc" id="L518" title="All 4 branches missed.">                    if (jsonFieldName == null || !jsonFieldName.isTextual())</span>
+<span class="nc" id="L519">                        throw new DataException(&quot;Struct schema's field name not specified properly&quot;);</span>
+<span class="nc" id="L520">                    builder.field(jsonFieldName.asText(), asConnectSchema(field));</span>
+<span class="nc" id="L521">                }</span>
+<span class="nc" id="L522">                break;</span>
+            default:
+<span class="nc" id="L524">                throw new DataException(&quot;Unknown schema type: &quot; + schemaTypeNode.textValue());</span>
+        }
+
+
+<span class="nc" id="L528">        JsonNode schemaOptionalNode = jsonSchema.get(JsonSchema.SCHEMA_OPTIONAL_FIELD_NAME);</span>
+<span class="nc bnc" id="L529" title="All 6 branches missed.">        if (schemaOptionalNode != null &amp;&amp; schemaOptionalNode.isBoolean() &amp;&amp; schemaOptionalNode.booleanValue())</span>
+<span class="nc" id="L530">            builder.optional();</span>
+        else
+<span class="nc" id="L532">            builder.required();</span>
+
+<span class="nc" id="L534">        JsonNode schemaNameNode = jsonSchema.get(JsonSchema.SCHEMA_NAME_FIELD_NAME);</span>
+<span class="nc bnc" id="L535" title="All 4 branches missed.">        if (schemaNameNode != null &amp;&amp; schemaNameNode.isTextual())</span>
+<span class="nc" id="L536">            builder.name(schemaNameNode.textValue());</span>
+
+<span class="nc" id="L538">        JsonNode schemaVersionNode = jsonSchema.get(JsonSchema.SCHEMA_VERSION_FIELD_NAME);</span>
+<span class="nc bnc" id="L539" title="All 4 branches missed.">        if (schemaVersionNode != null &amp;&amp; schemaVersionNode.isIntegralNumber()) {</span>
+<span class="nc" id="L540">            builder.version(schemaVersionNode.intValue());</span>
+        }
+
+<span class="nc" id="L543">        JsonNode schemaDocNode = jsonSchema.get(JsonSchema.SCHEMA_DOC_FIELD_NAME);</span>
+<span class="nc bnc" id="L544" title="All 4 branches missed.">        if (schemaDocNode != null &amp;&amp; schemaDocNode.isTextual())</span>
+<span class="nc" id="L545">            builder.doc(schemaDocNode.textValue());</span>
+
+<span class="nc" id="L547">        JsonNode schemaParamsNode = jsonSchema.get(JsonSchema.SCHEMA_PARAMETERS_FIELD_NAME);</span>
+<span class="nc bnc" id="L548" title="All 4 branches missed.">        if (schemaParamsNode != null &amp;&amp; schemaParamsNode.isObject()) {</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">            for (Map.Entry&lt;String, JsonNode&gt; entry : schemaParamsNode.properties()) {</span>
+<span class="nc" id="L550">                JsonNode paramValue = entry.getValue();</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">                if (!paramValue.isTextual())</span>
+<span class="nc" id="L552">                    throw new DataException(&quot;Schema parameters must have string values.&quot;);</span>
+<span class="nc" id="L553">                builder.parameter(entry.getKey(), paramValue.textValue());</span>
+<span class="nc" id="L554">            }</span>
+        }
+
+<span class="nc" id="L557">        JsonNode schemaDefaultNode = jsonSchema.get(JsonSchema.SCHEMA_DEFAULT_FIELD_NAME);</span>
+<span class="nc bnc" id="L558" title="All 2 branches missed.">        if (schemaDefaultNode != null)</span>
+<span class="nc" id="L559">            builder.defaultValue(convertToConnect(builder, schemaDefaultNode, config));</span>
+
+<span class="nc" id="L561">        Schema result = builder.build();</span>
+<span class="nc" id="L562">        toConnectSchemaCache.put(jsonSchema, result);</span>
+<span class="nc" id="L563">        return result;</span>
+    }
+
+
+    /**
+     * Convert this object, in the {@link org.apache.kafka.connect.data} format, into a JSON object with an envelope
+     * object containing schema and payload fields.
+     * @param schema the schema for the data
+     * @param value the value
+     * @return JsonNode-encoded version
+     */
+    private JsonNode convertToJsonWithEnvelope(Schema schema, Object value) {
+<span class="nc" id="L575">        return new JsonSchema.Envelope(asJsonSchema(schema), convertToJson(schema, value)).toJsonNode();</span>
+    }
+
+    private JsonNode convertToJsonWithoutEnvelope(Schema schema, Object value) {
+<span class="fc" id="L579">        return convertToJson(schema, value);</span>
+    }
+
+    /**
+     * Convert this object, in the {@link org.apache.kafka.connect.data} format, into a JSON object, returning both the
+     * schema and the converted object.
+     */
+    private JsonNode convertToJson(Schema schema, Object value) {
+<span class="fc bfc" id="L587" title="All 2 branches covered.">        if (value == null) {</span>
+<span class="pc bpc" id="L588" title="1 of 2 branches missed.">            if (schema == null) // Any schema is valid and we don't have a default, so treat this as an optional schema</span>
+<span class="nc" id="L589">                return null;</span>
+<span class="pc bpc" id="L590" title="3 of 4 branches missed.">            if (schema.defaultValue() != null &amp;&amp; config.replaceNullWithDefault())</span>
+<span class="nc" id="L591">                return convertToJson(schema, schema.defaultValue());</span>
+<span class="pc bpc" id="L592" title="1 of 2 branches missed.">            if (schema.isOptional())</span>
+<span class="fc" id="L593">                return JSON_NODE_FACTORY.nullNode();</span>
+<span class="nc" id="L594">            throw new DataException(&quot;Conversion error: null value for field that is required and has no default value&quot;);</span>
+        }
+
+<span class="pc bpc" id="L597" title="1 of 4 branches missed.">        if (schema != null &amp;&amp; schema.name() != null) {</span>
+<span class="nc" id="L598">            LogicalTypeConverter logicalConverter = LOGICAL_CONVERTERS.get(schema.name());</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">            if (logicalConverter != null)</span>
+<span class="nc" id="L600">                return logicalConverter.toJson(schema, value, config);</span>
+        }
+
+        try {
+            final Schema.Type schemaType;
+<span class="fc bfc" id="L605" title="All 2 branches covered.">            if (schema == null) {</span>
+<span class="fc" id="L606">                schemaType = ConnectSchema.schemaType(value.getClass());</span>
+<span class="pc bpc" id="L607" title="1 of 2 branches missed.">                if (schemaType == null)</span>
+<span class="nc" id="L608">                    throw new DataException(&quot;Java class &quot; + value.getClass() + &quot; does not have corresponding schema type.&quot;);</span>
+            } else {
+<span class="fc" id="L610">                schemaType = schema.type();</span>
+            }
+<span class="pc bpc" id="L612" title="7 of 13 branches missed.">            switch (schemaType) {</span>
+                case INT8:
+<span class="nc" id="L614">                    return JSON_NODE_FACTORY.numberNode((Byte) value);</span>
+                case INT16:
+<span class="nc" id="L616">                    return JSON_NODE_FACTORY.numberNode((Short) value);</span>
+                case INT32:
+<span class="fc" id="L618">                    return JSON_NODE_FACTORY.numberNode((Integer) value);</span>
+                case INT64:
+<span class="fc" id="L620">                    return JSON_NODE_FACTORY.numberNode((Long) value);</span>
+                case FLOAT32:
+<span class="nc" id="L622">                    return JSON_NODE_FACTORY.numberNode((Float) value);</span>
+                case FLOAT64:
+<span class="nc" id="L624">                    return JSON_NODE_FACTORY.numberNode((Double) value);</span>
+                case BOOLEAN:
+<span class="nc" id="L626">                    return JSON_NODE_FACTORY.booleanNode((Boolean) value);</span>
+                case STRING:
+<span class="fc" id="L628">                    CharSequence charSeq = (CharSequence) value;</span>
+<span class="fc" id="L629">                    return JSON_NODE_FACTORY.textNode(charSeq.toString());</span>
+                case BYTES:
+<span class="nc bnc" id="L631" title="All 2 branches missed.">                    if (value instanceof byte[])</span>
+<span class="nc" id="L632">                        return JSON_NODE_FACTORY.binaryNode((byte[]) value);</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">                    else if (value instanceof ByteBuffer)</span>
+<span class="nc" id="L634">                        return JSON_NODE_FACTORY.binaryNode(((ByteBuffer) value).array());</span>
+                    else
+<span class="nc" id="L636">                        throw new DataException(&quot;Invalid type for bytes type: &quot; + value.getClass());</span>
+                case ARRAY: {
+<span class="fc" id="L638">                    Collection&lt;?&gt; collection = (Collection&lt;?&gt;) value;</span>
+<span class="fc" id="L639">                    ArrayNode list = JSON_NODE_FACTORY.arrayNode();</span>
+<span class="fc bfc" id="L640" title="All 2 branches covered.">                    for (Object elem : collection) {</span>
+<span class="pc bpc" id="L641" title="1 of 2 branches missed.">                        Schema valueSchema = schema == null ? null : schema.valueSchema();</span>
+<span class="fc" id="L642">                        JsonNode fieldValue = convertToJson(valueSchema, elem);</span>
+<span class="fc" id="L643">                        list.add(fieldValue);</span>
+<span class="fc" id="L644">                    }</span>
+<span class="fc" id="L645">                    return list;</span>
+                }
+                case MAP: {
+<span class="fc" id="L648">                    Map&lt;?, ?&gt; map = (Map&lt;?, ?&gt;) value;</span>
+                    // If true, using string keys and JSON object; if false, using non-string keys and Array-encoding
+                    boolean objectMode;
+<span class="fc bfc" id="L651" title="All 2 branches covered.">                    if (schema == null) {</span>
+<span class="fc" id="L652">                        objectMode = true;</span>
+<span class="fc bfc" id="L653" title="All 2 branches covered.">                        for (Map.Entry&lt;?, ?&gt; entry : map.entrySet()) {</span>
+<span class="pc bpc" id="L654" title="1 of 2 branches missed.">                            if (!(entry.getKey() instanceof String)) {</span>
+<span class="nc" id="L655">                                objectMode = false;</span>
+<span class="nc" id="L656">                                break;</span>
+                            }
+<span class="fc" id="L658">                        }</span>
+                    } else {
+<span class="pc bpc" id="L660" title="1 of 2 branches missed.">                        objectMode = schema.keySchema().type() == Schema.Type.STRING;</span>
+                    }
+<span class="fc" id="L662">                    ObjectNode obj = null;</span>
+<span class="fc" id="L663">                    ArrayNode list = null;</span>
+<span class="pc bpc" id="L664" title="1 of 2 branches missed.">                    if (objectMode)</span>
+<span class="fc" id="L665">                        obj = JSON_NODE_FACTORY.objectNode();</span>
+                    else
+<span class="nc" id="L667">                        list = JSON_NODE_FACTORY.arrayNode();</span>
+<span class="fc bfc" id="L668" title="All 2 branches covered.">                    for (Map.Entry&lt;?, ?&gt; entry : map.entrySet()) {</span>
+<span class="fc bfc" id="L669" title="All 2 branches covered.">                        Schema keySchema = schema == null ? null : schema.keySchema();</span>
+<span class="fc bfc" id="L670" title="All 2 branches covered.">                        Schema valueSchema = schema == null ? null : schema.valueSchema();</span>
+<span class="fc" id="L671">                        JsonNode mapKey = convertToJson(keySchema, entry.getKey());</span>
+<span class="fc" id="L672">                        JsonNode mapValue = convertToJson(valueSchema, entry.getValue());</span>
+
+<span class="pc bpc" id="L674" title="1 of 2 branches missed.">                        if (objectMode)</span>
+<span class="fc" id="L675">                            obj.set(mapKey.asText(), mapValue);</span>
+                        else
+<span class="nc" id="L677">                            list.add(JSON_NODE_FACTORY.arrayNode().add(mapKey).add(mapValue));</span>
+<span class="fc" id="L678">                    }</span>
+<span class="pc bpc" id="L679" title="1 of 2 branches missed.">                    return objectMode ? obj : list;</span>
+                }
+                case STRUCT: {
+<span class="fc" id="L682">                    Struct struct = (Struct) value;</span>
+<span class="pc bpc" id="L683" title="1 of 2 branches missed.">                    if (!struct.schema().equals(schema))</span>
+<span class="nc" id="L684">                        throw new DataException(&quot;Mismatching schema.&quot;);</span>
+<span class="fc" id="L685">                    ObjectNode obj = JSON_NODE_FACTORY.objectNode();</span>
+<span class="fc bfc" id="L686" title="All 2 branches covered.">                    for (Field field : schema.fields()) {</span>
+<span class="fc" id="L687">                        obj.set(field.name(), convertToJson(field.schema(), struct.getWithoutDefault(field.name())));</span>
+<span class="fc" id="L688">                    }</span>
+<span class="fc" id="L689">                    return obj;</span>
+                }
+            }
+
+<span class="nc" id="L693">            throw new DataException(&quot;Couldn't convert &quot; + value + &quot; to JSON.&quot;);</span>
+<span class="nc" id="L694">        } catch (ClassCastException e) {</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">            String schemaTypeStr = (schema != null) ? schema.type().toString() : &quot;unknown schema&quot;;</span>
+<span class="nc" id="L696">            throw new DataException(&quot;Invalid type for &quot; + schemaTypeStr + &quot;: &quot; + value.getClass());</span>
+        }
+    }
+
+
+    private static Object convertToConnect(Schema schema, JsonNode jsonValue, JsonConverterConfig config) {
+        final Schema.Type schemaType;
+<span class="pc bpc" id="L703" title="1 of 2 branches missed.">        if (schema != null) {</span>
+<span class="nc" id="L704">            schemaType = schema.type();</span>
+<span class="nc bnc" id="L705" title="All 4 branches missed.">            if (jsonValue == null || jsonValue.isNull()) {</span>
+<span class="nc bnc" id="L706" title="All 4 branches missed.">                if (schema.defaultValue() != null &amp;&amp; config.replaceNullWithDefault())</span>
+<span class="nc" id="L707">                    return schema.defaultValue(); // any logical type conversions should already have been applied</span>
+<span class="nc bnc" id="L708" title="All 2 branches missed.">                if (schema.isOptional())</span>
+<span class="nc" id="L709">                    return null;</span>
+<span class="nc" id="L710">                throw new DataException(&quot;Invalid null value for required &quot; + schemaType +  &quot; field&quot;);</span>
+            }
+        } else {
+<span class="pc bpc" id="L713" title="2 of 7 branches missed.">            switch (jsonValue.getNodeType()) {</span>
+                case NULL:
+                case MISSING:
+                    // Special case. With no schema
+<span class="fc" id="L717">                    return null;</span>
+                case BOOLEAN:
+<span class="nc" id="L719">                    schemaType = Schema.Type.BOOLEAN;</span>
+<span class="nc" id="L720">                    break;</span>
+                case NUMBER:
+<span class="pc bpc" id="L722" title="1 of 2 branches missed.">                    if (jsonValue.isIntegralNumber())</span>
+<span class="fc" id="L723">                        schemaType = Schema.Type.INT64;</span>
+                    else
+<span class="nc" id="L725">                        schemaType = Schema.Type.FLOAT64;</span>
+<span class="nc" id="L726">                    break;</span>
+                case ARRAY:
+<span class="fc" id="L728">                    schemaType = Schema.Type.ARRAY;</span>
+<span class="fc" id="L729">                    break;</span>
+                case OBJECT:
+<span class="fc" id="L731">                    schemaType = Schema.Type.MAP;</span>
+<span class="fc" id="L732">                    break;</span>
+                case STRING:
+<span class="fc" id="L734">                    schemaType = Schema.Type.STRING;</span>
+<span class="fc" id="L735">                    break;</span>
+
+                case BINARY:
+                case POJO:
+                default:
+<span class="nc" id="L740">                    schemaType = null;</span>
+                    break;
+            }
+        }
+
+<span class="fc" id="L745">        final JsonToConnectTypeConverter typeConverter = TO_CONNECT_CONVERTERS.get(schemaType);</span>
+<span class="pc bpc" id="L746" title="1 of 2 branches missed.">        if (typeConverter == null)</span>
+<span class="nc" id="L747">            throw new DataException(&quot;Unknown schema type: &quot; + schemaType);</span>
+
+<span class="pc bpc" id="L749" title="3 of 4 branches missed.">        if (schema != null &amp;&amp; schema.name() != null) {</span>
+<span class="nc" id="L750">            LogicalTypeConverter logicalConverter = LOGICAL_CONVERTERS.get(schema.name());</span>
+<span class="nc bnc" id="L751" title="All 2 branches missed.">            if (logicalConverter != null)</span>
+<span class="nc" id="L752">                return logicalConverter.toConnect(schema, jsonValue);</span>
+        }
+
+<span class="fc" id="L755">        return typeConverter.convert(schema, jsonValue, config);</span>
+    }
+
+    private interface JsonToConnectTypeConverter {
+        Object convert(Schema schema, JsonNode value, JsonConverterConfig config);
+    }
+
+    private interface LogicalTypeConverter {
+        JsonNode toJson(Schema schema, Object value, JsonConverterConfig config);
+        Object toConnect(Schema schema, JsonNode value);
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

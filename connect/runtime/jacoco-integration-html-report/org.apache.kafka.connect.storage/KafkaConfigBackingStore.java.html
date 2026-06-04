@@ -1,0 +1,1340 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaConfigBackingStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.storage</a> &gt; <span class="el_source">KafkaConfigBackingStore.java</span></div><h1>KafkaConfigBackingStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.storage;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.SchemaAndValue;
+import org.apache.kafka.connect.data.SchemaBuilder;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.runtime.Herder;
+import org.apache.kafka.connect.runtime.RestartRequest;
+import org.apache.kafka.connect.runtime.SessionKey;
+import org.apache.kafka.connect.runtime.TargetState;
+import org.apache.kafka.connect.runtime.WorkerConfig;
+import org.apache.kafka.connect.runtime.WorkerConfigTransformer;
+import org.apache.kafka.connect.runtime.distributed.ConnectProtocolCompatibility;
+import org.apache.kafka.connect.runtime.distributed.DistributedConfig;
+import org.apache.kafka.connect.util.Callback;
+import org.apache.kafka.connect.util.ConnectUtils;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+import org.apache.kafka.connect.util.KafkaBasedLog;
+import org.apache.kafka.connect.util.TopicAdmin;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Supplier;
+
+import javax.crypto.spec.SecretKeySpec;
+
+import static org.apache.kafka.connect.runtime.TargetState.PAUSED;
+import static org.apache.kafka.connect.runtime.TargetState.STOPPED;
+import static org.apache.kafka.connect.util.ConnectUtils.className;
+
+/**
+ * &lt;p&gt;
+ * Provides persistent storage of Kafka Connect connector configurations in a Kafka topic.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * This class manages both connector and task configurations, among other various configurations. It tracks seven types
+ * of records:
+ * &lt;ol&gt;
+ *   &lt;li&gt; Connector config: map of string -&gt; string configurations passed to the Connector class, with support for
+ *   expanding this format if necessary. (Kafka key: connector-[connector-id]).
+ *   These configs are *not* ephemeral. They represent the source of truth. If the entire Connect
+ *   cluster goes down, this is all that is really needed to recover.
+ *   &lt;li&gt; Task configs: map of string -&gt; string configurations passed to the Task class, with support for expanding
+ *   this format if necessary. (Kafka key: task-[connector-id]-[task-id]).
+ *   These configs are ephemeral; they are stored here to:
+ *     &lt;ul&gt;
+ *       &lt;li&gt; disseminate them to all workers while ensuring agreement
+ *       &lt;li&gt; to allow faster cluster/worker recovery since the common case of recovery (restoring a connector) will simply
+ *       result in the same task configuration as before the failure.
+ *     &lt;/ul&gt;
+ *   &lt;li&gt; Task commit &quot;configs&quot;: records indicating that previous task config entries should be committed and all task
+ *   configs for a connector can be applied. (Kafka key: commit-[connector-id].
+ *   This config has two effects. First, it records the number of tasks the connector is currently
+ *   running (and can therefore increase/decrease parallelism). Second, because each task config
+ *   is stored separately but they need to be applied together to ensure each partition is assigned
+ *   to a single task, this record also indicates that task configs for the specified connector
+ *   can be &quot;applied&quot; or &quot;committed&quot;.
+ *   &lt;li&gt; Connector target states: records indicating the {@link TargetState} for a connector
+ *   &lt;li&gt; {@link RestartRequest Restart requests}: records representing requests to restart a connector and / or its
+ *   tasks. See &lt;a href=&quot;https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=181308623&quot;&gt;KIP-745&lt;/a&gt; for more
+ *   details.
+ *   &lt;li&gt; Task count records: an integer value that that tracks the number of task producers (for source connectors) that
+ *   will have to be fenced out if a connector is reconfigured before bringing up any tasks with the new set of task
+ *   configurations. This is required for exactly-once support for source connectors, see
+ *   &lt;a href=&quot;https://cwiki.apache.org/confluence/display/KAFKA/KIP-618%3A+Exactly-Once+Support+for+Source+Connectors&quot;&gt;KIP-618&lt;/a&gt;
+ *   for more details.
+ *   &lt;li&gt; Session key records: A {@link SessionKey} generated by the leader of the cluster when
+ *   {@link ConnectProtocolCompatibility#SESSIONED} is the Connect protocol being used by the cluster. This session key
+ *   is used to verify internal REST requests between workers in the cluster. See
+ *   &lt;a href=&quot;https://cwiki.apache.org/confluence/display/KAFKA/KIP-507%3A+Securing+Internal+Connect+REST+Endpoints&quot;&gt;KIP-507&lt;/a&gt;
+ *   for more details.
+ * &lt;/ol&gt;
+ * &lt;p/&gt;
+ * &lt;p&gt;
+ * This configuration is expected to be stored in a *single partition* and *compacted* topic. Using a single partition
+ * ensures we can enforce ordering on messages, allowing Kafka to be used as a write ahead log. Compaction allows
+ * us to clean up outdated configurations over time. However, this combination has some important implications for
+ * the implementation of this class and the configuration state that it may expose.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Connector configurations are independent of all other configs, so they are handled easily. Writing a single record
+ * is already atomic, so these can be applied as soon as they are read. One connectors config does not affect any
+ * others, and they do not need to coordinate with the connector's task configuration at all.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * The most obvious implication for task configs is the need for the commit messages. This class doesn't currently make
+ * use of Kafka's multi-record transactions and instead uses task commit messages to ensure that readers do not
+ * end up using inconsistent configs. For example, consider if a connector wrote configs for its tasks,
+ * then was reconfigured and only managed to write updated configs for half its tasks. If task configs
+ * were applied immediately you could be using half the old configs and half the new configs. In that condition, some
+ * partitions may be double-assigned because the old config and new config may use completely different assignments.
+ * Therefore, when reading the log, we must buffer config updates for a connector's tasks and only apply atomically them
+ * once a commit message has been read.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * However, there are also further challenges. This simple buffering approach would work fine as long as the entire log was
+ * always available, but we would like to be able to enable compaction so our configuration topic does not grow
+ * indefinitely. Compaction may break a normal log because old entries will suddenly go missing. A new worker reading
+ * from the beginning of the log in order to build up the full current configuration will see task commits, but some
+ * records required for those commits will have been removed because the same keys have subsequently been rewritten.
+ * For example, if you have a sequence of record keys [connector-foo-config, task-foo-1-config, task-foo-2-config,
+ * commit-foo (2 tasks), task-foo-1-config, commit-foo (1 task)], we can end up with a compacted log containing
+ * [connector-foo-config, task-foo-2-config, commit-foo (2 tasks), task-foo-1-config, commit-foo (1 task)]. When read
+ * back, the first commit will see an invalid state because the first task-foo-1-config has been cleaned up.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Compaction can further complicate things if writing new task configs fails mid-write. Consider a similar scenario
+ * as the previous one, but in this case both the first and second update will write 2 task configs. However, the
+ * second write fails half of the way through:
+ * [connector-foo-config, task-foo-1-config, task-foo-2-config, commit-foo (2 tasks), task-foo-1-config]. Now compaction
+ * occurs and we're left with
+ * [connector-foo-config, task-foo-2-config, commit-foo (2 tasks), task-foo-1-config]. At the first commit, we don't
+ * have a complete set of configs. And because of the failure, there is no second commit. We are left in an inconsistent
+ * state with no obvious way to resolve the issue -- we can try to keep on reading, but the failed node may never
+ * recover and write the updated config. Meanwhile, other workers may have seen the entire log; they will see the second
+ * task-foo-1-config waiting to be applied, but will otherwise think everything is ok -- they have a valid set of task
+ * configs for connector &quot;foo&quot;.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Because we can encounter these inconsistencies and addressing them requires support from the rest of the system
+ * (resolving the task configuration inconsistencies requires support from the connector instance to regenerate updated
+ * configs), this class exposes not only the current set of configs, but also which connectors have inconsistent data.
+ * This allows users of this class (i.e., {@link Herder} implementations) to take action to resolve any inconsistencies. These
+ * inconsistencies should be rare (as described above, due to compaction combined with leader failures in the middle
+ * of updating task configurations).
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Note that the expectation is that this config storage system has only a single writer at a time.
+ * The caller (Herder) must ensure this is the case. In distributed mode this will require forwarding config change
+ * requests to the leader in the cluster (i.e. the worker group coordinated by the Kafka broker).
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Since processing of the config log occurs in a background thread, callers must take care when using accessors.
+ * To simplify handling this correctly, this class only exposes a mechanism to snapshot the current state of the cluster.
+ * Updates may continue to be applied (and callbacks invoked) in the background. Callers must take care that they are
+ * using a consistent snapshot and only update when it is safe. In particular, if task configs are updated which require
+ * synchronization across workers to commit offsets and update the configuration, callbacks and updates during the
+ * rebalance must be deferred.
+ * &lt;/p&gt;
+ */
+public final class KafkaConfigBackingStore extends KafkaTopicBasedBackingStore implements ConfigBackingStore {
+<span class="fc" id="L195">    private static final Logger log = LoggerFactory.getLogger(KafkaConfigBackingStore.class);</span>
+
+    public static final String TARGET_STATE_PREFIX = &quot;target-state-&quot;;
+
+    public static String TARGET_STATE_KEY(String connectorName) {
+<span class="fc" id="L200">        return TARGET_STATE_PREFIX + connectorName;</span>
+    }
+
+    public static final String CONNECTOR_PREFIX = &quot;connector-&quot;;
+
+    public static String CONNECTOR_KEY(String connectorName) {
+<span class="fc" id="L206">        return CONNECTOR_PREFIX + connectorName;</span>
+    }
+
+    public static final String TASK_PREFIX = &quot;task-&quot;;
+
+    public static String TASK_KEY(ConnectorTaskId taskId) {
+<span class="fc" id="L212">        return TASK_PREFIX + taskId.connector() + &quot;-&quot; + taskId.task();</span>
+    }
+
+    public static final String COMMIT_TASKS_PREFIX = &quot;commit-&quot;;
+
+    public static String COMMIT_TASKS_KEY(String connectorName) {
+<span class="fc" id="L218">        return COMMIT_TASKS_PREFIX + connectorName;</span>
+    }
+
+    public static final String TASK_COUNT_RECORD_PREFIX = &quot;tasks-fencing-&quot;;
+
+    public static String TASK_COUNT_RECORD_KEY(String connectorName) {
+<span class="nc" id="L224">        return TASK_COUNT_RECORD_PREFIX + connectorName;</span>
+    }
+
+    public static final String SESSION_KEY_KEY = &quot;session-key&quot;;
+
+    // Note that while using real serialization for values as we have here, but ad hoc string serialization for keys,
+    // isn't ideal, we use this approach because it avoids any potential problems with schema evolution or
+    // converter/serializer changes causing keys to change. We need to absolutely ensure that the keys remain precisely
+    // the same.
+<span class="fc" id="L233">    public static final Schema CONNECTOR_CONFIGURATION_V0 = SchemaBuilder.struct()</span>
+<span class="fc" id="L234">            .field(&quot;properties&quot;, SchemaBuilder.map(Schema.STRING_SCHEMA, Schema.OPTIONAL_STRING_SCHEMA).build())</span>
+<span class="fc" id="L235">            .build();</span>
+<span class="fc" id="L236">    public static final Schema TASK_CONFIGURATION_V0 = CONNECTOR_CONFIGURATION_V0;</span>
+<span class="fc" id="L237">    public static final Schema CONNECTOR_TASKS_COMMIT_V0 = SchemaBuilder.struct()</span>
+<span class="fc" id="L238">            .field(&quot;tasks&quot;, Schema.INT32_SCHEMA)</span>
+<span class="fc" id="L239">            .build();</span>
+<span class="fc" id="L240">    public static final Schema TARGET_STATE_V0 = SchemaBuilder.struct()</span>
+<span class="fc" id="L241">            .field(&quot;state&quot;, Schema.STRING_SCHEMA)</span>
+<span class="fc" id="L242">            .build();</span>
+<span class="fc" id="L243">    public static final Schema TARGET_STATE_V1 = SchemaBuilder.struct()</span>
+<span class="fc" id="L244">            .field(&quot;state&quot;, Schema.STRING_SCHEMA)</span>
+<span class="fc" id="L245">            .field(&quot;state.v2&quot;, Schema.OPTIONAL_STRING_SCHEMA)</span>
+<span class="fc" id="L246">            .build();</span>
+<span class="fc" id="L247">    public static final Schema TASK_COUNT_RECORD_V0 = SchemaBuilder.struct()</span>
+<span class="fc" id="L248">            .field(&quot;task-count&quot;, Schema.INT32_SCHEMA)</span>
+<span class="fc" id="L249">            .build();</span>
+    // The key is logically a byte array, but we can't use the JSON converter to (de-)serialize that without a schema.
+    // So instead, we base 64-encode it before serializing and decode it after deserializing.
+<span class="fc" id="L252">    public static final Schema SESSION_KEY_V0 = SchemaBuilder.struct()</span>
+<span class="fc" id="L253">            .field(&quot;key&quot;, Schema.STRING_SCHEMA)</span>
+<span class="fc" id="L254">            .field(&quot;algorithm&quot;, Schema.STRING_SCHEMA)</span>
+<span class="fc" id="L255">            .field(&quot;creation-timestamp&quot;, Schema.INT64_SCHEMA)</span>
+<span class="fc" id="L256">            .build();</span>
+
+    public static final String RESTART_PREFIX = &quot;restart-connector-&quot;;
+
+    public static String RESTART_KEY(String connectorName) {
+<span class="nc" id="L261">        return RESTART_PREFIX + connectorName;</span>
+    }
+
+    public static final boolean ONLY_FAILED_DEFAULT = false;
+    public static final boolean INCLUDE_TASKS_DEFAULT = false;
+    public static final String ONLY_FAILED_FIELD_NAME = &quot;only-failed&quot;;
+    public static final String INCLUDE_TASKS_FIELD_NAME = &quot;include-tasks&quot;;
+<span class="fc" id="L268">    public static final Schema RESTART_REQUEST_V0 = SchemaBuilder.struct()</span>
+<span class="fc" id="L269">            .field(INCLUDE_TASKS_FIELD_NAME, Schema.BOOLEAN_SCHEMA)</span>
+<span class="fc" id="L270">            .field(ONLY_FAILED_FIELD_NAME, Schema.BOOLEAN_SCHEMA)</span>
+<span class="fc" id="L271">            .build();</span>
+
+    public static final String LOGGER_CLUSTER_PREFIX = &quot;logger-cluster-&quot;;
+    public static String LOGGER_CLUSTER_KEY(String namespace) {
+<span class="nc" id="L275">        return LOGGER_CLUSTER_PREFIX + namespace;</span>
+    }
+<span class="fc" id="L277">    public static final Schema LOGGER_LEVEL_V0 = SchemaBuilder.struct()</span>
+<span class="fc" id="L278">            .field(&quot;level&quot;, Schema.STRING_SCHEMA)</span>
+<span class="fc" id="L279">            .build();</span>
+
+    // Visible for testing
+    static final long READ_WRITE_TOTAL_TIMEOUT_MS = 30000;
+
+    private final Object lock;
+    private final Converter converter;
+    private volatile boolean started;
+    // Although updateListener is not final, it's guaranteed to be visible to any thread after its
+    // initialization as long as we always read the volatile variable &quot;started&quot; before we access the listener.
+    private ConfigBackingStore.UpdateListener updateListener;
+
+    private final Map&lt;String, Object&gt; baseProducerProps;
+
+    private final String topic;
+    // Data is passed to the log already serialized. We use a converter to handle translating to/from generic Connect
+    // format to serialized form
+    private KafkaBasedLog&lt;String, byte[]&gt; configLog;
+    // Connector -&gt; # of tasks
+<span class="fc" id="L298">    final Map&lt;String, Integer&gt; connectorTaskCounts = new HashMap&lt;&gt;();</span>
+    // Connector and task configs: name or id -&gt; config map
+<span class="fc" id="L300">    final Map&lt;String, Map&lt;String, String&gt;&gt; connectorConfigs = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L301">    final Map&lt;ConnectorTaskId, Map&lt;String, String&gt;&gt; taskConfigs = new HashMap&lt;&gt;();</span>
+    private final Supplier&lt;TopicAdmin&gt; topicAdminSupplier;
+    private final String clientId;
+
+    // Set of connectors where we saw a task commit with an incomplete set of task config updates, indicating the data
+    // is in an inconsistent state and we cannot safely use them until they have been refreshed.
+<span class="fc" id="L307">    final Set&lt;String&gt; inconsistent = new HashSet&lt;&gt;();</span>
+    // The most recently read offset. This does not take into account deferred task updates/commits, so we may have
+    // outstanding data to be applied.
+    private volatile long offset;
+    // The most recently read session key, to use for validating internal REST requests.
+    private volatile SessionKey sessionKey;
+
+    // Connector -&gt; Map[ConnectorTaskId -&gt; Configs]
+    // visible for testing
+<span class="fc" id="L316">    final Map&lt;String, Map&lt;ConnectorTaskId, Map&lt;String, String&gt;&gt;&gt; deferredTaskUpdates = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L318">    final Map&lt;String, TargetState&gt; connectorTargetStates = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L320">    final Map&lt;String, Integer&gt; connectorTaskCountRecords = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L321">    final Map&lt;String, Integer&gt; connectorTaskConfigGenerations = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L322">    final Map&lt;String, AppliedConnectorConfig&gt; appliedConnectorConfigs = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L323">    final Set&lt;String&gt; connectorsPendingFencing = new HashSet&lt;&gt;();</span>
+
+    private final WorkerConfigTransformer configTransformer;
+
+    private final boolean usesFencableWriter;
+    private volatile Producer&lt;String, byte[]&gt; fencableProducer;
+    private final Map&lt;String, Object&gt; fencableProducerProps;
+    private final Time time;
+
+    //VisibleForTesting
+    void setConfigLog(KafkaBasedLog&lt;String, byte[]&gt; configLog) {
+<span class="nc" id="L334">        this.configLog = configLog;</span>
+<span class="nc" id="L335">    }</span>
+
+    public KafkaConfigBackingStore(Converter converter, DistributedConfig config, WorkerConfigTransformer configTransformer, Supplier&lt;TopicAdmin&gt; adminSupplier, String clientIdBase) {
+<span class="fc" id="L338">        this(converter, config, configTransformer, adminSupplier, clientIdBase, Time.SYSTEM);</span>
+<span class="fc" id="L339">    }</span>
+
+<span class="fc" id="L341">    KafkaConfigBackingStore(Converter converter, DistributedConfig config, WorkerConfigTransformer configTransformer, Supplier&lt;TopicAdmin&gt; adminSupplier, String clientIdBase, Time time) {</span>
+<span class="fc" id="L342">        this.lock = new Object();</span>
+<span class="fc" id="L343">        this.started = false;</span>
+<span class="fc" id="L344">        this.converter = converter;</span>
+<span class="fc" id="L345">        this.offset = -1;</span>
+<span class="fc" id="L346">        this.topicAdminSupplier = adminSupplier;</span>
+<span class="fc" id="L347">        this.clientId = Objects.requireNonNull(clientIdBase) + &quot;configs&quot;;</span>
+<span class="fc" id="L348">        this.time = time;</span>
+
+<span class="fc" id="L350">        this.baseProducerProps = baseProducerProps(config);</span>
+        // By default, Connect disables idempotent behavior for all producers, even though idempotence became
+        // default for Kafka producers. This is to ensure Connect continues to work with many Kafka broker versions, including older brokers that do not support
+        // idempotent producers or require explicit steps to enable them (e.g. adding the IDEMPOTENT_WRITE ACL to brokers older than 2.8).
+        // These settings might change when https://cwiki.apache.org/confluence/display/KAFKA/KIP-318%3A+Make+Kafka+Connect+Source+idempotent
+        // gets approved and scheduled for release.
+<span class="fc" id="L356">        baseProducerProps.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, &quot;false&quot;);</span>
+
+<span class="fc" id="L358">        this.fencableProducerProps = fencableProducerProps(config);</span>
+
+<span class="fc" id="L360">        this.usesFencableWriter = config.transactionalLeaderEnabled();</span>
+<span class="fc" id="L361">        this.topic = config.getString(DistributedConfig.CONFIG_TOPIC_CONFIG);</span>
+<span class="pc bpc" id="L362" title="2 of 4 branches missed.">        if (this.topic == null || this.topic.trim().isEmpty())</span>
+<span class="nc" id="L363">            throw new ConfigException(&quot;Must specify topic for connector configuration.&quot;);</span>
+
+<span class="fc" id="L365">        configLog = setupAndCreateKafkaBasedLog(this.topic, config);</span>
+<span class="fc" id="L366">        this.configTransformer = configTransformer;</span>
+<span class="fc" id="L367">    }</span>
+
+    @Override
+    public void setUpdateListener(ConfigBackingStore.UpdateListener listener) {
+<span class="fc" id="L371">        this.updateListener = listener;</span>
+<span class="fc" id="L372">    }</span>
+
+    @Override
+    public void start() {
+<span class="fc" id="L376">        log.info(&quot;Starting KafkaConfigBackingStore&quot;);</span>
+        // Before startup, callbacks are *not* invoked. You can grab a snapshot after starting -- just take care that
+        // updates can continue to occur in the background
+        try {
+<span class="fc" id="L380">            configLog.start();</span>
+<span class="nc" id="L381">        } catch (UnsupportedVersionException e) {</span>
+<span class="nc" id="L382">            throw new ConnectException(</span>
+                    &quot;Enabling exactly-once support for source connectors requires a Kafka broker version that allows &quot;
+                            + &quot;admin clients to read consumer offsets. Please either disable the worker's exactly-once &quot;
+                            + &quot;support for source connectors, or use a newer Kafka broker version.&quot;,
+                    e
+            );
+<span class="fc" id="L388">        }</span>
+
+<span class="fc" id="L390">        int partitionCount = configLog.partitionCount();</span>
+<span class="pc bpc" id="L391" title="1 of 2 branches missed.">        if (partitionCount &gt; 1) {</span>
+<span class="nc" id="L392">            String msg = String.format(&quot;Topic '%s' supplied via the '%s' property is required &quot;</span>
+                    + &quot;to have a single partition in order to guarantee consistency of &quot;
+                    + &quot;connector configurations, but found %d partitions.&quot;,
+<span class="nc" id="L395">                    topic, DistributedConfig.CONFIG_TOPIC_CONFIG, partitionCount);</span>
+<span class="nc" id="L396">            throw new ConfigException(msg);</span>
+        }
+
+<span class="fc" id="L399">        started = true;</span>
+<span class="fc" id="L400">        log.info(&quot;Started KafkaConfigBackingStore&quot;);</span>
+<span class="fc" id="L401">    }</span>
+
+    @Override
+    public void stop() {
+<span class="fc" id="L405">        log.info(&quot;Closing KafkaConfigBackingStore&quot;);</span>
+
+<span class="fc" id="L407">        relinquishWritePrivileges();</span>
+<span class="fc" id="L408">        Utils.closeQuietly(configLog::stop, &quot;KafkaBasedLog for config topic&quot;);</span>
+
+<span class="fc" id="L410">        log.info(&quot;Closed KafkaConfigBackingStore&quot;);</span>
+<span class="fc" id="L411">    }</span>
+
+    @Override
+    public void claimWritePrivileges() {
+<span class="pc bpc" id="L415" title="3 of 4 branches missed.">        if (usesFencableWriter &amp;&amp; fencableProducer == null) {</span>
+            try {
+<span class="nc" id="L417">                fencableProducer = createFencableProducer();</span>
+<span class="nc" id="L418">                fencableProducer.initTransactions();</span>
+<span class="nc" id="L419">            } catch (Exception e) {</span>
+<span class="nc" id="L420">                relinquishWritePrivileges();</span>
+<span class="nc" id="L421">                throw new ConnectException(&quot;Failed to create and initialize fencable producer for config topic&quot;, e);</span>
+<span class="nc" id="L422">            }</span>
+        }
+<span class="fc" id="L424">    }</span>
+
+    private Map&lt;String, Object&gt; baseProducerProps(WorkerConfig workerConfig) {
+<span class="fc" id="L427">        Map&lt;String, Object&gt; producerProps = new HashMap&lt;&gt;(workerConfig.originals());</span>
+<span class="fc" id="L428">        String kafkaClusterId = workerConfig.kafkaClusterId();</span>
+<span class="fc" id="L429">        producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());</span>
+<span class="fc" id="L430">        producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());</span>
+<span class="fc" id="L431">        producerProps.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, Integer.MAX_VALUE);</span>
+<span class="fc" id="L432">        ConnectUtils.addMetricsContextProperties(producerProps, workerConfig, kafkaClusterId);</span>
+<span class="fc" id="L433">        return producerProps;</span>
+    }
+
+    // Visible for testing
+    Map&lt;String, Object&gt; fencableProducerProps(DistributedConfig workerConfig) {
+<span class="fc" id="L438">        Map&lt;String, Object&gt; result = new HashMap&lt;&gt;(baseProducerProps(workerConfig));</span>
+
+<span class="fc" id="L440">        result.put(CommonClientConfigs.CLIENT_ID_CONFIG, clientId + &quot;-leader&quot;);</span>
+        // Always require producer acks to all to ensure durable writes
+<span class="fc" id="L442">        result.put(ProducerConfig.ACKS_CONFIG, &quot;all&quot;);</span>
+        // We can set this to 5 instead of 1 without risking reordering because we are using an idempotent producer
+<span class="fc" id="L444">        result.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);</span>
+
+<span class="fc" id="L446">        ConnectUtils.ensureProperty(</span>
+                result, ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, &quot;true&quot;,
+                &quot;for the worker's config topic producer when exactly-once source support is enabled or in preparation to be enabled&quot;,
+                false
+        );
+<span class="fc" id="L451">        ConnectUtils.ensureProperty(</span>
+<span class="fc" id="L452">                result, ProducerConfig.TRANSACTIONAL_ID_CONFIG, workerConfig.transactionalProducerId(),</span>
+                &quot;for the worker's config topic producer when exactly-once source support is enabled or in preparation to be enabled&quot;,
+                true
+        );
+
+<span class="fc" id="L457">        return result;</span>
+    }
+
+    // Visible in order to be mocked during testing
+    Producer&lt;String, byte[]&gt; createFencableProducer() {
+<span class="nc" id="L462">        return new KafkaProducer&lt;&gt;(fencableProducerProps);</span>
+    }
+
+    /**
+     * Get a snapshot of the current state of the cluster.
+     */
+    @Override
+    public ClusterConfigState snapshot() {
+<span class="fc" id="L470">        synchronized (lock) {</span>
+            // Only a shallow copy is performed here; in order to avoid accidentally corrupting the worker's view
+            // of the config topic, any nested structures should be copied before making modifications
+<span class="fc" id="L473">            return new ClusterConfigState(</span>
+                    offset,
+                    sessionKey,
+                    new HashMap&lt;&gt;(connectorTaskCounts),
+                    new HashMap&lt;&gt;(connectorConfigs),
+                    new HashMap&lt;&gt;(connectorTargetStates),
+                    new HashMap&lt;&gt;(taskConfigs),
+                    new HashMap&lt;&gt;(connectorTaskCountRecords),
+                    new HashMap&lt;&gt;(connectorTaskConfigGenerations),
+                    new HashMap&lt;&gt;(appliedConnectorConfigs),
+                    new HashSet&lt;&gt;(connectorsPendingFencing),
+                    new HashSet&lt;&gt;(inconsistent),
+                    configTransformer
+            );
+        }
+    }
+
+    @Override
+    public boolean contains(String connector) {
+<span class="fc" id="L492">        synchronized (lock) {</span>
+<span class="fc" id="L493">            return connectorConfigs.containsKey(connector);</span>
+        }
+    }
+
+    /**
+     * Write this connector configuration (and optionally a target state) to persistent storage and wait until it has been acknowledged and read
+     * back by tailing the Kafka log with a consumer. {@link #claimWritePrivileges()} must be successfully invoked before calling
+     * this method if the worker is configured to use a fencable producer for writes to the config topic.
+     *
+     * @param connector  name of the connector to write data for
+     * @param properties the configuration to write
+     * @param targetState the desired target state for the connector; may be {@code null} if no target state change is desired. Note that the default
+     *                    target state is {@link TargetState#STARTED} if no target state exists previously
+     * @throws IllegalStateException if {@link #claimWritePrivileges()} is required, but was not successfully invoked before
+     * this method was called
+     * @throws PrivilegedWriteException if the worker is configured to use a fencable producer for writes to the config topic
+     * and the write fails
+     */
+    @Override
+    public void putConnectorConfig(String connector, Map&lt;String, String&gt; properties, TargetState targetState) {
+<span class="fc" id="L513">        log.debug(&quot;Writing connector configuration for connector '{}'&quot;, connector);</span>
+<span class="fc" id="L514">        Struct connectConfig = new Struct(CONNECTOR_CONFIGURATION_V0);</span>
+<span class="fc" id="L515">        connectConfig.put(&quot;properties&quot;, properties);</span>
+<span class="fc" id="L516">        byte[] serializedConfig = converter.fromConnectData(topic, CONNECTOR_CONFIGURATION_V0, connectConfig);</span>
+        try {
+<span class="fc" id="L518">            Timer timer = time.timer(READ_WRITE_TOTAL_TIMEOUT_MS);</span>
+<span class="fc" id="L519">            List&lt;ProducerKeyValue&gt; keyValues = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L520" title="All 2 branches covered.">            if (targetState != null) {</span>
+<span class="fc" id="L521">                log.debug(&quot;Writing target state {} for connector {}&quot;, targetState, connector);</span>
+<span class="fc" id="L522">                keyValues.add(new ProducerKeyValue(TARGET_STATE_KEY(connector), serializeTargetState(targetState)));</span>
+            }
+<span class="fc" id="L524">            keyValues.add(new ProducerKeyValue(CONNECTOR_KEY(connector), serializedConfig));</span>
+<span class="fc" id="L525">            sendPrivileged(keyValues, timer);</span>
+<span class="fc" id="L526">            configLog.readToEnd().get(timer.remainingMs(), TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L527">        } catch (InterruptedException | ExecutionException | TimeoutException e) {</span>
+<span class="fc" id="L528">            log.error(&quot;Failed to write connector configuration to Kafka: &quot;, e);</span>
+<span class="fc" id="L529">            throw new ConnectException(&quot;Error writing connector configuration to Kafka&quot;, e);</span>
+<span class="fc" id="L530">        }</span>
+<span class="fc" id="L531">    }</span>
+
+    /**
+     * Remove configuration for a given connector. {@link #claimWritePrivileges()} must be successfully invoked before calling
+     * this method if the worker is configured to use a fencable producer for writes to the config topic.
+     * @param connector name of the connector to remove
+     * @throws IllegalStateException if {@link #claimWritePrivileges()} is required, but was not successfully invoked before
+     * this method was called
+     * @throws PrivilegedWriteException if the worker is configured to use a fencable producer for writes to the config topic
+     * and the write fails
+     */
+    @Override
+    public void removeConnectorConfig(String connector) {
+<span class="fc" id="L544">        log.debug(&quot;Removing connector configuration for connector '{}'&quot;, connector);</span>
+        try {
+<span class="fc" id="L546">            Timer timer = time.timer(READ_WRITE_TOTAL_TIMEOUT_MS);</span>
+<span class="fc" id="L547">            List&lt;ProducerKeyValue&gt; keyValues = List.of(</span>
+<span class="fc" id="L548">                    new ProducerKeyValue(CONNECTOR_KEY(connector), null),</span>
+<span class="fc" id="L549">                    new ProducerKeyValue(TARGET_STATE_KEY(connector), null)</span>
+            );
+<span class="fc" id="L551">            sendPrivileged(keyValues, timer);</span>
+
+<span class="fc" id="L553">            configLog.readToEnd().get(timer.remainingMs(), TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L554">        } catch (InterruptedException | ExecutionException | TimeoutException e) {</span>
+<span class="nc" id="L555">            log.error(&quot;Failed to remove connector configuration from Kafka: &quot;, e);</span>
+<span class="nc" id="L556">            throw new ConnectException(&quot;Error removing connector configuration from Kafka&quot;, e);</span>
+<span class="fc" id="L557">        }</span>
+<span class="fc" id="L558">    }</span>
+
+    @Override
+    public void removeTaskConfigs(String connector) {
+<span class="nc" id="L562">        throw new UnsupportedOperationException(&quot;Removal of tasks is not currently supported&quot;);</span>
+    }
+
+    /**
+     * Write these task configurations and associated commit messages, unless an inconsistency is found that indicates
+     * that we would be leaving one of the referenced connectors with an inconsistent state. {@link #claimWritePrivileges()}
+     * must be successfully invoked before calling this method if the worker is configured to use a fencable producer for
+     * writes to the config topic.
+     *
+     * @param connector the connector to write task configuration
+     * @param configs list of task configurations for the connector
+     * @throws ConnectException if the task configurations do not resolve inconsistencies found in the existing root
+     *                          and task configurations.
+     * @throws IllegalStateException if {@link #claimWritePrivileges()} is required, but was not successfully invoked before
+     * this method was called
+     * @throws PrivilegedWriteException if the worker is configured to use a fencable producer for writes to the config topic
+     * and the write fails
+     */
+    @Override
+    public void putTaskConfigs(String connector, List&lt;Map&lt;String, String&gt;&gt; configs) {
+<span class="fc" id="L582">        Timer timer = time.timer(READ_WRITE_TOTAL_TIMEOUT_MS);</span>
+        // Make sure we're at the end of the log. We should be the only writer, but we want to make sure we don't have
+        // any outstanding lagging data to consume.
+        try {
+<span class="fc" id="L586">            configLog.readToEnd().get(timer.remainingMs(), TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L587">            timer.update();</span>
+<span class="nc" id="L588">        } catch (InterruptedException | ExecutionException | TimeoutException e) {</span>
+<span class="nc" id="L589">            log.error(&quot;Failed to write root configuration to Kafka: &quot;, e);</span>
+<span class="nc" id="L590">            throw new ConnectException(&quot;Error writing root configuration to Kafka&quot;, e);</span>
+<span class="fc" id="L591">        }</span>
+
+<span class="fc" id="L593">        int taskCount = configs.size();</span>
+
+        // Send all the individual updates
+<span class="fc" id="L596">        int index = 0;</span>
+<span class="fc" id="L597">        List&lt;ProducerKeyValue&gt; keyValues = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L598" title="All 2 branches covered.">        for (Map&lt;String, String&gt; taskConfig: configs) {</span>
+<span class="fc" id="L599">            Struct connectConfig = new Struct(TASK_CONFIGURATION_V0);</span>
+<span class="fc" id="L600">            connectConfig.put(&quot;properties&quot;, taskConfig);</span>
+<span class="fc" id="L601">            byte[] serializedConfig = converter.fromConnectData(topic, TASK_CONFIGURATION_V0, connectConfig);</span>
+<span class="fc" id="L602">            log.debug(&quot;Writing configuration for connector '{}' task {}&quot;, connector, index);</span>
+<span class="fc" id="L603">            ConnectorTaskId connectorTaskId = new ConnectorTaskId(connector, index);</span>
+<span class="fc" id="L604">            keyValues.add(new ProducerKeyValue(TASK_KEY(connectorTaskId), serializedConfig));</span>
+<span class="fc" id="L605">            index++;</span>
+<span class="fc" id="L606">        }</span>
+
+        try {
+<span class="fc" id="L609">            sendPrivileged(keyValues, timer);</span>
+<span class="nc" id="L610">        } catch (ExecutionException | InterruptedException | TimeoutException e) {</span>
+<span class="nc" id="L611">            log.error(&quot;Failed to write task configurations to Kafka&quot;, e);</span>
+<span class="nc" id="L612">            throw new ConnectException(&quot;Error writing task configurations to Kafka&quot;, e);</span>
+<span class="fc" id="L613">        }</span>
+
+        // Finally, send the commit to update the number of tasks and apply the new configs, then wait until we read to
+        // the end of the log
+        try {
+            // Read to end to ensure all the task configs have been written
+<span class="fc bfc" id="L619" title="All 2 branches covered.">            if (taskCount &gt; 0) {</span>
+<span class="fc" id="L620">                configLog.readToEnd().get(timer.remainingMs(), TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L621">                timer.update();</span>
+            }
+            // Write the commit message
+<span class="fc" id="L624">            Struct connectConfig = new Struct(CONNECTOR_TASKS_COMMIT_V0);</span>
+<span class="fc" id="L625">            connectConfig.put(&quot;tasks&quot;, taskCount);</span>
+<span class="fc" id="L626">            byte[] serializedConfig = converter.fromConnectData(topic, CONNECTOR_TASKS_COMMIT_V0, connectConfig);</span>
+<span class="fc" id="L627">            log.debug(&quot;Writing commit for connector '{}' with {} tasks.&quot;, connector, taskCount);</span>
+
+<span class="fc" id="L629">            sendPrivileged(COMMIT_TASKS_KEY(connector), serializedConfig, timer);</span>
+
+            // Read to end to ensure all the commit messages have been written
+<span class="fc" id="L632">            configLog.readToEnd().get(timer.remainingMs(), TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L633">        } catch (InterruptedException | ExecutionException | TimeoutException e) {</span>
+<span class="nc" id="L634">            log.error(&quot;Failed to write root configuration to Kafka: &quot;, e);</span>
+<span class="nc" id="L635">            throw new ConnectException(&quot;Error writing root configuration to Kafka&quot;, e);</span>
+<span class="fc" id="L636">        }</span>
+<span class="fc" id="L637">    }</span>
+
+    @Override
+    public void refresh(long timeout, TimeUnit unit) throws TimeoutException {
+        try {
+<span class="fc" id="L642">            configLog.readToEnd().get(timeout, unit);</span>
+<span class="nc" id="L643">        } catch (InterruptedException | ExecutionException e) {</span>
+<span class="nc" id="L644">            throw new ConnectException(&quot;Error trying to read to end of config log&quot;, e);</span>
+<span class="fc" id="L645">        }</span>
+<span class="fc" id="L646">    }</span>
+
+    /**
+     * Write a new {@link TargetState} for the connector. Note that {@link #claimWritePrivileges()} does not need to be
+     * invoked before invoking this method.
+     * @param connector the name of the connector
+     * @param state the desired target state for the connector
+     */
+    @Override
+    public void putTargetState(String connector, TargetState state) {
+<span class="fc" id="L656">        log.debug(&quot;Writing target state {} for connector {}&quot;, state, connector);</span>
+        try {
+<span class="fc" id="L658">            configLog.sendWithReceipt(TARGET_STATE_KEY(connector), serializeTargetState(state))</span>
+<span class="fc" id="L659">                .get(READ_WRITE_TOTAL_TIMEOUT_MS, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L660">        } catch (InterruptedException | ExecutionException | TimeoutException e) {</span>
+<span class="nc" id="L661">            log.error(&quot;Failed to write target state to Kafka&quot;, e);</span>
+<span class="nc" id="L662">            throw new ConnectException(&quot;Error writing target state to Kafka&quot;, e);</span>
+<span class="fc" id="L663">        }</span>
+<span class="fc" id="L664">    }</span>
+
+    private byte[] serializeTargetState(TargetState state) {
+<span class="fc" id="L667">        Struct connectTargetState = new Struct(TARGET_STATE_V1);</span>
+        // Older workers don't support the STOPPED state; fall back on PAUSED
+<span class="fc bfc" id="L669" title="All 2 branches covered.">        connectTargetState.put(&quot;state&quot;, state == STOPPED ? PAUSED.name() : state.name());</span>
+<span class="fc" id="L670">        connectTargetState.put(&quot;state.v2&quot;, state.name());</span>
+<span class="fc" id="L671">        return converter.fromConnectData(topic, TARGET_STATE_V1, connectTargetState);</span>
+    }
+
+    /**
+     * Write a task count record for a connector to persistent storage and wait until it has been acknowledged and read back by
+     * tailing the Kafka log with a consumer. {@link #claimWritePrivileges()} must be successfully invoked before calling this method
+     * if the worker is configured to use a fencable producer for writes to the config topic.
+     * @param connector name of the connector
+     * @param taskCount number of tasks used by the connector
+     * @throws IllegalStateException if {@link #claimWritePrivileges()} is required, but was not successfully invoked before
+     * this method was called
+     * @throws PrivilegedWriteException if the worker is configured to use a fencable producer for writes to the config topic
+     * and the write fails
+     */
+    @Override
+    public void putTaskCountRecord(String connector, int taskCount) {
+<span class="nc" id="L687">        Struct taskCountRecord = new Struct(TASK_COUNT_RECORD_V0);</span>
+<span class="nc" id="L688">        taskCountRecord.put(&quot;task-count&quot;, taskCount);</span>
+<span class="nc" id="L689">        byte[] serializedTaskCountRecord = converter.fromConnectData(topic, TASK_COUNT_RECORD_V0, taskCountRecord);</span>
+<span class="nc" id="L690">        log.debug(&quot;Writing task count record {} for connector {}&quot;, taskCount, connector);</span>
+        try {
+<span class="nc" id="L692">            Timer timer = time.timer(READ_WRITE_TOTAL_TIMEOUT_MS);</span>
+<span class="nc" id="L693">            sendPrivileged(TASK_COUNT_RECORD_KEY(connector), serializedTaskCountRecord, timer);</span>
+<span class="nc" id="L694">            configLog.readToEnd().get(timer.remainingMs(), TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L695">        } catch (InterruptedException | ExecutionException | TimeoutException e) {</span>
+<span class="nc" id="L696">            log.error(&quot;Failed to write task count record with {} tasks for connector {} to Kafka: &quot;, taskCount, connector, e);</span>
+<span class="nc" id="L697">            throw new ConnectException(&quot;Error writing task count record to Kafka&quot;, e);</span>
+<span class="nc" id="L698">        }</span>
+<span class="nc" id="L699">    }</span>
+
+    /**
+     * Write a session key to persistent storage and wait until it has been acknowledged and read back by tailing the Kafka log
+     * with a consumer. {@link #claimWritePrivileges()} must be successfully invoked before calling this method if the worker
+     * is configured to use a fencable producer for writes to the config topic.
+     * @param sessionKey the session key to distributed
+     * @throws IllegalStateException if {@link #claimWritePrivileges()} is required, but was not successfully invoked before
+     * this method was called
+     * @throws PrivilegedWriteException if the worker is configured to use a fencable producer for writes to the config topic
+     * and the write fails
+     */
+    @Override
+    public void putSessionKey(SessionKey sessionKey) {
+<span class="fc" id="L713">        log.debug(&quot;Distributing new session key&quot;);</span>
+<span class="fc" id="L714">        Struct sessionKeyStruct = new Struct(SESSION_KEY_V0);</span>
+<span class="fc" id="L715">        sessionKeyStruct.put(&quot;key&quot;, Base64.getEncoder().encodeToString(sessionKey.key().getEncoded()));</span>
+<span class="fc" id="L716">        sessionKeyStruct.put(&quot;algorithm&quot;, sessionKey.key().getAlgorithm());</span>
+<span class="fc" id="L717">        sessionKeyStruct.put(&quot;creation-timestamp&quot;, sessionKey.creationTimestamp());</span>
+<span class="fc" id="L718">        byte[] serializedSessionKey = converter.fromConnectData(topic, SESSION_KEY_V0, sessionKeyStruct);</span>
+        try {
+<span class="fc" id="L720">            Timer timer = time.timer(READ_WRITE_TOTAL_TIMEOUT_MS);</span>
+<span class="fc" id="L721">            sendPrivileged(SESSION_KEY_KEY, serializedSessionKey, timer);</span>
+<span class="fc" id="L722">            configLog.readToEnd().get(timer.remainingMs(), TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L723">        } catch (InterruptedException | ExecutionException | TimeoutException e) {</span>
+<span class="nc" id="L724">            log.error(&quot;Failed to write session key to Kafka: &quot;, e);</span>
+<span class="nc" id="L725">            throw new ConnectException(&quot;Error writing session key to Kafka&quot;, e);</span>
+<span class="fc" id="L726">        }</span>
+<span class="fc" id="L727">    }</span>
+
+    /**
+     * Write a restart request for the connector and optionally its tasks to persistent storage and wait until it has been
+     * acknowledged and read back by tailing the Kafka log with a consumer. {@link #claimWritePrivileges()} must be successfully
+     * invoked before calling this method if the worker is configured to use a fencable producer for writes to the config topic.
+     * @param restartRequest the restart request details
+     */
+    @Override
+    public void putRestartRequest(RestartRequest restartRequest) {
+<span class="nc" id="L737">        log.debug(&quot;Writing {} to Kafka&quot;, restartRequest);</span>
+<span class="nc" id="L738">        String key = RESTART_KEY(restartRequest.connectorName());</span>
+<span class="nc" id="L739">        Struct value = new Struct(RESTART_REQUEST_V0);</span>
+<span class="nc" id="L740">        value.put(INCLUDE_TASKS_FIELD_NAME, restartRequest.includeTasks());</span>
+<span class="nc" id="L741">        value.put(ONLY_FAILED_FIELD_NAME, restartRequest.onlyFailed());</span>
+<span class="nc" id="L742">        byte[] serializedValue = converter.fromConnectData(topic, value.schema(), value);</span>
+        try {
+<span class="nc" id="L744">            Timer timer = time.timer(READ_WRITE_TOTAL_TIMEOUT_MS);</span>
+<span class="nc" id="L745">            sendPrivileged(key, serializedValue, timer);</span>
+<span class="nc" id="L746">            configLog.readToEnd().get(timer.remainingMs(), TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L747">        } catch (InterruptedException | ExecutionException | TimeoutException e) {</span>
+<span class="nc" id="L748">            log.error(&quot;Failed to write {} to Kafka: &quot;, restartRequest, e);</span>
+<span class="nc" id="L749">            throw new ConnectException(&quot;Error writing &quot; + restartRequest + &quot; to Kafka&quot;, e);</span>
+<span class="nc" id="L750">        }</span>
+<span class="nc" id="L751">    }</span>
+
+    @Override
+    public void putLoggerLevel(String namespace, String level) {
+<span class="nc" id="L755">        log.debug(&quot;Writing level {} for logging namespace {} to Kafka&quot;, level, namespace);</span>
+<span class="nc" id="L756">        Struct value = new Struct(LOGGER_LEVEL_V0);</span>
+<span class="nc" id="L757">        value.put(&quot;level&quot;, level);</span>
+<span class="nc" id="L758">        byte[] serializedValue = converter.fromConnectData(topic, value.schema(), value);</span>
+        try {
+<span class="nc" id="L760">            configLog.sendWithReceipt(LOGGER_CLUSTER_KEY(namespace), serializedValue).get(READ_WRITE_TOTAL_TIMEOUT_MS, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L761">        } catch (InterruptedException | ExecutionException | TimeoutException e) {</span>
+<span class="nc" id="L762">            log.error(&quot;Failed to write logger level to Kafka&quot;, e);</span>
+<span class="nc" id="L763">            throw new ConnectException(&quot;Error writing logger level to Kafka&quot;, e);</span>
+<span class="nc" id="L764">        }</span>
+<span class="nc" id="L765">    }</span>
+
+    // package private for testing
+    KafkaBasedLog&lt;String, byte[]&gt; setupAndCreateKafkaBasedLog(String topic, final WorkerConfig config) {
+<span class="fc" id="L769">        String clusterId = config.kafkaClusterId();</span>
+<span class="fc" id="L770">        Map&lt;String, Object&gt; originals = config.originals();</span>
+
+<span class="fc" id="L772">        Map&lt;String, Object&gt; producerProps = new HashMap&lt;&gt;(baseProducerProps);</span>
+<span class="fc" id="L773">        producerProps.put(CommonClientConfigs.CLIENT_ID_CONFIG, clientId);</span>
+
+<span class="fc" id="L775">        Map&lt;String, Object&gt; consumerProps = new HashMap&lt;&gt;(originals);</span>
+<span class="fc" id="L776">        consumerProps.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());</span>
+<span class="fc" id="L777">        consumerProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());</span>
+<span class="fc" id="L778">        consumerProps.put(CommonClientConfigs.CLIENT_ID_CONFIG, clientId);</span>
+<span class="fc" id="L779">        ConnectUtils.addMetricsContextProperties(consumerProps, config, clusterId);</span>
+<span class="pc bpc" id="L780" title="1 of 2 branches missed.">        if (config.exactlyOnceSourceEnabled()) {</span>
+<span class="nc" id="L781">            ConnectUtils.ensureProperty(</span>
+<span class="nc" id="L782">                    consumerProps, ConsumerConfig.ISOLATION_LEVEL_CONFIG, IsolationLevel.READ_COMMITTED.toString(),</span>
+                    &quot;for the worker's config topic consumer when exactly-once source support is enabled&quot;,
+                    true
+            );
+        }
+
+<span class="fc" id="L788">        Map&lt;String, Object&gt; adminProps = new HashMap&lt;&gt;(originals);</span>
+<span class="fc" id="L789">        ConnectUtils.addMetricsContextProperties(adminProps, config, clusterId);</span>
+<span class="fc" id="L790">        adminProps.put(CommonClientConfigs.CLIENT_ID_CONFIG, clientId);</span>
+
+<span class="pc bpc" id="L792" title="1 of 2 branches missed.">        Map&lt;String, Object&gt; topicSettings = config instanceof DistributedConfig</span>
+<span class="fc" id="L793">                                            ? ((DistributedConfig) config).configStorageTopicSettings()</span>
+<span class="pc" id="L794">                                            : Map.of();</span>
+<span class="fc" id="L795">        NewTopic topicDescription = TopicAdmin.defineTopic(topic)</span>
+<span class="fc" id="L796">                .config(topicSettings) // first so that we override user-supplied settings as needed</span>
+<span class="fc" id="L797">                .compacted()</span>
+<span class="fc" id="L798">                .partitions(1)</span>
+<span class="fc" id="L799">                .replicationFactor(config.getShort(DistributedConfig.CONFIG_STORAGE_REPLICATION_FACTOR_CONFIG))</span>
+<span class="fc" id="L800">                .build();</span>
+
+<span class="fc" id="L802">        return createKafkaBasedLog(topic, producerProps, consumerProps, new ConsumeCallback(), topicDescription, topicAdminSupplier, config, time);</span>
+    }
+
+    /**
+     * Send a single record to the config topic synchronously. Note that {@link #claimWritePrivileges()} must be
+     * successfully invoked before calling this method if this store is configured to use a fencable writer.
+     * @param key the record key
+     * @param value the record value
+     * @param timer Timer bounding how long this method can block. The timer is updated before the method returns.
+     */
+    private void sendPrivileged(String key, byte[] value, Timer timer) throws ExecutionException, InterruptedException, TimeoutException {
+<span class="fc" id="L813">        sendPrivileged(List.of(new ProducerKeyValue(key, value)), timer);</span>
+<span class="fc" id="L814">    }</span>
+
+    /**
+     * Send one or more records to the config topic synchronously. Note that {@link #claimWritePrivileges()} must be
+     * successfully invoked before calling this method if this store is configured to use a fencable writer.
+     * @param keyValues the list of producer record key/value pairs
+     * @param timer Timer bounding how long this method can block. The timer is updated before the method returns.
+     */
+    private void sendPrivileged(List&lt;ProducerKeyValue&gt; keyValues, Timer timer) throws ExecutionException, InterruptedException, TimeoutException {
+<span class="pc bpc" id="L823" title="1 of 2 branches missed.">        if (!usesFencableWriter) {</span>
+<span class="fc" id="L824">            List&lt;Future&lt;RecordMetadata&gt;&gt; producerFutures = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L825">            keyValues.forEach(</span>
+<span class="fc" id="L826">                    keyValue -&gt; producerFutures.add(configLog.sendWithReceipt(keyValue.key, keyValue.value))</span>
+            );
+
+<span class="fc" id="L829">            timer.update();</span>
+<span class="fc bfc" id="L830" title="All 2 branches covered.">            for (Future&lt;RecordMetadata&gt; future : producerFutures) {</span>
+<span class="fc" id="L831">                future.get(timer.remainingMs(), TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L832">                timer.update();</span>
+<span class="fc" id="L833">            }</span>
+
+<span class="fc" id="L835">            return;</span>
+        }
+
+<span class="nc bnc" id="L838" title="All 2 branches missed.">        if (fencableProducer == null) {</span>
+<span class="nc" id="L839">            throw new IllegalStateException(&quot;Cannot produce to config topic without claiming write privileges first&quot;);</span>
+        }
+
+        try {
+<span class="nc" id="L843">            fencableProducer.beginTransaction();</span>
+<span class="nc" id="L844">            keyValues.forEach(</span>
+<span class="nc" id="L845">                    keyValue -&gt; fencableProducer.send(new ProducerRecord&lt;&gt;(topic, keyValue.key, keyValue.value))</span>
+            );
+<span class="nc" id="L847">            fencableProducer.commitTransaction();</span>
+<span class="nc" id="L848">            timer.update();</span>
+<span class="nc" id="L849">        } catch (Exception e) {</span>
+<span class="nc" id="L850">            log.warn(&quot;Failed to perform fencable send to config topic&quot;, e);</span>
+<span class="nc" id="L851">            relinquishWritePrivileges();</span>
+<span class="nc" id="L852">            throw new PrivilegedWriteException(&quot;Failed to perform fencable send to config topic&quot;, e);</span>
+<span class="nc" id="L853">        }</span>
+<span class="nc" id="L854">    }</span>
+
+<span class="fc" id="L856">    private record ProducerKeyValue(String key, byte[] value) {</span>
+    }
+
+    private void relinquishWritePrivileges() {
+<span class="pc bpc" id="L860" title="1 of 2 branches missed.">        if (fencableProducer != null) {</span>
+<span class="nc" id="L861">            Utils.closeQuietly(() -&gt; fencableProducer.close(Duration.ZERO), &quot;fencable producer for config topic&quot;);</span>
+<span class="nc" id="L862">            fencableProducer = null;</span>
+        }
+<span class="fc" id="L864">    }</span>
+
+    @Override
+    protected String getTopicConfig() {
+<span class="fc" id="L868">        return DistributedConfig.CONFIG_TOPIC_CONFIG;</span>
+    }
+
+    @Override
+    protected String getTopicPurpose() {
+<span class="fc" id="L873">        return &quot;connector configurations&quot;;</span>
+    }
+
+<span class="fc" id="L876">    private class ConsumeCallback implements Callback&lt;ConsumerRecord&lt;String, byte[]&gt;&gt; {</span>
+        @Override
+        public void onCompletion(Throwable error, ConsumerRecord&lt;String, byte[]&gt; record) {
+<span class="pc bpc" id="L879" title="1 of 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L880">                log.error(&quot;Unexpected in consumer callback for KafkaConfigBackingStore: &quot;, error);</span>
+<span class="nc" id="L881">                return;</span>
+            }
+
+            final SchemaAndValue value;
+            try {
+<span class="fc" id="L886">                value = converter.toConnectData(topic, record.value());</span>
+<span class="nc" id="L887">            } catch (DataException e) {</span>
+<span class="nc" id="L888">                log.error(&quot;Failed to convert config data to Kafka Connect format: &quot;, e);</span>
+<span class="nc" id="L889">                return;</span>
+<span class="fc" id="L890">            }</span>
+            // Make the recorded offset match the API used for positions in the consumer -- return the offset of the
+            // *next record*, not the last one consumed.
+<span class="fc" id="L893">            offset = record.offset() + 1;</span>
+
+<span class="fc bfc" id="L895" title="All 2 branches covered.">            if (record.key().startsWith(TARGET_STATE_PREFIX)) {</span>
+<span class="fc" id="L896">                String connectorName = record.key().substring(TARGET_STATE_PREFIX.length());</span>
+<span class="fc" id="L897">                processTargetStateRecord(connectorName, value);</span>
+<span class="fc bfc" id="L898" title="All 2 branches covered.">            } else if (record.key().startsWith(CONNECTOR_PREFIX)) {</span>
+<span class="fc" id="L899">                String connectorName = record.key().substring(CONNECTOR_PREFIX.length());</span>
+<span class="fc" id="L900">                processConnectorConfigRecord(connectorName, value);</span>
+<span class="fc bfc" id="L901" title="All 2 branches covered.">            } else if (record.key().startsWith(TASK_PREFIX)) {</span>
+<span class="fc" id="L902">                ConnectorTaskId taskId = parseTaskId(record.key());</span>
+<span class="pc bpc" id="L903" title="1 of 2 branches missed.">                if (taskId == null) {</span>
+<span class="nc" id="L904">                    log.error(&quot;Ignoring task configuration because {} couldn't be parsed as a task config key&quot;, record.key());</span>
+<span class="nc" id="L905">                    return;</span>
+                }
+<span class="fc" id="L907">                processTaskConfigRecord(taskId, value);</span>
+<span class="fc bfc" id="L908" title="All 2 branches covered.">            } else if (record.key().startsWith(COMMIT_TASKS_PREFIX)) {</span>
+<span class="fc" id="L909">                String connectorName = record.key().substring(COMMIT_TASKS_PREFIX.length());</span>
+<span class="fc" id="L910">                processTasksCommitRecord(connectorName, value);</span>
+<span class="pc bpc" id="L911" title="1 of 2 branches missed.">            } else if (record.key().startsWith(RESTART_PREFIX)) {</span>
+<span class="nc" id="L912">                RestartRequest request = recordToRestartRequest(record, value);</span>
+                // Only notify the listener if this backing store is already successfully started (having caught up the first time)
+<span class="nc bnc" id="L914" title="All 4 branches missed.">                if (request != null &amp;&amp; started) {</span>
+<span class="nc" id="L915">                    updateListener.onRestartRequest(request);</span>
+                }
+<span class="pc bpc" id="L917" title="1 of 2 branches missed.">            } else if (record.key().startsWith(TASK_COUNT_RECORD_PREFIX)) {</span>
+<span class="nc" id="L918">                String connectorName = record.key().substring(TASK_COUNT_RECORD_PREFIX.length());</span>
+<span class="nc" id="L919">                processTaskCountRecord(connectorName, value);</span>
+<span class="pc bfc" id="L920" title="All 2 branches covered.">            } else if (record.key().equals(SESSION_KEY_KEY)) {</span>
+<span class="fc" id="L921">                processSessionKeyRecord(value);</span>
+<span class="pc bpc" id="L922" title="1 of 2 branches missed.">            } else if (record.key().startsWith(LOGGER_CLUSTER_PREFIX)) {</span>
+<span class="nc" id="L923">                String loggingNamespace = record.key().substring(LOGGER_CLUSTER_PREFIX.length());</span>
+<span class="nc" id="L924">                processLoggerLevelRecord(loggingNamespace, value);</span>
+<span class="nc" id="L925">            } else {</span>
+<span class="fc" id="L926">                log.error(&quot;Discarding config update record with invalid key: {}&quot;, record.key());</span>
+            }
+<span class="fc" id="L928">        }</span>
+
+    }
+
+    private void processTargetStateRecord(String connectorName, SchemaAndValue value) {
+<span class="fc" id="L933">        boolean removed = false;</span>
+<span class="fc" id="L934">        boolean stateChanged = true;</span>
+<span class="fc" id="L935">        synchronized (lock) {</span>
+<span class="fc bfc" id="L936" title="All 2 branches covered.">            if (value.value() == null) {</span>
+                // When connector configs are removed, we also write tombstones for the target state.
+<span class="fc" id="L938">                log.debug(&quot;Removed target state for connector {} due to null value in topic.&quot;, connectorName);</span>
+<span class="fc" id="L939">                connectorTargetStates.remove(connectorName);</span>
+<span class="fc" id="L940">                removed = true;</span>
+
+                // If for some reason we still have configs for the connector, add back the default
+                // STARTED state to ensure each connector always has a valid target state.
+<span class="pc bpc" id="L944" title="1 of 2 branches missed.">                if (connectorConfigs.containsKey(connectorName))</span>
+<span class="nc" id="L945">                    connectorTargetStates.put(connectorName, TargetState.STARTED);</span>
+            } else {
+<span class="pc bpc" id="L947" title="1 of 2 branches missed.">                if (!(value.value() instanceof Map)) {</span>
+<span class="nc" id="L948">                    log.error(&quot;Ignoring target state for connector '{}' because it is in the wrong format: {}&quot;, connectorName, className(value.value()));</span>
+<span class="nc" id="L949">                    return;</span>
+                }
+                @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L952">                Map&lt;String, Object&gt; valueMap = (Map&lt;String, Object&gt;) value.value();</span>
+<span class="fc" id="L953">                Object targetState = valueMap.get(&quot;state.v2&quot;);</span>
+<span class="pc bpc" id="L954" title="2 of 4 branches missed.">                if (targetState != null &amp;&amp; !(targetState instanceof String)) {</span>
+<span class="nc" id="L955">                    log.error(&quot;Invalid data for target state for connector '{}': 'state.v2' field should be a String but is {}&quot;,</span>
+<span class="nc" id="L956">                            connectorName, className(targetState));</span>
+                    // We don't return here; it's still possible that there's a value we can use in the older state field
+<span class="nc" id="L958">                    targetState = null;</span>
+                }
+<span class="pc bpc" id="L960" title="1 of 2 branches missed.">                if (targetState == null) {</span>
+                    // This record may have been written by an older worker; fall back on the older state field
+<span class="nc" id="L962">                    targetState = valueMap.get(&quot;state&quot;);</span>
+<span class="nc bnc" id="L963" title="All 2 branches missed.">                    if (!(targetState instanceof String)) {</span>
+<span class="nc" id="L964">                        log.error(&quot;Invalid data for target state for connector '{}': 'state' field should be a String but is {}&quot;,</span>
+<span class="nc" id="L965">                                connectorName, className(targetState));</span>
+<span class="nc" id="L966">                        return;</span>
+                    }
+                }
+
+                try {
+<span class="fc" id="L971">                    TargetState state = TargetState.valueOf((String) targetState);</span>
+<span class="fc" id="L972">                    log.debug(&quot;Setting target state for connector '{}' to {}&quot;, connectorName, targetState);</span>
+<span class="fc" id="L973">                    TargetState prevState = connectorTargetStates.put(connectorName, state);</span>
+<span class="fc bfc" id="L974" title="All 2 branches covered.">                    stateChanged = !state.equals(prevState);</span>
+<span class="nc" id="L975">                } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L976">                    log.error(&quot;Invalid target state for connector '{}': {}&quot;, connectorName, targetState);</span>
+<span class="nc" id="L977">                    return;</span>
+<span class="fc" id="L978">                }</span>
+            }
+<span class="fc" id="L980">        }</span>
+
+        // Note that we do not notify the update listener if the target state has been removed.
+        // Instead we depend on the removal callback of the connector config itself to notify the worker.
+        // We also don't notify the update listener if the connector doesn't exist yet - a scenario that can
+        // occur if an explicit initial target state is specified in the connector creation request.
+<span class="pc bpc" id="L986" title="1 of 8 branches missed.">        if (started &amp;&amp; !removed &amp;&amp; stateChanged &amp;&amp; connectorConfigs.containsKey(connectorName))</span>
+<span class="fc" id="L987">            updateListener.onConnectorTargetStateChange(connectorName);</span>
+<span class="fc" id="L988">    }</span>
+
+    private void processConnectorConfigRecord(String connectorName, SchemaAndValue value) {
+<span class="fc" id="L991">        boolean removed = false;</span>
+<span class="fc" id="L992">        synchronized (lock) {</span>
+<span class="fc bfc" id="L993" title="All 2 branches covered.">            if (value.value() == null) {</span>
+                // Connector deletion will be written as a null value
+<span class="fc" id="L995">                processConnectorRemoval(connectorName);</span>
+<span class="fc" id="L996">                log.info(&quot;Successfully processed removal of connector '{}'&quot;, connectorName);</span>
+<span class="fc" id="L997">                removed = true;</span>
+            } else {
+                // Connector configs can be applied and callbacks invoked immediately
+<span class="pc bpc" id="L1000" title="1 of 2 branches missed.">                if (!(value.value() instanceof Map)) {</span>
+<span class="nc" id="L1001">                    log.error(&quot;Ignoring configuration for connector '{}' because it is in the wrong format: {}&quot;, connectorName, className(value.value()));</span>
+<span class="nc" id="L1002">                    return;</span>
+                }
+                @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L1005">                Object newConnectorConfig = ((Map&lt;String, Object&gt;) value.value()).get(&quot;properties&quot;);</span>
+<span class="pc bpc" id="L1006" title="1 of 2 branches missed.">                if (!(newConnectorConfig instanceof Map)) {</span>
+<span class="nc" id="L1007">                    log.error(&quot;Invalid data for config for connector '{}': 'properties' field should be a Map but is {}&quot;,</span>
+<span class="nc" id="L1008">                            connectorName, className(newConnectorConfig));</span>
+<span class="nc" id="L1009">                    return;</span>
+                }
+<span class="fc" id="L1011">                log.debug(&quot;Updating configuration for connector '{}'&quot;, connectorName);</span>
+                @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L1013">                Map&lt;String, String&gt; stringsConnectorConfig = (Map&lt;String, String&gt;) newConnectorConfig;</span>
+<span class="fc" id="L1014">                connectorConfigs.put(connectorName, stringsConnectorConfig);</span>
+
+                // Set the initial state of the connector to STARTED, which ensures that any connectors
+                // which were created with 0.9 Connect will be initialized in the STARTED state.
+<span class="fc bfc" id="L1018" title="All 2 branches covered.">                if (!connectorTargetStates.containsKey(connectorName))</span>
+<span class="fc" id="L1019">                    connectorTargetStates.put(connectorName, TargetState.STARTED);</span>
+            }
+<span class="fc" id="L1021">        }</span>
+<span class="fc bfc" id="L1022" title="All 2 branches covered.">        if (started) {</span>
+<span class="fc bfc" id="L1023" title="All 2 branches covered.">            if (removed)</span>
+<span class="fc" id="L1024">                updateListener.onConnectorConfigRemove(connectorName);</span>
+            else
+<span class="fc" id="L1026">                updateListener.onConnectorConfigUpdate(connectorName);</span>
+        }
+<span class="fc" id="L1028">    }</span>
+
+    private void processTaskConfigRecord(ConnectorTaskId taskId, SchemaAndValue value) {
+<span class="fc" id="L1031">        synchronized (lock) {</span>
+<span class="pc bpc" id="L1032" title="1 of 2 branches missed.">            if (value.value() == null) {</span>
+<span class="nc" id="L1033">                log.error(&quot;Ignoring task configuration for task {} because it is unexpectedly null&quot;, taskId);</span>
+<span class="nc" id="L1034">                return;</span>
+            }
+<span class="pc bpc" id="L1036" title="1 of 2 branches missed.">            if (!(value.value() instanceof Map)) {</span>
+<span class="nc" id="L1037">                log.error(&quot;Ignoring task configuration for task {} because the value is not a Map but is {}&quot;, taskId, className(value.value()));</span>
+<span class="nc" id="L1038">                return;</span>
+            }
+
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L1042">            Object newTaskConfig = ((Map&lt;String, Object&gt;) value.value()).get(&quot;properties&quot;);</span>
+<span class="pc bpc" id="L1043" title="1 of 2 branches missed.">            if (!(newTaskConfig instanceof Map)) {</span>
+<span class="nc" id="L1044">                log.error(&quot;Invalid data for config of task {} 'properties' field should be a Map but is {}&quot;, taskId, className(newTaskConfig));</span>
+<span class="nc" id="L1045">                return;</span>
+            }
+
+<span class="fc" id="L1048">            Map&lt;ConnectorTaskId, Map&lt;String, String&gt;&gt; deferred = deferredTaskUpdates.computeIfAbsent(taskId.connector(), k -&gt; new HashMap&lt;&gt;());</span>
+<span class="fc" id="L1049">            log.debug(&quot;Storing new config for task {}; this will wait for a commit message before the new config will take effect.&quot;, taskId);</span>
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L1051">            Map&lt;String, String&gt; stringsTaskConfig = (Map&lt;String, String&gt;) newTaskConfig;</span>
+<span class="fc" id="L1052">            deferred.put(taskId, stringsTaskConfig);</span>
+<span class="fc" id="L1053">        }</span>
+<span class="fc" id="L1054">    }</span>
+
+    private void processTasksCommitRecord(String connectorName, SchemaAndValue value) {
+<span class="fc" id="L1057">        List&lt;ConnectorTaskId&gt; updatedTasks = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1058">        synchronized (lock) {</span>
+            // Edge case: connector was deleted before these task configs were published,
+            // but compaction took place and both the original connector config and the
+            // tombstone message for it have been removed from the config topic
+            // We should ignore these task configs
+<span class="fc" id="L1063">            Map&lt;String, String&gt; appliedConnectorConfig = connectorConfigs.get(connectorName);</span>
+<span class="fc bfc" id="L1064" title="All 2 branches covered.">            if (appliedConnectorConfig == null) {</span>
+<span class="fc" id="L1065">                processConnectorRemoval(connectorName);</span>
+<span class="fc" id="L1066">                log.debug(</span>
+                        &quot;Ignoring task configs for connector {}; it appears that the connector was deleted previously &quot;
+                            + &quot;and that log compaction has since removed any trace of its previous configurations &quot;
+                            + &quot;from the config topic&quot;,
+                        connectorName
+                );
+<span class="fc" id="L1072">                return;</span>
+            }
+
+            // Apply any outstanding deferred task updates for the given connector. Note that just because we
+            // encounter a commit message does not mean it will result in consistent output. In particular due to
+            // compaction, there may be cases where . For example if we have the following sequence of writes:
+            //
+            // 1. Write connector &quot;foo&quot;'s config
+            // 2. Write connector &quot;foo&quot;, task 1's config &lt;-- compacted
+            // 3. Write connector &quot;foo&quot;, task 2's config
+            // 4. Write connector &quot;foo&quot; task commit message
+            // 5. Write connector &quot;foo&quot;, task 1's config
+            // 6. Write connector &quot;foo&quot;, task 2's config
+            // 7. Write connector &quot;foo&quot; task commit message
+            //
+            // then when a new worker starts up, if message 2 had been compacted, then when message 4 is applied
+            // &quot;foo&quot; will not have a complete set of configs. Only when message 7 is applied will the complete
+            // configuration be available. Worse, if the leader died while writing messages 5, 6, and 7 such that
+            // only 5 was written, then there may be nothing that will finish writing the configs and get the
+            // log back into a consistent state.
+            //
+            // It is expected that the user of this class (i.e., the Herder) will take the necessary action to
+            // resolve this (i.e., get the connector to recommit its configuration). This inconsistent state is
+            // exposed in the snapshots provided via ClusterConfigState so they are easy to handle.
+<span class="pc bpc" id="L1096" title="1 of 2 branches missed.">            if (!(value.value() instanceof Map)) { // Schema-less, so we get maps instead of structs</span>
+<span class="nc" id="L1097">                log.error(&quot;Ignoring connector tasks configuration commit for connector '{}' because it is in the wrong format: {}&quot;, connectorName, className(value.value()));</span>
+<span class="nc" id="L1098">                return;</span>
+            }
+<span class="fc" id="L1100">            Map&lt;ConnectorTaskId, Map&lt;String, String&gt;&gt; deferred = deferredTaskUpdates.get(connectorName);</span>
+
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L1103">            int newTaskCount = intValue(((Map&lt;String, Object&gt;) value.value()).get(&quot;tasks&quot;));</span>
+
+            // Validate the configs we're supposed to update to ensure we're getting a complete configuration
+            // update of all tasks that are expected based on the number of tasks in the commit message.
+<span class="fc" id="L1107">            Set&lt;Integer&gt; taskIdSet = taskIds(connectorName, deferred);</span>
+<span class="pc bpc" id="L1108" title="1 of 2 branches missed.">            if (!completeTaskIdSet(taskIdSet, newTaskCount)) {</span>
+                // Given the logic for writing commit messages, we should only hit this condition due to compacted
+                // historical data, in which case we would not have applied any updates yet and there will be no
+                // task config data already committed for the connector, so we shouldn't have to clear any data
+                // out. All we need to do is add the flag marking it inconsistent.
+<span class="nc" id="L1113">                log.debug(&quot;We have an incomplete set of task configs for connector '{}' probably due to compaction. So we are not doing anything with the new configuration.&quot;, connectorName);</span>
+<span class="nc" id="L1114">                inconsistent.add(connectorName);</span>
+            } else {
+<span class="fc bfc" id="L1116" title="All 2 branches covered.">                if (deferred != null) {</span>
+<span class="fc" id="L1117">                    taskConfigs.putAll(deferred);</span>
+<span class="fc" id="L1118">                    updatedTasks.addAll(deferred.keySet());</span>
+<span class="fc bfc" id="L1119" title="All 2 branches covered.">                    connectorTaskConfigGenerations.compute(connectorName, (ignored, generation) -&gt; generation != null ? generation + 1 : 0);</span>
+                }
+<span class="fc" id="L1121">                inconsistent.remove(connectorName);</span>
+
+<span class="fc" id="L1123">                appliedConnectorConfigs.put(</span>
+                        connectorName,
+                        new AppliedConnectorConfig(appliedConnectorConfig)
+                );
+            }
+            // Always clear the deferred entries, even if we didn't apply them. If they represented an inconsistent
+            // update, then we need to see a completely fresh set of configs after this commit message, so we don't
+            // want any of these outdated configs
+<span class="fc bfc" id="L1131" title="All 2 branches covered.">            if (deferred != null)</span>
+<span class="fc" id="L1132">                deferred.clear();</span>
+
+<span class="fc" id="L1134">            connectorTaskCounts.put(connectorName, newTaskCount);</span>
+<span class="fc" id="L1135">        }</span>
+
+        // If task configs appear after the latest task count record, the connector needs a new round of zombie fencing
+        // before it can start tasks with these configs
+<span class="fc" id="L1139">        connectorsPendingFencing.add(connectorName);</span>
+<span class="fc bfc" id="L1140" title="All 2 branches covered.">        if (started)</span>
+<span class="fc" id="L1141">            updateListener.onTaskConfigUpdate(updatedTasks);</span>
+<span class="fc" id="L1142">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    RestartRequest recordToRestartRequest(ConsumerRecord&lt;String, byte[]&gt; record, SchemaAndValue value) {
+<span class="nc" id="L1146">        String connectorName = record.key().substring(RESTART_PREFIX.length());</span>
+<span class="nc bnc" id="L1147" title="All 2 branches missed.">        if (!(value.value() instanceof Map)) {</span>
+<span class="nc" id="L1148">            log.error(&quot;Ignoring restart request because the value is not a Map but is {}&quot;, className(value.value()));</span>
+<span class="nc" id="L1149">            return null;</span>
+        }
+
+<span class="nc" id="L1152">        Map&lt;String, Object&gt; valueAsMap = (Map&lt;String, Object&gt;) value.value();</span>
+
+<span class="nc" id="L1154">        Object failed = valueAsMap.get(ONLY_FAILED_FIELD_NAME);</span>
+        boolean onlyFailed;
+<span class="nc bnc" id="L1156" title="All 2 branches missed.">        if (!(failed instanceof Boolean)) {</span>
+<span class="nc" id="L1157">            log.warn(&quot;Invalid data for restart request '{}' field should be a Boolean but is {}, defaulting to {}&quot;, ONLY_FAILED_FIELD_NAME, className(failed), ONLY_FAILED_DEFAULT);</span>
+<span class="nc" id="L1158">            onlyFailed = ONLY_FAILED_DEFAULT;</span>
+        } else {
+<span class="nc" id="L1160">            onlyFailed = (Boolean) failed;</span>
+        }
+
+<span class="nc" id="L1163">        Object withTasks = valueAsMap.get(INCLUDE_TASKS_FIELD_NAME);</span>
+        boolean includeTasks;
+<span class="nc bnc" id="L1165" title="All 2 branches missed.">        if (!(withTasks instanceof Boolean)) {</span>
+<span class="nc" id="L1166">            log.warn(&quot;Invalid data for restart request '{}' field should be a Boolean but is {}, defaulting to {}&quot;, INCLUDE_TASKS_FIELD_NAME, className(withTasks), INCLUDE_TASKS_DEFAULT);</span>
+<span class="nc" id="L1167">            includeTasks = INCLUDE_TASKS_DEFAULT;</span>
+        } else {
+<span class="nc" id="L1169">            includeTasks = (Boolean) withTasks;</span>
+        }
+<span class="nc" id="L1171">        return new RestartRequest(connectorName, onlyFailed, includeTasks);</span>
+    }
+
+    private void processTaskCountRecord(String connectorName, SchemaAndValue value) {
+<span class="nc bnc" id="L1175" title="All 2 branches missed.">        if (!(value.value() instanceof Map)) {</span>
+<span class="nc" id="L1176">            log.error(&quot;Ignoring task count record for connector '{}' because it is in the wrong format: {}&quot;,  connectorName, className(value.value()));</span>
+<span class="nc" id="L1177">            return;</span>
+        }
+        @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L1180">        int taskCount = intValue(((Map&lt;String, Object&gt;) value.value()).get(&quot;task-count&quot;));</span>
+
+<span class="nc" id="L1182">        log.debug(&quot;Setting task count record for connector '{}' to {}&quot;, connectorName, taskCount);</span>
+<span class="nc" id="L1183">        connectorTaskCountRecords.put(connectorName, taskCount);</span>
+        // If a task count record appears after the latest task configs, the connector doesn't need a round of zombie
+        // fencing before it can start tasks with the latest configs
+<span class="nc" id="L1186">        connectorsPendingFencing.remove(connectorName);</span>
+<span class="nc" id="L1187">    }</span>
+
+    private void processSessionKeyRecord(SchemaAndValue value) {
+<span class="pc bpc" id="L1190" title="1 of 2 branches missed.">        if (value.value() == null) {</span>
+<span class="nc" id="L1191">            log.error(&quot;Ignoring session key because it is unexpectedly null&quot;);</span>
+<span class="nc" id="L1192">            return;</span>
+        }
+<span class="pc bpc" id="L1194" title="1 of 2 branches missed.">        if (!(value.value() instanceof Map)) {</span>
+<span class="nc" id="L1195">            log.error(&quot;Ignoring session key because the value is not a Map but is {}&quot;, className(value.value()));</span>
+<span class="nc" id="L1196">            return;</span>
+        }
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L1200">        Map&lt;String, Object&gt; valueAsMap = (Map&lt;String, Object&gt;) value.value();</span>
+
+<span class="fc" id="L1202">        Object sessionKey = valueAsMap.get(&quot;key&quot;);</span>
+<span class="pc bpc" id="L1203" title="1 of 2 branches missed.">        if (!(sessionKey instanceof String)) {</span>
+<span class="nc" id="L1204">            log.error(&quot;Invalid data for session key 'key' field should be a String but is {}&quot;, className(sessionKey));</span>
+<span class="nc" id="L1205">            return;</span>
+        }
+<span class="fc" id="L1207">        byte[] key = Base64.getDecoder().decode((String) sessionKey);</span>
+
+<span class="fc" id="L1209">        Object keyAlgorithm = valueAsMap.get(&quot;algorithm&quot;);</span>
+<span class="pc bpc" id="L1210" title="1 of 2 branches missed.">        if (!(keyAlgorithm instanceof String)) {</span>
+<span class="nc" id="L1211">            log.error(&quot;Invalid data for session key 'algorithm' field should be a String but it is {}&quot;, className(keyAlgorithm));</span>
+<span class="nc" id="L1212">            return;</span>
+        }
+
+<span class="fc" id="L1215">        Object creationTimestamp = valueAsMap.get(&quot;creation-timestamp&quot;);</span>
+<span class="pc bpc" id="L1216" title="1 of 2 branches missed.">        if (!(creationTimestamp instanceof Long)) {</span>
+<span class="nc" id="L1217">            log.error(&quot;Invalid data for session key 'creation-timestamp' field should be a long but it is {}&quot;, className(creationTimestamp));</span>
+<span class="nc" id="L1218">            return;</span>
+        }
+<span class="fc" id="L1220">        KafkaConfigBackingStore.this.sessionKey = new SessionKey(</span>
+                new SecretKeySpec(key, (String) keyAlgorithm),
+<span class="fc" id="L1222">                (long) creationTimestamp</span>
+        );
+
+<span class="fc bfc" id="L1225" title="All 2 branches covered.">        if (started)</span>
+<span class="fc" id="L1226">            updateListener.onSessionKeyUpdate(KafkaConfigBackingStore.this.sessionKey);</span>
+<span class="fc" id="L1227">    }</span>
+
+    private void processLoggerLevelRecord(String namespace, SchemaAndValue value) {
+<span class="nc bnc" id="L1230" title="All 2 branches missed.">        if (value.value() == null) {</span>
+<span class="nc" id="L1231">            log.error(&quot;Ignoring logging level for namespace {} because it is unexpectedly null&quot;, namespace);</span>
+<span class="nc" id="L1232">            return;</span>
+        }
+<span class="nc bnc" id="L1234" title="All 2 branches missed.">        if (!(value.value() instanceof Map)) {</span>
+<span class="nc" id="L1235">            log.error(&quot;Ignoring logging level for namespace {} because the value is not a Map but is {}&quot;, namespace, className(value.value()));</span>
+<span class="nc" id="L1236">            return;</span>
+        }
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L1240">        Map&lt;String, Object&gt; valueAsMap = (Map&lt;String, Object&gt;) value.value();</span>
+
+<span class="nc" id="L1242">        Object level = valueAsMap.get(&quot;level&quot;);</span>
+<span class="nc bnc" id="L1243" title="All 2 branches missed.">        if (!(level instanceof String)) {</span>
+<span class="nc" id="L1244">            log.error(&quot;Invalid data for logging level key 'level' field with namespace {}; should be a String but it is {}&quot;, namespace, className(level));</span>
+<span class="nc" id="L1245">            return;</span>
+        }
+
+<span class="nc bnc" id="L1248" title="All 2 branches missed.">        if (started) {</span>
+<span class="nc" id="L1249">            updateListener.onLoggingLevelUpdate(namespace, (String) level);</span>
+        } else {
+            // TRACE level since there may be many of these records in the config topic
+<span class="nc" id="L1252">            log.trace(</span>
+                    &quot;Ignoring old logging level {} for namespace {} that was written to the config topic before this worker completed startup&quot;,
+                    level,
+                    namespace
+            );
+        }
+<span class="nc" id="L1258">    }</span>
+
+    private void processConnectorRemoval(String connectorName) {
+<span class="fc" id="L1261">        connectorConfigs.remove(connectorName);</span>
+<span class="fc" id="L1262">        connectorTaskCounts.remove(connectorName);</span>
+<span class="fc" id="L1263">        taskConfigs.keySet().removeIf(taskId -&gt; taskId.connector().equals(connectorName));</span>
+<span class="fc" id="L1264">        deferredTaskUpdates.remove(connectorName);</span>
+<span class="fc" id="L1265">        appliedConnectorConfigs.remove(connectorName);</span>
+<span class="fc" id="L1266">    }</span>
+
+    private ConnectorTaskId parseTaskId(String key) {
+<span class="fc" id="L1269">        String[] parts = key.split(&quot;-&quot;);</span>
+<span class="pc bpc" id="L1270" title="1 of 2 branches missed.">        if (parts.length &lt; 3) return null;</span>
+
+        try {
+<span class="fc" id="L1273">            int taskNum = Integer.parseInt(parts[parts.length - 1]);</span>
+<span class="fc" id="L1274">            String connectorName = String.join(&quot;-&quot;, Arrays.copyOfRange(parts, 1, parts.length - 1));</span>
+<span class="fc" id="L1275">            return new ConnectorTaskId(connectorName, taskNum);</span>
+<span class="nc" id="L1276">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L1277">            return null;</span>
+        }
+    }
+
+    /**
+     * Given task configurations, get a set of integer task IDs for the connector.
+     */
+    private Set&lt;Integer&gt; taskIds(String connector, Map&lt;ConnectorTaskId, Map&lt;String, String&gt;&gt; configs) {
+<span class="fc" id="L1285">        Set&lt;Integer&gt; tasks = new TreeSet&lt;&gt;();</span>
+<span class="fc bfc" id="L1286" title="All 2 branches covered.">        if (configs == null) {</span>
+<span class="fc" id="L1287">            return tasks;</span>
+        }
+<span class="fc bfc" id="L1289" title="All 2 branches covered.">        for (ConnectorTaskId taskId : configs.keySet()) {</span>
+<span class="pc bpc" id="L1290" title="1 of 2 branches missed.">            assert taskId.connector().equals(connector);</span>
+<span class="fc" id="L1291">            tasks.add(taskId.task());</span>
+<span class="fc" id="L1292">        }</span>
+<span class="fc" id="L1293">        return tasks;</span>
+    }
+
+    private boolean completeTaskIdSet(Set&lt;Integer&gt; idSet, int expectedSize) {
+        // Note that we do *not* check for the exact set. This is an important implication of compaction. If we start out
+        // with 2 tasks, then reduce to 1, we'll end up with log entries like:
+        //
+        // 1. Connector &quot;foo&quot; config
+        // 2. Connector &quot;foo&quot;, task 1 config
+        // 3. Connector &quot;foo&quot;, task 2 config
+        // 4. Connector &quot;foo&quot;, commit 2 tasks
+        // 5. Connector &quot;foo&quot;, task 1 config
+        // 6. Connector &quot;foo&quot;, commit 1 tasks
+        //
+        // However, due to compaction we could end up with a log that looks like this:
+        //
+        // 1. Connector &quot;foo&quot; config
+        // 3. Connector &quot;foo&quot;, task 2 config
+        // 5. Connector &quot;foo&quot;, task 1 config
+        // 6. Connector &quot;foo&quot;, commit 1 tasks
+        //
+        // which isn't incorrect, but would appear in this code to have an extra task configuration. Instead, we just
+        // validate that all the configs specified by the commit message are present. This should be fine because the
+        // logic for writing configs ensures all the task configs are written (and reads them back) before writing the
+        // commit message.
+
+<span class="pc bpc" id="L1319" title="1 of 2 branches missed.">        if (idSet.size() &lt; expectedSize)</span>
+<span class="nc" id="L1320">            return false;</span>
+
+<span class="fc bfc" id="L1322" title="All 2 branches covered.">        for (int i = 0; i &lt; expectedSize; i++)</span>
+<span class="pc bpc" id="L1323" title="1 of 2 branches missed.">            if (!idSet.contains(i))</span>
+<span class="nc" id="L1324">                return false;</span>
+<span class="fc" id="L1325">        return true;</span>
+    }
+
+    // Convert an integer value extracted from a schemaless struct to an int. This handles potentially different
+    // encodings by different Converters.
+    private static int intValue(Object value) {
+<span class="pc bpc" id="L1331" title="1 of 2 branches missed.">        if (value instanceof Integer)</span>
+<span class="nc" id="L1332">            return (int) value;</span>
+<span class="pc bpc" id="L1333" title="1 of 2 branches missed.">        else if (value instanceof Long)</span>
+<span class="fc" id="L1334">            return (int) (long) value;</span>
+        else
+<span class="nc" id="L1336">            throw new ConnectException(&quot;Expected integer value to be either Integer or Long&quot;);</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

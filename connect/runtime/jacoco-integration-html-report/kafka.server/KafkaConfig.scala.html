@@ -1,0 +1,611 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaConfig.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">kafka.server</a> &gt; <span class="el_source">KafkaConfig.scala</span></div><h1>KafkaConfig.scala</h1><pre class="source lang-java linenums">/**
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+  * contributor license agreements.  See the NOTICE file distributed with
+  * this work for additional information regarding copyright ownership.
+  * The ASF licenses this file to You under the Apache License, Version 2.0
+  * (the &quot;License&quot;); you may not use this file except in compliance with
+  * the License.  You may obtain a copy of the License at
+  *
+  * http://www.apache.org/licenses/LICENSE-2.0
+  *
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+
+package kafka.server
+
+import java.util
+import java.util.concurrent.TimeUnit
+import java.util.Properties
+import kafka.utils.Logging
+import kafka.utils.Implicits._
+import org.apache.kafka.common.{Endpoint, Reconfigurable}
+import org.apache.kafka.common.config.{ConfigDef, ConfigException, TopicConfig}
+import org.apache.kafka.common.config.ConfigDef.ConfigKey
+import org.apache.kafka.common.config.internals.BrokerSecurityConfigs
+import org.apache.kafka.common.internals.Plugin
+import org.apache.kafka.common.metrics.Metrics
+import org.apache.kafka.common.network.ListenerName
+import org.apache.kafka.common.security.auth.KafkaPrincipalSerde
+import org.apache.kafka.common.security.auth.SecurityProtocol
+import org.apache.kafka.common.utils.Utils
+import org.apache.kafka.coordinator.group.Group.GroupType
+import org.apache.kafka.coordinator.group.modern.share.ShareGroupConfig
+import org.apache.kafka.coordinator.group.GroupCoordinatorConfig
+import org.apache.kafka.coordinator.share.ShareCoordinatorConfig
+import org.apache.kafka.network.SocketServerConfigs
+import org.apache.kafka.raft.{KRaftConfigs, MetadataLogConfig, QuorumConfig}
+import org.apache.kafka.security.authorizer.AuthorizerUtils
+import org.apache.kafka.server.ProcessRole
+import org.apache.kafka.server.authorizer.Authorizer
+import org.apache.kafka.server.config.{AbstractKafkaConfig, QuotaConfig, ReplicationConfigs, ServerConfigs, ServerLogConfigs, DynamicBrokerConfig =&gt; JDynamicBrokerConfig}
+import org.apache.kafka.server.log.remote.storage.RemoteLogManagerConfig
+import org.apache.kafka.server.metrics.MetricConfigs
+
+import scala.jdk.CollectionConverters._
+import scala.collection.{Map, Seq}
+import scala.jdk.OptionConverters.{RichOption, RichOptional}
+
+<span class="fc" id="L52">object KafkaConfig {</span>
+
+  def main(args: Array[String]): Unit = {
+<span class="nc" id="L55">    val combined = new ConfigDef(configDef)</span>
+    // Broker quota configs are dynamic-only and not defined in AbstractKafkaConfig.CONFIG_DEF,
+    // so we need to add them explicitly here for the generated HTML documentation.
+<span class="nc" id="L58">    QuotaConfig.brokerQuotaConfigs().configKeys().forEach((_, v) =&gt; combined.define(v))</span>
+<span class="nc" id="L59">    System.out.println(combined.toHtml(4, (config: String) =&gt; &quot;brokerconfigs_&quot; + config,</span>
+<span class="nc" id="L60">      JDynamicBrokerConfig.dynamicConfigUpdateModes))</span>
+  }
+
+<span class="fc" id="L63">  val configDef = AbstractKafkaConfig.CONFIG_DEF</span>
+
+<span class="nc" id="L65">  def configNames: Seq[String] = configDef.names.asScala.toBuffer.sorted</span>
+<span class="fc" id="L66">  private[server] def defaultValues: Map[String, _] = configDef.defaultValues.asScala</span>
+<span class="nc" id="L67">  private[server] def configKeys: Map[String, ConfigKey] = configDef.configKeys.asScala</span>
+
+  def clampDynamicConfigs(props: java.util.Map[String, String]): Unit = {
+<span class="nc" id="L70">    GroupCoordinatorConfig.clampDynamicConfigs(props)</span>
+  }
+
+  def fromProps(props: Properties): KafkaConfig =
+<span class="nc" id="L74">    fromProps(props, true)</span>
+
+  def fromProps(props: Properties, doLog: Boolean): KafkaConfig =
+<span class="nc" id="L77">    new KafkaConfig(props, doLog)</span>
+
+  def fromProps(defaults: Properties, overrides: Properties): KafkaConfig =
+<span class="nc" id="L80">    fromProps(defaults, overrides, true)</span>
+
+  def fromProps(defaults: Properties, overrides: Properties, doLog: Boolean): KafkaConfig = {
+<span class="nc" id="L83">    val props = new Properties()</span>
+<span class="nc" id="L84">    props ++= defaults</span>
+<span class="nc" id="L85">    props ++= overrides</span>
+<span class="nc" id="L86">    fromProps(props, doLog)</span>
+  }
+
+<span class="nc" id="L89">  def apply(props: java.util.Map[_, _], doLog: Boolean = true): KafkaConfig = new KafkaConfig(props, doLog)</span>
+
+  def configType(configName: String): Option[ConfigDef.Type] =
+<span class="nc" id="L92">    AbstractKafkaConfig.configType(configName).toScala</span>
+
+  def maybeSensitive(configType: Option[ConfigDef.Type]): Boolean = {
+<span class="fc" id="L95">    AbstractKafkaConfig.maybeSensitive(configType.toJava)</span>
+  }
+}
+
+/**
+ * The class extend {@link AbstractKafkaConfig} which will be the future KafkaConfig.
+ * When add any new methods if it doesn't depend on anything in Core, then move it to org.apache.kafka.server.config.KafkaConfig instead of here.
+ * Any code depends on kafka.server.KafkaConfig will keep for using kafka.server.KafkaConfig for the time being until we move it out of core
+ * For more details check KAFKA-15853
+ */
+<span class="pc bnc" id="L105" title="All 4 branches missed.">class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])</span>
+<span class="fc" id="L106">  extends AbstractKafkaConfig(KafkaConfig.configDef, props, Utils.castToStringObjectMap(props), doLog) with Logging {</span>
+
+<span class="nc" id="L108">  def this(props: java.util.Map[_, _]) = this(true, AbstractKafkaConfig.populateSynonyms(props))</span>
+<span class="fc" id="L109">  def this(props: java.util.Map[_, _], doLog: Boolean) = this(doLog, AbstractKafkaConfig.populateSynonyms(props))</span>
+
+  // Cache the current config to avoid acquiring read lock to access from dynamicConfig
+<span class="fc" id="L112">  @volatile private var currentConfig = this</span>
+<span class="fc" id="L113">  val processRoles: Set[ProcessRole] = parseProcessRoles()</span>
+<span class="fc" id="L114">  private[server] val dynamicConfig = new DynamicBrokerConfig(this)</span>
+
+  private[server] def updateCurrentConfig(newConfig: KafkaConfig): Unit = {
+<span class="fc" id="L117">    this.currentConfig = newConfig</span>
+  }
+
+  // for testing
+  private[server] def updateCurrentConfig(props: util.Map[_, _]): Unit = {
+<span class="nc" id="L122">    this.currentConfig = new KafkaConfig(props)</span>
+  }
+
+  override def originals: util.Map[String, AnyRef] =
+<span class="fc bfc" id="L126" title="All 2 branches covered.">    if (this eq currentConfig) super.originals else currentConfig.originals</span>
+  override def values: util.Map[String, _] =
+<span class="fc bfc" id="L128" title="All 2 branches covered.">    if (this eq currentConfig) super.values else currentConfig.values</span>
+  override def nonInternalValues: util.Map[String, _] =
+<span class="nc bnc" id="L130" title="All 2 branches missed.">    if (this eq currentConfig) super.nonInternalValues else currentConfig.nonInternalValues</span>
+  override def originalsStrings: util.Map[String, String] =
+<span class="nc bnc" id="L132" title="All 2 branches missed.">    if (this eq currentConfig) super.originalsStrings else currentConfig.originalsStrings</span>
+  override def originalsWithPrefix(prefix: String): util.Map[String, AnyRef] =
+<span class="fc bfc" id="L134" title="All 2 branches covered.">    if (this eq currentConfig) super.originalsWithPrefix(prefix) else currentConfig.originalsWithPrefix(prefix)</span>
+  override def valuesWithPrefixOverride(prefix: String): util.Map[String, AnyRef] =
+<span class="fc bfc" id="L136" title="All 2 branches covered.">    if (this eq currentConfig) super.valuesWithPrefixOverride(prefix) else currentConfig.valuesWithPrefixOverride(prefix)</span>
+  override def get(key: String): AnyRef =
+<span class="fc bfc" id="L138" title="All 2 branches covered.">    if (this eq currentConfig) super.get(key) else currentConfig.get(key)</span>
+
+  //  During dynamic update, we use the values from this config, these are only used in DynamicBrokerConfig
+<span class="fc" id="L141">  private[server] def originalsFromThisConfig: util.Map[String, AnyRef] = super.originals</span>
+<span class="fc" id="L142">  private[server] def valuesFromThisConfig: util.Map[String, _] = super.values</span>
+  def valuesFromThisConfigWithPrefixOverride(prefix: String): util.Map[String, AnyRef] =
+<span class="fc" id="L144">    super.valuesWithPrefixOverride(prefix)</span>
+
+<span class="fc" id="L146">  private val _remoteLogManagerConfig = new RemoteLogManagerConfig(this)</span>
+<span class="fc" id="L147">  def remoteLogManagerConfig = _remoteLogManagerConfig</span>
+
+<span class="fc" id="L149">  private val _quorumConfig = new QuorumConfig(this)</span>
+<span class="fc" id="L150">  def quorumConfig: QuorumConfig = _quorumConfig</span>
+
+<span class="fc" id="L152">  private val _groupCoordinatorConfig = new GroupCoordinatorConfig(this)</span>
+
+<span class="fc" id="L154">  def groupCoordinatorConfig: GroupCoordinatorConfig = _groupCoordinatorConfig</span>
+
+<span class="fc" id="L156">  private val _shareGroupConfig = new ShareGroupConfig(this)</span>
+<span class="fc" id="L157">  def shareGroupConfig: ShareGroupConfig = _shareGroupConfig</span>
+
+<span class="fc" id="L159">  private val _shareCoordinatorConfig = new ShareCoordinatorConfig(this)</span>
+<span class="fc" id="L160">  def shareCoordinatorConfig: ShareCoordinatorConfig = _shareCoordinatorConfig</span>
+
+<span class="fc" id="L162">  private val _quotaConfig = new QuotaConfig(this)</span>
+<span class="fc" id="L163">  def quotaConfig: QuotaConfig = _quotaConfig</span>
+
+  /** ********* General Configuration ***********/
+<span class="fc" id="L166">  val brokerSessionTimeoutMs: Int = getInt(KRaftConfigs.BROKER_SESSION_TIMEOUT_MS_CONFIG)</span>
+<span class="fc" id="L167">  val controllerPerformanceSamplePeriodMs: Long = getLong(KRaftConfigs.CONTROLLER_PERFORMANCE_SAMPLE_PERIOD_MS)</span>
+<span class="fc" id="L168">  val controllerPerformanceAlwaysLogThresholdMs: Long = getLong(KRaftConfigs.CONTROLLER_PERFORMANCE_ALWAYS_LOG_THRESHOLD_MS)</span>
+
+  private def parseProcessRoles(): Set[ProcessRole] = {
+<span class="pc bpc" id="L171" title="2 of 5 branches missed.">    val roles = getList(KRaftConfigs.PROCESS_ROLES_CONFIG).asScala.map {</span>
+<span class="pc bpc" id="L172" title="1 of 2 branches missed.">      case &quot;broker&quot; =&gt; ProcessRole.BrokerRole</span>
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">      case &quot;controller&quot; =&gt; ProcessRole.ControllerRole</span>
+<span class="nc" id="L174">      case role =&gt; throw new ConfigException(s&quot;Unknown process role '$role'&quot; +</span>
+        &quot; (only 'broker' and 'controller' are allowed roles)&quot;)
+    }
+<span class="fc" id="L177">    roles.toSet</span>
+  }
+
+  def isKRaftCombinedMode: Boolean = {
+<span class="pc bpc" id="L181" title="4 of 6 branches missed.">    processRoles == Set(ProcessRole.BrokerRole, ProcessRole.ControllerRole)</span>
+  }
+
+  def metadataLogDir: String = {
+<span class="pc" id="L185">    Option(getString(MetadataLogConfig.METADATA_LOG_DIR_CONFIG)) match {</span>
+<span class="pc bpc" id="L186" title="1 of 2 branches missed.">      case Some(dir) =&gt; dir</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">      case None =&gt; logDirs.get(0)</span>
+    }
+  }
+
+<span class="fc" id="L191">  val serverMaxStartupTimeMs = getLong(KRaftConfigs.SERVER_MAX_STARTUP_TIME_MS_CONFIG)</span>
+
+<span class="fc" id="L193">  def messageMaxBytes = getInt(ServerConfigs.MESSAGE_MAX_BYTES_CONFIG)</span>
+
+  def getNumReplicaAlterLogDirsThreads: Int = {
+<span class="fc" id="L196">    val numThreads: Integer = Option(getInt(ServerConfigs.NUM_REPLICA_ALTER_LOG_DIRS_THREADS_CONFIG)).getOrElse(logDirs.size)</span>
+<span class="fc" id="L197">    numThreads</span>
+  }
+
+  /************* Metadata Configuration ***********/
+<span class="fc" id="L201">  val metadataSnapshotMaxNewRecordBytes = getLong(MetadataLogConfig.METADATA_SNAPSHOT_MAX_NEW_RECORD_BYTES_CONFIG)</span>
+<span class="fc" id="L202">  val metadataSnapshotMaxIntervalMs = getLong(MetadataLogConfig.METADATA_SNAPSHOT_MAX_INTERVAL_MS_CONFIG)</span>
+<span class="fc" id="L203">  val metadataMaxIdleIntervalNs: Option[Long] = {</span>
+<span class="fc" id="L204">    val value = TimeUnit.NANOSECONDS.convert(getInt(MetadataLogConfig.METADATA_MAX_IDLE_INTERVAL_MS_CONFIG).toLong, TimeUnit.MILLISECONDS)</span>
+<span class="pc bpc" id="L205" title="1 of 2 branches missed.">    if (value &gt; 0) Some(value) else None</span>
+  }
+
+  /************* Authorizer Configuration ***********/
+  def createNewAuthorizer(metrics: Metrics, role: String): Option[Plugin[Authorizer]] = {
+<span class="fc" id="L210">    val className = getString(ServerConfigs.AUTHORIZER_CLASS_NAME_CONFIG)</span>
+<span class="pc bpc" id="L211" title="2 of 4 branches missed.">    if (className == null || className.isEmpty)</span>
+<span class="fc" id="L212">      None</span>
+    else {
+<span class="nc" id="L214">      Some(AuthorizerUtils.createAuthorizer(className, originals, metrics, ServerConfigs.AUTHORIZER_CLASS_NAME_CONFIG, role))</span>
+    }
+  }
+
+<span class="fc" id="L218">  val earlyStartListeners: Set[ListenerName] = {</span>
+<span class="fc" id="L219">    val listenersSet = listeners.map(l =&gt; ListenerName.normalised(l.listener)).toSet</span>
+<span class="fc" id="L220">    val controllerListenersSet = controllerListeners.map(l =&gt; ListenerName.normalised(l.listener)).toSet</span>
+<span class="pc" id="L221">    Option(getList(ServerConfigs.EARLY_START_LISTENERS_CONFIG)) match {</span>
+<span class="pc bpc" id="L222" title="1 of 2 branches missed.">      case None =&gt; controllerListenersSet</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">      case Some(list) =&gt;</span>
+<span class="nc" id="L224">        list.asScala.map(_.trim()).filterNot(_.isEmpty).map { str =&gt;</span>
+<span class="nc" id="L225">          val listenerName = new ListenerName(str)</span>
+<span class="nc bnc" id="L226" title="All 4 branches missed.">          if (!listenersSet.contains(listenerName) &amp;&amp; !controllerListenersSet.contains(listenerName))</span>
+<span class="nc" id="L227">            throw new ConfigException(s&quot;${ServerConfigs.EARLY_START_LISTENERS_CONFIG} contains &quot; +</span>
+<span class="nc" id="L228">              s&quot;listener ${listenerName.value()}, but this is not contained in &quot; +</span>
+              s&quot;${SocketServerConfigs.LISTENERS_CONFIG} or ${KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG}&quot;)
+<span class="nc" id="L230">          listenerName</span>
+        }.toSet
+    }
+  }
+
+  /***************** rack configuration **************/
+<span class="fc" id="L236">  val replicaSelectorClassName = Option(getString(ReplicationConfigs.REPLICA_SELECTOR_CLASS_CONFIG))</span>
+
+  /** ********* Replication configuration ***********/
+<span class="pc" id="L239">  val controllerSocketTimeoutMs: Int = getInt(ReplicationConfigs.CONTROLLER_SOCKET_TIMEOUT_MS_CONFIG)</span>
+<span class="fc" id="L240">  val defaultReplicationFactor: Int = getInt(ReplicationConfigs.DEFAULT_REPLICATION_FACTOR_CONFIG)</span>
+<span class="fc" id="L241">  val replicaLagTimeMaxMs = getLong(ReplicationConfigs.REPLICA_LAG_TIME_MAX_MS_CONFIG)</span>
+<span class="fc" id="L242">  val replicaSocketTimeoutMs = getInt(ReplicationConfigs.REPLICA_SOCKET_TIMEOUT_MS_CONFIG)</span>
+<span class="pc" id="L243">  val replicaSocketReceiveBufferBytes = getInt(ReplicationConfigs.REPLICA_SOCKET_RECEIVE_BUFFER_BYTES_CONFIG)</span>
+<span class="pc" id="L244">  val replicaFetchMaxBytes = getInt(ReplicationConfigs.REPLICA_FETCH_MAX_BYTES_CONFIG)</span>
+<span class="fc" id="L245">  val replicaFetchWaitMaxMs = getInt(ReplicationConfigs.REPLICA_FETCH_WAIT_MAX_MS_CONFIG)</span>
+<span class="pc" id="L246">  val replicaFetchMinBytes = getInt(ReplicationConfigs.REPLICA_FETCH_MIN_BYTES_CONFIG)</span>
+<span class="pc" id="L247">  val replicaFetchResponseMaxBytes = getInt(ReplicationConfigs.REPLICA_FETCH_RESPONSE_MAX_BYTES_CONFIG)</span>
+<span class="pc" id="L248">  val replicaFetchBackoffMs = getInt(ReplicationConfigs.REPLICA_FETCH_BACKOFF_MS_CONFIG)</span>
+<span class="fc" id="L249">  val replicaHighWatermarkCheckpointIntervalMs = getLong(ReplicationConfigs.REPLICA_HIGH_WATERMARK_CHECKPOINT_INTERVAL_MS_CONFIG)</span>
+<span class="fc" id="L250">  val fetchPurgatoryPurgeIntervalRequests = getInt(ReplicationConfigs.FETCH_PURGATORY_PURGE_INTERVAL_REQUESTS_CONFIG)</span>
+<span class="fc" id="L251">  val producerPurgatoryPurgeIntervalRequests = getInt(ReplicationConfigs.PRODUCER_PURGATORY_PURGE_INTERVAL_REQUESTS_CONFIG)</span>
+<span class="fc" id="L252">  val deleteRecordsPurgatoryPurgeIntervalRequests = getInt(ReplicationConfigs.DELETE_RECORDS_PURGATORY_PURGE_INTERVAL_REQUESTS_CONFIG)</span>
+<span class="fc" id="L253">  val autoLeaderRebalanceEnable = getBoolean(ReplicationConfigs.AUTO_LEADER_REBALANCE_ENABLE_CONFIG)</span>
+<span class="fc" id="L254">  val leaderImbalanceCheckIntervalSeconds: Long = getLong(ReplicationConfigs.LEADER_IMBALANCE_CHECK_INTERVAL_SECONDS_CONFIG)</span>
+<span class="fc" id="L255">  val uncleanLeaderElectionCheckIntervalMs: Long = getLong(ReplicationConfigs.UNCLEAN_LEADER_ELECTION_INTERVAL_MS_CONFIG)</span>
+<span class="fc" id="L256">  def uncleanLeaderElectionEnable: java.lang.Boolean = getBoolean(ReplicationConfigs.UNCLEAN_LEADER_ELECTION_ENABLE_CONFIG)</span>
+<span class="nc" id="L257">  def followerFetchLastTieredOffsetEnable: java.lang.Boolean = getBoolean(ReplicationConfigs.FOLLOWER_FETCH_LAST_TIERED_OFFSET_ENABLE_CONFIG);</span>
+
+  /** ********* Controlled shutdown configuration ***********/
+<span class="fc" id="L260">  val controlledShutdownEnable = getBoolean(ServerConfigs.CONTROLLED_SHUTDOWN_ENABLE_CONFIG)</span>
+
+  /** Group coordinator configs */
+<span class="pc" id="L263">  val groupCoordinatorRebalanceProtocols = {</span>
+<span class="fc" id="L264">    val protocols = getList(GroupCoordinatorConfig.GROUP_COORDINATOR_REBALANCE_PROTOCOLS_CONFIG)</span>
+<span class="fc" id="L265">      .asScala.map(_.toUpperCase).map(GroupType.valueOf).toSet</span>
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">    if (!protocols.contains(GroupType.CLASSIC)) {</span>
+<span class="nc" id="L267">      throw new ConfigException(s&quot;Disabling the '${GroupType.CLASSIC}' protocol is not supported.&quot;)</span>
+    }
+<span class="pc bpc" id="L269" title="1 of 4 branches missed.">    if (doLog &amp;&amp; protocols.contains(GroupType.SHARE)) {</span>
+<span class="nc" id="L270">      warn(s&quot;'${GroupType.SHARE}' in `${GroupCoordinatorConfig.GROUP_COORDINATOR_REBALANCE_PROTOCOLS_CONFIG}` is deprecated. &quot; +</span>
+<span class="nc" id="L271">        s&quot;Share groups are controlled by the 'share.version' feature. &quot; +</span>
+        s&quot;This config will be removed in Kafka 5.0.&quot;)
+    }
+<span class="pc bpc" id="L274" title="1 of 4 branches missed.">    if (doLog &amp;&amp; originals().containsKey(GroupCoordinatorConfig.GROUP_COORDINATOR_REBALANCE_PROTOCOLS_CONFIG)) {</span>
+<span class="nc" id="L275">      val defaultProtocols = GroupCoordinatorConfig.GROUP_COORDINATOR_REBALANCE_PROTOCOLS_DEFAULT</span>
+<span class="nc" id="L276">        .asScala.map(_.toUpperCase).map(GroupType.valueOf).toSet</span>
+<span class="nc" id="L277">      val missingProtocols = defaultProtocols -- protocols</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">      if (missingProtocols.nonEmpty) {</span>
+<span class="nc" id="L279">        warn(s&quot;The config `${GroupCoordinatorConfig.GROUP_COORDINATOR_REBALANCE_PROTOCOLS_CONFIG}` is deprecated and will be removed in Kafka 5.0. &quot; +</span>
+<span class="nc" id="L280">          s&quot;The following protocol(s) are currently disabled: ${missingProtocols.mkString(&quot;, &quot;)}. &quot; +</span>
+          s&quot;In Kafka 5.0, all protocols will always be enabled and controlled solely by feature versions &quot; +
+<span class="nc" id="L282">          s&quot;(group.version, streams.version, share.version) via kafka-features.sh. &quot; +</span>
+          s&quot;Please remove the configuration, which will restore all protocols to the default enabled state, to prepare for the upgrade.&quot;)
+      } else {
+<span class="nc" id="L285">        warn(s&quot;The config `${GroupCoordinatorConfig.GROUP_COORDINATOR_REBALANCE_PROTOCOLS_CONFIG}` is deprecated and will be removed in Kafka 5.0. &quot; +</span>
+          s&quot;Please remove the configuration to prepare for the upgrade.&quot;)
+      }
+    }
+<span class="fc" id="L289">    protocols</span>
+  }
+
+  /** ********* Metric Configuration **************/
+<span class="pc" id="L293">  val metricNumSamples = getInt(MetricConfigs.METRIC_NUM_SAMPLES_CONFIG)</span>
+<span class="pc" id="L294">  val metricSampleWindowMs = getLong(MetricConfigs.METRIC_SAMPLE_WINDOW_MS_CONFIG)</span>
+<span class="pc" id="L295">  val metricRecordingLevel = getString(MetricConfigs.METRIC_RECORDING_LEVEL_CONFIG)</span>
+
+  /** ********* Kafka Client Telemetry Metrics Configuration ***********/
+<span class="fc" id="L298">  val clientTelemetryMaxBytes: Int = getInt(MetricConfigs.CLIENT_TELEMETRY_MAX_BYTES_CONFIG)</span>
+
+  /** ********* SSL/SASL Configuration **************/
+  // Security configs may be overridden for listeners, so it is not safe to use the base values
+  // Hence the base SSL/SASL configs are not fields of KafkaConfig, listener configs should be
+  // retrieved using KafkaConfig#valuesWithPrefixOverride
+  private def saslEnabledMechanisms(listenerName: ListenerName): Set[String] = {
+<span class="nc" id="L305">    val value = valuesWithPrefixOverride(listenerName.configPrefix).get(BrokerSecurityConfigs.SASL_ENABLED_MECHANISMS_CONFIG)</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">    if (value != null)</span>
+<span class="nc" id="L307">      value.asInstanceOf[util.List[String]].asScala.toSet</span>
+    else
+<span class="nc" id="L309">      Set.empty[String]</span>
+  }
+
+<span class="fc" id="L312">  def saslMechanismInterBrokerProtocol = getString(BrokerSecurityConfigs.SASL_MECHANISM_INTER_BROKER_PROTOCOL_CONFIG)</span>
+
+  /** ********* Fetch Configuration **************/
+<span class="fc" id="L315">  val maxIncrementalFetchSessionCacheSlots = getInt(ServerConfigs.MAX_INCREMENTAL_FETCH_SESSION_CACHE_SLOTS_CONFIG)</span>
+<span class="fc" id="L316">  val fetchMaxBytes = getInt(ServerConfigs.FETCH_MAX_BYTES_CONFIG)</span>
+
+  /** ********* Request Limit Configuration ***********/
+<span class="fc" id="L319">  val maxRequestPartitionSizeLimit = getInt(ServerConfigs.MAX_REQUEST_PARTITION_SIZE_LIMIT_CONFIG)</span>
+
+<span class="fc" id="L321">  val deleteTopicEnable = getBoolean(ServerConfigs.DELETE_TOPIC_ENABLE_CONFIG)</span>
+<span class="fc" id="L322">  def compressionType = getString(ServerConfigs.COMPRESSION_TYPE_CONFIG)</span>
+
+<span class="fc" id="L324">  def gzipCompressionLevel = getInt(ServerConfigs.COMPRESSION_GZIP_LEVEL_CONFIG)</span>
+<span class="fc" id="L325">  def lz4CompressionLevel = getInt(ServerConfigs.COMPRESSION_LZ4_LEVEL_CONFIG)</span>
+<span class="fc" id="L326">  def zstdCompressionLevel = getInt(ServerConfigs.COMPRESSION_ZSTD_LEVEL_CONFIG)</span>
+
+  /** Internal Configurations **/
+<span class="fc" id="L329">  val unstableApiVersionsEnabled = getBoolean(ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG)</span>
+<span class="fc" id="L330">  val unstableFeatureVersionsEnabled = getBoolean(ServerConfigs.UNSTABLE_FEATURE_VERSIONS_ENABLE_CONFIG)</span>
+
+  override def addReconfigurable(reconfigurable: Reconfigurable): Unit = {
+<span class="fc" id="L333">    dynamicConfig.addReconfigurable(reconfigurable)</span>
+  }
+
+  override def removeReconfigurable(reconfigurable: Reconfigurable): Unit = {
+<span class="nc" id="L337">    dynamicConfig.removeReconfigurable(reconfigurable)</span>
+  }
+
+  def listeners: Seq[Endpoint] =
+<span class="fc" id="L341">    AbstractKafkaConfig.listenerListToEndPoints(getList(SocketServerConfigs.LISTENERS_CONFIG), effectiveListenerSecurityProtocolMap).asScala</span>
+
+  def controllerListeners: Seq[Endpoint] =
+<span class="fc" id="L344">    listeners.filter(l =&gt; controllerListenerNames.contains(l.listener))</span>
+
+<span class="fc" id="L346">  def saslMechanismControllerProtocol: String = getString(KRaftConfigs.SASL_MECHANISM_CONTROLLER_PROTOCOL_CONFIG)</span>
+
+  def dataPlaneListeners: Seq[Endpoint] = {
+<span class="fc" id="L349">    listeners.filterNot { listener =&gt;</span>
+<span class="fc" id="L350">      val name = listener.listener</span>
+<span class="fc" id="L351">        controllerListenerNames.contains(name)</span>
+    }
+  }
+
+  def effectiveAdvertisedControllerListeners: Seq[Endpoint] = {
+<span class="fc" id="L356">    val advertisedListenersProp = getList(SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG)</span>
+<span class="pc bpc" id="L357" title="1 of 2 branches missed.">    val controllerAdvertisedListeners = if (advertisedListenersProp != null) {</span>
+<span class="nc" id="L358">      AbstractKafkaConfig.listenerListToEndPoints(advertisedListenersProp, effectiveListenerSecurityProtocolMap, false).asScala</span>
+<span class="nc" id="L359">        .filter(l =&gt; controllerListenerNames.contains(l.listener))</span>
+    } else {
+<span class="fc" id="L361">      Seq.empty</span>
+    }
+<span class="fc" id="L363">    val controllerListenersValue = controllerListeners</span>
+
+<span class="fc" id="L365">    controllerListenerNames.asScala.flatMap { name =&gt;</span>
+<span class="fc" id="L366">      controllerAdvertisedListeners</span>
+<span class="pc" id="L367">        .find(endpoint =&gt; ListenerName.normalised(endpoint.listener).equals(ListenerName.normalised(name)))</span>
+        .orElse(
+          // If users don't define advertised.listeners, the advertised controller listeners inherit from listeners configuration
+          // which match listener names in controller.listener.names.
+          // Removing &quot;0.0.0.0&quot; host to avoid validation errors. This is to be compatible with the old behavior before 3.9.
+          // The null or &quot;&quot; host does a reverse lookup in ListenerInfo#withWildcardHostnamesResolved.
+<span class="fc" id="L373">          controllerListenersValue</span>
+<span class="fc" id="L374">            .find(endpoint =&gt; ListenerName.normalised(endpoint.listener).equals(ListenerName.normalised(name)))</span>
+<span class="pc bpc" id="L375" title="2 of 4 branches missed.">            .map(endpoint =&gt; if (endpoint.host == &quot;0.0.0.0&quot;) {</span>
+<span class="nc" id="L376">              new Endpoint(endpoint.listener, endpoint.securityProtocol, null, endpoint.port)</span>
+            } else {
+<span class="fc" id="L378">              endpoint</span>
+            })
+        )
+    }
+  }
+
+  def effectiveAdvertisedBrokerListeners: Seq[Endpoint] = {
+    // Use advertised listeners if defined, fallback to listeners otherwise
+<span class="fc" id="L386">    val advertisedListenersProp = getList(SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG)</span>
+<span class="pc bpc" id="L387" title="1 of 2 branches missed.">    val advertisedListeners = if (advertisedListenersProp != null) {</span>
+<span class="nc" id="L388">      AbstractKafkaConfig.listenerListToEndPoints(advertisedListenersProp, effectiveListenerSecurityProtocolMap, false).asScala</span>
+    } else {
+<span class="fc" id="L390">      listeners</span>
+    }
+    // Only expose broker listeners
+<span class="fc" id="L393">    advertisedListeners.filterNot(l =&gt; controllerListenerNames.contains(l.listener))</span>
+  }
+
+  def validateCordonedLogDirs(): Unit = {
+<span class="fc" id="L397">    val cordonedLogDirs = getList(ServerLogConfigs.CORDONED_LOG_DIRS_CONFIG)</span>
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">    if (cordonedLogDirs.contains(ServerLogConfigs.CORDONED_LOG_DIRS_ALL)) {</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">      require(cordonedLogDirs.size == 1, s&quot;When ${ServerLogConfigs.CORDONED_LOG_DIRS_CONFIG} is set to ${ServerLogConfigs.CORDONED_LOG_DIRS_ALL}, it must not contain other values&quot;)</span>
+    } else {
+<span class="pc bnc" id="L401" title="All 2 branches missed.">      val unknownLogDirs = cordonedLogDirs.asScala.filter(!logDirs().contains(_))</span>
+<span class="pc" id="L402">      require(unknownLogDirs.isEmpty, s&quot;All entries in ${ServerLogConfigs.CORDONED_LOG_DIRS_CONFIG} must be present in ${ServerLogConfigs.CORDONED_LOG_DIRS_CONFIG} or ${ServerLogConfigs.LOG_DIR_CONFIG}. Missing entries : ${unknownLogDirs.mkString(&quot;, &quot;)}&quot;)</span>
+    }
+  }
+
+<span class="fc" id="L406">  validateValues()</span>
+
+  private def validateValues(): Unit = {
+<span class="pc bpc" id="L409" title="1 of 2 branches missed.">    if (nodeId != brokerId) {</span>
+<span class="nc" id="L410">      throw new ConfigException(s&quot;You must set `${KRaftConfigs.NODE_ID_CONFIG}` to the same value as `${ServerConfigs.BROKER_ID_CONFIG}`.&quot;)</span>
+    }
+<span class="pc bpc" id="L412" title="1 of 2 branches missed.">    require(logRollTimeMillis &gt;= 1, &quot;log.roll.ms must be greater than or equal to 1&quot;)</span>
+<span class="pc bpc" id="L413" title="1 of 2 branches missed.">    require(logRollTimeJitterMillis &gt;= 0, &quot;log.roll.jitter.ms must be greater than or equal to 0&quot;)</span>
+<span class="pc bpc" id="L414" title="3 of 4 branches missed.">    require(logRetentionTimeMillis &gt;= 1 || logRetentionTimeMillis == -1, &quot;log.retention.ms must be unlimited (-1) or, greater than or equal to 1&quot;)</span>
+<span class="pc bpc" id="L415" title="1 of 2 branches missed.">    require(logDirs.size &gt; 0, &quot;At least one log directory must be defined via log.dirs or log.dir.&quot;)</span>
+<span class="pc bpc" id="L416" title="1 of 2 branches missed.">    require(logCleanerDedupeBufferSize / logCleanerThreads &gt; 1024 * 1024, &quot;log.cleaner.dedupe.buffer.size must be at least 1MB per cleaner thread.&quot;)</span>
+<span class="pc bpc" id="L417" title="1 of 2 branches missed.">    require(replicaFetchWaitMaxMs &lt;= replicaSocketTimeoutMs, &quot;replica.socket.timeout.ms should always be at least replica.fetch.wait.max.ms&quot; +</span>
+      &quot; to prevent unnecessary socket timeouts&quot;)
+<span class="pc bpc" id="L419" title="1 of 2 branches missed.">    require(replicaFetchWaitMaxMs &lt;= replicaLagTimeMaxMs, &quot;replica.fetch.wait.max.ms should always be less than or equal to replica.lag.time.max.ms&quot; +</span>
+      &quot; to prevent frequent changes in ISR&quot;)
+
+<span class="pc bpc" id="L422" title="1 of 2 branches missed.">    if (brokerHeartbeatIntervalMs * 2 &gt; brokerSessionTimeoutMs) {</span>
+<span class="nc" id="L423">      error(s&quot;${KRaftConfigs.BROKER_HEARTBEAT_INTERVAL_MS_CONFIG} ($brokerHeartbeatIntervalMs ms) must be less than or equal to half of the ${KRaftConfigs.BROKER_SESSION_TIMEOUT_MS_CONFIG} ($brokerSessionTimeoutMs ms). &quot; +</span>
+        s&quot;The ${KRaftConfigs.BROKER_SESSION_TIMEOUT_MS_CONFIG} is configured on controller. The ${KRaftConfigs.BROKER_HEARTBEAT_INTERVAL_MS_CONFIG} is configured on broker. &quot; +
+<span class="nc" id="L425">        s&quot;If a broker doesn't send heartbeat request within ${KRaftConfigs.BROKER_SESSION_TIMEOUT_MS_CONFIG}, it loses broker lease. &quot; +</span>
+        s&quot;Please increase ${KRaftConfigs.BROKER_SESSION_TIMEOUT_MS_CONFIG} or decrease ${KRaftConfigs.BROKER_HEARTBEAT_INTERVAL_MS_CONFIG}.&quot;)
+    }
+
+<span class="fc" id="L429">    val advertisedBrokerListenerNames = effectiveAdvertisedBrokerListeners.map(l =&gt; ListenerName.normalised(l.listener)).toSet</span>
+
+    // validate KRaft-related configs
+<span class="fc" id="L432">    val voterIds = QuorumConfig.parseVoterIds(quorumConfig.voters)</span>
+    def validateQuorumVotersAndQuorumBootstrapServerForKRaft(): Unit = {
+<span class="pc bpc" id="L434" title="3 of 4 branches missed.">      if (voterIds.isEmpty &amp;&amp; quorumConfig.bootstrapServers.isEmpty) {</span>
+<span class="nc" id="L435">        throw new ConfigException(</span>
+<span class="nc" id="L436">          s&quot;&quot;&quot;If using ${KRaftConfigs.PROCESS_ROLES_CONFIG}, either ${QuorumConfig.QUORUM_BOOTSTRAP_SERVERS_CONFIG} must</span>
+          |contain the set of bootstrap controllers or ${QuorumConfig.QUORUM_VOTERS_CONFIG} must contain a parseable
+<span class="pc" id="L438">          |set of controllers.&quot;&quot;&quot;.stripMargin.replace(&quot;\n&quot;, &quot; &quot;)</span>
+        )
+      }
+    }
+
+    def validateControllerQuorumVotersMustContainNodeIdForKRaftController(): Unit = {
+<span class="pc bpc" id="L444" title="2 of 4 branches missed.">      require(voterIds.isEmpty || voterIds.contains(nodeId),</span>
+<span class="pc" id="L445">        s&quot;If ${KRaftConfigs.PROCESS_ROLES_CONFIG} contains the 'controller' role, the node id $nodeId must be included in the set of voters ${QuorumConfig.QUORUM_VOTERS_CONFIG}=${voterIds.asScala.toSet}&quot;)</span>
+    }
+    def validateAdvertisedControllerListenersNonEmptyForKRaftController(): Unit = {
+<span class="fc" id="L448">      require(effectiveAdvertisedControllerListeners.nonEmpty,</span>
+<span class="pc" id="L449">        s&quot;${KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG} must contain at least one value appearing in the '${SocketServerConfigs.LISTENERS_CONFIG}' configuration when running the KRaft controller role&quot;)</span>
+    }
+    def validateControllerListenerNamesMustAppearInListenersForKRaftController(): Unit = {
+<span class="fc" id="L452">      val listenerNameValues = listeners.map(_.listener).toSet</span>
+<span class="fc" id="L453">      require(controllerListenerNames.stream().allMatch(cln =&gt; listenerNameValues.contains(cln)),</span>
+<span class="pc" id="L454">        s&quot;${KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG} must only contain values appearing in the '${SocketServerConfigs.LISTENERS_CONFIG}' configuration when running the KRaft controller role&quot;)</span>
+    }
+    def validateAdvertisedBrokerListenersNonEmptyForBroker(): Unit = {
+<span class="fc" id="L457">      require(advertisedBrokerListenerNames.nonEmpty,</span>
+<span class="fc" id="L458">        &quot;There must be at least one broker advertised listener.&quot; + (</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">          if (processRoles.contains(ProcessRole.BrokerRole)) s&quot; Perhaps all listeners appear in ${KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG}?&quot; else &quot;&quot;))</span>
+    }
+<span class="nc" id="L461">    def warnIfConfigDefinedInWrongRole(expectedRole: ProcessRole, configName: String, extraMessage: String = &quot;&quot;): Unit = {</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">      if (originals.containsKey(configName)) {</span>
+<span class="nc" id="L463">        warn(s&quot;$configName is defined in ${processRoles.mkString(&quot;, &quot;)}. It should be defined in the $expectedRole role. $extraMessage&quot;)</span>
+      }
+    }
+<span class="pc bpc" id="L466" title="4 of 6 branches missed.">    if (processRoles == Set(ProcessRole.BrokerRole)) {</span>
+      // KRaft broker-only
+<span class="nc" id="L468">      validateQuorumVotersAndQuorumBootstrapServerForKRaft()</span>
+      // nodeId must not appear in controller.quorum.voters
+<span class="nc bnc" id="L470" title="All 2 branches missed.">      require(!voterIds.contains(nodeId),</span>
+<span class="nc" id="L471">        s&quot;If ${KRaftConfigs.PROCESS_ROLES_CONFIG} contains just the 'broker' role, the node id $nodeId must not be included in the set of voters ${QuorumConfig.QUORUM_VOTERS_CONFIG}=${voterIds.asScala.toSet}&quot;)</span>
+      // controller.listener.names must be non-empty...
+<span class="nc bnc" id="L473" title="All 2 branches missed.">      require(controllerListenerNames.size() &gt; 0,</span>
+<span class="nc" id="L474">        s&quot;${KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG} must contain at least one value when running KRaft with just the broker role&quot;)</span>
+      // controller.listener.names are forbidden in listeners...
+<span class="nc" id="L476">      require(controllerListeners.isEmpty,</span>
+<span class="nc" id="L477">        s&quot;${KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG} must not contain a value appearing in the '${SocketServerConfigs.LISTENERS_CONFIG}' configuration when running KRaft with just the broker role&quot;)</span>
+      // controller.listener.names must all appear in listener.security.protocol.map
+<span class="nc" id="L479">      controllerListenerNames.forEach { name =&gt;</span>
+<span class="nc" id="L480">        val listenerName = ListenerName.normalised(name)</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">        if (!effectiveListenerSecurityProtocolMap.containsKey(listenerName)) {</span>
+<span class="nc" id="L482">          throw new ConfigException(s&quot;Controller listener with name ${listenerName.value} defined in &quot; +</span>
+            s&quot;${KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG} not found in ${SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG}  (an explicit security mapping for each controller listener is required if ${SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG} is non-empty, or if there are security protocols other than PLAINTEXT in use)&quot;)
+        }
+      }
+      // controller.quorum.auto.join.enable must be false for KRaft broker-only
+<span class="nc bnc" id="L487" title="All 2 branches missed.">      require(!quorumConfig.autoJoin,</span>
+<span class="nc" id="L488">        s&quot;${QuorumConfig.QUORUM_AUTO_JOIN_ENABLE_CONFIG} is only supported when ${KRaftConfigs.PROCESS_ROLES_CONFIG} contains the 'controller' role.&quot;)</span>
+      // warn that only the first controller listener is used if there is more than one
+<span class="nc bnc" id="L490" title="All 2 branches missed.">      if (controllerListenerNames.size &gt; 1) {</span>
+<span class="nc" id="L491">        warn(s&quot;${KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG} has multiple entries; only the first will be used since ${KRaftConfigs.PROCESS_ROLES_CONFIG}=broker: ${controllerListenerNames}&quot;)</span>
+      }
+      // warn if create.topic.policy.class.name or alter.config.policy.class.name is defined in the broker role
+<span class="nc" id="L494">      warnIfConfigDefinedInWrongRole(ProcessRole.ControllerRole, ServerLogConfigs.CREATE_TOPIC_POLICY_CLASS_NAME_CONFIG)</span>
+<span class="nc" id="L495">      warnIfConfigDefinedInWrongRole(ProcessRole.ControllerRole, ServerLogConfigs.ALTER_CONFIG_POLICY_CLASS_NAME_CONFIG)</span>
+      // warn if num.partitions or default.replication.factor is defined in the broker role
+<span class="nc" id="L497">      val ignoredIn5 = &quot;This configuration will be ignored in the broker role in 5.0.&quot;</span>
+<span class="nc" id="L498">      warnIfConfigDefinedInWrongRole(ProcessRole.ControllerRole, ServerLogConfigs.NUM_PARTITIONS_CONFIG, ignoredIn5)</span>
+<span class="nc" id="L499">      warnIfConfigDefinedInWrongRole(ProcessRole.ControllerRole, ReplicationConfigs.DEFAULT_REPLICATION_FACTOR_CONFIG, ignoredIn5)</span>
+<span class="pc bpc" id="L500" title="4 of 6 branches missed.">    } else if (processRoles == Set(ProcessRole.ControllerRole)) {</span>
+      // KRaft controller-only
+<span class="nc" id="L502">      validateQuorumVotersAndQuorumBootstrapServerForKRaft()</span>
+      // listeners should only contain listeners also enumerated in the controller listener
+<span class="nc" id="L504">      require(</span>
+<span class="nc bnc" id="L505" title="All 2 branches missed.">        effectiveAdvertisedControllerListeners.size == listeners.size,</span>
+<span class="nc" id="L506">        s&quot;The ${SocketServerConfigs.LISTENERS_CONFIG} config must only contain KRaft controller listeners from ${KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG} when ${KRaftConfigs.PROCESS_ROLES_CONFIG}=controller&quot;</span>
+      )
+      // controller.listener.names must not contain inter.broker.listener.name when inter.broker.listener.name is explicitly set
+<span class="nc bnc" id="L509" title="All 2 branches missed.">      if (Option(getString(ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG)).isDefined) {</span>
+<span class="nc" id="L510">        require(</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">          !controllerListenerNames.contains(interBrokerListenerName.value()),</span>
+<span class="nc" id="L512">          s&quot;${KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG} must not contain an explicitly set ${ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG} configuration value when ${KRaftConfigs.PROCESS_ROLES_CONFIG}=controller'&quot;</span>
+        )
+      }
+<span class="nc" id="L515">      validateControllerQuorumVotersMustContainNodeIdForKRaftController()</span>
+<span class="nc" id="L516">      validateAdvertisedControllerListenersNonEmptyForKRaftController()</span>
+<span class="nc" id="L517">      validateControllerListenerNamesMustAppearInListenersForKRaftController()</span>
+<span class="pc bpc" id="L518" title="1 of 2 branches missed.">    } else if (isKRaftCombinedMode) {</span>
+      // KRaft combined broker and controller
+<span class="fc" id="L520">      validateQuorumVotersAndQuorumBootstrapServerForKRaft()</span>
+<span class="fc" id="L521">      validateControllerQuorumVotersMustContainNodeIdForKRaftController()</span>
+<span class="fc" id="L522">      validateAdvertisedControllerListenersNonEmptyForKRaftController()</span>
+<span class="fc" id="L523">      validateControllerListenerNamesMustAppearInListenersForKRaftController()</span>
+    }
+
+<span class="fc" id="L526">    val listenerNames = listeners.map(l =&gt; ListenerName.normalised(l.listener)).toSet</span>
+<span class="pc bpc" id="L527" title="1 of 2 branches missed.">    if (processRoles.contains(ProcessRole.BrokerRole)) {</span>
+<span class="fc" id="L528">      validateAdvertisedBrokerListenersNonEmptyForBroker()</span>
+<span class="fc" id="L529">      require(advertisedBrokerListenerNames.contains(interBrokerListenerName),</span>
+<span class="fc" id="L530">        s&quot;${ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG} must be a listener name defined in ${SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG}. &quot; +</span>
+<span class="nc" id="L531">          s&quot;The valid options based on currently configured listeners are ${advertisedBrokerListenerNames.map(_.value).mkString(&quot;,&quot;)}&quot;)</span>
+<span class="fc" id="L532">      require(advertisedBrokerListenerNames.subsetOf(listenerNames),</span>
+        s&quot;${SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG} listener names must be equal to or a subset of the ones defined in ${SocketServerConfigs.LISTENERS_CONFIG}. &quot; +
+<span class="pc" id="L534">          s&quot;Found ${advertisedBrokerListenerNames.map(_.value).mkString(&quot;,&quot;)}. The valid options based on the current configuration &quot; +</span>
+<span class="nc" id="L535">          s&quot;are ${listenerNames.map(_.value).mkString(&quot;,&quot;)}&quot;</span>
+      )
+<span class="fc" id="L537">      validateCordonedLogDirs()</span>
+    }
+
+<span class="pc bpc" id="L540" title="3 of 6 branches missed.">    require(!effectiveAdvertisedBrokerListeners.exists(endpoint =&gt; endpoint.host==&quot;0.0.0.0&quot;),</span>
+<span class="pc" id="L541">      s&quot;${SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG} cannot use the nonroutable meta-address 0.0.0.0. &quot;+</span>
+      s&quot;Use a routable IP address.&quot;)
+
+<span class="pc bpc" id="L544" title="3 of 6 branches missed.">    require(!effectiveAdvertisedControllerListeners.exists(endpoint =&gt; endpoint.host==&quot;0.0.0.0&quot;),</span>
+<span class="pc" id="L545">      s&quot;${SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG} cannot use the nonroutable meta-address 0.0.0.0. &quot;+</span>
+      s&quot;Use a routable IP address.&quot;)
+
+<span class="pc bpc" id="L548" title="8 of 12 branches missed.">    val interBrokerUsesSasl = interBrokerSecurityProtocol == SecurityProtocol.SASL_PLAINTEXT || interBrokerSecurityProtocol == SecurityProtocol.SASL_SSL</span>
+<span class="pc bpc" id="L549" title="3 of 4 branches missed.">    require(!interBrokerUsesSasl || saslEnabledMechanisms(interBrokerListenerName).contains(saslMechanismInterBrokerProtocol),</span>
+<span class="pc" id="L550">      s&quot;${BrokerSecurityConfigs.SASL_MECHANISM_INTER_BROKER_PROTOCOL_CONFIG} must be included in ${BrokerSecurityConfigs.SASL_ENABLED_MECHANISMS_CONFIG} when SASL is used for inter-broker communication&quot;)</span>
+<span class="pc bpc" id="L551" title="3 of 4 branches missed.">    require(queuedMaxBytes &lt;= 0 || queuedMaxBytes &gt;= socketRequestMaxBytes,</span>
+<span class="pc" id="L552">      s&quot;${SocketServerConfigs.QUEUED_MAX_BYTES_CONFIG} must be larger or equal to ${SocketServerConfigs.SOCKET_REQUEST_MAX_BYTES_CONFIG}&quot;)</span>
+
+<span class="pc bpc" id="L554" title="1 of 2 branches missed.">    if (maxConnectionsPerIp == 0)</span>
+<span class="nc bnc" id="L555" title="All 2 branches missed.">      require(!maxConnectionsPerIpOverrides.isEmpty, s&quot;${SocketServerConfigs.MAX_CONNECTIONS_PER_IP_CONFIG} can be set to zero only if&quot; +</span>
+        s&quot; ${SocketServerConfigs.MAX_CONNECTIONS_PER_IP_OVERRIDES_CONFIG} property is set.&quot;)
+
+<span class="pc" id="L558">    val invalidAddresses = maxConnectionsPerIpOverrides.asScala.keys.filterNot(address =&gt; Utils.validHostPattern(address))</span>
+<span class="pc bpc" id="L559" title="1 of 2 branches missed.">    if (invalidAddresses.nonEmpty)</span>
+<span class="nc" id="L560">      throw new IllegalArgumentException(s&quot;${SocketServerConfigs.MAX_CONNECTIONS_PER_IP_OVERRIDES_CONFIG} contains invalid addresses : ${invalidAddresses.mkString(&quot;,&quot;)}&quot;)</span>
+
+<span class="pc bpc" id="L562" title="1 of 2 branches missed.">    if (connectionsMaxIdleMs &gt;= 0)</span>
+<span class="pc bpc" id="L563" title="1 of 2 branches missed.">      require(failedAuthenticationDelayMs &lt; connectionsMaxIdleMs,</span>
+<span class="nc" id="L564">        s&quot;${SocketServerConfigs.FAILED_AUTHENTICATION_DELAY_MS_CONFIG}=$failedAuthenticationDelayMs should always be less than&quot; +</span>
+<span class="pc" id="L565">        s&quot; ${SocketServerConfigs.CONNECTIONS_MAX_IDLE_MS_CONFIG}=$connectionsMaxIdleMs to prevent failed&quot; +</span>
+        s&quot; authentication responses from timing out&quot;)
+
+<span class="fc" id="L568">    val principalBuilderClass = getClass(BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG)</span>
+<span class="pc bpc" id="L569" title="1 of 2 branches missed.">    require(principalBuilderClass != null, s&quot;${BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG} must be non-null&quot;)</span>
+<span class="fc" id="L570">    require(classOf[KafkaPrincipalSerde].isAssignableFrom(principalBuilderClass),</span>
+<span class="pc" id="L571">      s&quot;${BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG} must implement KafkaPrincipalSerde&quot;)</span>
+  }
+
+  /**
+   * Copy the subset of properties that are relevant to Logs. The individual properties
+   * are listed here since the names are slightly different in each Config class...
+   */
+  def extractLogConfigMap: java.util.Map[String, Object] = {
+<span class="fc" id="L579">    val logProps = new java.util.HashMap[String, Object]()</span>
+<span class="fc" id="L580">    logProps.put(TopicConfig.SEGMENT_BYTES_CONFIG, logSegmentBytes)</span>
+<span class="fc" id="L581">    logProps.put(TopicConfig.SEGMENT_MS_CONFIG, logRollTimeMillis)</span>
+<span class="fc" id="L582">    logProps.put(TopicConfig.SEGMENT_JITTER_MS_CONFIG, logRollTimeJitterMillis)</span>
+<span class="fc" id="L583">    logProps.put(TopicConfig.SEGMENT_INDEX_BYTES_CONFIG, logIndexSizeMaxBytes)</span>
+<span class="fc" id="L584">    logProps.put(TopicConfig.FLUSH_MESSAGES_INTERVAL_CONFIG, logFlushIntervalMessages)</span>
+<span class="fc" id="L585">    logProps.put(TopicConfig.FLUSH_MS_CONFIG, logFlushIntervalMs)</span>
+<span class="fc" id="L586">    logProps.put(TopicConfig.RETENTION_BYTES_CONFIG, logRetentionBytes)</span>
+<span class="fc" id="L587">    logProps.put(TopicConfig.RETENTION_MS_CONFIG, logRetentionTimeMillis: java.lang.Long)</span>
+<span class="fc" id="L588">    logProps.put(TopicConfig.MAX_MESSAGE_BYTES_CONFIG, messageMaxBytes)</span>
+<span class="fc" id="L589">    logProps.put(TopicConfig.INDEX_INTERVAL_BYTES_CONFIG, logIndexIntervalBytes)</span>
+<span class="fc" id="L590">    logProps.put(TopicConfig.DELETE_RETENTION_MS_CONFIG, logCleanerDeleteRetentionMs)</span>
+<span class="fc" id="L591">    logProps.put(TopicConfig.MIN_COMPACTION_LAG_MS_CONFIG, logCleanerMinCompactionLagMs)</span>
+<span class="fc" id="L592">    logProps.put(TopicConfig.MAX_COMPACTION_LAG_MS_CONFIG, logCleanerMaxCompactionLagMs)</span>
+<span class="fc" id="L593">    logProps.put(TopicConfig.FILE_DELETE_DELAY_MS_CONFIG, logDeleteDelayMs)</span>
+<span class="fc" id="L594">    logProps.put(TopicConfig.MIN_CLEANABLE_DIRTY_RATIO_CONFIG, logCleanerMinCleanRatio)</span>
+<span class="fc" id="L595">    logProps.put(TopicConfig.CLEANUP_POLICY_CONFIG, logCleanupPolicy)</span>
+<span class="fc" id="L596">    logProps.put(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, minInSyncReplicas)</span>
+<span class="fc" id="L597">    logProps.put(TopicConfig.COMPRESSION_TYPE_CONFIG, compressionType)</span>
+<span class="fc" id="L598">    logProps.put(TopicConfig.COMPRESSION_GZIP_LEVEL_CONFIG, gzipCompressionLevel)</span>
+<span class="fc" id="L599">    logProps.put(TopicConfig.COMPRESSION_LZ4_LEVEL_CONFIG, lz4CompressionLevel)</span>
+<span class="fc" id="L600">    logProps.put(TopicConfig.COMPRESSION_ZSTD_LEVEL_CONFIG, zstdCompressionLevel)</span>
+<span class="fc" id="L601">    logProps.put(TopicConfig.UNCLEAN_LEADER_ELECTION_ENABLE_CONFIG, uncleanLeaderElectionEnable)</span>
+<span class="fc" id="L602">    logProps.put(TopicConfig.PREALLOCATE_CONFIG, logPreAllocateEnable)</span>
+<span class="fc" id="L603">    logProps.put(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG, logMessageTimestampType.name)</span>
+<span class="fc" id="L604">    logProps.put(TopicConfig.MESSAGE_TIMESTAMP_BEFORE_MAX_MS_CONFIG, logMessageTimestampBeforeMaxMs: java.lang.Long)</span>
+<span class="fc" id="L605">    logProps.put(TopicConfig.MESSAGE_TIMESTAMP_AFTER_MAX_MS_CONFIG, logMessageTimestampAfterMaxMs: java.lang.Long)</span>
+<span class="fc" id="L606">    logProps.put(TopicConfig.LOCAL_LOG_RETENTION_MS_CONFIG, remoteLogManagerConfig.logLocalRetentionMs: java.lang.Long)</span>
+<span class="fc" id="L607">    logProps.put(TopicConfig.LOCAL_LOG_RETENTION_BYTES_CONFIG, remoteLogManagerConfig.logLocalRetentionBytes: java.lang.Long)</span>
+<span class="fc" id="L608">    logProps</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

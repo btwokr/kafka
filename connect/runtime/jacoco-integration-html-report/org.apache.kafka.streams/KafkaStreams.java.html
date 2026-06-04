@@ -1,0 +1,2159 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KafkaStreams.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams</a> &gt; <span class="el_source">KafkaStreams.java</span></div><h1>KafkaStreams.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams;
+
+import org.apache.kafka.clients.CommonClientConfigs;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.ListOffsetsResult.ListOffsetsResultInfo;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.Metric;
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.annotation.InterfaceStability.Evolving;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.metrics.KafkaMetricsContext;
+import org.apache.kafka.common.metrics.MetricConfig;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.MetricsContext;
+import org.apache.kafka.common.metrics.MetricsReporter;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.Sensor.RecordingLevel;
+import org.apache.kafka.common.serialization.Serializer;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.streams.errors.InvalidStateStoreException;
+import org.apache.kafka.streams.errors.InvalidStateStorePartitionException;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.errors.StreamsException;
+import org.apache.kafka.streams.errors.StreamsNotStartedException;
+import org.apache.kafka.streams.errors.StreamsStoppedException;
+import org.apache.kafka.streams.errors.StreamsUncaughtExceptionHandler;
+import org.apache.kafka.streams.errors.UnknownStateStoreException;
+import org.apache.kafka.streams.internals.ClientInstanceIdsImpl;
+import org.apache.kafka.streams.internals.CloseOptionsInternal;
+import org.apache.kafka.streams.internals.metrics.ClientMetrics;
+import org.apache.kafka.streams.internals.metrics.StreamsClientMetricsDelegatingReporter;
+import org.apache.kafka.streams.processor.StandbyUpdateListener;
+import org.apache.kafka.streams.processor.StateRestoreListener;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.StreamPartitioner;
+import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.internals.ClientUtils;
+import org.apache.kafka.streams.processor.internals.DefaultKafkaClientSupplier;
+import org.apache.kafka.streams.processor.internals.GlobalStreamThread;
+import org.apache.kafka.streams.processor.internals.StateDirectory;
+import org.apache.kafka.streams.processor.internals.StreamThread;
+import org.apache.kafka.streams.processor.internals.StreamsMetadataState;
+import org.apache.kafka.streams.processor.internals.Task;
+import org.apache.kafka.streams.processor.internals.ThreadStateTransitionValidator;
+import org.apache.kafka.streams.processor.internals.TopologyMetadata;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+import org.apache.kafka.streams.processor.internals.namedtopology.NamedTopology;
+import org.apache.kafka.streams.query.FailureReason;
+import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.QueryConfig;
+import org.apache.kafka.streams.query.QueryResult;
+import org.apache.kafka.streams.query.StateQueryRequest;
+import org.apache.kafka.streams.query.StateQueryResult;
+import org.apache.kafka.streams.state.HostInfo;
+import org.apache.kafka.streams.state.internals.GlobalStateStoreProvider;
+import org.apache.kafka.streams.state.internals.QueryableStoreProvider;
+import org.apache.kafka.streams.state.internals.StreamThreadStateStoreProvider;
+
+import org.slf4j.Logger;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.streams.StreamsConfig.METRICS_RECORDING_LEVEL_CONFIG;
+import static org.apache.kafka.streams.errors.StreamsUncaughtExceptionHandler.StreamThreadExceptionResponse.SHUTDOWN_CLIENT;
+import static org.apache.kafka.streams.internals.ApiUtils.prepareMillisCheckFailMsgPrefix;
+import static org.apache.kafka.streams.internals.ApiUtils.validateMillisecondDuration;
+import static org.apache.kafka.streams.internals.StreamsConfigUtils.totalCacheSize;
+import static org.apache.kafka.streams.processor.internals.ClientUtils.fetchEndOffsets;
+import static org.apache.kafka.streams.processor.internals.TopologyMetadata.UNNAMED_TOPOLOGY;
+
+/**
+ * A Kafka client that allows for performing continuous computation on input coming from one or more input topics and
+ * sends output to zero, one, or more output topics.
+ * &lt;p&gt;
+ * The computational logic can be specified either by using the {@link Topology} to define a DAG topology of
+ * {@link org.apache.kafka.streams.processor.api.Processor}s or by using the {@link StreamsBuilder} which provides the high-level DSL to define
+ * transformations.
+ * &lt;p&gt;
+ * One {@code KafkaStreams} instance can contain one or more threads specified in the configs for the processing work.
+ * &lt;p&gt;
+ * A {@code KafkaStreams} instance can co-ordinate with any other instances with the same
+ * {@link StreamsConfig#APPLICATION_ID_CONFIG application ID} (whether in the same process, on other processes on this
+ * machine, or on remote machines) as a single (possibly distributed) stream processing application.
+ * These instances will divide up the work based on the assignment of the input topic partitions so that all partitions
+ * are being consumed.
+ * If instances are added or fail, all (remaining) instances will rebalance the partition assignment among themselves
+ * to balance processing load and ensure that all input topic partitions are processed.
+ * &lt;p&gt;
+ * Internally a {@code KafkaStreams} instance contains a normal {@link KafkaProducer} and {@link KafkaConsumer} instance
+ * that is used for reading input and writing output.
+ * &lt;p&gt;
+ * A simple example might look like this:
+ * &lt;pre&gt;{@code
+ * Properties props = new Properties();
+ * props.put(StreamsConfig.APPLICATION_ID_CONFIG, &quot;my-stream-processing-application&quot;);
+ * props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, &quot;localhost:9092&quot;);
+ * props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+ * props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+ *
+ * StreamsBuilder builder = new StreamsBuilder();
+ * builder.&lt;String, String&gt;stream(&quot;my-input-topic&quot;).mapValues(value -&gt; String.valueOf(value.length())).to(&quot;my-output-topic&quot;);
+ *
+ * KafkaStreams streams = new KafkaStreams(builder.build(), props);
+ * streams.start();
+ * }&lt;/pre&gt;
+ *
+ * @see org.apache.kafka.streams.StreamsBuilder
+ * @see org.apache.kafka.streams.Topology
+ */
+public class KafkaStreams implements AutoCloseable {
+
+    private static final String JMX_PREFIX = &quot;kafka.streams&quot;;
+
+    // processId is expected to be unique across JVMs and to be used
+    // in userData of the subscription request to allow assignor be aware
+    // of the co-location of stream thread's consumers. It is for internal
+    // usage only and should not be exposed to users at all.
+    private final Time time;
+    private final Logger log;
+    protected final String clientId;
+    private final Metrics metrics;
+    protected final StreamsConfig applicationConfigs;
+    protected final List&lt;StreamThread&gt; threads;
+    protected final StreamsMetadataState streamsMetadataState;
+    private final ScheduledExecutorService stateDirCleaner;
+    private final ScheduledExecutorService rocksDBMetricsRecordingService;
+    protected final Admin adminClient;
+    private final StreamsMetricsImpl streamsMetrics;
+    private final long totalCacheSize;
+    private final StreamStateListener streamStateListener;
+    private final DelegatingStateRestoreListener delegatingStateRestoreListener;
+    private final UUID processId;
+    private final KafkaClientSupplier clientSupplier;
+    protected final TopologyMetadata topologyMetadata;
+    private final QueryableStoreProvider queryableStoreProvider;
+    private final DelegatingStandbyUpdateListener delegatingStandbyUpdateListener;
+    private final LogContext logContext;
+
+    GlobalStreamThread globalStreamThread;
+<span class="nc" id="L189">    protected StateDirectory stateDirectory = null;</span>
+    private KafkaStreams.StateListener stateListener;
+    private BiConsumer&lt;Throwable, Boolean&gt; streamsUncaughtExceptionHandler;
+<span class="nc" id="L192">    private final Object changeThreadCount = new Object();</span>
+
+    // container states
+    /**
+     * Kafka Streams states are the possible state that a Kafka Streams instance can be in.
+     * An instance must only be in one state at a time.
+     * The expected state transition with the following defined states is:
+     *
+     * &lt;pre&gt;
+     *                 +--------------+
+     *         +&amp;lt;----- | Created (0)  |
+     *         |       +-----+--------+
+     *         |             |
+     *         |             v
+     *         |       +----+--+------+
+     *         |       | Re-          |
+     *         +&amp;lt;----- | Balancing (1)| --------&amp;gt;+
+     *         |       +-----+-+------+          |
+     *         |             | ^                 |
+     *         |             v |                 |
+     *         |       +--------------+          v
+     *         |       | Running (2)  | --------&amp;gt;+
+     *         |       +------+-------+          |
+     *         |              |                  |
+     *         |              v                  |
+     *         |       +------+-------+     +----+-------+
+     *         +-----&amp;gt; | Pending      |     | Pending    |
+     *                 | Shutdown (3) |     | Error (5)  |
+     *                 +------+-------+     +-----+------+
+     *                        |                   |
+     *                        v                   v
+     *                 +------+-------+     +-----+--------+
+     *                 | Not          |     | Error (6)    |
+     *                 | Running (4)  |     +--------------+
+     *                 +--------------+
+     *
+     *
+     * &lt;/pre&gt;
+     * Note the following:
+     * &lt;ul&gt;
+     *   &lt;li&gt;
+     *     RUNNING state will transit to REBALANCING if any of its threads is in PARTITION_REVOKED or PARTITIONS_ASSIGNED state
+     *   &lt;/li&gt;
+     *   &lt;li&gt;
+     *     REBALANCING state will transit to RUNNING if all of its threads are in RUNNING state
+     *     (Note: a thread transits to RUNNING state, if all active tasks got restored are ready for processing.
+     *     Standby tasks are not considered.)
+     *   &lt;/li&gt;
+     *   &lt;li&gt;
+     *     Any state except NOT_RUNNING, PENDING_ERROR or ERROR can go to PENDING_SHUTDOWN (whenever close is called)
+     *   &lt;/li&gt;
+     *   &lt;li&gt;
+     *     PENDING_SHUTDOWN and PENDING_ERROR are transitory states where the Streams application gracefully closes
+     *     its existing resources before transitioning into their corresponding terminal states. These states are
+     *     not recoverable, and only a restart would get an application back to the RUNNING state.
+     *   &lt;/li&gt;
+     *   &lt;li&gt;
+     *     Of special importance: If the global stream thread dies, or all stream threads die (or both) then
+     *     the instance will be in the ERROR state. The user will not need to close it.
+     *   &lt;/li&gt;
+     * &lt;/ul&gt;
+     */
+<span class="nc" id="L254">    public enum State {</span>
+        // Note: if you add a new state, check the below methods and how they are used within Streams to see if
+        // any of them should be updated to include the new state. For example a new shutdown path or terminal
+        // state would likely need to be included in methods like isShuttingDown(), hasCompletedShutdown(), etc.
+<span class="nc" id="L258">        CREATED(1, 3),          // 0</span>
+<span class="nc" id="L259">        REBALANCING(2, 3, 5),   // 1</span>
+<span class="nc" id="L260">        RUNNING(1, 2, 3, 5),    // 2</span>
+<span class="nc" id="L261">        PENDING_SHUTDOWN(4),    // 3</span>
+<span class="nc" id="L262">        NOT_RUNNING,            // 4</span>
+<span class="nc" id="L263">        PENDING_ERROR(6),       // 5</span>
+<span class="nc" id="L264">        ERROR;                  // 6</span>
+
+<span class="nc" id="L266">        private final Set&lt;Integer&gt; validTransitions = new HashSet&lt;&gt;();</span>
+
+<span class="nc" id="L268">        State(final Integer... validTransitions) {</span>
+<span class="nc" id="L269">            this.validTransitions.addAll(Arrays.asList(validTransitions));</span>
+<span class="nc" id="L270">        }</span>
+
+        public boolean hasNotStarted() {
+<span class="nc" id="L273">            return equals(CREATED);</span>
+        }
+
+        public boolean isRunningOrRebalancing() {
+<span class="nc bnc" id="L277" title="All 4 branches missed.">            return equals(RUNNING) || equals(REBALANCING);</span>
+        }
+
+        public boolean isShuttingDown() {
+<span class="nc bnc" id="L281" title="All 4 branches missed.">            return equals(PENDING_SHUTDOWN) || equals(PENDING_ERROR);</span>
+        }
+
+        public boolean hasCompletedShutdown() {
+<span class="nc bnc" id="L285" title="All 4 branches missed.">            return equals(NOT_RUNNING) || equals(ERROR);</span>
+        }
+
+        public boolean hasStartedOrFinishedShuttingDown() {
+<span class="nc bnc" id="L289" title="All 4 branches missed.">            return isShuttingDown() || hasCompletedShutdown();</span>
+        }
+
+        public boolean isValidTransition(final State newState) {
+<span class="nc" id="L293">            return validTransitions.contains(newState.ordinal());</span>
+        }
+    }
+
+<span class="nc" id="L297">    private final Object stateLock = new Object();</span>
+<span class="nc" id="L298">    protected volatile State state = State.CREATED;</span>
+
+    private boolean waitOnStates(final long waitMs, final State... targetStates) {
+<span class="nc" id="L301">        final Set&lt;State&gt; targetStateSet = Set.of(targetStates);</span>
+<span class="nc" id="L302">        final long begin = time.milliseconds();</span>
+<span class="nc" id="L303">        synchronized (stateLock) {</span>
+<span class="nc" id="L304">            boolean interrupted = false;</span>
+<span class="nc" id="L305">            long elapsedMs = 0L;</span>
+            try {
+<span class="nc bnc" id="L307" title="All 2 branches missed.">                while (!targetStateSet.contains(state)) {</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">                    if (waitMs &gt; elapsedMs) {</span>
+<span class="nc" id="L309">                        final long remainingMs = waitMs - elapsedMs;</span>
+                        try {
+<span class="nc" id="L311">                            stateLock.wait(remainingMs);</span>
+<span class="nc" id="L312">                        } catch (final InterruptedException e) {</span>
+<span class="nc" id="L313">                            interrupted = true;</span>
+<span class="nc" id="L314">                        }</span>
+<span class="nc" id="L315">                    } else {</span>
+<span class="nc" id="L316">                        log.debug(</span>
+                            &quot;Cannot transit to {} within {}ms&quot;,
+<span class="nc" id="L318">                            Arrays.stream(targetStates).map(State::toString).collect(Collectors.joining(&quot; or &quot;)),</span>
+<span class="nc" id="L319">                            waitMs</span>
+                        );
+<span class="nc" id="L321">                        return false;</span>
+                    }
+<span class="nc" id="L323">                    elapsedMs = time.milliseconds() - begin;</span>
+                }
+            } finally {
+                // Make sure to restore the interruption status before returning.
+                // We do not always own the current thread that executes this method, i.e., we do not know the
+                // interruption policy of the thread. The least we can do is restore the interruption status before
+                // the current thread exits this method.
+<span class="nc bnc" id="L330" title="All 2 branches missed.">                if (interrupted) {</span>
+<span class="nc" id="L331">                    Thread.currentThread().interrupt();</span>
+                }
+            }
+<span class="nc" id="L334">            return true;</span>
+        }
+    }
+
+    /**
+     * Sets the state
+     * @param newState New state
+     */
+    private boolean setState(final State newState) {
+        final State oldState;
+
+<span class="nc" id="L345">        synchronized (stateLock) {</span>
+<span class="nc" id="L346">            oldState = state;</span>
+
+<span class="nc bnc" id="L348" title="All 4 branches missed.">            if (state == State.PENDING_SHUTDOWN &amp;&amp; newState != State.NOT_RUNNING) {</span>
+                // when the state is already in PENDING_SHUTDOWN, all other transitions than NOT_RUNNING (due to thread dying) will be
+                // refused, but we do not throw exception here, to allow appropriate error handling
+<span class="nc" id="L351">                return false;</span>
+<span class="nc bnc" id="L352" title="All 6 branches missed.">            } else if (state == State.NOT_RUNNING &amp;&amp; (newState == State.PENDING_SHUTDOWN || newState == State.NOT_RUNNING)) {</span>
+                // when the state is already in NOT_RUNNING, its transition to PENDING_SHUTDOWN or NOT_RUNNING (due to consecutive close calls)
+                // will be refused, but we do not throw exception here, to allow idempotent close calls
+<span class="nc" id="L355">                return false;</span>
+<span class="nc bnc" id="L356" title="All 4 branches missed.">            } else if (state == State.REBALANCING &amp;&amp; newState == State.REBALANCING) {</span>
+                // when the state is already in REBALANCING, it should not transit to REBALANCING again
+<span class="nc" id="L358">                return false;</span>
+<span class="nc bnc" id="L359" title="All 8 branches missed.">            } else if (state == State.ERROR &amp;&amp; (newState == State.PENDING_ERROR || newState == State.ERROR || newState == State.PENDING_SHUTDOWN)) {</span>
+                // when the state is already in ERROR, its transition attempts to PENDING_SHUTDOWN, PENDING_ERROR or ERROR will
+                // not throw an exception.
+<span class="nc" id="L362">                return false;</span>
+<span class="nc bnc" id="L363" title="All 4 branches missed.">            } else if (state == State.PENDING_ERROR &amp;&amp; newState != State.ERROR) {</span>
+                // when the state is already in PENDING_ERROR, all other transitions than ERROR (due to thread dying) will be
+                // refused, but we do not throw exception here, to allow appropriate error handling
+<span class="nc" id="L366">                return false;</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">            } else if (!state.isValidTransition(newState)) {</span>
+<span class="nc" id="L368">                throw new IllegalStateException(&quot;Stream-client &quot; + clientId + &quot;: Unexpected state transition from &quot; + oldState + &quot; to &quot; + newState);</span>
+            } else {
+<span class="nc" id="L370">                log.info(&quot;State transition from {} to {}&quot;, oldState, newState);</span>
+            }
+<span class="nc" id="L372">            state = newState;</span>
+<span class="nc" id="L373">            stateLock.notifyAll();</span>
+<span class="nc" id="L374">        }</span>
+
+        // we need to call the user customized state listener outside the state lock to avoid potential deadlocks
+<span class="nc bnc" id="L377" title="All 2 branches missed.">        if (stateListener != null) {</span>
+<span class="nc" id="L378">            stateListener.onChange(newState, oldState);</span>
+        }
+
+<span class="nc" id="L381">        return true;</span>
+    }
+
+    /**
+     * Return the current {@link State} of this {@code KafkaStreams} instance.
+     *
+     * @return the current state of this Kafka Streams instance
+     */
+    public State state() {
+<span class="nc" id="L390">        return state;</span>
+    }
+
+    protected boolean isRunningOrRebalancing() {
+<span class="nc" id="L394">        synchronized (stateLock) {</span>
+<span class="nc" id="L395">            return state.isRunningOrRebalancing();</span>
+        }
+    }
+
+    protected boolean hasStartedOrFinishedShuttingDown() {
+<span class="nc" id="L400">        synchronized (stateLock) {</span>
+<span class="nc" id="L401">            return state.hasStartedOrFinishedShuttingDown();</span>
+        }
+    }
+
+    protected void validateIsRunningOrRebalancing() {
+<span class="nc" id="L406">        synchronized (stateLock) {</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">            if (state.hasNotStarted()) {</span>
+<span class="nc" id="L408">                throw new StreamsNotStartedException(&quot;KafkaStreams has not been started, you can retry after calling start()&quot;);</span>
+            }
+<span class="nc bnc" id="L410" title="All 2 branches missed.">            if (!state.isRunningOrRebalancing()) {</span>
+<span class="nc" id="L411">                throw new IllegalStateException(&quot;KafkaStreams is not running. State is &quot; + state + &quot;.&quot;);</span>
+            }
+<span class="nc" id="L413">        }</span>
+<span class="nc" id="L414">    }</span>
+
+    /**
+     * Listen to {@link State} change events.
+     */
+    public interface StateListener {
+
+        /**
+         * Called when state changes.
+         *
+         * @param newState new state
+         * @param oldState previous state
+         */
+        void onChange(final State newState, final State oldState);
+    }
+
+    /**
+     * An app can set a single {@link KafkaStreams.StateListener} so that the app is notified when state changes.
+     *
+     * @param listener a new state listener
+     * @throws IllegalStateException if this {@code KafkaStreams} instance has already been started.
+     */
+    public void setStateListener(final KafkaStreams.StateListener listener) {
+<span class="nc" id="L437">        synchronized (stateLock) {</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">            if (state.hasNotStarted()) {</span>
+<span class="nc" id="L439">                stateListener = listener;</span>
+            } else {
+<span class="nc" id="L441">                throw new IllegalStateException(&quot;Can only set StateListener before calling start(). Current state is: &quot; + state);</span>
+            }
+<span class="nc" id="L443">        }</span>
+<span class="nc" id="L444">    }</span>
+
+
+    /**
+     * Set the handler invoked when an internal {@link StreamsConfig#NUM_STREAM_THREADS_CONFIG stream thread}
+     * throws an unexpected exception.
+     * These might be exceptions indicating rare bugs in Kafka Streams, or they
+     * might be exceptions thrown by your code, for example a NullPointerException thrown from your processor logic.
+     * The handler will execute on the thread that produced the exception.
+     * In order to get the thread that threw the exception, use {@code Thread.currentThread()}.
+     * &lt;p&gt;
+     * Note, this handler must be thread safe, since it will be shared among all threads, and invoked from any
+     * thread that encounters such an exception.
+     *
+     * @param userStreamsUncaughtExceptionHandler the uncaught exception handler of type {@link StreamsUncaughtExceptionHandler} for all internal threads
+     * @throws IllegalStateException if this {@code KafkaStreams} instance has already been started.
+     * @throws NullPointerException if userStreamsUncaughtExceptionHandler is null.
+     */
+    public void setUncaughtExceptionHandler(final StreamsUncaughtExceptionHandler userStreamsUncaughtExceptionHandler) {
+<span class="nc" id="L463">        synchronized (stateLock) {</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">            if (state.hasNotStarted()) {</span>
+<span class="nc" id="L465">                Objects.requireNonNull(userStreamsUncaughtExceptionHandler);</span>
+<span class="nc" id="L466">                streamsUncaughtExceptionHandler =</span>
+                    (exception, skipThreadReplacement) -&gt;
+<span class="nc" id="L468">                        handleStreamsUncaughtException(exception, userStreamsUncaughtExceptionHandler, skipThreadReplacement);</span>
+<span class="nc" id="L469">                processStreamThread(thread -&gt; thread.setStreamsUncaughtExceptionHandler(streamsUncaughtExceptionHandler));</span>
+<span class="nc bnc" id="L470" title="All 2 branches missed.">                if (globalStreamThread != null) {</span>
+<span class="nc" id="L471">                    globalStreamThread.setUncaughtExceptionHandler(</span>
+<span class="nc" id="L472">                        exception -&gt; handleStreamsUncaughtException(exception, userStreamsUncaughtExceptionHandler, false)</span>
+                    );
+                }
+<span class="nc" id="L475">                processStreamThread(thread -&gt; thread.setUncaughtExceptionHandler((t, e) -&gt; { }</span>
+                ));
+            } else {
+<span class="nc" id="L478">                throw new IllegalStateException(&quot;Can only set UncaughtExceptionHandler before calling start(). &quot; +</span>
+                    &quot;Current state is: &quot; + state);
+            }
+<span class="nc" id="L481">        }</span>
+<span class="nc" id="L482">    }</span>
+
+    private void replaceStreamThread(final Throwable throwable) {
+<span class="nc bnc" id="L485" title="All 4 branches missed.">        if (globalStreamThread != null &amp;&amp; Thread.currentThread().getName().equals(globalStreamThread.getName())) {</span>
+<span class="nc" id="L486">            log.warn(&quot;The global thread cannot be replaced. Reverting to shutting down the client.&quot;);</span>
+<span class="nc" id="L487">            log.error(&quot;Encountered the following exception during processing &quot; +</span>
+                    &quot; The streams client is going to shut down now. &quot;, throwable);
+<span class="nc" id="L489">            closeToError();</span>
+        }
+<span class="nc" id="L491">        final StreamThread deadThread = (StreamThread) Thread.currentThread();</span>
+<span class="nc" id="L492">        deadThread.shutdown(org.apache.kafka.streams.CloseOptions.GroupMembershipOperation.REMAIN_IN_GROUP);</span>
+<span class="nc" id="L493">        addStreamThread();</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">        if (throwable instanceof RuntimeException) {</span>
+<span class="nc" id="L495">            throw (RuntimeException) throwable;</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">        } else if (throwable instanceof Error) {</span>
+<span class="nc" id="L497">            throw (Error) throwable;</span>
+        } else {
+<span class="nc" id="L499">            throw new RuntimeException(&quot;Unexpected checked exception caught in the uncaught exception handler&quot;, throwable);</span>
+        }
+    }
+
+    private void handleStreamsUncaughtException(final Throwable throwable,
+                                                final StreamsUncaughtExceptionHandler streamsUncaughtExceptionHandler,
+                                                final boolean skipThreadReplacement) {
+<span class="nc" id="L506">        final StreamsUncaughtExceptionHandler.StreamThreadExceptionResponse action = streamsUncaughtExceptionHandler.handle(throwable);</span>
+
+<span class="nc bnc" id="L508" title="All 4 branches missed.">        switch (action) {</span>
+            case REPLACE_THREAD:
+<span class="nc bnc" id="L510" title="All 2 branches missed.">                if (!skipThreadReplacement) {</span>
+<span class="nc" id="L511">                    log.error(&quot;Replacing thread in the streams uncaught exception handler&quot;, throwable);</span>
+<span class="nc" id="L512">                    replaceStreamThread(throwable);</span>
+                } else {
+<span class="nc" id="L514">                    log.debug(&quot;Skipping thread replacement for recoverable error&quot;);</span>
+                }
+<span class="nc" id="L516">                break;</span>
+            case SHUTDOWN_CLIENT:
+<span class="nc" id="L518">                log.error(</span>
+                    &quot;Encountered the following exception during processing and the registered exception handler &quot; +
+                        &quot;opted to {}. The streams client is going to shut down now.&quot;,
+                    action,
+                    throwable
+                );
+<span class="nc" id="L524">                closeToError();</span>
+<span class="nc" id="L525">                break;</span>
+            case SHUTDOWN_APPLICATION:
+<span class="nc bnc" id="L527" title="All 2 branches missed.">                if (numLiveStreamThreads() == 1) {</span>
+<span class="nc" id="L528">                    log.warn(&quot;Attempt to shut down the application requires adding a thread to communicate the shutdown. No processing will be done on this thread&quot;);</span>
+<span class="nc" id="L529">                    addStreamThread();</span>
+                }
+<span class="nc bnc" id="L531" title="All 2 branches missed.">                if (throwable instanceof Error) {</span>
+<span class="nc" id="L532">                    log.error(&quot;This option requires running threads to shut down the application.&quot; +</span>
+                            &quot;but the uncaught exception was an Error, which means this runtime is no &quot; +
+                            &quot;longer in a well-defined state. Attempting to send the shutdown command anyway.&quot;, throwable);
+                }
+<span class="nc bnc" id="L536" title="All 4 branches missed.">                if (Thread.currentThread().equals(globalStreamThread) &amp;&amp; numLiveStreamThreads() == 0) {</span>
+<span class="nc" id="L537">                    log.error(&quot;Exception in global thread caused the application to attempt to shutdown.&quot; +</span>
+                            &quot; This action will succeed only if there is at least one StreamThread running on this client.&quot; +
+                            &quot; Currently there are no running threads so will now close the client.&quot;);
+<span class="nc" id="L540">                    closeToError();</span>
+<span class="nc" id="L541">                    break;</span>
+                }
+<span class="nc" id="L543">                processStreamThread(StreamThread::sendShutdownRequest);</span>
+<span class="nc" id="L544">                log.error(&quot;Encountered the following exception during processing &quot; +</span>
+                        &quot;and sent shutdown request for the entire application.&quot;, throwable);
+                break;
+        }
+<span class="nc" id="L548">    }</span>
+
+    /**
+     * Set the listener which is triggered whenever a {@link StateStore} is being restored in order to resume
+     * processing.
+     *
+     * @param globalStateRestoreListener The listener triggered when {@link StateStore} is being restored.
+     * @throws IllegalStateException if this {@code KafkaStreams} instance has already been started.
+     */
+    public void setGlobalStateRestoreListener(final StateRestoreListener globalStateRestoreListener) {
+<span class="nc" id="L558">        synchronized (stateLock) {</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">            if (state.hasNotStarted()) {</span>
+<span class="nc" id="L560">                delegatingStateRestoreListener.setUserStateRestoreListener(globalStateRestoreListener);</span>
+            } else {
+<span class="nc" id="L562">                throw new IllegalStateException(&quot;Can only set GlobalStateRestoreListener before calling start(). &quot; +</span>
+                    &quot;Current state is: &quot; + state);
+            }
+<span class="nc" id="L565">        }</span>
+<span class="nc" id="L566">    }</span>
+
+    /**
+     * Set the listener which is triggered whenever a standby task is updated
+     *
+     * @param standbyListener The listener triggered when a standby task is updated.
+     * @throws IllegalStateException if this {@code KafkaStreams} instance has already been started.
+     */
+    public void setStandbyUpdateListener(final StandbyUpdateListener standbyListener) {
+<span class="nc" id="L575">        synchronized (stateLock) {</span>
+<span class="nc bnc" id="L576" title="All 2 branches missed.">            if (state.hasNotStarted()) {</span>
+<span class="nc" id="L577">                this.delegatingStandbyUpdateListener.setUserStandbyListener(standbyListener);</span>
+            } else {
+<span class="nc" id="L579">                throw new IllegalStateException(&quot;Can only set StandbyUpdateListener before calling start(). &quot; +</span>
+                        &quot;Current state is: &quot; + state);
+            }
+<span class="nc" id="L582">        }</span>
+<span class="nc" id="L583">    }</span>
+
+    /**
+     * Get read-only handle on global metrics registry, including streams client's own metrics plus
+     * its embedded producer, consumer and admin clients' metrics.
+     *
+     * @return Map of all metrics.
+     */
+    public Map&lt;MetricName, ? extends Metric&gt; metrics() {
+<span class="nc" id="L592">        final Map&lt;MetricName, Metric&gt; result = new LinkedHashMap&lt;&gt;();</span>
+        // producer and consumer clients are per-thread
+<span class="nc" id="L594">        processStreamThread(thread -&gt; {</span>
+<span class="nc" id="L595">            result.putAll(thread.producerMetrics());</span>
+<span class="nc" id="L596">            result.putAll(thread.consumerMetrics());</span>
+            // admin client is shared, so we can actually move it
+            // to result.putAll(adminClient.metrics()).
+            // we did it intentionally just for flexibility.
+<span class="nc" id="L600">            result.putAll(thread.adminClientMetrics());</span>
+<span class="nc" id="L601">        });</span>
+        // global thread's consumer client
+<span class="nc bnc" id="L603" title="All 2 branches missed.">        if (globalStreamThread != null) {</span>
+<span class="nc" id="L604">            result.putAll(globalStreamThread.consumerMetrics());</span>
+        }
+        // self streams metrics
+<span class="nc" id="L607">        result.putAll(metrics.metrics());</span>
+<span class="nc" id="L608">        return Collections.unmodifiableMap(result);</span>
+    }
+
+    /**
+     * Class that handles stream thread transitions
+     */
+    private final class StreamStateListener implements StreamThread.StateListener {
+        private final Map&lt;Long, StreamThread.State&gt; threadState;
+        private GlobalStreamThread.State globalThreadState;
+
+<span class="nc" id="L618">        StreamStateListener(final GlobalStreamThread.State globalThreadState) {</span>
+<span class="nc" id="L619">            this.threadState = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L620">            this.globalThreadState = globalThreadState;</span>
+<span class="nc" id="L621">        }</span>
+
+        /**
+         * If all threads are up, including the global thread, set to RUNNING
+         */
+        private void maybeSetRunning() {
+            // state can be transferred to RUNNING if
+            // 1) all threads are either RUNNING or DEAD
+            // 2) thread is pending-shutdown and there are still other threads running
+<span class="nc bnc" id="L630" title="All 2 branches missed.">            final boolean hasRunningThread = threadState.values().stream().anyMatch(s -&gt; s == StreamThread.State.RUNNING);</span>
+<span class="nc bnc" id="L631" title="All 2 branches missed.">            for (final StreamThread.State state : threadState.values()) {</span>
+<span class="nc bnc" id="L632" title="All 4 branches missed.">                if (state == StreamThread.State.PENDING_SHUTDOWN &amp;&amp; hasRunningThread) continue;</span>
+<span class="nc bnc" id="L633" title="All 4 branches missed.">                if (state != StreamThread.State.RUNNING &amp;&amp; state != StreamThread.State.DEAD) {</span>
+<span class="nc" id="L634">                    return;</span>
+                }
+<span class="nc" id="L636">            }</span>
+
+            // the global state thread is relevant only if it is started. There are cases
+            // when we don't have a global state thread at all, e.g., when we don't have global KTables
+<span class="nc bnc" id="L640" title="All 4 branches missed.">            if (globalThreadState != null &amp;&amp; globalThreadState != GlobalStreamThread.State.RUNNING) {</span>
+<span class="nc" id="L641">                return;</span>
+            }
+
+<span class="nc" id="L644">            setState(State.RUNNING);</span>
+<span class="nc" id="L645">        }</span>
+
+
+        @Override
+        public synchronized void onChange(final Thread thread,
+                                          final ThreadStateTransitionValidator abstractNewState,
+                                          final ThreadStateTransitionValidator abstractOldState) {
+            // StreamThreads first
+<span class="nc bnc" id="L653" title="All 2 branches missed.">            if (thread instanceof StreamThread) {</span>
+<span class="nc" id="L654">                final StreamThread.State newState = (StreamThread.State) abstractNewState;</span>
+<span class="nc" id="L655">                threadState.put(thread.getId(), newState);</span>
+
+<span class="nc bnc" id="L657" title="All 4 branches missed.">                if (newState == StreamThread.State.PARTITIONS_REVOKED || newState == StreamThread.State.PARTITIONS_ASSIGNED) {</span>
+<span class="nc" id="L658">                    setState(State.REBALANCING);</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">                } else if (newState == StreamThread.State.RUNNING) {</span>
+<span class="nc" id="L660">                    maybeSetRunning();</span>
+                }
+<span class="nc bnc" id="L662" title="All 2 branches missed.">            } else if (thread instanceof GlobalStreamThread) {</span>
+                // global stream thread has different invariants
+<span class="nc" id="L664">                final GlobalStreamThread.State newState = (GlobalStreamThread.State) abstractNewState;</span>
+<span class="nc" id="L665">                globalThreadState = newState;</span>
+
+<span class="nc bnc" id="L667" title="All 2 branches missed.">                if (newState == GlobalStreamThread.State.RUNNING) {</span>
+<span class="nc" id="L668">                    maybeSetRunning();</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">                } else if (newState == GlobalStreamThread.State.DEAD) {</span>
+<span class="nc bnc" id="L670" title="All 2 branches missed.">                    if (state != State.PENDING_SHUTDOWN) {</span>
+<span class="nc" id="L671">                        log.error(&quot;Global thread has died. The streams application or client will now close to ERROR.&quot;);</span>
+<span class="nc" id="L672">                        closeToError();</span>
+                    }
+                }
+            }
+<span class="nc" id="L676">        }</span>
+
+        private synchronized void registerStreamThread(final StreamThread streamThread) {
+<span class="nc" id="L679">            threadState.put(streamThread.getId(), streamThread.state());</span>
+<span class="nc" id="L680">        }</span>
+    }
+
+<span class="nc" id="L683">    static final class DelegatingStateRestoreListener implements StateRestoreListener {</span>
+        private StateRestoreListener userStateRestoreListener;
+
+        private void throwOnFatalException(final Exception fatalUserException,
+                                           final TopicPartition topicPartition,
+                                           final String storeName) {
+<span class="nc" id="L689">            throw new StreamsException(</span>
+<span class="nc" id="L690">                    String.format(&quot;Fatal user code error in store restore listener for store %s, partition %s.&quot;,</span>
+                            storeName,
+                            topicPartition),
+                    fatalUserException);
+        }
+
+        void setUserStateRestoreListener(final StateRestoreListener userStateRestoreListener) {
+<span class="nc" id="L697">            this.userStateRestoreListener = userStateRestoreListener;</span>
+<span class="nc" id="L698">        }</span>
+
+        @Override
+        public void onRestoreStart(final TopicPartition topicPartition,
+                                   final String storeName,
+                                   final long startingOffset,
+                                   final long endingOffset) {
+<span class="nc bnc" id="L705" title="All 2 branches missed.">            if (userStateRestoreListener != null) {</span>
+                try {
+<span class="nc" id="L707">                    userStateRestoreListener.onRestoreStart(topicPartition, storeName, startingOffset, endingOffset);</span>
+<span class="nc" id="L708">                } catch (final Exception fatalUserException) {</span>
+<span class="nc" id="L709">                    throwOnFatalException(fatalUserException, topicPartition, storeName);</span>
+<span class="nc" id="L710">                }</span>
+            }
+<span class="nc" id="L712">        }</span>
+
+        @Override
+        public void onBatchRestored(final TopicPartition topicPartition,
+                                    final String storeName,
+                                    final long batchEndOffset,
+                                    final long numRestored) {
+<span class="nc bnc" id="L719" title="All 2 branches missed.">            if (userStateRestoreListener != null) {</span>
+                try {
+<span class="nc" id="L721">                    userStateRestoreListener.onBatchRestored(topicPartition, storeName, batchEndOffset, numRestored);</span>
+<span class="nc" id="L722">                } catch (final Exception fatalUserException) {</span>
+<span class="nc" id="L723">                    throwOnFatalException(fatalUserException, topicPartition, storeName);</span>
+<span class="nc" id="L724">                }</span>
+            }
+<span class="nc" id="L726">        }</span>
+
+        @Override
+        public void onRestoreEnd(final TopicPartition topicPartition, final String storeName, final long totalRestored) {
+<span class="nc bnc" id="L730" title="All 2 branches missed.">            if (userStateRestoreListener != null) {</span>
+                try {
+<span class="nc" id="L732">                    userStateRestoreListener.onRestoreEnd(topicPartition, storeName, totalRestored);</span>
+<span class="nc" id="L733">                } catch (final Exception fatalUserException) {</span>
+<span class="nc" id="L734">                    throwOnFatalException(fatalUserException, topicPartition, storeName);</span>
+<span class="nc" id="L735">                }</span>
+            }
+<span class="nc" id="L737">        }</span>
+
+        @Override
+        public void onRestoreSuspended(final TopicPartition topicPartition, final String storeName, final long totalRestored) {
+<span class="nc bnc" id="L741" title="All 2 branches missed.">            if (userStateRestoreListener != null) {</span>
+                try {
+<span class="nc" id="L743">                    userStateRestoreListener.onRestoreSuspended(topicPartition, storeName, totalRestored);</span>
+<span class="nc" id="L744">                } catch (final Exception fatalUserException) {</span>
+<span class="nc" id="L745">                    throwOnFatalException(fatalUserException, topicPartition, storeName);</span>
+<span class="nc" id="L746">                }</span>
+            }
+<span class="nc" id="L748">        }</span>
+    }
+
+<span class="nc" id="L751">    static final class DelegatingStandbyUpdateListener implements StandbyUpdateListener {</span>
+        private StandbyUpdateListener userStandbyListener;
+
+        private void throwOnFatalException(final Exception fatalUserException,
+                                           final TopicPartition topicPartition,
+                                           final String storeName) {
+<span class="nc" id="L757">            throw new StreamsException(</span>
+<span class="nc" id="L758">                    String.format(&quot;Fatal user code error in standby update listener for store %s, partition %s.&quot;,</span>
+                            storeName,
+                            topicPartition),
+                    fatalUserException);
+        }
+
+        @Override
+        public void onUpdateStart(final TopicPartition topicPartition,
+                          final String storeName,
+                          final long startingOffset) {
+<span class="nc bnc" id="L768" title="All 2 branches missed.">            if (userStandbyListener != null) {</span>
+                try {
+<span class="nc" id="L770">                    userStandbyListener.onUpdateStart(topicPartition, storeName, startingOffset);</span>
+<span class="nc" id="L771">                } catch (final Exception fatalUserException) {</span>
+<span class="nc" id="L772">                    throwOnFatalException(fatalUserException, topicPartition, storeName);</span>
+<span class="nc" id="L773">                }</span>
+            }
+<span class="nc" id="L775">        }</span>
+
+        @Override
+        public void onBatchLoaded(final TopicPartition topicPartition, final String storeName, final TaskId taskId, final long batchEndOffset, final long batchSize, final long currentEndOffset) {
+<span class="nc bnc" id="L779" title="All 2 branches missed.">            if (userStandbyListener != null) {</span>
+                try {
+<span class="nc" id="L781">                    userStandbyListener.onBatchLoaded(topicPartition, storeName, taskId, batchEndOffset, batchSize, currentEndOffset);</span>
+<span class="nc" id="L782">                } catch (final Exception fatalUserException) {</span>
+<span class="nc" id="L783">                    throwOnFatalException(fatalUserException, topicPartition, storeName);</span>
+<span class="nc" id="L784">                }</span>
+            }
+<span class="nc" id="L786">        }</span>
+
+        @Override
+        public void onUpdateSuspended(final TopicPartition topicPartition, final String storeName, final long storeOffset, final long currentEndOffset, final SuspendReason reason) {
+<span class="nc bnc" id="L790" title="All 2 branches missed.">            if (userStandbyListener != null) {</span>
+                try {
+<span class="nc" id="L792">                    userStandbyListener.onUpdateSuspended(topicPartition, storeName, storeOffset, currentEndOffset, reason);</span>
+<span class="nc" id="L793">                } catch (final Exception fatalUserException) {</span>
+<span class="nc" id="L794">                    throwOnFatalException(fatalUserException, topicPartition, storeName);</span>
+<span class="nc" id="L795">                }</span>
+            }
+<span class="nc" id="L797">        }</span>
+
+        void setUserStandbyListener(final StandbyUpdateListener userStandbyListener) {
+<span class="nc" id="L800">            this.userStandbyListener = userStandbyListener;</span>
+<span class="nc" id="L801">        }</span>
+    }
+
+    /**
+     * Create a {@code KafkaStreams} instance.
+     * &lt;p&gt;
+     * Note: even if you never call {@link #start()} on a {@code KafkaStreams} instance,
+     * you still must {@link #close()} it to avoid resource leaks.
+     *
+     * @param topology the topology specifying the computational logic
+     * @param props    properties for {@link StreamsConfig}
+     * @throws StreamsException if any fatal error occurs
+     */
+    public KafkaStreams(final Topology topology,
+                        final Properties props) {
+<span class="nc" id="L816">        this(topology, new StreamsConfig(props));</span>
+<span class="nc" id="L817">    }</span>
+
+    /**
+     * Create a {@code KafkaStreams} instance.
+     * &lt;p&gt;
+     * Note: even if you never call {@link #start()} on a {@code KafkaStreams} instance,
+     * you still must {@link #close()} it to avoid resource leaks.
+     *
+     * @param topology       the topology specifying the computational logic
+     * @param props          properties for {@link StreamsConfig}
+     * @param clientSupplier the Kafka clients supplier which provides underlying producer and consumer clients
+     *                       for the new {@code KafkaStreams} instance
+     * @throws StreamsException if any fatal error occurs
+     */
+    public KafkaStreams(final Topology topology,
+                        final Properties props,
+                        final KafkaClientSupplier clientSupplier) {
+<span class="nc" id="L834">        this(topology, new StreamsConfig(props), clientSupplier, Time.SYSTEM);</span>
+<span class="nc" id="L835">    }</span>
+
+    /**
+     * Create a {@code KafkaStreams} instance.
+     * &lt;p&gt;
+     * Note: even if you never call {@link #start()} on a {@code KafkaStreams} instance,
+     * you still must {@link #close()} it to avoid resource leaks.
+     *
+     * @param topology       the topology specifying the computational logic
+     * @param props          properties for {@link StreamsConfig}
+     * @param time           {@code Time} implementation; cannot be null
+     * @throws StreamsException if any fatal error occurs
+     */
+    public KafkaStreams(final Topology topology,
+                        final Properties props,
+                        final Time time) {
+<span class="nc" id="L851">        this(topology, new StreamsConfig(props), time);</span>
+<span class="nc" id="L852">    }</span>
+
+    /**
+     * Create a {@code KafkaStreams} instance.
+     * &lt;p&gt;
+     * Note: even if you never call {@link #start()} on a {@code KafkaStreams} instance,
+     * you still must {@link #close()} it to avoid resource leaks.
+     *
+     * @param topology       the topology specifying the computational logic
+     * @param props          properties for {@link StreamsConfig}
+     * @param clientSupplier the Kafka clients supplier which provides underlying producer and consumer clients
+     *                       for the new {@code KafkaStreams} instance
+     * @param time           {@code Time} implementation; cannot be null
+     * @throws StreamsException if any fatal error occurs
+     */
+    public KafkaStreams(final Topology topology,
+                        final Properties props,
+                        final KafkaClientSupplier clientSupplier,
+                        final Time time) {
+<span class="nc" id="L871">        this(topology, new StreamsConfig(props), clientSupplier, time);</span>
+<span class="nc" id="L872">    }</span>
+
+    /**
+     * Create a {@code KafkaStreams} instance.
+     * &lt;p&gt;
+     * Note: even if you never call {@link #start()} on a {@code KafkaStreams} instance,
+     * you still must {@link #close()} it to avoid resource leaks.
+     *
+     * @param topology  the topology specifying the computational logic
+     * @param applicationConfigs    configs for Kafka Streams
+     * @throws StreamsException if any fatal error occurs
+     */
+    public KafkaStreams(final Topology topology,
+                        final StreamsConfig applicationConfigs) {
+<span class="nc" id="L886">        this(topology, applicationConfigs, applicationConfigs.getKafkaClientSupplier());</span>
+<span class="nc" id="L887">    }</span>
+
+    /**
+     * Create a {@code KafkaStreams} instance.
+     * &lt;p&gt;
+     * Note: even if you never call {@link #start()} on a {@code KafkaStreams} instance,
+     * you still must {@link #close()} it to avoid resource leaks.
+     *
+     * @param topology       the topology specifying the computational logic
+     * @param applicationConfigs         configs for Kafka Streams
+     * @param clientSupplier the Kafka clients supplier which provides underlying producer and consumer clients
+     *                       for the new {@code KafkaStreams} instance
+     * @throws StreamsException if any fatal error occurs
+     */
+    public KafkaStreams(final Topology topology,
+                        final StreamsConfig applicationConfigs,
+                        final KafkaClientSupplier clientSupplier) {
+<span class="nc" id="L904">        this(new TopologyMetadata(topology.internalTopologyBuilder, applicationConfigs), applicationConfigs, clientSupplier);</span>
+<span class="nc" id="L905">    }</span>
+
+    /**
+     * Create a {@code KafkaStreams} instance.
+     * &lt;p&gt;
+     * Note: even if you never call {@link #start()} on a {@code KafkaStreams} instance,
+     * you still must {@link #close()} it to avoid resource leaks.
+     *
+     * @param topology       the topology specifying the computational logic
+     * @param applicationConfigs         configs for Kafka Streams
+     * @param time           {@code Time} implementation; cannot be null
+     * @throws StreamsException if any fatal error occurs
+     */
+    public KafkaStreams(final Topology topology,
+                        final StreamsConfig applicationConfigs,
+                        final Time time) {
+<span class="nc" id="L921">        this(new TopologyMetadata(topology.internalTopologyBuilder, applicationConfigs), applicationConfigs, applicationConfigs.getKafkaClientSupplier(), time);</span>
+<span class="nc" id="L922">    }</span>
+
+    private KafkaStreams(final Topology topology,
+                         final StreamsConfig applicationConfigs,
+                         final KafkaClientSupplier clientSupplier,
+                         final Time time) throws StreamsException {
+<span class="nc" id="L928">        this(new TopologyMetadata(topology.internalTopologyBuilder, applicationConfigs), applicationConfigs, clientSupplier, time);</span>
+<span class="nc" id="L929">    }</span>
+
+    protected KafkaStreams(final TopologyMetadata topologyMetadata,
+                           final StreamsConfig applicationConfigs,
+                           final KafkaClientSupplier clientSupplier) throws StreamsException {
+<span class="nc" id="L934">        this(topologyMetadata, applicationConfigs, clientSupplier, Time.SYSTEM);</span>
+<span class="nc" id="L935">    }</span>
+
+    @SuppressWarnings(&quot;this-escape&quot;)
+    private KafkaStreams(final TopologyMetadata topologyMetadata,
+                         final StreamsConfig applicationConfigs,
+                         final KafkaClientSupplier clientSupplier,
+<span class="nc" id="L941">                         final Time time) throws StreamsException {</span>
+<span class="nc" id="L942">        this.applicationConfigs = applicationConfigs;</span>
+<span class="nc" id="L943">        this.time = time;</span>
+
+<span class="nc" id="L945">        this.topologyMetadata = topologyMetadata;</span>
+<span class="nc" id="L946">        this.topologyMetadata.buildAndRewriteTopology();</span>
+
+<span class="nc" id="L948">        final boolean hasGlobalTopology = topologyMetadata.hasGlobalTopology();</span>
+
+        try {
+<span class="nc" id="L951">            stateDirectory = new StateDirectory(applicationConfigs, time, topologyMetadata.hasPersistentStores(), topologyMetadata.hasNamedTopologies());</span>
+<span class="nc" id="L952">            processId = stateDirectory.initializeProcessId();</span>
+<span class="nc" id="L953">        } catch (final ProcessorStateException fatal) {</span>
+<span class="nc" id="L954">            Utils.closeQuietly(stateDirectory, &quot;streams state directory&quot;);</span>
+<span class="nc" id="L955">            throw new StreamsException(fatal);</span>
+<span class="nc" id="L956">        }</span>
+
+        // The application ID is a required config and hence should always have value
+<span class="nc" id="L959">        final String userClientId = applicationConfigs.getString(StreamsConfig.CLIENT_ID_CONFIG);</span>
+<span class="nc" id="L960">        final String applicationId = applicationConfigs.getString(StreamsConfig.APPLICATION_ID_CONFIG);</span>
+<span class="nc bnc" id="L961" title="All 2 branches missed.">        if (userClientId.isEmpty()) {</span>
+<span class="nc" id="L962">            clientId = applicationId + &quot;-&quot; + processId;</span>
+        } else {
+<span class="nc" id="L964">            clientId = userClientId;</span>
+        }
+<span class="nc" id="L966">        logContext = new LogContext(String.format(&quot;stream-client [%s] &quot;, clientId));</span>
+<span class="nc" id="L967">        this.log = logContext.logger(getClass());</span>
+<span class="nc" id="L968">        topologyMetadata.setLog(logContext);</span>
+
+<span class="nc" id="L970">        this.clientSupplier = clientSupplier;</span>
+
+<span class="nc" id="L972">        log.info(&quot;Kafka Streams version: {}&quot;, ClientMetrics.version());</span>
+<span class="nc" id="L973">        log.info(&quot;Kafka Streams commit ID: {}&quot;, ClientMetrics.commitId());</span>
+
+<span class="nc" id="L975">        throwIfUnsupportedFeatureIsUsedWithStreamsRebalanceProtocol();</span>
+
+        // use client id instead of thread client id since this admin client may be shared among threads
+<span class="nc" id="L978">        adminClient = clientSupplier.getAdmin(applicationConfigs.getAdminConfigs(ClientUtils.adminClientId(clientId)));</span>
+
+<span class="nc" id="L980">        metrics = createMetrics(applicationConfigs, time, clientId);</span>
+<span class="nc" id="L981">        final StreamsClientMetricsDelegatingReporter reporter = new StreamsClientMetricsDelegatingReporter(adminClient, clientId);</span>
+<span class="nc" id="L982">        metrics.addReporter(reporter);</span>
+
+<span class="nc" id="L984">        streamsMetrics = new StreamsMetricsImpl(</span>
+            metrics,
+            clientId,
+            time
+        );
+
+<span class="nc" id="L990">        ClientMetrics.addVersionMetric(streamsMetrics);</span>
+<span class="nc" id="L991">        ClientMetrics.addCommitIdMetric(streamsMetrics);</span>
+<span class="nc" id="L992">        ClientMetrics.addApplicationIdMetric(streamsMetrics, applicationConfigs.getString(StreamsConfig.APPLICATION_ID_CONFIG));</span>
+<span class="nc" id="L993">        ClientMetrics.addTopologyDescriptionMetric(streamsMetrics, (metricsConfig, now) -&gt; this.topologyMetadata.topologyDescriptionString());</span>
+<span class="nc" id="L994">        ClientMetrics.addStateMetric(streamsMetrics, (metricsConfig, now) -&gt; state.name());</span>
+<span class="nc" id="L995">        ClientMetrics.addClientStateTelemetryMetric(processId.toString(), applicationId, streamsMetrics, (metricsConfig, now) -&gt; state.ordinal());</span>
+<span class="nc" id="L996">        ClientMetrics.addClientRecordingLevelMetric(processId.toString(), streamsMetrics, calculateMetricsRecordingLevel());</span>
+<span class="nc" id="L997">        threads = Collections.synchronizedList(new LinkedList&lt;&gt;());</span>
+<span class="nc" id="L998">        ClientMetrics.addNumAliveStreamThreadMetric(streamsMetrics, (metricsConfig, now) -&gt; numLiveStreamThreads());</span>
+
+<span class="nc" id="L1000">        streamsMetadataState = new StreamsMetadataState(</span>
+            this.topologyMetadata,
+<span class="nc" id="L1002">            parseHostInfo(applicationConfigs.getString(StreamsConfig.APPLICATION_SERVER_CONFIG)),</span>
+            logContext
+        );
+<span class="nc" id="L1005">        streamsUncaughtExceptionHandler = (throwable, skipThreadReplacement) -&gt; handleStreamsUncaughtException(throwable, t -&gt; SHUTDOWN_CLIENT, skipThreadReplacement);</span>
+<span class="nc" id="L1006">        delegatingStateRestoreListener = new DelegatingStateRestoreListener();</span>
+<span class="nc" id="L1007">        delegatingStandbyUpdateListener = new DelegatingStandbyUpdateListener();</span>
+
+<span class="nc" id="L1009">        totalCacheSize = totalCacheSize(applicationConfigs);</span>
+<span class="nc" id="L1010">        final int numStreamThreads = topologyMetadata.numStreamThreads(applicationConfigs);</span>
+<span class="nc" id="L1011">        final long cacheSizePerThread = cacheSizePerThread(numStreamThreads);</span>
+
+<span class="nc" id="L1013">        GlobalStreamThread.State globalThreadState = null;</span>
+<span class="nc bnc" id="L1014" title="All 2 branches missed.">        if (hasGlobalTopology) {</span>
+<span class="nc" id="L1015">            final String globalThreadId = clientId + &quot;-GlobalStreamThread&quot;;</span>
+<span class="nc" id="L1016">            globalStreamThread = new GlobalStreamThread(</span>
+<span class="nc" id="L1017">                topologyMetadata.globalTaskTopology(),</span>
+                applicationConfigs,
+<span class="nc" id="L1019">                clientSupplier.getGlobalConsumer(applicationConfigs.getGlobalConsumerConfigs(clientId)),</span>
+                stateDirectory,
+                cacheSizePerThread,
+                streamsMetrics,
+                time,
+                globalThreadId,
+                delegatingStateRestoreListener,
+<span class="nc" id="L1026">                exception -&gt; handleStreamsUncaughtException(exception, t -&gt; SHUTDOWN_CLIENT, false)</span>
+            );
+<span class="nc" id="L1028">            globalThreadState = globalStreamThread.state();</span>
+        }
+
+<span class="nc" id="L1031">        streamStateListener = new StreamStateListener(globalThreadState);</span>
+
+<span class="nc" id="L1033">        final GlobalStateStoreProvider globalStateStoreProvider = new GlobalStateStoreProvider(this.topologyMetadata.globalStateStores());</span>
+
+<span class="nc bnc" id="L1035" title="All 2 branches missed.">        if (hasGlobalTopology) {</span>
+<span class="nc" id="L1036">            globalStreamThread.setStateListener(streamStateListener);</span>
+        }
+
+<span class="nc" id="L1039">        queryableStoreProvider = new QueryableStoreProvider(globalStateStoreProvider);</span>
+<span class="nc bnc" id="L1040" title="All 2 branches missed.">        for (int i = 1; i &lt;= numStreamThreads; i++) {</span>
+<span class="nc" id="L1041">            createAndAddStreamThread(cacheSizePerThread, i);</span>
+        }
+
+<span class="nc" id="L1044">        stateDirCleaner = setupStateDirCleaner();</span>
+<span class="nc" id="L1045">        rocksDBMetricsRecordingService = maybeCreateRocksDBMetricsRecordingService(clientId, applicationConfigs);</span>
+<span class="nc" id="L1046">    }</span>
+
+    private void throwIfUnsupportedFeatureIsUsedWithStreamsRebalanceProtocol() {
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">        if (applicationConfigs.isStreamsProtocolEnabled()) {</span>
+<span class="nc" id="L1050">            log.info(&quot;Streams rebalance protocol enabled&quot;);</span>
+<span class="nc bnc" id="L1051" title="All 2 branches missed.">            if (topologyMetadata.hasNamedTopologies()) {</span>
+<span class="nc" id="L1052">                throw new UnsupportedOperationException(&quot;Named topologies are not supported with the STREAMS protocol.&quot;);</span>
+            }
+<span class="nc bnc" id="L1054" title="All 2 branches missed.">            if (topologyMetadata.usesPatternSubscription()) {</span>
+<span class="nc" id="L1055">                throw new UnsupportedOperationException(&quot;Pattern subscriptions are not supported with the STREAMS protocol.&quot;);</span>
+            }
+<span class="nc bnc" id="L1057" title="All 2 branches missed.">            if (!(clientSupplier instanceof DefaultKafkaClientSupplier)) {</span>
+<span class="nc" id="L1058">                log.warn(&quot;A non-default kafka client supplier was supplied. Note that supplying a custom main consumer&quot; +</span>
+                    &quot; is not supported with the STREAMS protocol.&quot;);
+            }
+        }
+<span class="nc" id="L1062">    }</span>
+
+    private StreamThread createAndAddStreamThread(final long cacheSizePerThread, final int threadIdx) {
+<span class="nc" id="L1065">        final StreamThread streamThread = StreamThread.create(</span>
+            topologyMetadata,
+            applicationConfigs,
+            clientSupplier,
+            adminClient,
+            processId,
+            clientId,
+            streamsMetrics,
+            time,
+            streamsMetadataState,
+            cacheSizePerThread,
+            stateDirectory,
+            delegatingStateRestoreListener,
+            delegatingStandbyUpdateListener,
+            threadIdx,
+            KafkaStreams.this::closeToError,
+            streamsUncaughtExceptionHandler
+        );
+<span class="nc" id="L1083">        streamStateListener.registerStreamThread(streamThread);</span>
+<span class="nc" id="L1084">        streamThread.setStateListener(streamStateListener);</span>
+<span class="nc" id="L1085">        threads.add(streamThread);</span>
+<span class="nc" id="L1086">        queryableStoreProvider.addStoreProviderForThread(streamThread.getName(), new StreamThreadStateStoreProvider(streamThread));</span>
+<span class="nc" id="L1087">        return streamThread;</span>
+    }
+
+    private static Metrics createMetrics(final StreamsConfig config, final Time time, final String clientId) {
+<span class="nc" id="L1091">        final MetricConfig metricConfig = new MetricConfig()</span>
+<span class="nc" id="L1092">            .samples(config.getInt(StreamsConfig.METRICS_NUM_SAMPLES_CONFIG))</span>
+<span class="nc" id="L1093">            .recordLevel(Sensor.RecordingLevel.forName(config.getString(StreamsConfig.METRICS_RECORDING_LEVEL_CONFIG)))</span>
+<span class="nc" id="L1094">            .timeWindow(config.getLong(StreamsConfig.METRICS_SAMPLE_WINDOW_MS_CONFIG), TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L1095">        final List&lt;MetricsReporter&gt; reporters = CommonClientConfigs.metricsReporters(clientId, config);</span>
+
+<span class="nc" id="L1097">        final MetricsContext metricsContext = new KafkaMetricsContext(JMX_PREFIX,</span>
+<span class="nc" id="L1098">                                                                      config.originalsWithPrefix(CommonClientConfigs.METRICS_CONTEXT_PREFIX));</span>
+<span class="nc" id="L1099">        return new Metrics(metricConfig, reporters, time, metricsContext);</span>
+    }
+
+    /**
+     * Adds and starts a stream thread in addition to the stream threads that are already running in this
+     * Kafka Streams client.
+     * &lt;p&gt;
+     * Since the number of stream threads increases, the sizes of the caches in the new stream thread
+     * and the existing stream threads are adapted so that the sum of the cache sizes over all stream
+     * threads does not exceed the total cache size specified in configuration
+     * {@link StreamsConfig#STATESTORE_CACHE_MAX_BYTES_CONFIG}.
+     * &lt;p&gt;
+     * Stream threads can only be added if this Kafka Streams client is in state RUNNING or REBALANCING.
+     *
+     * @return name of the added stream thread or empty if a new stream thread could not be added
+     */
+    public Optional&lt;String&gt; addStreamThread() {
+<span class="nc bnc" id="L1116" title="All 2 branches missed.">        if (isRunningOrRebalancing()) {</span>
+            final StreamThread streamThread;
+<span class="nc" id="L1118">            synchronized (changeThreadCount) {</span>
+<span class="nc" id="L1119">                final int threadIdx = nextThreadIndex();</span>
+<span class="nc" id="L1120">                final int numLiveThreads = numLiveStreamThreads();</span>
+<span class="nc" id="L1121">                final long cacheSizePerThread = cacheSizePerThread(numLiveThreads + 1);</span>
+<span class="nc" id="L1122">                log.info(&quot;Adding StreamThread-{}, there will now be {} live threads and the new cache size per thread is {}&quot;,</span>
+<span class="nc" id="L1123">                         threadIdx, numLiveThreads + 1, cacheSizePerThread);</span>
+<span class="nc" id="L1124">                resizeThreadCache(cacheSizePerThread);</span>
+                // Creating thread should hold the lock in order to avoid duplicate thread index.
+                // If the duplicate index happen, the metadata of thread may be duplicate too.
+<span class="nc" id="L1127">                streamThread = createAndAddStreamThread(cacheSizePerThread, threadIdx);</span>
+<span class="nc" id="L1128">            }</span>
+
+<span class="nc" id="L1130">            synchronized (stateLock) {</span>
+<span class="nc bnc" id="L1131" title="All 2 branches missed.">                if (isRunningOrRebalancing()) {</span>
+<span class="nc" id="L1132">                    streamThread.start();</span>
+<span class="nc" id="L1133">                    return Optional.of(streamThread.getName());</span>
+                } else {
+<span class="nc" id="L1135">                    log.warn(&quot;Terminating the new thread because the Kafka Streams client is in state {}&quot;, state);</span>
+<span class="nc" id="L1136">                    streamThread.shutdown(org.apache.kafka.streams.CloseOptions.GroupMembershipOperation.LEAVE_GROUP);</span>
+<span class="nc" id="L1137">                    threads.remove(streamThread);</span>
+<span class="nc" id="L1138">                    final long cacheSizePerThread = cacheSizePerThread(numLiveStreamThreads());</span>
+<span class="nc" id="L1139">                    log.info(&quot;Resizing thread cache due to terminating added thread, new cache size per thread is {}&quot;, cacheSizePerThread);</span>
+<span class="nc" id="L1140">                    resizeThreadCache(cacheSizePerThread);</span>
+<span class="nc" id="L1141">                    return Optional.empty();</span>
+                }
+            }
+        } else {
+<span class="nc" id="L1145">            log.warn(&quot;Cannot add a stream thread when Kafka Streams client is in state {}&quot;, state);</span>
+<span class="nc" id="L1146">            return Optional.empty();</span>
+        }
+    }
+
+    /**
+     * Removes one stream thread out of the running stream threads from this Kafka Streams client.
+     * &lt;p&gt;
+     * The removed stream thread is gracefully shut down. This method does not specify which stream
+     * thread is shut down.
+     * &lt;p&gt;
+     * The consumer associated with the stream thread is closed using consumer.close() during the shutdown process.
+     * Note that this method does not guarantee immediate removal of the consumer from the consumer group.
+     * The consumer is only kicked off from the group after the stream thread completes its run function.
+     * &lt;p&gt;
+     * Since the number of stream threads decreases, the sizes of the caches in the remaining stream
+     * threads are adapted so that the sum of the cache sizes over all stream threads equals the total
+     * cache size specified in configuration {@link StreamsConfig#STATESTORE_CACHE_MAX_BYTES_CONFIG}.
+     *
+     * @return name of the removed stream thread or empty if a stream thread could not be removed because
+     *         no stream threads are alive
+     */
+    public Optional&lt;String&gt; removeStreamThread() {
+<span class="nc" id="L1168">        return removeStreamThread(Long.MAX_VALUE);</span>
+    }
+
+    /**
+     * The consumer associated with the stream thread is closed using consumer.close() during the shutdown process.
+     * Note that this method does not guarantee immediate removal of the consumer from the consumer group.
+     * The consumer is only kicked off from the group after the stream thread completes its run function.
+     * &lt;p&gt;
+     * Since the number of stream threads decreases, the sizes of the caches in the remaining stream
+     * threads are adapted so that the sum of the cache sizes over all stream threads equals the total
+     * cache size specified in configuration {@link StreamsConfig#STATESTORE_CACHE_MAX_BYTES_CONFIG}.
+     *
+     * @param timeout The length of time to wait for the thread to shut down
+     * @return name of the removed stream thread or empty if a stream thread could not be removed because
+     *         no stream threads are alive
+     */
+    public Optional&lt;String&gt; removeStreamThread(final Duration timeout) {
+<span class="nc" id="L1185">        final String msgPrefix = prepareMillisCheckFailMsgPrefix(timeout, &quot;timeout&quot;);</span>
+<span class="nc" id="L1186">        final long timeoutMs = validateMillisecondDuration(timeout, msgPrefix);</span>
+<span class="nc" id="L1187">        return removeStreamThread(timeoutMs);</span>
+    }
+
+    private Optional&lt;String&gt; removeStreamThread(final long timeoutMs) throws TimeoutException {
+<span class="nc" id="L1191">        final long startMs = time.milliseconds();</span>
+
+<span class="nc bnc" id="L1193" title="All 2 branches missed.">        if (isRunningOrRebalancing()) {</span>
+<span class="nc" id="L1194">            synchronized (changeThreadCount) {</span>
+                // make a copy of threads to avoid holding lock
+<span class="nc bnc" id="L1196" title="All 2 branches missed.">                for (final StreamThread streamThread : new ArrayList&lt;&gt;(threads)) {</span>
+<span class="nc bnc" id="L1197" title="All 2 branches missed.">                    final boolean callingThreadIsNotCurrentStreamThread = !streamThread.getName().equals(Thread.currentThread().getName());</span>
+<span class="nc bnc" id="L1198" title="All 6 branches missed.">                    if (streamThread.isThreadAlive() &amp;&amp; (callingThreadIsNotCurrentStreamThread || numLiveStreamThreads() == 1)) {</span>
+<span class="nc" id="L1199">                        log.info(&quot;Removing StreamThread {}&quot;, streamThread.getName());</span>
+<span class="nc" id="L1200">                        streamThread.shutdown(org.apache.kafka.streams.CloseOptions.GroupMembershipOperation.LEAVE_GROUP);</span>
+<span class="nc bnc" id="L1201" title="All 2 branches missed.">                        if (callingThreadIsNotCurrentStreamThread) {</span>
+<span class="nc" id="L1202">                            final long remainingTimeMs = timeoutMs - (time.milliseconds() - startMs);</span>
+<span class="nc bnc" id="L1203" title="All 4 branches missed.">                            if (remainingTimeMs &lt;= 0 || !streamThread.waitOnThreadState(StreamThread.State.DEAD, remainingTimeMs)) {</span>
+<span class="nc" id="L1204">                                log.warn(&quot;{} did not shutdown in the allotted time.&quot;, streamThread.getName());</span>
+                                // Don't remove from threads until shutdown is complete. We will trim it from the
+                                // list once it reaches DEAD, and if for some reason it's hanging indefinitely in the
+                                // shutdown then we should just consider this thread.id to be burned
+                            } else {
+<span class="nc" id="L1209">                                log.info(&quot;Successfully removed {} in {}ms&quot;, streamThread.getName(), time.milliseconds() - startMs);</span>
+<span class="nc" id="L1210">                                threads.remove(streamThread);</span>
+<span class="nc" id="L1211">                                queryableStoreProvider.removeStoreProviderForThread(streamThread.getName());</span>
+                            }
+<span class="nc" id="L1213">                        } else {</span>
+<span class="nc" id="L1214">                            log.info(&quot;{} is the last remaining thread and must remove itself, therefore we cannot wait &quot;</span>
+<span class="nc" id="L1215">                                + &quot;for it to complete shutdown as this will result in deadlock.&quot;, streamThread.getName());</span>
+                        }
+
+<span class="nc" id="L1218">                        final long cacheSizePerThread = cacheSizePerThread(numLiveStreamThreads());</span>
+<span class="nc" id="L1219">                        log.info(&quot;Resizing thread cache due to thread removal, new cache size per thread is {}&quot;, cacheSizePerThread);</span>
+<span class="nc" id="L1220">                        resizeThreadCache(cacheSizePerThread);</span>
+<span class="nc" id="L1221">                        final long remainingTimeMs = timeoutMs - (time.milliseconds() - startMs);</span>
+<span class="nc bnc" id="L1222" title="All 2 branches missed.">                        if (remainingTimeMs &lt;= 0) {</span>
+<span class="nc" id="L1223">                            throw new TimeoutException(&quot;Thread &quot; + streamThread.getName() + &quot; did not stop in the allotted time&quot;);</span>
+                        }
+<span class="nc" id="L1225">                        return Optional.of(streamThread.getName());</span>
+                    }
+<span class="nc" id="L1227">                }</span>
+<span class="nc" id="L1228">            }</span>
+<span class="nc" id="L1229">            log.warn(&quot;There are no threads eligible for removal&quot;);</span>
+        } else {
+<span class="nc" id="L1231">            log.warn(&quot;Cannot remove a stream thread when Kafka Streams client is in state {}&quot;, state());</span>
+        }
+<span class="nc" id="L1233">        return Optional.empty();</span>
+    }
+
+    private int calculateMetricsRecordingLevel() {
+        final int recordingLevel;
+<span class="nc" id="L1238">        final String recordingLevelString = applicationConfigs.getString(METRICS_RECORDING_LEVEL_CONFIG);</span>
+<span class="nc bnc" id="L1239" title="All 4 branches missed.">        switch (recordingLevelString) {</span>
+            case &quot;INFO&quot;:
+<span class="nc" id="L1241">                recordingLevel = 0;</span>
+<span class="nc" id="L1242">                break;</span>
+            case &quot;DEBUG&quot;:
+<span class="nc" id="L1244">                recordingLevel = 1;</span>
+<span class="nc" id="L1245">                break;</span>
+            case &quot;TRACE&quot;:
+<span class="nc" id="L1247">                recordingLevel = 2;</span>
+<span class="nc" id="L1248">                break;</span>
+            default:
+<span class="nc" id="L1250">                throw new IllegalArgumentException(&quot;Unexpected recording level: &quot; + recordingLevelString);</span>
+        }
+<span class="nc" id="L1252">        return recordingLevel;</span>
+    }
+
+    /*
+     * Takes a snapshot and counts the number of stream threads which are not in PENDING_SHUTDOWN or DEAD
+     *
+     * Note: iteration over SynchronizedList is not thread safe, so it must be manually synchronized. However, we may
+     * require other locks when looping threads, and it could cause deadlock. Hence, we create a copy to avoid holding
+     * threads lock when looping threads.
+     *
+     * @return number of alive stream threads
+     */
+    private int numLiveStreamThreads() {
+<span class="nc" id="L1265">        final AtomicInteger numLiveThreads = new AtomicInteger(0);</span>
+
+<span class="nc" id="L1267">        synchronized (threads) {</span>
+<span class="nc" id="L1268">            processStreamThread(thread -&gt; {</span>
+<span class="nc bnc" id="L1269" title="All 2 branches missed.">                if (thread.state() == StreamThread.State.DEAD) {</span>
+<span class="nc" id="L1270">                    log.debug(&quot;Trimming thread {} from the threads list since it's state is {}&quot;, thread.getName(), StreamThread.State.DEAD);</span>
+<span class="nc" id="L1271">                    threads.remove(thread);</span>
+<span class="nc bnc" id="L1272" title="All 2 branches missed.">                } else if (thread.state() == StreamThread.State.PENDING_SHUTDOWN) {</span>
+<span class="nc" id="L1273">                    log.debug(&quot;Skipping thread {} from num live threads computation since it's state is {}&quot;,</span>
+<span class="nc" id="L1274">                              thread.getName(), StreamThread.State.PENDING_SHUTDOWN);</span>
+                } else {
+<span class="nc" id="L1276">                    numLiveThreads.incrementAndGet();</span>
+                }
+<span class="nc" id="L1278">            });</span>
+<span class="nc" id="L1279">            return numLiveThreads.get();</span>
+        }
+    }
+
+    private int nextThreadIndex() {
+<span class="nc" id="L1284">        final HashSet&lt;String&gt; allLiveThreadNames = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1285">        final AtomicInteger maxThreadId = new AtomicInteger(1);</span>
+<span class="nc" id="L1286">        synchronized (threads) {</span>
+<span class="nc" id="L1287">            processStreamThread(thread -&gt; {</span>
+                // trim any DEAD threads from the list, so we can reuse the thread.id
+                // this is only safe to do once the thread has fully completed shutdown
+<span class="nc bnc" id="L1290" title="All 2 branches missed.">                if (thread.state() == StreamThread.State.DEAD) {</span>
+<span class="nc" id="L1291">                    threads.remove(thread);</span>
+                } else {
+<span class="nc" id="L1293">                    allLiveThreadNames.add(thread.getName());</span>
+                    // Assume threads are always named with the &quot;-StreamThread-&lt;threadId&gt;&quot; suffix
+<span class="nc" id="L1295">                    final int threadId = Integer.parseInt(thread.getName().substring(thread.getName().lastIndexOf(&quot;-&quot;) + 1));</span>
+<span class="nc bnc" id="L1296" title="All 2 branches missed.">                    if (threadId &gt; maxThreadId.get()) {</span>
+<span class="nc" id="L1297">                        maxThreadId.set(threadId);</span>
+                    }
+                }
+<span class="nc" id="L1300">            });</span>
+
+<span class="nc" id="L1302">            final String baseName = clientId + &quot;-StreamThread-&quot;;</span>
+<span class="nc bnc" id="L1303" title="All 2 branches missed.">            for (int i = 1; i &lt;= maxThreadId.get(); i++) {</span>
+<span class="nc" id="L1304">                final String name = baseName + i;</span>
+<span class="nc bnc" id="L1305" title="All 2 branches missed.">                if (!allLiveThreadNames.contains(name)) {</span>
+<span class="nc" id="L1306">                    return i;</span>
+                }
+            }
+            // It's safe to use threads.size() rather than getNumLiveStreamThreads() to infer the number of threads
+            // here since we trimmed any DEAD threads earlier in this method while holding the lock
+<span class="nc" id="L1311">            return threads.size() + 1;</span>
+        }
+    }
+
+    private long cacheSizePerThread(final int numStreamThreads) {
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">        if (numStreamThreads == 0) {</span>
+<span class="nc" id="L1317">            return totalCacheSize;</span>
+        }
+<span class="nc bnc" id="L1319" title="All 2 branches missed.">        return totalCacheSize / (numStreamThreads + (topologyMetadata.hasGlobalTopology() ? 1 : 0));</span>
+    }
+
+    private void resizeThreadCache(final long cacheSizePerThread) {
+<span class="nc" id="L1323">        processStreamThread(thread -&gt; thread.resizeCache(cacheSizePerThread));</span>
+<span class="nc bnc" id="L1324" title="All 2 branches missed.">        if (globalStreamThread != null) {</span>
+<span class="nc" id="L1325">            globalStreamThread.resize(cacheSizePerThread);</span>
+        }
+<span class="nc" id="L1327">    }</span>
+
+    private ScheduledExecutorService setupStateDirCleaner() {
+<span class="nc" id="L1330">        return Executors.newSingleThreadScheduledExecutor(r -&gt; {</span>
+<span class="nc" id="L1331">            final Thread thread = new Thread(r, clientId + &quot;-CleanupThread&quot;);</span>
+<span class="nc" id="L1332">            thread.setDaemon(true);</span>
+<span class="nc" id="L1333">            return thread;</span>
+        });
+    }
+
+    private static ScheduledExecutorService maybeCreateRocksDBMetricsRecordingService(final String clientId,
+                                                                                      final StreamsConfig config) {
+<span class="nc bnc" id="L1339" title="All 2 branches missed.">        if (RecordingLevel.forName(config.getString(METRICS_RECORDING_LEVEL_CONFIG)) == RecordingLevel.DEBUG) {</span>
+<span class="nc" id="L1340">            return Executors.newSingleThreadScheduledExecutor(r -&gt; {</span>
+<span class="nc" id="L1341">                final Thread thread = new Thread(r, clientId + &quot;-RocksDBMetricsRecordingTrigger&quot;);</span>
+<span class="nc" id="L1342">                thread.setDaemon(true);</span>
+<span class="nc" id="L1343">                return thread;</span>
+            });
+        }
+<span class="nc" id="L1346">        return null;</span>
+    }
+
+    private static HostInfo parseHostInfo(final String endPoint) {
+<span class="nc" id="L1350">        final HostInfo hostInfo = HostInfo.buildFromEndpoint(endPoint);</span>
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">        if (hostInfo == null) {</span>
+<span class="nc" id="L1352">            return StreamsMetadataState.UNKNOWN_HOST;</span>
+        } else {
+<span class="nc" id="L1354">            return hostInfo;</span>
+        }
+    }
+
+    /**
+     * Start the {@code KafkaStreams} instance by starting all its threads.
+     * This function is expected to be called only once during the life cycle of the client.
+     * &lt;p&gt;
+     * Because threads are started in the background, this method does not block.
+     * However, if you have global stores in your topology, this method blocks until all global stores are restored.
+     * As a consequence, any fatal exception that happens during processing is by default only logged.
+     * If you want to be notified about dying threads, you can
+     * {@link #setUncaughtExceptionHandler(StreamsUncaughtExceptionHandler) register an uncaught exception handler}
+     * before starting the {@code KafkaStreams} instance.
+     * &lt;p&gt;
+     * &lt;b&gt;Note on broker compatibility:&lt;/b&gt;
+     * &lt;ul&gt;
+     *   &lt;li&gt;Kafka Streams 4.x requires brokers on version 2.1 or higher. Connection attempts to
+     *       older brokers will fail due to unsupported protocol versions.&lt;/li&gt;
+     *   &lt;li&gt;When {@link StreamsConfig#PROCESSING_GUARANTEE_CONFIG processing.guarantee} is set to
+     *       {@link StreamsConfig#EXACTLY_ONCE_V2 exactly_once_v2}, brokers must be version 2.5 or higher.
+     *       If the broker version is too old, the application will detect this during the first rebalance
+     *       and transition to {@link State#ERROR ERROR} state.&lt;/li&gt;
+     * &lt;/ul&gt;
+     * &lt;p&gt;
+     * Broker compatibility issues are typically detected asynchronously after {@code start()} returns.
+     * Use {@link #setStateListener(StateListener)} or
+     * {@link #setUncaughtExceptionHandler(StreamsUncaughtExceptionHandler)} to be notified of such failures.
+     *
+     * @throws IllegalStateException if process was already started
+     * @throws StreamsException if the Kafka Streams instance has fatal error and cannot be restarted
+     *
+     * @see #setStateListener(StateListener)
+     * @see #setUncaughtExceptionHandler(StreamsUncaughtExceptionHandler)
+     */
+    public synchronized void start() throws IllegalStateException, StreamsException {
+<span class="nc bnc" id="L1390" title="All 2 branches missed.">        if (setState(State.REBALANCING)) {</span>
+<span class="nc" id="L1391">            final Long dirMaxAgeMs = applicationConfigs.getLong(StreamsConfig.STATE_CLEANUP_DIR_MAX_AGE_MS_CONFIG);</span>
+<span class="nc bnc" id="L1392" title="All 2 branches missed.">            if (dirMaxAgeMs != StreamsConfig.STATE_CLEANUP_DIR_MAX_AGE_MS_DISABLED) {</span>
+<span class="nc" id="L1393">                log.debug(&quot;Start cleaning outdated directories&quot;);</span>
+<span class="nc" id="L1394">                stateDirectory.cleanOutdatedDirsOnStartup(dirMaxAgeMs);</span>
+            }
+<span class="nc" id="L1396">            log.debug(&quot;Initializing store offsets for existing local state&quot;);</span>
+<span class="nc" id="L1397">            stateDirectory.initializeStartupStores(topologyMetadata, logContext, streamsMetrics);</span>
+
+<span class="nc" id="L1399">            log.debug(&quot;Starting Streams client&quot;);</span>
+
+<span class="nc bnc" id="L1401" title="All 2 branches missed.">            if (globalStreamThread != null) {</span>
+<span class="nc" id="L1402">                globalStreamThread.start();</span>
+            }
+
+<span class="nc" id="L1405">            final int numThreads = processStreamThread(StreamThread::start);</span>
+
+<span class="nc" id="L1407">            log.info(&quot;Started {} stream threads&quot;, numThreads);</span>
+
+<span class="nc" id="L1409">            final Long cleanupDelay = applicationConfigs.getLong(StreamsConfig.STATE_CLEANUP_DELAY_MS_CONFIG);</span>
+<span class="nc" id="L1410">            stateDirCleaner.scheduleAtFixedRate(() -&gt; {</span>
+                // we do not use lock here since we only read on the value and act on it
+<span class="nc bnc" id="L1412" title="All 2 branches missed.">                if (state == State.RUNNING) {</span>
+<span class="nc" id="L1413">                    stateDirectory.cleanRemovedTasks(cleanupDelay);</span>
+                }
+<span class="nc" id="L1415">            }, cleanupDelay, cleanupDelay, TimeUnit.MILLISECONDS);</span>
+
+<span class="nc" id="L1417">            final long recordingDelay = 0;</span>
+<span class="nc" id="L1418">            final long recordingInterval = 1;</span>
+<span class="nc bnc" id="L1419" title="All 2 branches missed.">            if (rocksDBMetricsRecordingService != null) {</span>
+<span class="nc" id="L1420">                rocksDBMetricsRecordingService.scheduleAtFixedRate(</span>
+<span class="nc" id="L1421">                    streamsMetrics.rocksDBMetricsRecordingTrigger(),</span>
+                    recordingDelay,
+                    recordingInterval,
+                    TimeUnit.MINUTES
+                );
+            }
+<span class="nc" id="L1427">        } else {</span>
+<span class="nc" id="L1428">            throw new IllegalStateException(&quot;The client is either already started or already stopped, cannot re-start&quot;);</span>
+        }
+<span class="nc" id="L1430">    }</span>
+
+    /**
+     * Class that handles options passed in case of {@code KafkaStreams} instance scale down
+     */
+    @Deprecated(since = &quot;4.2&quot;)
+<span class="nc" id="L1436">    public static class CloseOptions {</span>
+<span class="nc" id="L1437">        private Duration timeout = Duration.ofMillis(Long.MAX_VALUE);</span>
+<span class="nc" id="L1438">        private boolean leaveGroup = false;</span>
+
+        @Deprecated(since = &quot;4.2&quot;)
+        public CloseOptions timeout(final Duration timeout) {
+<span class="nc" id="L1442">            this.timeout = timeout;</span>
+<span class="nc" id="L1443">            return this;</span>
+        }
+
+        @Deprecated(since = &quot;4.2&quot;)
+        public CloseOptions leaveGroup(final boolean leaveGroup) {
+<span class="nc" id="L1448">            this.leaveGroup = leaveGroup;</span>
+<span class="nc" id="L1449">            return this;</span>
+        }
+    }
+
+    /**
+     * Shutdown this {@code KafkaStreams} instance by signaling all the threads to stop, and then wait for them to join.
+     * This will block until all threads have stopped.
+     * &lt;p&gt;
+     * When using the classic protocol, the consumer will not leave the group explicitly. However, when using
+     * the streams group protocol ({@code group.protocol=streams}), the consumer will always leave the group.
+     */
+    public void close() {
+<span class="nc" id="L1461">        close(Optional.empty(), org.apache.kafka.streams.CloseOptions.GroupMembershipOperation.REMAIN_IN_GROUP);</span>
+<span class="nc" id="L1462">    }</span>
+
+    private Thread shutdownHelper(
+        final boolean error,
+        final long timeoutMs,
+        final org.apache.kafka.streams.CloseOptions.GroupMembershipOperation operation
+    ) {
+<span class="nc" id="L1469">        stateDirCleaner.shutdownNow();</span>
+<span class="nc bnc" id="L1470" title="All 2 branches missed.">        if (rocksDBMetricsRecordingService != null) {</span>
+<span class="nc" id="L1471">            rocksDBMetricsRecordingService.shutdownNow();</span>
+        }
+
+        // wait for all threads to join in a separate thread;
+        // save the current thread so that if it is a stream thread
+        // we don't attempt to join it and cause a deadlock
+<span class="nc" id="L1477">        return new Thread(() -&gt; {</span>
+            // notify all the threads to stop; avoid deadlocks by stopping any
+            // further state reports from the thread since we're shutting down
+<span class="nc" id="L1480">            int numStreamThreads = processStreamThread(</span>
+<span class="nc" id="L1481">                streamThread -&gt; streamThread.shutdown(operation)</span>
+            );
+
+<span class="nc" id="L1484">            log.info(&quot;Shutting down {} stream threads&quot;, numStreamThreads);</span>
+
+<span class="nc" id="L1486">            topologyMetadata.wakeupThreads();</span>
+
+<span class="nc" id="L1488">            numStreamThreads = processStreamThread(thread -&gt; {</span>
+                try {
+<span class="nc bnc" id="L1490" title="All 2 branches missed.">                    if (!thread.isRunning()) {</span>
+<span class="nc" id="L1491">                        log.debug(&quot;Shutdown {} complete&quot;, thread.getName());</span>
+
+<span class="nc" id="L1493">                        thread.join();</span>
+                    }
+<span class="nc" id="L1495">                } catch (final InterruptedException ex) {</span>
+<span class="nc" id="L1496">                    log.warn(&quot;Shutdown {} interrupted&quot;, thread.getName());</span>
+
+<span class="nc" id="L1498">                    Thread.currentThread().interrupt();</span>
+<span class="nc" id="L1499">                }</span>
+<span class="nc" id="L1500">            });</span>
+
+<span class="nc" id="L1502">            log.info(&quot;Shutdown {} stream threads complete&quot;, numStreamThreads);</span>
+
+<span class="nc bnc" id="L1504" title="All 2 branches missed.">            if (globalStreamThread != null) {</span>
+<span class="nc" id="L1505">                log.info(&quot;Shutting down the global stream threads&quot;);</span>
+
+<span class="nc" id="L1507">                globalStreamThread.shutdown();</span>
+            }
+
+<span class="nc bnc" id="L1510" title="All 4 branches missed.">            if (globalStreamThread != null &amp;&amp; !globalStreamThread.stillRunning()) {</span>
+                try {
+<span class="nc" id="L1512">                    globalStreamThread.join();</span>
+<span class="nc" id="L1513">                } catch (final InterruptedException e) {</span>
+<span class="nc" id="L1514">                    log.warn(&quot;Shutdown the global stream thread interrupted&quot;);</span>
+
+<span class="nc" id="L1516">                    Thread.currentThread().interrupt();</span>
+<span class="nc" id="L1517">                }</span>
+<span class="nc" id="L1518">                globalStreamThread = null;</span>
+
+<span class="nc" id="L1520">                log.info(&quot;Shutdown global stream threads complete&quot;);</span>
+            }
+
+<span class="nc" id="L1523">            stateDirectory.close();</span>
+            // passing in `timeoutMs` here is a quick fix to avoid blocking forever
+            // cf https://issues.apache.org/jira/browse/KAFKA-7996
+<span class="nc bnc" id="L1526" title="All 2 branches missed.">            if (timeoutMs &gt;= 0) {</span>
+<span class="nc" id="L1527">                adminClient.close(Duration.ofMillis(timeoutMs));</span>
+            } else {
+<span class="nc" id="L1529">                adminClient.close();</span>
+            }
+
+<span class="nc" id="L1532">            streamsMetrics.removeAllClientLevelSensorsAndMetrics();</span>
+<span class="nc" id="L1533">            metrics.close();</span>
+<span class="nc bnc" id="L1534" title="All 2 branches missed.">            if (!error) {</span>
+<span class="nc" id="L1535">                setState(State.NOT_RUNNING);</span>
+            } else {
+<span class="nc" id="L1537">                setState(State.ERROR);</span>
+            }
+<span class="nc" id="L1539">        }, clientId + &quot;-CloseThread&quot;);</span>
+    }
+
+    // visible for testing
+    boolean close(final Optional&lt;Long&gt; timeout, final org.apache.kafka.streams.CloseOptions.GroupMembershipOperation operation) {
+        final long timeoutMs;
+<span class="nc bnc" id="L1545" title="All 2 branches missed.">        if (timeout.isPresent()) {</span>
+<span class="nc" id="L1546">            timeoutMs = timeout.get();</span>
+<span class="nc" id="L1547">            log.debug(&quot;Stopping Streams client with timeout = {}ms.&quot;, timeoutMs);</span>
+        } else {
+<span class="nc" id="L1549">            timeoutMs = Long.MAX_VALUE;</span>
+        }
+
+<span class="nc bnc" id="L1552" title="All 2 branches missed.">        if (!setState(State.PENDING_SHUTDOWN)) {</span>
+            // Copy the state so that we can atomically check if we are shut down and act on it (log it)
+<span class="nc" id="L1554">            final State immutableStateCopy = state;</span>
+<span class="nc bnc" id="L1555" title="All 2 branches missed.">            if (immutableStateCopy.isShuttingDown()) {</span>
+<span class="nc" id="L1556">                log.info(&quot;Skipping shutdown since Streams client is already in {}, waiting for a terminal state&quot;, immutableStateCopy);</span>
+<span class="nc bnc" id="L1557" title="All 2 branches missed.">                if (!waitOnStates(timeoutMs, State.ERROR, State.NOT_RUNNING)) {</span>
+<span class="nc" id="L1558">                    log.warn(&quot;Streams client did transition to a terminal state (ERROR or NOT_RUNNING) within the {}ms timeout&quot;, timeoutMs);</span>
+<span class="nc" id="L1559">                    return false;</span>
+                }
+<span class="nc" id="L1561">                log.info(&quot;Streams client stopped completely and transitioned to the terminal {} state&quot;, state);</span>
+<span class="nc" id="L1562">                return true;</span>
+            }
+
+<span class="nc bnc" id="L1565" title="All 2 branches missed.">            if (state.hasCompletedShutdown()) {</span>
+<span class="nc" id="L1566">                log.info(&quot;Skipping shutdown since Streams client is already in the terminal {} state&quot;, state);</span>
+<span class="nc" id="L1567">                return true;</span>
+            }
+
+<span class="nc" id="L1570">            throw new IllegalStateException(&quot;If transitioning to PENDING_SHUTDOWN fails, the state should be either in &quot;</span>
+                + &quot;PENDING_SHUTDOWN, PENDING_ERROR, ERROR, or NOT_RUNNING&quot;);
+        }
+
+<span class="nc" id="L1574">        final Thread shutdownThread = shutdownHelper(false, timeoutMs, operation);</span>
+
+<span class="nc" id="L1576">        shutdownThread.setDaemon(true);</span>
+<span class="nc" id="L1577">        shutdownThread.start();</span>
+
+<span class="nc bnc" id="L1579" title="All 2 branches missed.">        if (waitOnStates(timeoutMs, State.NOT_RUNNING)) {</span>
+<span class="nc" id="L1580">            log.info(&quot;Streams client stopped completely&quot;);</span>
+<span class="nc" id="L1581">            return true;</span>
+        } else {
+<span class="nc" id="L1583">            log.info(&quot;Streams client cannot stop completely within the {}ms timeout&quot;, timeoutMs);</span>
+<span class="nc" id="L1584">            return false;</span>
+        }
+    }
+
+    void closeToError() {
+<span class="nc bnc" id="L1589" title="All 2 branches missed.">        if (!setState(State.PENDING_ERROR)) {</span>
+<span class="nc" id="L1590">            log.info(&quot;Skipping shutdown since we are already in {}&quot;, state());</span>
+        } else {
+<span class="nc" id="L1592">            final Thread shutdownThread = shutdownHelper(true, -1, org.apache.kafka.streams.CloseOptions.GroupMembershipOperation.REMAIN_IN_GROUP);</span>
+
+<span class="nc" id="L1594">            shutdownThread.setDaemon(true);</span>
+<span class="nc" id="L1595">            shutdownThread.start();</span>
+        }
+<span class="nc" id="L1597">    }</span>
+
+    /**
+     * Shutdown this {@code KafkaStreams} by signaling all the threads to stop, and then wait up to the timeout for the
+     * threads to join.
+     * A {@code timeout} of {@link Duration#ZERO} (or any other zero duration) makes the close operation asynchronous.
+     * Negative-duration timeouts are rejected.
+     * &lt;p&gt;
+     * When using the classic protocol, the consumer will not leave the group explicitly. However, when using
+     * the streams group protocol ({@code group.protocol=streams}), the consumer will always leave the group.
+     *
+     * @param timeout how long to wait for the threads to shut down
+     * @return {@code true} if all threads were successfully stopped&amp;mdash;{@code false} if the timeout was reached
+     * before all threads stopped
+     * Note that this method must not be called in the {@link StateListener#onChange(KafkaStreams.State, KafkaStreams.State)} callback of {@link StateListener}.
+     * @throws IllegalArgumentException if {@code timeout} can't be represented as {@code long milliseconds}
+     */
+    public synchronized boolean close(final Duration timeout) throws IllegalArgumentException {
+<span class="nc" id="L1615">        final String msgPrefix = prepareMillisCheckFailMsgPrefix(timeout, &quot;timeout&quot;);</span>
+<span class="nc" id="L1616">        final long timeoutMs = validateMillisecondDuration(timeout, msgPrefix);</span>
+<span class="nc bnc" id="L1617" title="All 2 branches missed.">        if (timeoutMs &lt; 0) {</span>
+<span class="nc" id="L1618">            throw new IllegalArgumentException(&quot;Timeout can't be negative.&quot;);</span>
+        }
+
+<span class="nc" id="L1621">        return close(Optional.of(timeoutMs), org.apache.kafka.streams.CloseOptions.GroupMembershipOperation.REMAIN_IN_GROUP);</span>
+    }
+
+    /**
+     * Shutdown this {@code KafkaStreams} by signaling all the threads to stop, and then wait up to the timeout for the
+     * threads to join.
+     * This method is deprecated and replaced by {@link #close(org.apache.kafka.streams.CloseOptions)}.
+     * @param options  contains timeout to specify how long to wait for the threads to shut down, and a flag leaveGroup to
+     *                 trigger consumer leave call
+     * @return {@code true} if all threads were successfully stopped&amp;mdash;{@code false} if the timeout was reached
+     * before all threads stopped
+     * Note that this method must not be called in the {@link StateListener#onChange(KafkaStreams.State, KafkaStreams.State)} callback of {@link StateListener}.
+     * @throws IllegalArgumentException if {@code timeout} can't be represented as {@code long milliseconds}
+     */
+    @Deprecated(since = &quot;4.2&quot;)
+    public synchronized boolean close(final CloseOptions options) throws IllegalArgumentException {
+<span class="nc" id="L1637">        final org.apache.kafka.streams.CloseOptions closeOptions = org.apache.kafka.streams.CloseOptions.timeout(options.timeout)</span>
+<span class="nc bnc" id="L1638" title="All 2 branches missed.">                .withGroupMembershipOperation(options.leaveGroup ?</span>
+<span class="nc" id="L1639">                        org.apache.kafka.streams.CloseOptions.GroupMembershipOperation.LEAVE_GROUP :</span>
+<span class="nc" id="L1640">                        org.apache.kafka.streams.CloseOptions.GroupMembershipOperation.REMAIN_IN_GROUP);</span>
+<span class="nc" id="L1641">        return close(closeOptions);</span>
+    }
+
+    /**
+     * Shutdown this {@code KafkaStreams} by signaling all the threads to stop, and then wait up to the timeout for the
+     * threads to join.
+     * @param options  contains timeout to specify how long to wait for the threads to shut down,
+     *                 and a {@link org.apache.kafka.streams.CloseOptions.GroupMembershipOperation}
+     *                 to trigger consumer leave call or remain in the group
+     * @return {@code true} if all threads were successfully stopped&amp;mdash;{@code false} if the timeout was reached
+     * before all threads stopped
+     * Note that this method must not be called in the {@link StateListener#onChange(KafkaStreams.State, KafkaStreams.State)} callback of {@link StateListener}.
+     * @throws IllegalArgumentException if {@code timeout} can't be represented as {@code long milliseconds}
+     */
+    public synchronized boolean close(final org.apache.kafka.streams.CloseOptions options) throws IllegalArgumentException {
+<span class="nc" id="L1656">        Objects.requireNonNull(options, &quot;options cannot be null&quot;);</span>
+<span class="nc" id="L1657">        final CloseOptionsInternal optionsInternal = new CloseOptionsInternal(options);</span>
+<span class="nc" id="L1658">        final Duration timeout = optionsInternal.timeout().orElseGet(() -&gt; Duration.ofMillis(Long.MAX_VALUE));</span>
+<span class="nc" id="L1659">        final String msgPrefix = prepareMillisCheckFailMsgPrefix(timeout, &quot;timeout&quot;);</span>
+<span class="nc" id="L1660">        final long timeoutMs = validateMillisecondDuration(timeout, msgPrefix);</span>
+<span class="nc bnc" id="L1661" title="All 2 branches missed.">        if (timeoutMs &lt; 0) {</span>
+<span class="nc" id="L1662">            throw new IllegalArgumentException(&quot;Timeout can't be negative.&quot;);</span>
+        }
+
+<span class="nc" id="L1665">        return close(Optional.of(timeoutMs), optionsInternal.operation());</span>
+    }
+
+    /**
+     * Do a cleanup of the local {@link StateStore} directory ({@link StreamsConfig#STATE_DIR_CONFIG}) by deleting all
+     * data with regard to the {@link StreamsConfig#APPLICATION_ID_CONFIG application ID}.
+     * &lt;p&gt;
+     * May only be called either before this {@code KafkaStreams} instance is {@link #start() started} or after the
+     * instance is {@link #close() closed}.
+     * &lt;p&gt;
+     * Calling this method triggers a restore of local {@link StateStore}s on the next {@link #start() application start}.
+     *
+     * @throws IllegalStateException if this {@code KafkaStreams} instance has been started and hasn't fully shut down
+     * @throws StreamsException if cleanup failed
+     */
+    public void cleanUp() {
+<span class="nc bnc" id="L1681" title="All 4 branches missed.">        if (!(state.hasNotStarted() || state.hasCompletedShutdown())) {</span>
+<span class="nc" id="L1682">            throw new IllegalStateException(&quot;Cannot clean up while running.&quot;);</span>
+        }
+<span class="nc" id="L1684">        stateDirectory.clean();</span>
+<span class="nc" id="L1685">    }</span>
+
+    /**
+     * Find all currently running {@code KafkaStreams} instances (potentially remotely) that use the same
+     * {@link StreamsConfig#APPLICATION_ID_CONFIG application ID} as this instance (i.e., all instances that belong to
+     * the same Kafka Streams application) and return {@link StreamsMetadata} for each discovered instance.
+     * &lt;p&gt;
+     * Note: this is a point in time view, and it may change due to partition reassignment.
+     *
+     * @return {@link StreamsMetadata} for each {@code KafkaStreams} instances of this application
+     */
+    public Collection&lt;StreamsMetadata&gt; metadataForAllStreamsClients() {
+<span class="nc" id="L1697">        validateIsRunningOrRebalancing();</span>
+<span class="nc" id="L1698">        return streamsMetadataState.allMetadata();</span>
+    }
+
+    /**
+     * Find all currently running {@code KafkaStreams} instances (potentially remotely) that
+     * &lt;ul&gt;
+     *   &lt;li&gt;use the same {@link StreamsConfig#APPLICATION_ID_CONFIG application ID} as this instance (i.e., all
+     *       instances that belong to the same Kafka Streams application)&lt;/li&gt;
+     *   &lt;li&gt;and that contain a {@link StateStore} with the given {@code storeName}&lt;/li&gt;
+     * &lt;/ul&gt;
+     * and return {@link StreamsMetadata} for each discovered instance.
+     * &lt;p&gt;
+     * Note: this is a point in time view, and it may change due to partition reassignment.
+     *
+     * @param storeName the {@code storeName} to find metadata for
+     * @return {@link StreamsMetadata} for each {@code KafkaStreams} instances with the provided {@code storeName} of
+     * this application
+     */
+    public Collection&lt;StreamsMetadata&gt; streamsMetadataForStore(final String storeName) {
+<span class="nc" id="L1717">        validateIsRunningOrRebalancing();</span>
+<span class="nc" id="L1718">        return streamsMetadataState.allMetadataForStore(storeName);</span>
+    }
+
+    /**
+     * Finds the metadata containing the active hosts and standby hosts where the key being queried would reside.
+     *
+     * @param storeName     the {@code storeName} to find metadata for
+     * @param key           the key to find metadata for
+     * @param keySerializer serializer for the key
+     * @param &lt;K&gt;           key type
+     * Returns {@link KeyQueryMetadata} containing all metadata about hosting the given key for the given store,
+     * or {@code null} if no matching metadata could be found.
+     */
+    public &lt;K&gt; KeyQueryMetadata queryMetadataForKey(final String storeName,
+                                                    final K key,
+                                                    final Serializer&lt;K&gt; keySerializer) {
+<span class="nc" id="L1734">        validateIsRunningOrRebalancing();</span>
+<span class="nc" id="L1735">        return streamsMetadataState.keyQueryMetadataForKey(storeName, key, keySerializer);</span>
+    }
+
+    /**
+     * Finds the metadata containing the active hosts and standby hosts where the key being queried would reside.
+     *
+     * @param storeName     the {@code storeName} to find metadata for
+     * @param key           the key to find metadata for
+     * @param partitioner   the partitioner to be used to locate the host for the key
+     * @param &lt;K&gt;           key type
+     * Returns {@link KeyQueryMetadata} containing all metadata about hosting the given key for the given store, using
+     * the supplied partitioner, or {@code null} if no matching metadata could be found.
+     */
+    public &lt;K&gt; KeyQueryMetadata queryMetadataForKey(final String storeName,
+                                                    final K key,
+                                                    final StreamPartitioner&lt;? super K, ?&gt; partitioner) {
+<span class="nc" id="L1751">        validateIsRunningOrRebalancing();</span>
+<span class="nc" id="L1752">        return streamsMetadataState.keyQueryMetadataForKey(storeName, key, partitioner);</span>
+    }
+
+    /**
+     * Get a facade wrapping the local {@link StateStore} instances with the provided {@link StoreQueryParameters}.
+     * The returned object can be used to query the {@link StateStore} instances.
+     *
+     * @param storeQueryParameters   the parameters used to fetch a queryable store
+     * @return A facade wrapping the local {@link StateStore} instances
+     * @throws StreamsNotStartedException If Streams has not yet been started. Just call {@link KafkaStreams#start()}
+     *                                    and then retry this call.
+     * @throws UnknownStateStoreException If the specified store name does not exist in the topology.
+     * @throws InvalidStateStorePartitionException If the specified partition does not exist.
+     * @throws InvalidStateStoreException If the Streams instance isn't in a queryable state.
+     *                                    If the store's type does not match the QueryableStoreType,
+     *                                    the Streams instance is not in a queryable state with respect
+     *                                    to the parameters, or if the store is not available locally, then
+     *                                    an InvalidStateStoreException is thrown upon store access.
+     */
+    public &lt;T&gt; T store(final StoreQueryParameters&lt;T&gt; storeQueryParameters) {
+<span class="nc" id="L1772">        validateIsRunningOrRebalancing();</span>
+<span class="nc" id="L1773">        final String storeName = storeQueryParameters.storeName();</span>
+<span class="nc bnc" id="L1774" title="All 2 branches missed.">        if (!topologyMetadata.hasStore(storeName)) {</span>
+<span class="nc" id="L1775">            throw new UnknownStateStoreException(</span>
+                &quot;Cannot get state store &quot; + storeName + &quot; because no such store is registered in the topology.&quot;
+            );
+        }
+<span class="nc" id="L1779">        return queryableStoreProvider.store(storeQueryParameters);</span>
+    }
+
+    /**
+     *  This method pauses processing for the KafkaStreams instance.
+     *
+     *  &lt;p&gt;Paused topologies will only skip over (a) processing, (b) punctuation, and (c) standby tasks.
+     *  Notably, paused topologies will still poll Kafka consumers, and commit offsets.
+     *  This method sets transient state that is not maintained or managed among instances.
+     *  Note that pause() can be called before start() in order to start a KafkaStreams instance
+     *  in a manner where the processing is paused as described, but the consumers are started up.
+     */
+    @SuppressWarnings(&quot;deprecation&quot;)
+    public void pause() {
+<span class="nc bnc" id="L1793" title="All 2 branches missed.">        if (topologyMetadata.hasNamedTopologies()) {</span>
+<span class="nc bnc" id="L1794" title="All 2 branches missed.">            for (final NamedTopology namedTopology : topologyMetadata.allNamedTopologies()) {</span>
+<span class="nc" id="L1795">                topologyMetadata.pauseTopology(namedTopology.name());</span>
+<span class="nc" id="L1796">            }</span>
+        } else {
+<span class="nc" id="L1798">            topologyMetadata.pauseTopology(UNNAMED_TOPOLOGY);</span>
+        }
+<span class="nc" id="L1800">    }</span>
+
+    /**
+     * @return true when the KafkaStreams instance has its processing paused.
+     */
+    @SuppressWarnings(&quot;deprecation&quot;)
+    public boolean isPaused() {
+<span class="nc bnc" id="L1807" title="All 2 branches missed.">        if (topologyMetadata.hasNamedTopologies()) {</span>
+<span class="nc" id="L1808">            return topologyMetadata.allNamedTopologies().stream()</span>
+<span class="nc" id="L1809">                .map(NamedTopology::name)</span>
+<span class="nc" id="L1810">                .allMatch(topologyMetadata::isPaused);</span>
+        } else {
+<span class="nc" id="L1812">            return topologyMetadata.isPaused(UNNAMED_TOPOLOGY);</span>
+        }
+    }
+
+    /**
+     * This method resumes processing for the KafkaStreams instance.
+     */
+    @SuppressWarnings(&quot;deprecation&quot;)
+    public void resume() {
+<span class="nc bnc" id="L1821" title="All 2 branches missed.">        if (topologyMetadata.hasNamedTopologies()) {</span>
+<span class="nc bnc" id="L1822" title="All 2 branches missed.">            for (final NamedTopology namedTopology : topologyMetadata.allNamedTopologies()) {</span>
+<span class="nc" id="L1823">                topologyMetadata.resumeTopology(namedTopology.name());</span>
+<span class="nc" id="L1824">            }</span>
+        } else {
+<span class="nc" id="L1826">            topologyMetadata.resumeTopology(UNNAMED_TOPOLOGY);</span>
+        }
+<span class="nc" id="L1828">        threads.forEach(StreamThread::signalResume);</span>
+<span class="nc" id="L1829">    }</span>
+
+    /**
+     * handle each stream thread in a snapshot of threads.
+     * noted: iteration over SynchronizedList is not thread safe, so it must be manually synchronized. However, we may
+     * require other locks when looping threads, and it could cause deadlock. Hence, we create a copy to avoid holding
+     * threads lock when looping threads.
+     * @param consumer handler
+     */
+    protected int processStreamThread(final Consumer&lt;StreamThread&gt; consumer) {
+<span class="nc" id="L1839">        final List&lt;StreamThread&gt; copy = new ArrayList&lt;&gt;(threads);</span>
+<span class="nc bnc" id="L1840" title="All 2 branches missed.">        for (final StreamThread thread : copy) consumer.accept(thread);</span>
+
+<span class="nc" id="L1842">        return copy.size();</span>
+    }
+
+    /**
+     * Returns the internal clients' assigned {@code client instance ids}.
+     *
+     * @return The internal clients' assigned instance ids used for metrics collection.
+     *
+     * @throws IllegalArgumentException If {@code timeout} is negative.
+     * @throws IllegalStateException If {@code KafkaStreams} is not running.
+     * @throws TimeoutException Indicates that a request timed out.
+     * @throws StreamsException For any other error that might occur.
+     */
+    public synchronized ClientInstanceIds clientInstanceIds(final Duration timeout) {
+<span class="nc bnc" id="L1856" title="All 2 branches missed.">        if (timeout.isNegative()) {</span>
+<span class="nc" id="L1857">            throw new IllegalArgumentException(&quot;The timeout cannot be negative.&quot;);</span>
+        }
+<span class="nc bnc" id="L1859" title="All 2 branches missed.">        if (state().hasNotStarted()) {</span>
+<span class="nc" id="L1860">            throw new IllegalStateException(&quot;KafkaStreams has not been started, you can retry after calling start().&quot;);</span>
+        }
+<span class="nc bnc" id="L1862" title="All 4 branches missed.">        if (state().isShuttingDown() || state.hasCompletedShutdown()) {</span>
+<span class="nc" id="L1863">            throw new IllegalStateException(&quot;KafkaStreams has been stopped (&quot; + state + &quot;).&quot;);</span>
+        }
+
+<span class="nc" id="L1866">        final Timer remainingTime = time.timer(timeout.toMillis());</span>
+<span class="nc" id="L1867">        final ClientInstanceIdsImpl clientInstanceIds = new ClientInstanceIdsImpl();</span>
+
+        // (1) fan-out calls to threads
+
+        // StreamThread for main/restore consumers and producer(s)
+<span class="nc" id="L1872">        final Map&lt;String, KafkaFuture&lt;Uuid&gt;&gt; clientFutures = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L1873">        synchronized (changeThreadCount) {</span>
+<span class="nc bnc" id="L1874" title="All 2 branches missed.">            for (final StreamThread streamThread : threads) {</span>
+<span class="nc" id="L1875">                clientFutures.putAll(streamThread.clientInstanceIds(timeout));</span>
+<span class="nc" id="L1876">            }</span>
+<span class="nc" id="L1877">        }</span>
+
+        // GlobalThread
+<span class="nc" id="L1880">        KafkaFuture&lt;Uuid&gt; globalThreadFuture = null;</span>
+<span class="nc bnc" id="L1881" title="All 2 branches missed.">        if (globalStreamThread != null) {</span>
+<span class="nc" id="L1882">            globalThreadFuture = globalStreamThread.globalConsumerInstanceId(timeout);</span>
+        }
+
+        // (2) get admin client instance id in a blocking fashion, while Stream/GlobalThreads work in parallel
+        try {
+<span class="nc" id="L1887">            clientInstanceIds.setAdminInstanceId(adminClient.clientInstanceId(timeout));</span>
+<span class="nc" id="L1888">            remainingTime.update(time.milliseconds());</span>
+<span class="nc" id="L1889">        } catch (final IllegalStateException telemetryDisabledError) {</span>
+            // swallow
+<span class="nc" id="L1891">            log.debug(&quot;Telemetry is disabled on the admin client.&quot;);</span>
+<span class="nc" id="L1892">        } catch (final TimeoutException timeoutException) {</span>
+<span class="nc" id="L1893">            throw timeoutException;</span>
+<span class="nc" id="L1894">        } catch (final Exception error) {</span>
+<span class="nc" id="L1895">            throw new StreamsException(&quot;Could not retrieve admin client instance id.&quot;, error);</span>
+<span class="nc" id="L1896">        }</span>
+
+        // (3) collect client instance ids from threads
+
+        // (3a) collect consumers and producer from StreamsThread
+<span class="nc bnc" id="L1901" title="All 2 branches missed.">        for (final Map.Entry&lt;String, KafkaFuture&lt;Uuid&gt;&gt; clientFuture : clientFutures.entrySet()) {</span>
+<span class="nc" id="L1902">            final Uuid instanceId = getOrThrowException(</span>
+<span class="nc" id="L1903">                clientFuture.getValue(),</span>
+<span class="nc" id="L1904">                remainingTime.remainingMs(),</span>
+<span class="nc" id="L1905">                () -&gt; String.format(</span>
+                    &quot;Could not retrieve consumer/producer instance id for %s.&quot;,
+<span class="nc" id="L1907">                    clientFuture.getKey()</span>
+                )
+            );
+<span class="nc" id="L1910">            remainingTime.update(time.milliseconds());</span>
+
+            // could be `null` if telemetry is disabled on the consumer itself
+<span class="nc bnc" id="L1913" title="All 2 branches missed.">            if (instanceId != null) {</span>
+<span class="nc" id="L1914">                final String clientFutureKey = clientFuture.getKey();</span>
+<span class="nc bnc" id="L1915" title="All 2 branches missed.">                if (clientFutureKey.toLowerCase(Locale.getDefault()).endsWith(&quot;-producer&quot;)) {</span>
+<span class="nc" id="L1916">                    clientInstanceIds.addProducerInstanceId(</span>
+                            clientFutureKey,
+                            instanceId
+                    );
+                } else {
+<span class="nc" id="L1921">                    clientInstanceIds.addConsumerInstanceId(</span>
+                            clientFutureKey,
+                            instanceId
+                    );
+                }
+<span class="nc" id="L1926">            } else {</span>
+<span class="nc" id="L1927">                log.debug(String.format(&quot;Telemetry is disabled for %s.&quot;, clientFuture.getKey()));</span>
+            }
+<span class="nc" id="L1929">        }</span>
+
+        // (3b) collect from GlobalThread
+<span class="nc bnc" id="L1932" title="All 2 branches missed.">        if (globalThreadFuture != null) {</span>
+<span class="nc" id="L1933">            final Uuid instanceId = getOrThrowException(</span>
+                globalThreadFuture,
+<span class="nc" id="L1935">                remainingTime.remainingMs(),</span>
+<span class="nc" id="L1936">                () -&gt; &quot;Could not retrieve global consumer client instance id.&quot;</span>
+            );
+<span class="nc" id="L1938">            remainingTime.update(time.milliseconds());</span>
+
+            // could be `null` if telemetry is disabled on the client itself
+<span class="nc bnc" id="L1941" title="All 2 branches missed.">            if (instanceId != null) {</span>
+<span class="nc" id="L1942">                clientInstanceIds.addConsumerInstanceId(</span>
+<span class="nc" id="L1943">                    globalStreamThread.getName() + &quot;-global-consumer&quot;,</span>
+                    instanceId
+                );
+            } else {
+<span class="nc" id="L1947">                log.debug(&quot;Telemetry is disabled for the global consumer.&quot;);</span>
+            }
+        }
+
+<span class="nc" id="L1951">        return clientInstanceIds;</span>
+    }
+
+    private &lt;T&gt; T getOrThrowException(
+        final KafkaFuture&lt;T&gt; future,
+        final long timeoutMs,
+        final Supplier&lt;String&gt; errorMessage) {
+        final Throwable cause;
+
+        try {
+<span class="nc" id="L1961">            return future.get(timeoutMs, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L1962">        } catch (final java.util.concurrent.TimeoutException timeout) {</span>
+<span class="nc" id="L1963">            throw new TimeoutException(errorMessage.get(), timeout);</span>
+<span class="nc" id="L1964">        } catch (final ExecutionException exception) {</span>
+<span class="nc" id="L1965">            cause = exception.getCause();</span>
+<span class="nc bnc" id="L1966" title="All 2 branches missed.">            if (cause instanceof TimeoutException) {</span>
+<span class="nc" id="L1967">                throw (TimeoutException) cause;</span>
+            }
+<span class="nc" id="L1969">        } catch (final InterruptedException error) {</span>
+<span class="nc" id="L1970">            cause = error;</span>
+<span class="nc" id="L1971">        }</span>
+
+<span class="nc" id="L1973">        throw new StreamsException(errorMessage.get(), cause);</span>
+    }
+
+    /**
+     * Returns runtime information about the local threads of this {@link KafkaStreams} instance.
+     *
+     * @return the set of {@link ThreadMetadata}.
+     */
+    public Set&lt;ThreadMetadata&gt; metadataForLocalThreads() {
+<span class="nc" id="L1982">        final Set&lt;ThreadMetadata&gt; threadMetadata = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1983">        processStreamThread(thread -&gt; {</span>
+<span class="nc" id="L1984">            synchronized (thread.getStateLock()) {</span>
+<span class="nc bnc" id="L1985" title="All 2 branches missed.">                if (thread.state() != StreamThread.State.DEAD) {</span>
+<span class="nc" id="L1986">                    threadMetadata.add(thread.threadMetadata());</span>
+                }
+<span class="nc" id="L1988">            }</span>
+<span class="nc" id="L1989">        });</span>
+<span class="nc" id="L1990">        return threadMetadata;</span>
+    }
+
+    /**
+     * Returns {@link LagInfo}, for all store partitions (active or standby) local to this Streams instance. Note that the
+     * values returned are just estimates and meant to be used for making soft decisions on whether the data in the store
+     * partition is fresh enough for querying.
+     *
+     * &lt;p&gt;Note: Each invocation of this method issues a call to the Kafka brokers. Thus, it's advisable to limit the frequency
+     * of invocation to once every few seconds.
+     *
+     * @return map of store names to another map of partition to {@link LagInfo}s
+     * @throws StreamsException if the admin client request throws exception
+     */
+    public Map&lt;String, Map&lt;Integer, LagInfo&gt;&gt; allLocalStorePartitionLags() {
+<span class="nc" id="L2005">        final List&lt;Task&gt; allTasks = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L2006">        processStreamThread(thread -&gt; allTasks.addAll(thread.readyOnlyAllTasks()));</span>
+<span class="nc" id="L2007">        return allLocalStorePartitionLags(allTasks);</span>
+    }
+
+    protected Map&lt;String, Map&lt;Integer, LagInfo&gt;&gt; allLocalStorePartitionLags(final List&lt;Task&gt; tasksToCollectLagFor) {
+<span class="nc" id="L2011">        final Map&lt;String, Map&lt;Integer, LagInfo&gt;&gt; localStorePartitionLags = new TreeMap&lt;&gt;();</span>
+<span class="nc" id="L2012">        final Collection&lt;TopicPartition&gt; allPartitions = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L2013">        final Map&lt;TopicPartition, Long&gt; allChangelogPositions = new HashMap&lt;&gt;();</span>
+
+        // Obtain the current positions, of all the active-restoring and standby tasks
+<span class="nc bnc" id="L2016" title="All 2 branches missed.">        for (final Task task : tasksToCollectLagFor) {</span>
+<span class="nc" id="L2017">            allPartitions.addAll(task.changelogPartitions());</span>
+            // Note that not all changelog partitions, will have positions; since some may not have started
+<span class="nc" id="L2019">            allChangelogPositions.putAll(task.changelogOffsets());</span>
+<span class="nc" id="L2020">        }</span>
+
+<span class="nc" id="L2022">        log.debug(&quot;Current changelog positions: {}&quot;, allChangelogPositions);</span>
+        final Map&lt;TopicPartition, ListOffsetsResultInfo&gt; allEndOffsets;
+<span class="nc" id="L2024">        allEndOffsets = fetchEndOffsets(allPartitions, adminClient);</span>
+<span class="nc" id="L2025">        log.debug(&quot;Current end offsets :{}&quot;, allEndOffsets);</span>
+
+<span class="nc bnc" id="L2027" title="All 2 branches missed.">        for (final Map.Entry&lt;TopicPartition, ListOffsetsResultInfo&gt; entry : allEndOffsets.entrySet()) {</span>
+            // Avoiding an extra admin API lookup by computing lags for not-yet-started restorations
+            // from zero instead of the real &quot;earliest offset&quot; for the changelog.
+            // This will yield the correct relative order of lagginess for the tasks in the cluster,
+            // but it is an over-estimate of how much work remains to restore the task from scratch.
+<span class="nc" id="L2032">            final long earliestOffset = 0L;</span>
+<span class="nc" id="L2033">            final long changelogPosition = allChangelogPositions.getOrDefault(entry.getKey(), earliestOffset);</span>
+<span class="nc" id="L2034">            final long latestOffset = entry.getValue().offset();</span>
+<span class="nc bnc" id="L2035" title="All 2 branches missed.">            final LagInfo lagInfo = new LagInfo(changelogPosition == Task.LATEST_OFFSET ? latestOffset : changelogPosition, latestOffset);</span>
+<span class="nc" id="L2036">            final String storeName = streamsMetadataState.storeForChangelogTopic(entry.getKey().topic());</span>
+<span class="nc" id="L2037">            localStorePartitionLags.computeIfAbsent(storeName, ignored -&gt; new TreeMap&lt;&gt;())</span>
+<span class="nc" id="L2038">                .put(entry.getKey().partition(), lagInfo);</span>
+<span class="nc" id="L2039">        }</span>
+
+<span class="nc" id="L2041">        return Collections.unmodifiableMap(localStorePartitionLags);</span>
+    }
+
+    /**
+     * Run an interactive query against a state store.
+     * &lt;p&gt;
+     * This method allows callers outside the Streams runtime to access the internal state of
+     * stateful processors. See &lt;a href=&quot;https://kafka.apache.org/documentation/streams/developer-guide/interactive-queries.html&quot;&gt;IQ docs&lt;/a&gt;
+     * for more information.
+     * &lt;p&gt;
+     * NOTICE: This functionality is {@link Evolving} and subject to change in minor versions.
+     * Once it is stabilized, this notice and the evolving annotation will be removed.
+     *
+     * @param &lt;R&gt; The result type specified by the query.
+     * @throws StreamsNotStartedException If Streams has not yet been started. Just call {@link
+     *                                    KafkaStreams#start()} and then retry this call.
+     * @throws StreamsStoppedException    If Streams is in a terminal state like PENDING_SHUTDOWN,
+     *                                    NOT_RUNNING, PENDING_ERROR, or ERROR. The caller should
+     *                                    discover a new instance to query.
+     * @throws UnknownStateStoreException If the specified store name does not exist in the
+     *                                    topology.
+     */
+    @Evolving
+    public &lt;R&gt; StateQueryResult&lt;R&gt; query(final StateQueryRequest&lt;R&gt; request) {
+<span class="nc" id="L2065">        final String storeName = request.getStoreName();</span>
+<span class="nc bnc" id="L2066" title="All 2 branches missed.">        if (!topologyMetadata.hasStore(storeName)) {</span>
+<span class="nc" id="L2067">            throw new UnknownStateStoreException(</span>
+                &quot;Cannot get state store &quot;
+                    + storeName
+                    + &quot; because no such store is registered in the topology.&quot;
+            );
+        }
+<span class="nc bnc" id="L2073" title="All 2 branches missed.">        if (state().hasNotStarted()) {</span>
+<span class="nc" id="L2074">            throw new StreamsNotStartedException(</span>
+                &quot;KafkaStreams has not been started, you can retry after calling start().&quot;
+            );
+        }
+<span class="nc bnc" id="L2078" title="All 4 branches missed.">        if (state().isShuttingDown() || state.hasCompletedShutdown()) {</span>
+<span class="nc" id="L2079">            throw new StreamsStoppedException(</span>
+                &quot;KafkaStreams has been stopped (&quot; + state + &quot;).&quot;
+                    + &quot; This instance can no longer serve queries.&quot;
+            );
+        }
+<span class="nc" id="L2084">        final StateQueryResult&lt;R&gt; result = new StateQueryResult&lt;&gt;();</span>
+
+<span class="nc" id="L2086">        final Map&lt;String, StateStore&gt; globalStateStores = topologyMetadata.globalStateStores();</span>
+<span class="nc bnc" id="L2087" title="All 2 branches missed.">        if (globalStateStores.containsKey(storeName)) {</span>
+            // See KAFKA-13523
+<span class="nc" id="L2089">            result.setGlobalResult(</span>
+<span class="nc" id="L2090">                QueryResult.forFailure(</span>
+                    FailureReason.UNKNOWN_QUERY_TYPE,
+                    &quot;Global stores do not yet support the KafkaStreams#query API. Use KafkaStreams#store instead.&quot;
+                )
+            );
+        } else {
+<span class="nc bnc" id="L2096" title="All 2 branches missed.">            for (final StreamThread thread : threads) {</span>
+<span class="nc" id="L2097">                final Set&lt;Task&gt; tasks = thread.readyOnlyAllTasks();</span>
+<span class="nc bnc" id="L2098" title="All 2 branches missed.">                for (final Task task : tasks) {</span>
+
+<span class="nc" id="L2100">                    final TaskId taskId = task.id();</span>
+<span class="nc" id="L2101">                    final int partition = taskId.partition();</span>
+<span class="nc bnc" id="L2102" title="All 4 branches missed.">                    if (request.isAllPartitions() || request.getPartitions().contains(partition)) {</span>
+<span class="nc" id="L2103">                        final StateStore store = task.store(storeName);</span>
+<span class="nc bnc" id="L2104" title="All 2 branches missed.">                        if (store != null) {</span>
+<span class="nc" id="L2105">                            final StreamThread.State state = thread.state();</span>
+<span class="nc" id="L2106">                            final boolean active = task.isActive();</span>
+<span class="nc bnc" id="L2107" title="All 6 branches missed.">                            if (request.isRequireActive()</span>
+                                &amp;&amp; (state != StreamThread.State.RUNNING || !active)) {
+
+<span class="nc" id="L2110">                                result.addResult(</span>
+                                    partition,
+<span class="nc" id="L2112">                                    QueryResult.forFailure(</span>
+                                        FailureReason.NOT_ACTIVE,
+                                        &quot;Query requires a running active task,&quot;
+                                            + &quot; but partition was in state &quot;
+                                            + state + &quot; and was &quot;
+<span class="nc bnc" id="L2117" title="All 2 branches missed.">                                            + (active ? &quot;active&quot; : &quot;not active&quot;) + &quot;.&quot;</span>
+                                    )
+                                );
+                            } else {
+<span class="nc" id="L2121">                                final QueryResult&lt;R&gt; r = store.query(</span>
+<span class="nc" id="L2122">                                    request.getQuery(),</span>
+<span class="nc bnc" id="L2123" title="All 2 branches missed.">                                    request.isRequireActive()</span>
+<span class="nc" id="L2124">                                        ? PositionBound.unbounded()</span>
+<span class="nc" id="L2125">                                        : request.getPositionBound(),</span>
+<span class="nc" id="L2126">                                    new QueryConfig(request.executionInfoEnabled())</span>
+                                );
+<span class="nc" id="L2128">                                result.addResult(partition, r);</span>
+                            }
+
+
+                            // optimization: if we have handled all the requested partitions,
+                            // we can return right away.
+<span class="nc bnc" id="L2134" title="All 2 branches missed.">                            if (!request.isAllPartitions()</span>
+<span class="nc bnc" id="L2135" title="All 2 branches missed.">                                &amp;&amp; result.getPartitionResults().keySet().containsAll(request.getPartitions())) {</span>
+<span class="nc" id="L2136">                                return result;</span>
+                            }
+                        }
+                    }
+<span class="nc" id="L2140">                }</span>
+<span class="nc" id="L2141">            }</span>
+        }
+
+<span class="nc bnc" id="L2144" title="All 2 branches missed.">        if (!request.isAllPartitions()) {</span>
+<span class="nc bnc" id="L2145" title="All 2 branches missed.">            for (final Integer partition : request.getPartitions()) {</span>
+<span class="nc bnc" id="L2146" title="All 2 branches missed.">                if (!result.getPartitionResults().containsKey(partition)) {</span>
+<span class="nc" id="L2147">                    result.addResult(partition, QueryResult.forFailure(</span>
+                        FailureReason.NOT_PRESENT,
+                        &quot;The requested partition was not present at the time of the query.&quot;
+                    ));
+                }
+<span class="nc" id="L2152">            }</span>
+        }
+
+<span class="nc" id="L2155">        return result;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

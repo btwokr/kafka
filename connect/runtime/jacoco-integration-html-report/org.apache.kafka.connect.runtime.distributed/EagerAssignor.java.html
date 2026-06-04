@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>EagerAssignor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.distributed</a> &gt; <span class="el_source">EagerAssignor.java</span></div><h1>EagerAssignor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime.distributed;
+
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.internals.CircularIterator;
+import org.apache.kafka.connect.storage.ClusterConfigState;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+
+import org.slf4j.Logger;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.apache.kafka.common.message.JoinGroupResponseData.JoinGroupResponseMember;
+import static org.apache.kafka.connect.runtime.distributed.ConnectProtocol.Assignment;
+import static org.apache.kafka.connect.runtime.distributed.WorkerCoordinator.LeaderState;
+
+
+/**
+ * An assignor that computes a unweighted round-robin distribution of connectors and tasks. The
+ * connectors are assigned to the workers first, followed by the tasks. This is to avoid
+ * load imbalance when several 1-task connectors are running, given that a connector is usually
+ * more lightweight than a task.
+ * &lt;p&gt;
+ * Note that this class is NOT thread-safe.
+ */
+public class EagerAssignor implements ConnectAssignor {
+    private final Logger log;
+
+<span class="fc" id="L50">    public EagerAssignor(LogContext logContext) {</span>
+<span class="fc" id="L51">        this.log = logContext.logger(EagerAssignor.class);</span>
+<span class="fc" id="L52">    }</span>
+
+    @Override
+    public Map&lt;String, ByteBuffer&gt; performAssignment(String leaderId, ConnectProtocolCompatibility protocol,
+                                                     List&lt;JoinGroupResponseMember&gt; allMemberMetadata,
+                                                     WorkerCoordinator coordinator) {
+<span class="nc" id="L58">        log.debug(&quot;Performing task assignment&quot;);</span>
+<span class="nc" id="L59">        Map&lt;String, ExtendedWorkerState&gt; memberConfigs = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L60" title="All 2 branches missed.">        for (JoinGroupResponseMember member : allMemberMetadata)</span>
+<span class="nc" id="L61">            memberConfigs.put(member.memberId(), IncrementalCooperativeConnectProtocol.deserializeMetadata(ByteBuffer.wrap(member.metadata())));</span>
+
+<span class="nc" id="L63">        long maxOffset = findMaxMemberConfigOffset(memberConfigs, coordinator);</span>
+<span class="nc" id="L64">        Long leaderOffset = ensureLeaderConfig(maxOffset, coordinator);</span>
+<span class="nc bnc" id="L65" title="All 2 branches missed.">        if (leaderOffset == null)</span>
+<span class="nc" id="L66">            return fillAssignmentsAndSerialize(memberConfigs.keySet(), Assignment.CONFIG_MISMATCH,</span>
+<span class="nc" id="L67">                    leaderId, memberConfigs.get(leaderId).url(), maxOffset,</span>
+                    new HashMap&lt;&gt;(), new HashMap&lt;&gt;());
+<span class="nc" id="L69">        return performTaskAssignment(leaderId, leaderOffset, memberConfigs, coordinator);</span>
+    }
+
+    private Long ensureLeaderConfig(long maxOffset, WorkerCoordinator coordinator) {
+        // If this leader is behind some other members, we can't do assignment
+<span class="nc bnc" id="L74" title="All 2 branches missed.">        if (coordinator.configSnapshot().offset() &lt; maxOffset) {</span>
+            // We might be able to take a new snapshot to catch up immediately and avoid another round of syncing here.
+            // Alternatively, if this node has already passed the maximum reported by any other member of the group, it
+            // is also safe to use this newer state.
+<span class="nc" id="L78">            ClusterConfigState updatedSnapshot = coordinator.configFreshSnapshot();</span>
+<span class="nc bnc" id="L79" title="All 2 branches missed.">            if (updatedSnapshot.offset() &lt; maxOffset) {</span>
+<span class="nc" id="L80">                log.info(&quot;Was selected to perform assignments, but do not have latest config found in sync request. &quot; +</span>
+                        &quot;Returning an empty configuration to trigger re-sync.&quot;);
+<span class="nc" id="L82">                return null;</span>
+            } else {
+<span class="nc" id="L84">                coordinator.configSnapshot(updatedSnapshot);</span>
+<span class="nc" id="L85">                return updatedSnapshot.offset();</span>
+            }
+        }
+<span class="nc" id="L88">        return maxOffset;</span>
+    }
+
+    private Map&lt;String, ByteBuffer&gt; performTaskAssignment(String leaderId, long maxOffset,
+                                                          Map&lt;String, ExtendedWorkerState&gt; memberConfigs,
+                                                          WorkerCoordinator coordinator) {
+<span class="nc" id="L94">        Map&lt;String, Collection&lt;String&gt;&gt; connectorAssignments = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L95">        Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; taskAssignments = new HashMap&lt;&gt;();</span>
+
+        // Perform round-robin task assignment. Assign all connectors and then all tasks because assigning both the
+        // connector and its tasks can lead to very uneven distribution of work in some common cases (e.g. for connectors
+        // that generate only 1 task each; in a cluster of 2 or an even # of nodes, only even nodes will be assigned
+        // connectors and only odd nodes will be assigned tasks, but tasks are, on average, actually more resource
+        // intensive than connectors).
+<span class="nc" id="L102">        List&lt;String&gt; connectorsSorted = sorted(coordinator.configSnapshot().connectors());</span>
+<span class="nc" id="L103">        CircularIterator&lt;String&gt; memberIt = new CircularIterator&lt;&gt;(sorted(memberConfigs.keySet()));</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        for (String connectorId : connectorsSorted) {</span>
+<span class="nc" id="L105">            String connectorAssignedTo = memberIt.next();</span>
+<span class="nc" id="L106">            log.trace(&quot;Assigning connector {} to {}&quot;, connectorId, connectorAssignedTo);</span>
+<span class="nc" id="L107">            Collection&lt;String&gt; memberConnectors = connectorAssignments.computeIfAbsent(connectorAssignedTo, k -&gt; new ArrayList&lt;&gt;());</span>
+<span class="nc" id="L108">            memberConnectors.add(connectorId);</span>
+<span class="nc" id="L109">        }</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">        for (String connectorId : connectorsSorted) {</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">            for (ConnectorTaskId taskId : sorted(coordinator.configSnapshot().tasks(connectorId))) {</span>
+<span class="nc" id="L112">                String taskAssignedTo = memberIt.next();</span>
+<span class="nc" id="L113">                log.trace(&quot;Assigning task {} to {}&quot;, taskId, taskAssignedTo);</span>
+<span class="nc" id="L114">                Collection&lt;ConnectorTaskId&gt; memberTasks = taskAssignments.computeIfAbsent(taskAssignedTo, k -&gt; new ArrayList&lt;&gt;());</span>
+<span class="nc" id="L115">                memberTasks.add(taskId);</span>
+<span class="nc" id="L116">            }</span>
+<span class="nc" id="L117">        }</span>
+
+<span class="nc" id="L119">        coordinator.leaderState(new LeaderState(memberConfigs, connectorAssignments, taskAssignments));</span>
+
+<span class="nc" id="L121">        return fillAssignmentsAndSerialize(memberConfigs.keySet(), Assignment.NO_ERROR,</span>
+<span class="nc" id="L122">                leaderId, memberConfigs.get(leaderId).url(), maxOffset, connectorAssignments, taskAssignments);</span>
+    }
+
+    private Map&lt;String, ByteBuffer&gt; fillAssignmentsAndSerialize(Collection&lt;String&gt; members,
+                                                                short error,
+                                                                String leaderId,
+                                                                String leaderUrl,
+                                                                long maxOffset,
+                                                                Map&lt;String, Collection&lt;String&gt;&gt; connectorAssignments,
+                                                                Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; taskAssignments) {
+
+<span class="nc" id="L133">        Map&lt;String, ByteBuffer&gt; groupAssignment = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        for (String member : members) {</span>
+<span class="nc" id="L135">            Collection&lt;String&gt; connectors = connectorAssignments.getOrDefault(member, List.of());</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">            if (connectors == null) {</span>
+<span class="nc" id="L137">                connectors = List.of();</span>
+            }
+<span class="nc" id="L139">            Collection&lt;ConnectorTaskId&gt; tasks = taskAssignments.getOrDefault(member, List.of());</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">            if (tasks == null) {</span>
+<span class="nc" id="L141">                tasks = List.of();</span>
+            }
+<span class="nc" id="L143">            Assignment assignment = new Assignment(error, leaderId, leaderUrl, maxOffset, connectors, tasks);</span>
+<span class="nc" id="L144">            log.debug(&quot;Assignment: {} -&gt; {}&quot;, member, assignment);</span>
+<span class="nc" id="L145">            groupAssignment.put(member, ConnectProtocol.serializeAssignment(assignment));</span>
+<span class="nc" id="L146">        }</span>
+<span class="nc" id="L147">        log.debug(&quot;Finished assignment&quot;);</span>
+<span class="nc" id="L148">        return groupAssignment;</span>
+    }
+
+    private long findMaxMemberConfigOffset(Map&lt;String, ExtendedWorkerState&gt; memberConfigs,
+                                           WorkerCoordinator coordinator) {
+        // The new config offset is the maximum seen by any member. We always perform assignment using this offset,
+        // even if some members have fallen behind. The config offset used to generate the assignment is included in
+        // the response so members that have fallen behind will not use the assignment until they have caught up.
+<span class="nc" id="L156">        Long maxOffset = null;</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">        for (Map.Entry&lt;String, ExtendedWorkerState&gt; stateEntry : memberConfigs.entrySet()) {</span>
+<span class="nc" id="L158">            long memberRootOffset = stateEntry.getValue().offset();</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">            if (maxOffset == null)</span>
+<span class="nc" id="L160">                maxOffset = memberRootOffset;</span>
+            else
+<span class="nc" id="L162">                maxOffset = Math.max(maxOffset, memberRootOffset);</span>
+<span class="nc" id="L163">        }</span>
+
+<span class="nc" id="L165">        log.debug(&quot;Max config offset root: {}, local snapshot config offsets root: {}&quot;,</span>
+<span class="nc" id="L166">                  maxOffset, coordinator.configSnapshot().offset());</span>
+<span class="nc" id="L167">        return maxOffset;</span>
+    }
+
+    private static &lt;T extends Comparable&lt;T&gt;&gt; List&lt;T&gt; sorted(Collection&lt;T&gt; members) {
+<span class="nc" id="L171">        List&lt;T&gt; res = new ArrayList&lt;&gt;(members);</span>
+<span class="nc" id="L172">        Collections.sort(res);</span>
+<span class="nc" id="L173">        return res;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

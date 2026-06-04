@@ -1,0 +1,629 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FetchSessionHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.clients</a> &gt; <span class="el_source">FetchSessionHandler.java</span></div><h1>FetchSessionHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.kafka.clients;
+
+import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.FetchMetadata;
+import org.apache.kafka.common.requests.FetchRequest.PartitionData;
+import org.apache.kafka.common.requests.FetchResponse;
+import org.apache.kafka.common.utils.LogContext;
+
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import static org.apache.kafka.common.requests.FetchMetadata.INVALID_SESSION_ID;
+
+/**
+ * FetchSessionHandler maintains the fetch session state for connecting to a broker.
+ *
+ * Using the protocol outlined by KIP-227, clients can create incremental fetch sessions.
+ * These sessions allow the client to fetch information about a set of partition over
+ * and over, without explicitly enumerating all the partitions in the request and the
+ * response.
+ *
+ * FetchSessionHandler tracks the partitions which are in the session.  It also
+ * determines which partitions need to be included in each fetch request, and what
+ * the attached fetch session metadata should be for each request.  The corresponding
+ * class on the receiving broker side is FetchManager.
+ */
+public class FetchSessionHandler {
+    private final Logger log;
+
+    private final int node;
+
+    /**
+     * The metadata for the next fetch request.
+     */
+<span class="fc" id="L68">    private FetchMetadata nextMetadata = FetchMetadata.INITIAL;</span>
+
+<span class="fc" id="L70">    public FetchSessionHandler(LogContext logContext, int node) {</span>
+<span class="fc" id="L71">        this.log = logContext.logger(FetchSessionHandler.class);</span>
+<span class="fc" id="L72">        this.node = node;</span>
+<span class="fc" id="L73">    }</span>
+
+    // visible for testing
+    public int sessionId() {
+<span class="nc" id="L77">        return nextMetadata.sessionId();</span>
+    }
+
+    /**
+     * All of the partitions which exist in the fetch request session.
+     */
+<span class="fc" id="L83">    private LinkedHashMap&lt;TopicPartition, PartitionData&gt; sessionPartitions =</span>
+        new LinkedHashMap&lt;&gt;(0);
+
+    /**
+     * All of the topic names mapped to topic ids for topics which exist in the fetch request session.
+     */
+<span class="fc" id="L89">    private Map&lt;Uuid, String&gt; sessionTopicNames = new HashMap&lt;&gt;(0);</span>
+
+    public Map&lt;Uuid, String&gt; sessionTopicNames() {
+<span class="fc" id="L92">        return sessionTopicNames;</span>
+    }
+
+    public static class FetchRequestData {
+        /**
+         * The partitions to send in the fetch request.
+         */
+        private final Map&lt;TopicPartition, PartitionData&gt; toSend;
+
+        /**
+         * The partitions to send in the request's &quot;forget&quot; list.
+         */
+        private final List&lt;TopicIdPartition&gt; toForget;
+
+        /**
+         * The partitions to send in the request's &quot;forget&quot; list if
+         * the version is &gt;= 13.
+         */
+        private final List&lt;TopicIdPartition&gt; toReplace;
+
+        /**
+         * All of the partitions which exist in the fetch request session.
+         */
+        private final Map&lt;TopicPartition, PartitionData&gt; sessionPartitions;
+
+        /**
+         * The metadata to use in this fetch request.
+         */
+        private final FetchMetadata metadata;
+
+        /**
+         * A boolean indicating whether we have a topic ID for every topic in the request so that we can send a request that
+         * uses topic IDs
+         */
+        private final boolean canUseTopicIds;
+
+        FetchRequestData(Map&lt;TopicPartition, PartitionData&gt; toSend,
+                         List&lt;TopicIdPartition&gt; toForget,
+                         List&lt;TopicIdPartition&gt; toReplace,
+                         Map&lt;TopicPartition, PartitionData&gt; sessionPartitions,
+                         FetchMetadata metadata,
+<span class="fc" id="L133">                         boolean canUseTopicIds) {</span>
+<span class="fc" id="L134">            this.toSend = toSend;</span>
+<span class="fc" id="L135">            this.toForget = toForget;</span>
+<span class="fc" id="L136">            this.toReplace = toReplace;</span>
+<span class="fc" id="L137">            this.sessionPartitions = sessionPartitions;</span>
+<span class="fc" id="L138">            this.metadata = metadata;</span>
+<span class="fc" id="L139">            this.canUseTopicIds = canUseTopicIds;</span>
+<span class="fc" id="L140">        }</span>
+
+        /**
+         * Get the set of partitions to send in this fetch request.
+         */
+        public Map&lt;TopicPartition, PartitionData&gt; toSend() {
+<span class="fc" id="L146">            return toSend;</span>
+        }
+
+        /**
+         * Get a list of partitions to forget in this fetch request.
+         */
+        public List&lt;TopicIdPartition&gt; toForget() {
+<span class="fc" id="L153">            return toForget;</span>
+        }
+
+        /**
+         * Get a list of partitions to forget in this fetch request.
+         */
+        public List&lt;TopicIdPartition&gt; toReplace() {
+<span class="fc" id="L160">            return toReplace;</span>
+        }
+
+        /**
+         * Get the full set of partitions involved in this fetch request.
+         */
+        public Map&lt;TopicPartition, PartitionData&gt; sessionPartitions() {
+<span class="fc" id="L167">            return sessionPartitions;</span>
+        }
+
+        public FetchMetadata metadata() {
+<span class="fc" id="L171">            return metadata;</span>
+        }
+
+        public boolean canUseTopicIds() {
+<span class="fc" id="L175">            return canUseTopicIds;</span>
+        }
+
+        @Override
+        public String toString() {
+            StringBuilder bld;
+<span class="nc bnc" id="L181" title="All 2 branches missed.">            if (metadata.isFull()) {</span>
+<span class="nc" id="L182">                bld = new StringBuilder(&quot;FullFetchRequest(toSend=(&quot;);</span>
+<span class="nc" id="L183">                String prefix = &quot;&quot;;</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">                for (TopicPartition partition : toSend.keySet()) {</span>
+<span class="nc" id="L185">                    bld.append(prefix);</span>
+<span class="nc" id="L186">                    bld.append(partition);</span>
+<span class="nc" id="L187">                    prefix = &quot;, &quot;;</span>
+<span class="nc" id="L188">                }</span>
+<span class="nc" id="L189">            } else {</span>
+<span class="nc" id="L190">                bld = new StringBuilder(&quot;IncrementalFetchRequest(toSend=(&quot;);</span>
+<span class="nc" id="L191">                String prefix = &quot;&quot;;</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">                for (TopicPartition partition : toSend.keySet()) {</span>
+<span class="nc" id="L193">                    bld.append(prefix);</span>
+<span class="nc" id="L194">                    bld.append(partition);</span>
+<span class="nc" id="L195">                    prefix = &quot;, &quot;;</span>
+<span class="nc" id="L196">                }</span>
+<span class="nc" id="L197">                bld.append(&quot;), toForget=(&quot;);</span>
+<span class="nc" id="L198">                prefix = &quot;&quot;;</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">                for (TopicIdPartition partition : toForget) {</span>
+<span class="nc" id="L200">                    bld.append(prefix);</span>
+<span class="nc" id="L201">                    bld.append(partition);</span>
+<span class="nc" id="L202">                    prefix = &quot;, &quot;;</span>
+<span class="nc" id="L203">                }</span>
+<span class="nc" id="L204">                bld.append(&quot;), toReplace=(&quot;);</span>
+<span class="nc" id="L205">                prefix = &quot;&quot;;</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">                for (TopicIdPartition partition : toReplace) {</span>
+<span class="nc" id="L207">                    bld.append(prefix);</span>
+<span class="nc" id="L208">                    bld.append(partition);</span>
+<span class="nc" id="L209">                    prefix = &quot;, &quot;;</span>
+<span class="nc" id="L210">                }</span>
+<span class="nc" id="L211">                bld.append(&quot;), implied=(&quot;);</span>
+<span class="nc" id="L212">                prefix = &quot;&quot;;</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">                for (TopicPartition partition : sessionPartitions.keySet()) {</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">                    if (!toSend.containsKey(partition)) {</span>
+<span class="nc" id="L215">                        bld.append(prefix);</span>
+<span class="nc" id="L216">                        bld.append(partition);</span>
+<span class="nc" id="L217">                        prefix = &quot;, &quot;;</span>
+                    }
+<span class="nc" id="L219">                }</span>
+            }
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            if (canUseTopicIds) {</span>
+<span class="nc" id="L222">                bld.append(&quot;), canUseTopicIds=True&quot;);</span>
+            } else {
+<span class="nc" id="L224">                bld.append(&quot;), canUseTopicIds=False&quot;);</span>
+            }
+<span class="nc" id="L226">            bld.append(&quot;)&quot;);</span>
+<span class="nc" id="L227">            return bld.toString();</span>
+        }
+    }
+
+    public class Builder {
+        private final Map&lt;Uuid, String&gt; topicNames;
+        private final boolean copySessionPartitions;
+        /**
+         * The next partitions which we want to fetch.
+         *
+         * It is important to maintain the insertion order of this list by using a LinkedHashMap rather
+         * than a regular Map.
+         *
+         * One reason is that when dealing with FULL fetch requests, if there is not enough response
+         * space to return data from all partitions, the server will only return data from partitions
+         * early in this list.
+         *
+         * Another reason is because we make use of the list ordering to optimize the preparation of
+         * incremental fetch requests (see below).
+         */
+        private LinkedHashMap&lt;TopicPartition, PartitionData&gt; next;
+<span class="pc" id="L248">        private int partitionsWithoutTopicIds = 0;</span>
+
+<span class="fc" id="L250">        Builder() {</span>
+<span class="fc" id="L251">            this.next = new LinkedHashMap&lt;&gt;();</span>
+<span class="fc" id="L252">            this.topicNames = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L253">            this.copySessionPartitions = true;</span>
+<span class="fc" id="L254">        }</span>
+
+<span class="nc" id="L256">        Builder(int initialSize, boolean copySessionPartitions) {</span>
+<span class="nc" id="L257">            this.next = new LinkedHashMap&lt;&gt;(initialSize);</span>
+<span class="nc" id="L258">            this.topicNames = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L259">            this.copySessionPartitions = copySessionPartitions;</span>
+<span class="nc" id="L260">        }</span>
+
+        /**
+         * Mark that we want data from this partition in the upcoming fetch.
+         */
+        public void add(TopicPartition topicPartition, PartitionData data) {
+<span class="fc" id="L266">            next.put(topicPartition, data);</span>
+            // topicIds should not change between adding partitions and building, so we can use putIfAbsent
+<span class="fc bfc" id="L268" title="All 2 branches covered.">            if (data.topicId.equals(Uuid.ZERO_UUID)) {</span>
+<span class="fc" id="L269">                partitionsWithoutTopicIds++;</span>
+            } else {
+<span class="fc" id="L271">                topicNames.putIfAbsent(data.topicId, topicPartition.topic());</span>
+            }
+<span class="fc" id="L273">        }</span>
+
+        public FetchRequestData build() {
+<span class="fc bfc" id="L276" title="All 2 branches covered.">            boolean canUseTopicIds = partitionsWithoutTopicIds == 0;</span>
+
+<span class="fc bfc" id="L278" title="All 2 branches covered.">            if (nextMetadata.isFull()) {</span>
+<span class="pc bpc" id="L279" title="1 of 2 branches missed.">                if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L280">                    log.debug(&quot;Built full fetch {} for node {} with {}.&quot;,</span>
+<span class="nc" id="L281">                            nextMetadata, node, topicPartitionsToLogString(next.keySet()));</span>
+                }
+<span class="fc" id="L283">                sessionPartitions = next;</span>
+<span class="fc" id="L284">                next = null;</span>
+                // Only add topic IDs to the session if we are using topic IDs.
+<span class="fc bfc" id="L286" title="All 2 branches covered.">                if (canUseTopicIds) {</span>
+<span class="fc" id="L287">                    sessionTopicNames = topicNames;</span>
+                } else {
+<span class="fc" id="L289">                    sessionTopicNames = Collections.emptyMap();</span>
+                }
+<span class="fc" id="L291">                Map&lt;TopicPartition, PartitionData&gt; toSend =</span>
+<span class="fc" id="L292">                        Collections.unmodifiableMap(new LinkedHashMap&lt;&gt;(sessionPartitions));</span>
+<span class="fc" id="L293">                return new FetchRequestData(toSend, Collections.emptyList(), Collections.emptyList(), toSend, nextMetadata, canUseTopicIds);</span>
+            }
+
+<span class="fc" id="L296">            List&lt;TopicIdPartition&gt; added = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L297">            List&lt;TopicIdPartition&gt; removed = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L298">            List&lt;TopicIdPartition&gt; altered = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L299">            List&lt;TopicIdPartition&gt; replaced = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L300">            for (Iterator&lt;Entry&lt;TopicPartition, PartitionData&gt;&gt; iter =</span>
+<span class="fc bfc" id="L301" title="All 2 branches covered.">                 sessionPartitions.entrySet().iterator(); iter.hasNext(); ) {</span>
+<span class="fc" id="L302">                Entry&lt;TopicPartition, PartitionData&gt; entry = iter.next();</span>
+<span class="fc" id="L303">                TopicPartition topicPartition = entry.getKey();</span>
+<span class="fc" id="L304">                PartitionData prevData = entry.getValue();</span>
+<span class="fc" id="L305">                PartitionData nextData = next.remove(topicPartition);</span>
+<span class="fc bfc" id="L306" title="All 2 branches covered.">                if (nextData != null) {</span>
+                    // We basically check if the new partition had the same topic ID. If not,
+                    // we add it to the &quot;replaced&quot; set. If the request is version 13 or higher, the replaced
+                    // partition will be forgotten. In any case, we will send the new partition in the request.
+<span class="fc bfc" id="L310" title="All 2 branches covered.">                    if (!prevData.topicId.equals(nextData.topicId)</span>
+<span class="fc bfc" id="L311" title="All 2 branches covered.">                            &amp;&amp; !prevData.topicId.equals(Uuid.ZERO_UUID)</span>
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">                            &amp;&amp; !nextData.topicId.equals(Uuid.ZERO_UUID)) {</span>
+                        // Re-add the replaced partition to the end of 'next'
+<span class="nc" id="L314">                        next.put(topicPartition, nextData);</span>
+<span class="nc" id="L315">                        entry.setValue(nextData);</span>
+<span class="nc" id="L316">                        replaced.add(new TopicIdPartition(prevData.topicId, topicPartition));</span>
+<span class="fc bfc" id="L317" title="All 2 branches covered.">                    } else if (!prevData.equals(nextData)) {</span>
+                        // Re-add the altered partition to the end of 'next'
+<span class="fc" id="L319">                        next.put(topicPartition, nextData);</span>
+<span class="fc" id="L320">                        entry.setValue(nextData);</span>
+<span class="fc" id="L321">                        altered.add(new TopicIdPartition(nextData.topicId, topicPartition));</span>
+                    }
+                } else {
+                    // Remove this partition from the session.
+<span class="fc" id="L325">                    iter.remove();</span>
+                    // Indicate that we no longer want to listen to this partition.
+<span class="fc" id="L327">                    removed.add(new TopicIdPartition(prevData.topicId, topicPartition));</span>
+                    // If we do not have this topic ID in the builder or the session, we can not use topic IDs.
+<span class="fc bfc" id="L329" title="All 4 branches covered.">                    if (canUseTopicIds &amp;&amp; prevData.topicId.equals(Uuid.ZERO_UUID))</span>
+<span class="fc" id="L330">                        canUseTopicIds = false;</span>
+                }
+<span class="fc" id="L332">            }</span>
+            // Add any new partitions to the session.
+<span class="fc bfc" id="L334" title="All 2 branches covered.">            for (Entry&lt;TopicPartition, PartitionData&gt; entry : next.entrySet()) {</span>
+<span class="fc" id="L335">                TopicPartition topicPartition = entry.getKey();</span>
+<span class="fc" id="L336">                PartitionData nextData = entry.getValue();</span>
+<span class="fc bfc" id="L337" title="All 2 branches covered.">                if (sessionPartitions.containsKey(topicPartition)) {</span>
+                    // In the previous loop, all the partitions which existed in both sessionPartitions
+                    // and next were moved to the end of next, or removed from next.  Therefore,
+                    // once we hit one of them, we know there are no more unseen entries to look
+                    // at in next.
+<span class="fc" id="L342">                    break;</span>
+                }
+<span class="fc" id="L344">                sessionPartitions.put(topicPartition, nextData);</span>
+<span class="fc" id="L345">                added.add(new TopicIdPartition(nextData.topicId, topicPartition));</span>
+<span class="fc" id="L346">            }</span>
+
+            // Add topic IDs to session if we can use them. If an ID is inconsistent, we will handle in the receiving broker.
+            // If we switched from using topic IDs to not using them (or vice versa), that error will also be handled in the receiving broker.
+<span class="fc bfc" id="L350" title="All 2 branches covered.">            if (canUseTopicIds) {</span>
+<span class="fc" id="L351">                sessionTopicNames = topicNames;</span>
+            } else {
+<span class="fc" id="L353">                sessionTopicNames = Collections.emptyMap();</span>
+            }
+
+<span class="pc bpc" id="L356" title="1 of 2 branches missed.">            if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L357">                log.debug(&quot;Built incremental fetch {} for node {}. Added {}, altered {}, removed {}, &quot; +</span>
+<span class="nc" id="L358">                          &quot;replaced {} out of {}&quot;, nextMetadata, node, topicIdPartitionsToLogString(added),</span>
+<span class="nc" id="L359">                          topicIdPartitionsToLogString(altered), topicIdPartitionsToLogString(removed),</span>
+<span class="nc" id="L360">                          topicIdPartitionsToLogString(replaced), topicPartitionsToLogString(sessionPartitions.keySet()));</span>
+            }
+<span class="fc" id="L362">            Map&lt;TopicPartition, PartitionData&gt; toSend = Collections.unmodifiableMap(next);</span>
+<span class="pc bpc" id="L363" title="1 of 2 branches missed.">            Map&lt;TopicPartition, PartitionData&gt; curSessionPartitions = copySessionPartitions</span>
+<span class="fc" id="L364">                    ? Collections.unmodifiableMap(new LinkedHashMap&lt;&gt;(sessionPartitions))</span>
+<span class="pc" id="L365">                    : Collections.unmodifiableMap(sessionPartitions);</span>
+<span class="fc" id="L366">            next = null;</span>
+<span class="fc" id="L367">            return new FetchRequestData(toSend,</span>
+<span class="fc" id="L368">                    Collections.unmodifiableList(removed),</span>
+<span class="fc" id="L369">                    Collections.unmodifiableList(replaced),</span>
+                    curSessionPartitions,
+                    nextMetadata,
+                    canUseTopicIds);
+        }
+    }
+
+    public Builder newBuilder() {
+<span class="fc" id="L377">        return new Builder();</span>
+    }
+
+
+    /** A builder that allows for presizing the PartitionData hashmap, and avoiding making a
+     *  secondary copy of the sessionPartitions, in cases where this is not necessarily.
+     *  This builder is primarily for use by the Replica Fetcher
+     * @param size the initial size of the PartitionData hashmap
+     * @param copySessionPartitions boolean denoting whether the builder should make a deep copy of
+     *                              session partitions
+     */
+    public Builder newBuilder(int size, boolean copySessionPartitions) {
+<span class="nc" id="L389">        return new Builder(size, copySessionPartitions);</span>
+    }
+
+    private String topicPartitionsToLogString(Collection&lt;TopicPartition&gt; partitions) {
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        if (!log.isTraceEnabled()) {</span>
+<span class="nc" id="L394">            return String.format(&quot;%d partition(s)&quot;, partitions.size());</span>
+        }
+<span class="nc" id="L396">        return &quot;(&quot; + partitions.stream().map(TopicPartition::toString).collect(Collectors.joining(&quot;, &quot;)) + &quot;)&quot;;</span>
+    }
+
+    private String topicIdPartitionsToLogString(Collection&lt;TopicIdPartition&gt; partitions) {
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (!log.isTraceEnabled()) {</span>
+<span class="nc" id="L401">            return String.format(&quot;%d partition(s)&quot;, partitions.size());</span>
+        }
+<span class="nc" id="L403">        return &quot;(&quot; + partitions.stream().map(TopicIdPartition::toString).collect(Collectors.joining(&quot;, &quot;)) + &quot;)&quot;;</span>
+    }
+
+    /**
+     * Return missing items which are expected to be in a particular set, but which are not.
+     *
+     * @param toFind    The items to look for.
+     * @param toSearch  The set of items to search.
+     * @return          Empty set if all items were found; some of the missing ones in a set, if not.
+     */
+    static &lt;T&gt; Set&lt;T&gt; findMissing(Set&lt;T&gt; toFind, Set&lt;T&gt; toSearch) {
+<span class="fc" id="L414">        Set&lt;T&gt; ret = new LinkedHashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L415" title="All 2 branches covered.">        for (T toFindItem: toFind) {</span>
+<span class="fc bfc" id="L416" title="All 2 branches covered.">            if (!toSearch.contains(toFindItem)) {</span>
+<span class="fc" id="L417">                ret.add(toFindItem);</span>
+            }
+<span class="fc" id="L419">        }</span>
+<span class="fc" id="L420">        return ret;</span>
+    }
+
+    /**
+     * Verify that a full fetch response contains all the partitions in the fetch session.
+     *
+     * @param topicPartitions  The topicPartitions from the FetchResponse.
+     * @param ids              The topic IDs from the FetchResponse.
+     * @param version          The version of the FetchResponse.
+     * @return                 null if the full fetch response partitions are valid; human-readable problem description otherwise.
+     */
+    String verifyFullFetchResponsePartitions(Set&lt;TopicPartition&gt; topicPartitions, Set&lt;Uuid&gt; ids, short version) {
+<span class="fc" id="L432">        StringBuilder bld = new StringBuilder();</span>
+<span class="fc" id="L433">        Set&lt;TopicPartition&gt; extra =</span>
+<span class="fc" id="L434">            findMissing(topicPartitions, sessionPartitions.keySet());</span>
+<span class="fc" id="L435">        Set&lt;TopicPartition&gt; omitted =</span>
+<span class="fc" id="L436">            findMissing(sessionPartitions.keySet(), topicPartitions);</span>
+<span class="fc" id="L437">        Set&lt;Uuid&gt; extraIds = new HashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L438" title="All 2 branches covered.">        if (version &gt;= 13) {</span>
+<span class="fc" id="L439">            extraIds = findMissing(ids, sessionTopicNames.keySet());</span>
+        }
+<span class="pc bpc" id="L441" title="1 of 2 branches missed.">        if (!omitted.isEmpty()) {</span>
+<span class="nc" id="L442">            bld.append(&quot;omittedPartitions=(&quot;).append(omitted.stream().map(TopicPartition::toString).collect(Collectors.joining(&quot;, &quot;))).append(&quot;), &quot;);</span>
+        }
+<span class="pc bpc" id="L444" title="1 of 2 branches missed.">        if (!extra.isEmpty()) {</span>
+<span class="nc" id="L445">            bld.append(&quot;extraPartitions=(&quot;).append(extra.stream().map(TopicPartition::toString).collect(Collectors.joining(&quot;, &quot;))).append(&quot;), &quot;);</span>
+        }
+<span class="fc bfc" id="L447" title="All 2 branches covered.">        if (!extraIds.isEmpty()) {</span>
+<span class="fc" id="L448">            bld.append(&quot;extraIds=(&quot;).append(extraIds.stream().map(Uuid::toString).collect(Collectors.joining(&quot;, &quot;))).append(&quot;), &quot;);</span>
+        }
+<span class="pc bpc" id="L450" title="2 of 6 branches missed.">        if ((!omitted.isEmpty()) || (!extra.isEmpty()) || (!extraIds.isEmpty())) {</span>
+<span class="fc" id="L451">            bld.append(&quot;response=(&quot;).append(topicPartitions.stream().map(TopicPartition::toString).collect(Collectors.joining(&quot;, &quot;))).append(&quot;)&quot;);</span>
+<span class="fc" id="L452">            return bld.toString();</span>
+        }
+<span class="fc" id="L454">        return null;</span>
+    }
+
+    /**
+     * Verify that the partitions in an incremental fetch response are contained in the session.
+     *
+     * @param topicPartitions  The topicPartitions from the FetchResponse.
+     * @param ids              The topic IDs from the FetchResponse.
+     * @param version          The version of the FetchResponse.
+     * @return                 null if the incremental fetch response partitions are valid; human-readable problem description otherwise.
+     */
+    String verifyIncrementalFetchResponsePartitions(Set&lt;TopicPartition&gt; topicPartitions, Set&lt;Uuid&gt; ids, short version) {
+<span class="fc" id="L466">        Set&lt;Uuid&gt; extraIds = new HashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L467" title="All 2 branches covered.">        if (version &gt;= 13) {</span>
+<span class="fc" id="L468">            extraIds = findMissing(ids, sessionTopicNames.keySet());</span>
+        }
+<span class="fc" id="L470">        Set&lt;TopicPartition&gt; extra =</span>
+<span class="fc" id="L471">            findMissing(topicPartitions, sessionPartitions.keySet());</span>
+<span class="fc" id="L472">        StringBuilder bld = new StringBuilder();</span>
+<span class="pc bpc" id="L473" title="1 of 2 branches missed.">        if (!extra.isEmpty())</span>
+<span class="nc" id="L474">            bld.append(&quot;extraPartitions=(&quot;).append(extra.stream().map(TopicPartition::toString).collect(Collectors.joining(&quot;, &quot;))).append(&quot;), &quot;);</span>
+<span class="pc bpc" id="L475" title="1 of 2 branches missed.">        if (!extraIds.isEmpty())</span>
+<span class="nc" id="L476">            bld.append(&quot;extraIds=(&quot;).append(extraIds.stream().map(Uuid::toString).collect(Collectors.joining(&quot;, &quot;))).append(&quot;), &quot;);</span>
+<span class="pc bpc" id="L477" title="2 of 4 branches missed.">        if ((!extra.isEmpty()) || (!extraIds.isEmpty())) {</span>
+<span class="nc" id="L478">            bld.append(&quot;response=(&quot;).append(topicPartitions.stream().map(TopicPartition::toString).collect(Collectors.joining(&quot;, &quot;))).append(&quot;)&quot;);</span>
+<span class="nc" id="L479">            return bld.toString();</span>
+        }
+<span class="fc" id="L481">        return null;</span>
+    }
+
+    /**
+     * Create a string describing the partitions in a FetchResponse.
+     *
+     * @param topicPartitions  The topicPartitions from the FetchResponse.
+     * @return                 The string to log.
+     */
+    private String responseDataToLogString(Set&lt;TopicPartition&gt; topicPartitions) {
+<span class="nc bnc" id="L491" title="All 2 branches missed.">        if (!log.isTraceEnabled()) {</span>
+<span class="nc" id="L492">            int implied = sessionPartitions.size() - topicPartitions.size();</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">            if (implied &gt; 0) {</span>
+<span class="nc" id="L494">                return String.format(&quot; with %d response partition(s), %d implied partition(s)&quot;,</span>
+<span class="nc" id="L495">                    topicPartitions.size(), implied);</span>
+            } else {
+<span class="nc" id="L497">                return String.format(&quot; with %d response partition(s)&quot;,</span>
+<span class="nc" id="L498">                    topicPartitions.size());</span>
+            }
+        }
+<span class="nc" id="L501">        StringBuilder bld = new StringBuilder();</span>
+<span class="nc" id="L502">        bld.append(&quot; with response=(&quot;).</span>
+<span class="nc" id="L503">            append(topicPartitions.stream().map(TopicPartition::toString).collect(Collectors.joining(&quot;, &quot;))).</span>
+<span class="nc" id="L504">            append(&quot;)&quot;);</span>
+<span class="nc" id="L505">        String prefix = &quot;, implied=(&quot;;</span>
+<span class="nc" id="L506">        String suffix = &quot;&quot;;</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">        for (TopicPartition partition : sessionPartitions.keySet()) {</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">            if (!topicPartitions.contains(partition)) {</span>
+<span class="nc" id="L509">                bld.append(prefix);</span>
+<span class="nc" id="L510">                bld.append(partition);</span>
+<span class="nc" id="L511">                prefix = &quot;, &quot;;</span>
+<span class="nc" id="L512">                suffix = &quot;)&quot;;</span>
+            }
+<span class="nc" id="L514">        }</span>
+<span class="nc" id="L515">        bld.append(suffix);</span>
+<span class="nc" id="L516">        return bld.toString();</span>
+    }
+
+    /**
+     * Handle the fetch response.
+     *
+     * @param response  The response.
+     * @param version   The version of the request.
+     * @return          True if the response is well-formed; false if it can't be processed
+     *                  because of missing or unexpected partitions.
+     */
+    public boolean handleResponse(FetchResponse response, short version) {
+<span class="fc bfc" id="L528" title="All 2 branches covered.">        if (response.error() != Errors.NONE) {</span>
+<span class="fc" id="L529">            log.info(&quot;Node {} was unable to process the fetch request with {}: {}.&quot;,</span>
+<span class="fc" id="L530">                node, nextMetadata, response.error());</span>
+<span class="pc bpc" id="L531" title="1 of 2 branches missed.">            if (response.error() == Errors.FETCH_SESSION_ID_NOT_FOUND) {</span>
+<span class="nc" id="L532">                nextMetadata = FetchMetadata.INITIAL;</span>
+            } else {
+<span class="fc" id="L534">                nextMetadata = nextMetadata.nextCloseExistingAttemptNew();</span>
+            }
+<span class="fc" id="L536">            return false;</span>
+        }
+<span class="fc" id="L538">        Set&lt;TopicPartition&gt; topicPartitions = response.responseData(sessionTopicNames, version).keySet();</span>
+<span class="fc bfc" id="L539" title="All 2 branches covered.">        if (nextMetadata.isFull()) {</span>
+<span class="pc bpc" id="L540" title="1 of 4 branches missed.">            if (topicPartitions.isEmpty() &amp;&amp; response.throttleTimeMs() &gt; 0) {</span>
+                // Normally, an empty full fetch response would be invalid.  However, KIP-219
+                // specifies that if the broker wants to throttle the client, it will respond
+                // to a full fetch request with an empty response and a throttleTimeMs
+                // value set.  We don't want to log this with a warning, since it's not an error.
+                // However, the empty full fetch response can't be processed, so it's still appropriate
+                // to return false here.
+<span class="nc bnc" id="L547" title="All 2 branches missed.">                if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L548">                    log.debug(&quot;Node {} sent a empty full fetch response to indicate that this &quot; +</span>
+<span class="nc" id="L549">                        &quot;client should be throttled for {} ms.&quot;, node, response.throttleTimeMs());</span>
+                }
+<span class="nc" id="L551">                nextMetadata = FetchMetadata.INITIAL;</span>
+<span class="nc" id="L552">                return false;</span>
+            }
+<span class="fc" id="L554">            String problem = verifyFullFetchResponsePartitions(topicPartitions, response.topicIds(), version);</span>
+<span class="fc bfc" id="L555" title="All 2 branches covered.">            if (problem != null) {</span>
+<span class="fc" id="L556">                log.info(&quot;Node {} sent an invalid full fetch response with {}&quot;, node, problem);</span>
+<span class="fc" id="L557">                nextMetadata = FetchMetadata.INITIAL;</span>
+<span class="fc" id="L558">                return false;</span>
+<span class="pc bpc" id="L559" title="1 of 2 branches missed.">            } else if (response.sessionId() == INVALID_SESSION_ID) {</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">                if (log.isDebugEnabled())</span>
+<span class="nc" id="L561">                    log.debug(&quot;Node {} sent a full fetch response{}&quot;, node, responseDataToLogString(topicPartitions));</span>
+<span class="nc" id="L562">                nextMetadata = FetchMetadata.INITIAL;</span>
+<span class="nc" id="L563">                return true;</span>
+            } else {
+                // The server created a new incremental fetch session.
+<span class="pc bpc" id="L566" title="1 of 2 branches missed.">                if (log.isDebugEnabled())</span>
+<span class="nc" id="L567">                    log.debug(&quot;Node {} sent a full fetch response that created a new incremental &quot; +</span>
+<span class="nc" id="L568">                            &quot;fetch session {}{}&quot;, node, response.sessionId(), responseDataToLogString(topicPartitions));</span>
+<span class="fc" id="L569">                nextMetadata = FetchMetadata.newIncremental(response.sessionId());</span>
+<span class="fc" id="L570">                return true;</span>
+            }
+        } else {
+<span class="fc" id="L573">            String problem = verifyIncrementalFetchResponsePartitions(topicPartitions, response.topicIds(), version);</span>
+<span class="pc bpc" id="L574" title="1 of 2 branches missed.">            if (problem != null) {</span>
+<span class="nc" id="L575">                log.info(&quot;Node {} sent an invalid incremental fetch response with {}&quot;, node, problem);</span>
+<span class="nc" id="L576">                nextMetadata = nextMetadata.nextCloseExistingAttemptNew();</span>
+<span class="nc" id="L577">                return false;</span>
+<span class="pc bpc" id="L578" title="1 of 2 branches missed.">            } else if (response.sessionId() == INVALID_SESSION_ID) {</span>
+                // The incremental fetch session was closed by the server.
+<span class="nc bnc" id="L580" title="All 2 branches missed.">                if (log.isDebugEnabled())</span>
+<span class="nc" id="L581">                    log.debug(&quot;Node {} sent an incremental fetch response closing session {}{}&quot;,</span>
+<span class="nc" id="L582">                            node, nextMetadata.sessionId(), responseDataToLogString(topicPartitions));</span>
+<span class="nc" id="L583">                nextMetadata = FetchMetadata.INITIAL;</span>
+<span class="nc" id="L584">                return true;</span>
+            } else {
+                // The incremental fetch session was continued by the server.
+                // We don't have to do anything special here to support KIP-219, since an empty incremental
+                // fetch request is perfectly valid.
+<span class="pc bpc" id="L589" title="1 of 2 branches missed.">                if (log.isDebugEnabled())</span>
+<span class="nc" id="L590">                    log.debug(&quot;Node {} sent an incremental fetch response with throttleTimeMs = {} &quot; +</span>
+<span class="nc" id="L591">                        &quot;for session {}{}&quot;, node, response.throttleTimeMs(), response.sessionId(),</span>
+<span class="nc" id="L592">                        responseDataToLogString(topicPartitions));</span>
+<span class="fc" id="L593">                nextMetadata = nextMetadata.nextIncremental();</span>
+<span class="fc" id="L594">                return true;</span>
+            }
+        }
+    }
+
+    /**
+     * The client will initiate the session close on next fetch request.
+     */
+    public void notifyClose() {
+<span class="pc bpc" id="L603" title="1 of 2 branches missed.">        if (log.isDebugEnabled()) {</span>
+<span class="nc" id="L604">            log.debug(&quot;Set the metadata for next fetch request to close the existing session ID={}&quot;, nextMetadata.sessionId());</span>
+        }
+<span class="fc" id="L606">        nextMetadata = nextMetadata.nextCloseExisting();</span>
+<span class="fc" id="L607">    }</span>
+
+    /**
+     * Handle an error sending the prepared request.
+     *
+     * When a network error occurs, we close any existing fetch session on our next request,
+     * and try to create a new session.
+     *
+     * @param t     The exception.
+     */
+    public void handleError(Throwable t) {
+<span class="fc" id="L618">        log.info(&quot;Error sending fetch request {} to node {}:&quot;, nextMetadata, node, t);</span>
+<span class="fc" id="L619">        nextMetadata = nextMetadata.nextCloseExistingAttemptNew();</span>
+<span class="fc" id="L620">    }</span>
+
+    /**
+     * Get the fetch request session's partitions.
+     */
+    public Set&lt;TopicPartition&gt; sessionTopicPartitions() {
+<span class="fc" id="L626">        return sessionPartitions.keySet();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

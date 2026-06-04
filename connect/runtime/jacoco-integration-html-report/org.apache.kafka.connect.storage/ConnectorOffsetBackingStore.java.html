@@ -1,0 +1,488 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConnectorOffsetBackingStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.storage</a> &gt; <span class="el_source">ConnectorOffsetBackingStore.java</span></div><h1>ConnectorOffsetBackingStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.storage;
+
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.connect.runtime.WorkerConfig;
+import org.apache.kafka.connect.util.Callback;
+import org.apache.kafka.connect.util.LoggingContext;
+import org.apache.kafka.connect.util.TopicAdmin;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.ByteBuffer;
+import java.time.Duration;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+
+/**
+ * An {@link OffsetBackingStore} with support for reading from and writing to a worker-global
+ * offset backing store and/or a connector-specific offset backing store.
+ */
+public class ConnectorOffsetBackingStore implements OffsetBackingStore {
+
+<span class="fc" id="L52">    private static final Logger log = LoggerFactory.getLogger(ConnectorOffsetBackingStore.class);</span>
+
+    /**
+     * Builds an offset store that uses a connector-specific offset topic as the primary store and
+     * the worker-global offset store as the secondary store.
+     *
+     * @param loggingContext a {@link Supplier} for the {@link LoggingContext} that should be used
+     *                       for messages logged by this offset store; may not be null, and may never return null
+     * @param workerStore the worker-global offset store; may not be null
+     * @param connectorStore the connector-specific offset store; may not be null
+     * @param connectorOffsetsTopic the name of the connector-specific offset topic; may not be null
+     * @param connectorStoreAdmin the topic admin to use for the connector-specific offset topic; may not be null
+     * @return an offset store backed primarily by the connector-specific offset topic and secondarily
+     * by the worker-global offset store; never null
+     */
+    public static ConnectorOffsetBackingStore withConnectorAndWorkerStores(
+            Supplier&lt;LoggingContext&gt; loggingContext,
+            OffsetBackingStore workerStore,
+            KafkaOffsetBackingStore connectorStore,
+            String connectorOffsetsTopic,
+            TopicAdmin connectorStoreAdmin
+    ) {
+<span class="nc" id="L74">        Objects.requireNonNull(loggingContext);</span>
+<span class="nc" id="L75">        Objects.requireNonNull(workerStore);</span>
+<span class="nc" id="L76">        Objects.requireNonNull(connectorStore);</span>
+<span class="nc" id="L77">        Objects.requireNonNull(connectorOffsetsTopic);</span>
+<span class="nc" id="L78">        Objects.requireNonNull(connectorStoreAdmin);</span>
+<span class="nc" id="L79">        return new ConnectorOffsetBackingStore(</span>
+                Time.SYSTEM,
+                loggingContext,
+                connectorOffsetsTopic,
+                workerStore,
+                connectorStore,
+                connectorStoreAdmin
+        );
+    }
+
+    /**
+     * Builds an offset store that uses the worker-global offset store as the primary store, and no secondary store.
+     *
+     * @param loggingContext a {@link Supplier} for the {@link LoggingContext} that should be used
+     *                       for messages logged by this offset store; may not be null, and may never return null
+     * @param workerStore the worker-global offset store; may not be null
+     * @param workerOffsetsTopic the name of the worker-global offset topic; may be null if the worker
+     *                           does not use an offset topic for its offset store
+     * @return an offset store for the connector backed solely by the worker-global offset store; never null
+     */
+    public static ConnectorOffsetBackingStore withOnlyWorkerStore(
+            Supplier&lt;LoggingContext&gt; loggingContext,
+            OffsetBackingStore workerStore,
+            String workerOffsetsTopic
+    ) {
+<span class="fc" id="L104">        Objects.requireNonNull(loggingContext);</span>
+<span class="fc" id="L105">        Objects.requireNonNull(workerStore);</span>
+<span class="fc" id="L106">        return new ConnectorOffsetBackingStore(Time.SYSTEM, loggingContext, workerOffsetsTopic, workerStore, null, null);</span>
+    }
+
+    /**
+     * Builds an offset store that uses a connector-specific offset topic as the primary store, and no secondary store.
+     *
+     * @param loggingContext a {@link Supplier} for the {@link LoggingContext} that should be used
+     *                       for messages logged by this offset store; may not be null, and may never return null
+     * @param connectorStore the connector-specific offset store; may not be null
+     * @param connectorOffsetsTopic the name of the connector-specific offset topic; may not be null
+     * @param connectorStoreAdmin the topic admin to use for the connector-specific offset topic; may not be null
+     * @return an offset store for the connector backed solely by the connector-specific offset topic; never null
+     */
+    public static ConnectorOffsetBackingStore withOnlyConnectorStore(
+            Supplier&lt;LoggingContext&gt; loggingContext,
+            KafkaOffsetBackingStore connectorStore,
+            String connectorOffsetsTopic,
+            TopicAdmin connectorStoreAdmin
+    ) {
+<span class="nc" id="L125">        Objects.requireNonNull(loggingContext);</span>
+<span class="nc" id="L126">        Objects.requireNonNull(connectorOffsetsTopic);</span>
+<span class="nc" id="L127">        Objects.requireNonNull(connectorStoreAdmin);</span>
+<span class="nc" id="L128">        return new ConnectorOffsetBackingStore(</span>
+                Time.SYSTEM,
+                loggingContext,
+                connectorOffsetsTopic,
+                null,
+                connectorStore,
+                connectorStoreAdmin
+        );
+    }
+
+    private final Time time;
+    private final Supplier&lt;LoggingContext&gt; loggingContext;
+    private final String primaryOffsetsTopic;
+    private final Optional&lt;OffsetBackingStore&gt; workerStore;
+    private final Optional&lt;KafkaOffsetBackingStore&gt; connectorStore;
+    private final Optional&lt;TopicAdmin&gt; connectorStoreAdmin;
+
+    ConnectorOffsetBackingStore(
+            Time time,
+            Supplier&lt;LoggingContext&gt; loggingContext,
+            String primaryOffsetsTopic,
+            OffsetBackingStore workerStore,
+            KafkaOffsetBackingStore connectorStore,
+            TopicAdmin connectorStoreAdmin
+<span class="fc" id="L152">    ) {</span>
+<span class="pc bpc" id="L153" title="3 of 4 branches missed.">        if (workerStore == null &amp;&amp; connectorStore == null) {</span>
+<span class="nc" id="L154">            throw new IllegalArgumentException(&quot;At least one non-null offset store must be provided&quot;);</span>
+        }
+<span class="fc" id="L156">        this.time = time;</span>
+<span class="fc" id="L157">        this.loggingContext = loggingContext;</span>
+<span class="fc" id="L158">        this.primaryOffsetsTopic = primaryOffsetsTopic;</span>
+<span class="fc" id="L159">        this.workerStore = Optional.ofNullable(workerStore);</span>
+<span class="fc" id="L160">        this.connectorStore = Optional.ofNullable(connectorStore);</span>
+<span class="fc" id="L161">        this.connectorStoreAdmin = Optional.ofNullable(connectorStoreAdmin);</span>
+<span class="fc" id="L162">    }</span>
+
+    public String primaryOffsetsTopic() {
+<span class="nc" id="L165">        return primaryOffsetsTopic;</span>
+    }
+
+    /**
+     * If configured to use a connector-specific offset store, {@link OffsetBackingStore#start() start} that store.
+     *
+     * &lt;p&gt;The worker-global offset store is not modified; it is the caller's responsibility to ensure that it is started
+     * before calls to {@link #get(Collection)} and {@link #set(Map, Callback)} take place.
+     */
+    @Override
+    public void start() {
+        // Worker offset store should already be started
+<span class="fc" id="L177">        connectorStore.ifPresent(OffsetBackingStore::start);</span>
+<span class="fc" id="L178">    }</span>
+
+    /**
+     * If configured to use a connector-specific offset store, {@link OffsetBackingStore#stop() stop} that store,
+     * and {@link TopicAdmin#close(Duration) close} the topic admin used by that store.
+     *
+     * &lt;p&gt;The worker-global offset store is not modified as it may be used for other connectors that either already exist,
+     * or will be created, on this worker.
+     */
+    @Override
+    public void stop() {
+        // Worker offset store should not be stopped as it may be used for multiple connectors
+<span class="fc" id="L190">        connectorStore.ifPresent(OffsetBackingStore::stop);</span>
+<span class="fc" id="L191">        connectorStoreAdmin.ifPresent(TopicAdmin::close);</span>
+<span class="fc" id="L192">    }</span>
+
+    /**
+     * Get the offset values for the specified keys.
+     *
+     * &lt;p&gt;If configured to use a connector-specific offset store, priority is given to the values contained in that store,
+     * and the values in the worker-global offset store (if one is provided) are used as a fallback for keys that are not
+     * present in the connector-specific store.
+     *
+     * &lt;p&gt;If not configured to use a connector-specific offset store, only the values contained in the worker-global
+     * offset store are returned.
+
+     * @param keys list of keys to look up
+     * @return future for the resulting map from key to value
+     */
+    @Override
+    public Future&lt;Map&lt;ByteBuffer, ByteBuffer&gt;&gt; get(Collection&lt;ByteBuffer&gt; keys) {
+<span class="fc" id="L209">        Future&lt;Map&lt;ByteBuffer, ByteBuffer&gt;&gt; workerGetFuture = getFromStore(workerStore, keys);</span>
+<span class="fc" id="L210">        Future&lt;Map&lt;ByteBuffer, ByteBuffer&gt;&gt; connectorGetFuture = getFromStore(connectorStore, keys);</span>
+
+<span class="fc" id="L212">        return new Future&lt;&gt;() {</span>
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning) {
+                // Note the use of | instead of || here; this causes cancel to be invoked on both futures,
+                // even if the first call to cancel returns true
+<span class="nc" id="L217">                return workerGetFuture.cancel(mayInterruptIfRunning)</span>
+<span class="nc" id="L218">                        | connectorGetFuture.cancel(mayInterruptIfRunning);</span>
+            }
+
+            @Override
+            public boolean isCancelled() {
+<span class="nc bnc" id="L223" title="All 2 branches missed.">                return workerGetFuture.isCancelled()</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">                        || connectorGetFuture.isCancelled();</span>
+            }
+
+            @Override
+            public boolean isDone() {
+<span class="nc bnc" id="L229" title="All 2 branches missed.">                return workerGetFuture.isDone()</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">                        &amp;&amp; connectorGetFuture.isDone();</span>
+            }
+
+            @Override
+            public Map&lt;ByteBuffer, ByteBuffer&gt; get() throws InterruptedException, ExecutionException {
+<span class="fc" id="L235">                Map&lt;ByteBuffer, ByteBuffer&gt; result = new HashMap&lt;&gt;(workerGetFuture.get());</span>
+<span class="fc" id="L236">                result.putAll(connectorGetFuture.get());</span>
+<span class="fc" id="L237">                return result;</span>
+            }
+
+            @Override
+            public Map&lt;ByteBuffer, ByteBuffer&gt; get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+<span class="nc" id="L242">                long timeoutMs = unit.toMillis(timeout);</span>
+<span class="nc" id="L243">                long endTime = time.milliseconds() + timeoutMs;</span>
+<span class="nc" id="L244">                Map&lt;ByteBuffer, ByteBuffer&gt; result = new HashMap&lt;&gt;(workerGetFuture.get(timeoutMs, unit));</span>
+<span class="nc" id="L245">                timeoutMs = Math.max(1, endTime - time.milliseconds());</span>
+<span class="nc" id="L246">                result.putAll(connectorGetFuture.get(timeoutMs, TimeUnit.MILLISECONDS));</span>
+<span class="nc" id="L247">                return result;</span>
+            }
+        };
+    }
+
+    /**
+     * Store the specified offset key/value pairs.
+     *
+     * &lt;p&gt;If configured to use a connector-specific offset store, the returned {@link Future} corresponds to a
+     * write to that store, and the passed-in {@link Callback} is invoked once that write completes. If a worker-global
+     * store is provided, a secondary write is made to that store if the write to the connector-specific store
+     * succeeds.
+     * &lt;p&gt;
+     * Normally, errors with this secondary write are not reflected in the returned {@link Future} or the passed-in
+     * {@link Callback}; they are only logged as a warning to users. The only exception to this rule is when the
+     * offsets that need to be committed contain tombstone records.
+     * &lt;p&gt;When the to-be-committed offsets contain tombstones, offset commits take place in three phases:
+     * &lt;ol&gt;
+     *     &lt;li&gt;First, only the tombstone offsets are written to the worker-global store. Failures during this step will
+     *     be reflected in the returned {@link Future} and reported to the passed-in {@link Callback}.&lt;/li&gt;
+     *     &lt;li&gt;If and only if the previous write to the worker-global store succeeded, all offsets (both tombstones and
+     *     non-tombstones) are written to the connector-specific store. Failures during this step will also be
+     *     reflected in the returned {@link Future} and reported to the passed-in {@link Callback}.&lt;/li&gt;
+     *     &lt;li&gt;Finally, if and only if the previous write to the connector-specific store succeeded, all offsets with
+     *     non-tombstone values are written to the worker-global store. Failures during this step will only be reported
+     *     as warning log messages, and will not be reflected in the returned {@link Future} or reported to the
+     *     passed-in {@link Callback}.&lt;/li&gt;
+     * &lt;/ol&gt;
+     *
+     * &lt;p&gt;If not configured to use a connector-specific offset store, the returned {@link Future} corresponds to a
+     * write to the worker-global offset store, and the passed-in {@link Callback} is invoked once that write completes.
+
+     * @param values map from key to value
+     * @param callback callback to invoke on completion of the primary write
+     * @return void future for the primary write
+    *
+     * @see &lt;a href=&quot;https://issues.apache.org/jira/browse/KAFKA-15018&quot;&gt;KAFKA-15018&lt;/a&gt; for context on the three-step
+     * write sequence
+     *
+     */
+    @Override
+    public Future&lt;Void&gt; set(Map&lt;ByteBuffer, ByteBuffer&gt; values, Callback&lt;Void&gt; callback) {
+        final OffsetBackingStore primaryStore;
+        final OffsetBackingStore secondaryStore;
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">        if (connectorStore.isPresent()) {</span>
+<span class="nc" id="L292">            primaryStore = connectorStore.get();</span>
+<span class="nc" id="L293">            secondaryStore = workerStore.orElse(null);</span>
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">        } else if (workerStore.isPresent()) {</span>
+<span class="fc" id="L295">            primaryStore = workerStore.get();</span>
+<span class="fc" id="L296">            secondaryStore = null;</span>
+        } else {
+            // Should never happen since we check for this case in the constructor, but just in case, this should
+            // be more informative than the NPE that would otherwise be thrown
+<span class="nc" id="L300">            throw new IllegalStateException(&quot;At least one non-null offset store must be provided&quot;);</span>
+        }
+
+<span class="fc" id="L303">        Map&lt;ByteBuffer, ByteBuffer&gt; regularOffsets = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L304">        Map&lt;ByteBuffer, ByteBuffer&gt; tombstoneOffsets = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L305">        values.forEach((partition, offset) -&gt; {</span>
+<span class="pc bpc" id="L306" title="1 of 2 branches missed.">            if (offset == null) {</span>
+<span class="nc" id="L307">                tombstoneOffsets.put(partition, null);</span>
+            } else {
+<span class="fc" id="L309">                regularOffsets.put(partition, offset);</span>
+            }
+<span class="fc" id="L311">        });</span>
+
+<span class="pc bpc" id="L313" title="3 of 4 branches missed.">        if (secondaryStore != null &amp;&amp; !tombstoneOffsets.isEmpty()) {</span>
+<span class="nc" id="L314">            return new ChainedOffsetWriteFuture(</span>
+                primaryStore,
+                secondaryStore,
+                values,
+                regularOffsets,
+                tombstoneOffsets,
+                callback
+            );
+        } else {
+<span class="fc" id="L323">            return setPrimaryThenSecondary(primaryStore, secondaryStore, values, regularOffsets, callback);</span>
+        }
+    }
+
+    private Future&lt;Void&gt; setPrimaryThenSecondary(
+        OffsetBackingStore primaryStore,
+        OffsetBackingStore secondaryStore,
+        Map&lt;ByteBuffer, ByteBuffer&gt; completeOffsets,
+        Map&lt;ByteBuffer, ByteBuffer&gt; nonTombstoneOffsets,
+        Callback&lt;Void&gt; callback
+    ) {
+<span class="fc" id="L334">        return primaryStore.set(completeOffsets, (primaryWriteError, ignored) -&gt; {</span>
+<span class="pc bpc" id="L335" title="1 of 2 branches missed.">            if (secondaryStore != null) {</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">                if (primaryWriteError != null) {</span>
+<span class="nc" id="L337">                    log.trace(&quot;Skipping offsets write to secondary store because primary write has failed&quot;, primaryWriteError);</span>
+                } else {
+                    try {
+                        // Invoke OffsetBackingStore::set but ignore the resulting future; we don't block on writes to this
+                        // backing store.
+<span class="nc" id="L342">                        secondaryStore.set(nonTombstoneOffsets, (secondaryWriteError, ignored2) -&gt; {</span>
+<span class="nc" id="L343">                            try (LoggingContext context = loggingContext()) {</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">                                if (secondaryWriteError != null) {</span>
+<span class="nc" id="L345">                                    log.warn(&quot;Failed to write offsets to secondary backing store&quot;, secondaryWriteError);</span>
+                                } else {
+<span class="nc" id="L347">                                    log.debug(&quot;Successfully flushed offsets to secondary backing store&quot;);</span>
+                                }
+                            }
+<span class="nc" id="L350">                        });</span>
+<span class="nc" id="L351">                    } catch (Exception e) {</span>
+<span class="nc" id="L352">                        log.warn(&quot;Failed to write offsets to secondary backing store&quot;, e);</span>
+<span class="nc" id="L353">                    }</span>
+                }
+            }
+<span class="fc" id="L356">            try (LoggingContext context = loggingContext()) {</span>
+<span class="fc" id="L357">                callback.onCompletion(primaryWriteError, ignored);</span>
+            }
+<span class="fc" id="L359">        });</span>
+    }
+
+    @Override
+    public Set&lt;Map&lt;String, Object&gt;&gt; connectorPartitions(String connectorName) {
+<span class="nc" id="L364">        Set&lt;Map&lt;String, Object&gt;&gt; partitions = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L365">        workerStore.ifPresent(offsetBackingStore -&gt; partitions.addAll(offsetBackingStore.connectorPartitions(connectorName)));</span>
+<span class="nc" id="L366">        connectorStore.ifPresent(offsetBackingStore -&gt; partitions.addAll(offsetBackingStore.connectorPartitions(connectorName)));</span>
+<span class="nc" id="L367">        return partitions;</span>
+    }
+
+    /**
+     * If configured to use a connector-specific offset store,
+     * {@link OffsetBackingStore#configure(WorkerConfig) configure} that store.
+     *
+     * &lt;p&gt;The worker-global offset store is not modified; it is the caller's responsibility to ensure that it is configured
+     * before calls to {@link #start()}, {@link #get(Collection)} and {@link #set(Map, Callback)} take place.
+     */
+    @Override
+    public void configure(WorkerConfig config) {
+        // Worker offset store should already be configured
+<span class="pc" id="L380">        connectorStore.ifPresent(store -&gt; store.configure(config));</span>
+<span class="fc" id="L381">    }</span>
+
+    // For testing
+    public boolean hasConnectorSpecificStore() {
+<span class="nc" id="L385">        return connectorStore.isPresent();</span>
+    }
+
+    // For testing
+    public boolean hasWorkerGlobalStore() {
+<span class="nc" id="L390">        return workerStore.isPresent();</span>
+    }
+
+    private LoggingContext loggingContext() {
+<span class="fc" id="L394">        LoggingContext result = loggingContext.get();</span>
+<span class="fc" id="L395">        Objects.requireNonNull(result);</span>
+<span class="fc" id="L396">        return result;</span>
+    }
+
+    private static Future&lt;Map&lt;ByteBuffer, ByteBuffer&gt;&gt; getFromStore(Optional&lt;? extends OffsetBackingStore&gt; store, Collection&lt;ByteBuffer&gt; keys) {
+<span class="fc" id="L400">        return store.map(s -&gt; s.get(keys)).orElseGet(() -&gt; CompletableFuture.completedFuture(Map.of()));</span>
+    }
+
+    private class ChainedOffsetWriteFuture implements Future&lt;Void&gt; {
+
+        private final OffsetBackingStore primaryStore;
+        private final OffsetBackingStore secondaryStore;
+        private final Map&lt;ByteBuffer, ByteBuffer&gt; completeOffsets;
+        private final Map&lt;ByteBuffer, ByteBuffer&gt; regularOffsets;
+        private final Callback&lt;Void&gt; callback;
+        private final AtomicReference&lt;Throwable&gt; writeError;
+        private final CountDownLatch completed;
+
+        public ChainedOffsetWriteFuture(
+            OffsetBackingStore primaryStore,
+            OffsetBackingStore secondaryStore,
+            Map&lt;ByteBuffer, ByteBuffer&gt; completeOffsets,
+            Map&lt;ByteBuffer, ByteBuffer&gt; regularOffsets,
+            Map&lt;ByteBuffer, ByteBuffer&gt; tombstoneOffsets,
+            Callback&lt;Void&gt; callback
+<span class="nc" id="L420">        ) {</span>
+<span class="nc" id="L421">            this.primaryStore = primaryStore;</span>
+<span class="nc" id="L422">            this.secondaryStore = secondaryStore;</span>
+<span class="nc" id="L423">            this.completeOffsets = completeOffsets;</span>
+<span class="nc" id="L424">            this.regularOffsets = regularOffsets;</span>
+<span class="nc" id="L425">            this.callback = callback;</span>
+<span class="nc" id="L426">            this.writeError = new AtomicReference&lt;&gt;();</span>
+<span class="nc" id="L427">            this.completed = new CountDownLatch(1);</span>
+
+<span class="nc" id="L429">            secondaryStore.set(tombstoneOffsets, this::onFirstWrite);</span>
+<span class="nc" id="L430">        }</span>
+
+        private void onFirstWrite(Throwable error, Void ignored) {
+<span class="nc bnc" id="L433" title="All 2 branches missed.">            if (error != null) {</span>
+<span class="nc" id="L434">                log.trace(&quot;Skipping offsets write to primary store because secondary tombstone write has failed&quot;, error);</span>
+<span class="nc" id="L435">                try (LoggingContext context = loggingContext()) {</span>
+<span class="nc" id="L436">                    callback.onCompletion(error, ignored);</span>
+<span class="nc" id="L437">                    writeError.compareAndSet(null, error);</span>
+<span class="nc" id="L438">                    completed.countDown();</span>
+                }
+<span class="nc" id="L440">                return;</span>
+            }
+<span class="nc" id="L442">            setPrimaryThenSecondary(primaryStore, secondaryStore, completeOffsets, regularOffsets, this::onSecondWrite);</span>
+<span class="nc" id="L443">        }</span>
+
+        private void onSecondWrite(Throwable error, Void ignored) {
+<span class="nc" id="L446">            callback.onCompletion(error, ignored);</span>
+<span class="nc" id="L447">            writeError.compareAndSet(null, error);</span>
+<span class="nc" id="L448">            completed.countDown();</span>
+<span class="nc" id="L449">        }</span>
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+<span class="nc" id="L453">            return false;</span>
+        }
+
+        @Override
+        public boolean isCancelled() {
+<span class="nc" id="L458">            return false;</span>
+        }
+
+        @Override
+        public boolean isDone() {
+<span class="nc bnc" id="L463" title="All 2 branches missed.">            return completed.getCount() == 0;</span>
+        }
+
+        @Override
+        public Void get() throws InterruptedException, ExecutionException {
+<span class="nc" id="L468">            completed.await();</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">            if (writeError.get() != null) {</span>
+<span class="nc" id="L470">                throw new ExecutionException(writeError.get());</span>
+            }
+<span class="nc" id="L472">            return null;</span>
+        }
+
+        @Override
+        public Void get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+<span class="nc bnc" id="L477" title="All 2 branches missed.">            if (!completed.await(timeout, unit)) {</span>
+<span class="nc" id="L478">                throw new TimeoutException(&quot;Failed to complete offset write in time&quot;);</span>
+            }
+<span class="nc bnc" id="L480" title="All 2 branches missed.">            if (writeError.get() != null) {</span>
+<span class="nc" id="L481">                throw new ExecutionException(writeError.get());</span>
+            }
+<span class="nc" id="L483">            return null;</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

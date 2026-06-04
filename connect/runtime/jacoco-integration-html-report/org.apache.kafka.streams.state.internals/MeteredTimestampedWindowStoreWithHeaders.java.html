@@ -1,0 +1,466 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MeteredTimestampedWindowStoreWithHeaders.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.streams.state.internals</a> &gt; <span class="el_source">MeteredTimestampedWindowStoreWithHeaders.java</span></div><h1>MeteredTimestampedWindowStoreWithHeaders.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.streams.state.internals;
+
+import org.apache.kafka.common.header.Headers;
+import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.errors.ProcessorStateException;
+import org.apache.kafka.streams.kstream.Windowed;
+import org.apache.kafka.streams.processor.StateStore;
+import org.apache.kafka.streams.processor.internals.ProcessorRecordContext;
+import org.apache.kafka.streams.processor.internals.SerdeGetter;
+import org.apache.kafka.streams.query.FailureReason;
+import org.apache.kafka.streams.query.PositionBound;
+import org.apache.kafka.streams.query.Query;
+import org.apache.kafka.streams.query.QueryConfig;
+import org.apache.kafka.streams.query.QueryResult;
+import org.apache.kafka.streams.query.WindowKeyQuery;
+import org.apache.kafka.streams.query.WindowRangeQuery;
+import org.apache.kafka.streams.query.internals.InternalQueryResultUtil;
+import org.apache.kafka.streams.state.KeyValueIterator;
+import org.apache.kafka.streams.state.TimestampedBytesStore;
+import org.apache.kafka.streams.state.TimestampedWindowStoreWithHeaders;
+import org.apache.kafka.streams.state.ValueAndTimestamp;
+import org.apache.kafka.streams.state.ValueTimestampHeaders;
+import org.apache.kafka.streams.state.WindowStore;
+import org.apache.kafka.streams.state.WindowStoreIterator;
+
+import java.util.Objects;
+import java.util.function.Function;
+
+import static org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl.maybeMeasureLatency;
+
+/**
+ * A Metered {@link TimestampedWindowStoreWithHeaders} wrapper that is used for recording operation metrics,
+ * and hence its inner WindowStore implementation does not need to provide its own metrics collecting functionality.
+ * The inner {@link WindowStore} of this class is of type &amp;lt;Bytes,byte[]&amp;gt;, hence we use {@link Serde}s
+ * to convert from &amp;lt;K,ValueTimestampHeaders&amp;lt;V&amp;gt;&amp;gt; to &amp;lt;Bytes,byte[]&amp;gt;.
+ *
+ * @param &lt;K&gt; key type
+ * @param &lt;V&gt; value type
+ */
+public class MeteredTimestampedWindowStoreWithHeaders&lt;K, V&gt;
+    extends MeteredWindowStore&lt;K, ValueTimestampHeaders&lt;V&gt;&gt;
+    implements TimestampedWindowStoreWithHeaders&lt;K, V&gt; {
+
+    MeteredTimestampedWindowStoreWithHeaders(
+        final WindowStore&lt;Bytes, byte[]&gt; inner,
+        final long windowSizeMs,
+        final String metricScope,
+        final Time time,
+        final Serde&lt;K&gt; keySerde,
+        final Serde&lt;ValueTimestampHeaders&lt;V&gt;&gt; valueSerde
+    ) {
+<span class="nc" id="L72">        super(inner, windowSizeMs, metricScope, time, keySerde, valueSerde);</span>
+<span class="nc" id="L73">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    protected Serde&lt;ValueTimestampHeaders&lt;V&gt;&gt; prepareValueSerde(final Serde&lt;ValueTimestampHeaders&lt;V&gt;&gt; valueSerde, final SerdeGetter getter) {
+<span class="nc bnc" id="L78" title="All 2 branches missed.">        if (valueSerde == null) {</span>
+<span class="nc" id="L79">            return new ValueTimestampHeadersSerde&lt;&gt;((Serde&lt;V&gt;) getter.valueSerde());</span>
+        } else {
+<span class="nc" id="L81">            return super.prepareValueSerde(valueSerde, getter);</span>
+        }
+    }
+
+    @Override
+    public void put(final K key, final ValueTimestampHeaders&lt;V&gt; value, final long windowStartTimestamp) {
+<span class="nc" id="L87">        Objects.requireNonNull(key, &quot;key cannot be null&quot;);</span>
+        try {
+<span class="nc" id="L89">            maybeMeasureLatency(</span>
+                () -&gt; {
+<span class="nc bnc" id="L91" title="All 2 branches missed.">                    if (value == null) {</span>
+                        // Deletion path
+<span class="nc" id="L93">                        final ProcessorRecordContext currentContext = internalContext.recordContext();</span>
+
+                        // Create new headers object to isolate delete operation from input record
+<span class="nc" id="L96">                        final Headers deleteHeaders = new RecordHeaders(currentContext.headers());</span>
+
+                        // Create temporary context with new headers
+<span class="nc" id="L99">                        final ProcessorRecordContext temporaryContext = new ProcessorRecordContext(</span>
+<span class="nc" id="L100">                            currentContext.timestamp(),</span>
+<span class="nc" id="L101">                            currentContext.offset(),</span>
+<span class="nc" id="L102">                            currentContext.partition(),</span>
+<span class="nc" id="L103">                            currentContext.topic(),</span>
+                            deleteHeaders
+                        );
+
+                        try {
+<span class="nc" id="L108">                            internalContext.setRecordContext(temporaryContext);</span>
+<span class="nc" id="L109">                            wrapped().put(serializeKey(key, deleteHeaders), null, windowStartTimestamp);</span>
+                        } finally {
+                            // Restore original context
+<span class="nc" id="L112">                            internalContext.setRecordContext(currentContext);</span>
+                        }
+<span class="nc" id="L114">                    } else {</span>
+                        // it's ok to only pass headers into `serializeKey`, because for the value case passed-in headers are
+                        // getting ignored anyway, because the value (of type `ValueTimestampHeaders`) itself carries the headers
+<span class="nc" id="L117">                        wrapped().put(serializeKey(key, value.headers()), serializeValue(value), windowStartTimestamp);</span>
+                    }
+<span class="nc" id="L119">                },</span>
+                time,
+                putSensor
+            );
+<span class="nc" id="L123">            maybeRecordE2ELatency();</span>
+<span class="nc" id="L124">        } catch (final ProcessorStateException e) {</span>
+<span class="nc" id="L125">            final String message = String.format(e.getMessage(), key, value);</span>
+<span class="nc" id="L126">            throw new ProcessorStateException(message, e);</span>
+<span class="nc" id="L127">        }</span>
+<span class="nc" id="L128">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    public &lt;R&gt; QueryResult&lt;R&gt; query(
+        final Query&lt;R&gt; query,
+        final PositionBound positionBound,
+        final QueryConfig config
+    ) {
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        final long start = config.isCollectExecutionInfo() ? System.nanoTime() : -1L;</span>
+        final QueryResult&lt;R&gt; result;
+
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (query instanceof WindowKeyQuery) {</span>
+<span class="nc" id="L141">            result = runWindowKeyQuery((WindowKeyQuery&lt;K, ValueTimestampHeaders&lt;V&gt;&gt;) query, positionBound, config);</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        } else if (query instanceof WindowRangeQuery) {</span>
+<span class="nc" id="L143">            result = runWindowRangeQuery((WindowRangeQuery&lt;K, ValueTimestampHeaders&lt;V&gt;&gt;) query, positionBound, config);</span>
+        } else {
+<span class="nc" id="L145">            result = wrapped().query(query, positionBound, config);</span>
+        }
+
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (config.isCollectExecutionInfo()) {</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">            final String conversionType = isUnderlyingStoreTimestamped()</span>
+<span class="nc" id="L150">                ? &quot;with conversion to ValueAndTimestamp&quot;</span>
+<span class="nc" id="L151">                : &quot;with extraction of plain values&quot;;</span>
+<span class="nc" id="L152">            result.addExecutionInfo(</span>
+<span class="nc" id="L153">                &quot;Handled in &quot; + getClass() + &quot; &quot; + conversionType + &quot; in &quot;</span>
+<span class="nc" id="L154">                    + (time.nanoseconds() - start) + &quot;ns&quot;);</span>
+        }
+<span class="nc" id="L156">        return result;</span>
+    }
+
+    /**
+     * Handles WindowKeyQuery by creating a MeteredWindowStoreIterator with conversion from
+     * ValueTimestampHeaders to either ValueAndTimestamp&lt;V&gt; (for timestamped stores) or V (for non-timestamped stores).
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;R&gt; QueryResult&lt;R&gt; runWindowKeyQuery(
+        final WindowKeyQuery&lt;K, ValueTimestampHeaders&lt;V&gt;&gt; query,
+        final PositionBound positionBound,
+        final QueryConfig config
+    ) {
+        final QueryResult&lt;R&gt; queryResult;
+
+<span class="nc bnc" id="L171" title="All 4 branches missed.">        if (query.getTimeFrom().isPresent() &amp;&amp; query.getTimeTo().isPresent()) {</span>
+<span class="nc" id="L172">            final WindowKeyQuery&lt;Bytes, byte[]&gt; rawKeyQuery =</span>
+<span class="nc" id="L173">                WindowKeyQuery.withKeyAndWindowStartRange(</span>
+<span class="nc" id="L174">                    serializeKey(query.getKey(), internalContext.headers()),</span>
+<span class="nc" id="L175">                    query.getTimeFrom().get(),</span>
+<span class="nc" id="L176">                    query.getTimeTo().get()</span>
+                );
+<span class="nc" id="L178">            final QueryResult&lt;WindowStoreIterator&lt;byte[]&gt;&gt; rawResult = wrapped().query(rawKeyQuery, positionBound, config);</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">            if (rawResult.isSuccess()) {</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">                if (isUnderlyingStoreTimestamped()) {</span>
+                    // For timestamped stores, return ValueAndTimestamp&lt;V&gt;
+<span class="nc" id="L182">                    final MeteredWindowStoreIterator&lt;ValueAndTimestamp&lt;V&gt;&gt; typedResult = meteredIterator(</span>
+                        rawResult,
+                        rawValueTimestampHeaders -&gt; {
+<span class="nc" id="L185">                            final ValueTimestampHeaders&lt;V&gt; vth = deserializeValue(rawValueTimestampHeaders);</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">                            return vth == null ? null : ValueAndTimestamp.make(vth.value(), vth.timestamp());</span>
+                        }
+                    );
+<span class="nc" id="L189">                    queryResult = (QueryResult&lt;R&gt;) InternalQueryResultUtil.copyAndSubstituteDeserializedResult(rawResult, typedResult);</span>
+<span class="nc" id="L190">                } else {</span>
+                    // For non-timestamped stores, return plain V
+<span class="nc" id="L192">                    final MeteredWindowStoreIterator&lt;V&gt; typedResult = meteredIterator(</span>
+                        rawResult,
+                        rawValueTimestampHeaders -&gt; {
+<span class="nc" id="L195">                            final ValueTimestampHeaders&lt;V&gt; vth = deserializeValue(rawValueTimestampHeaders);</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">                            return vth == null ? null : vth.value();</span>
+                        }
+                    );
+<span class="nc" id="L199">                    queryResult = (QueryResult&lt;R&gt;) InternalQueryResultUtil.copyAndSubstituteDeserializedResult(rawResult, typedResult);</span>
+<span class="nc" id="L200">                }</span>
+            } else {
+<span class="nc" id="L202">                queryResult = (QueryResult&lt;R&gt;) rawResult;</span>
+            }
+<span class="nc" id="L204">        } else {</span>
+<span class="nc" id="L205">            queryResult = QueryResult.forFailure(</span>
+                FailureReason.UNKNOWN_QUERY_TYPE,
+<span class="nc" id="L207">                &quot;This store (&quot; + getClass() + &quot;) doesn't know how to execute&quot;</span>
+                    + &quot; the given query (&quot; + query + &quot;) because it only supports closed-range&quot;
+                    + &quot; queries.&quot;
+                    + &quot; Contact the store maintainer if you need support for a new query type.&quot;
+            );
+        }
+<span class="nc" id="L213">        return queryResult;</span>
+    }
+
+    private &lt;ValueType&gt; MeteredWindowStoreIterator&lt;ValueType&gt; meteredIterator(
+        final QueryResult&lt;WindowStoreIterator&lt;byte[]&gt;&gt; rawResult,
+        final Function&lt;byte[], ValueType&gt; valueDeserializer
+    ) {
+<span class="nc" id="L220">        return new MeteredWindowStoreIterator&lt;&gt;(</span>
+<span class="nc" id="L221">            rawResult.getResult(),</span>
+            fetchSensor,
+            iteratorDurationSensor,
+            valueDeserializer,
+            time,
+            numOpenIterators,
+            openIterators
+        );
+    }
+
+    /**
+     * Handles WindowRangeQuery by creating a MeteredWindowedKeyValueIterator with conversion from
+     * ValueTimestampHeaders to either ValueAndTimestamp&lt;V&gt; (for timestamped stores) or V (for non-timestamped stores).
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;R&gt; QueryResult&lt;R&gt; runWindowRangeQuery(
+        final WindowRangeQuery&lt;K, ValueTimestampHeaders&lt;V&gt;&gt; query,
+        final PositionBound positionBound,
+        final QueryConfig config
+    ) {
+        final QueryResult&lt;R&gt; result;
+
+<span class="nc bnc" id="L243" title="All 4 branches missed.">        if (query.getTimeFrom().isPresent() &amp;&amp; query.getTimeTo().isPresent()) {</span>
+<span class="nc" id="L244">            final WindowRangeQuery&lt;Bytes, byte[]&gt; rawKeyQuery =</span>
+<span class="nc" id="L245">                WindowRangeQuery.withWindowStartRange(</span>
+<span class="nc" id="L246">                    query.getTimeFrom().get(),</span>
+<span class="nc" id="L247">                    query.getTimeTo().get()</span>
+                );
+
+<span class="nc" id="L250">            final QueryResult&lt;KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt;&gt; rawResult = wrapped().query(rawKeyQuery, positionBound, config);</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">            if (rawResult.isSuccess()) {</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">                if (isUnderlyingStoreTimestamped()) {</span>
+                    // For timestamped stores, return ValueAndTimestamp&lt;V&gt;
+<span class="nc" id="L254">                    final MeteredWindowedKeyValueIterator&lt;K, ValueAndTimestamp&lt;V&gt;&gt; typedResult =</span>
+<span class="nc" id="L255">                        meteredWindowedIterator(</span>
+                            rawResult,
+<span class="nc bnc" id="L257" title="All 2 branches missed.">                            valueTimestampHeaders -&gt; valueTimestampHeaders == null ? null : ValueAndTimestamp.make(valueTimestampHeaders.value(), valueTimestampHeaders.timestamp())</span>
+                        );
+
+<span class="nc" id="L260">                    final QueryResult&lt;MeteredWindowedKeyValueIterator&lt;K, ValueAndTimestamp&lt;V&gt;&gt;&gt; typedQueryResult =</span>
+<span class="nc" id="L261">                        InternalQueryResultUtil.copyAndSubstituteDeserializedResult(rawResult, typedResult);</span>
+<span class="nc" id="L262">                    result = (QueryResult&lt;R&gt;) typedQueryResult;</span>
+<span class="nc" id="L263">                } else {</span>
+                    // For non-timestamped stores, return plain V
+<span class="nc" id="L265">                    final MeteredWindowedKeyValueIterator&lt;K, V&gt; typedResult =</span>
+<span class="nc" id="L266">                        meteredWindowedIterator(</span>
+                            rawResult,
+<span class="nc bnc" id="L268" title="All 2 branches missed.">                            valueTimestampHeaders -&gt; valueTimestampHeaders == null ? null : valueTimestampHeaders.value()</span>
+                        );
+
+<span class="nc" id="L271">                    final QueryResult&lt;MeteredWindowedKeyValueIterator&lt;K, V&gt;&gt; typedQueryResult =</span>
+<span class="nc" id="L272">                        InternalQueryResultUtil.copyAndSubstituteDeserializedResult(rawResult, typedResult);</span>
+<span class="nc" id="L273">                    result = (QueryResult&lt;R&gt;) typedQueryResult;</span>
+<span class="nc" id="L274">                }</span>
+            } else {
+<span class="nc" id="L276">                result = (QueryResult&lt;R&gt;) rawResult;</span>
+            }
+<span class="nc" id="L278">        } else {</span>
+<span class="nc" id="L279">            result = QueryResult.forFailure(</span>
+                FailureReason.UNKNOWN_QUERY_TYPE,
+<span class="nc" id="L281">                &quot;This store (&quot; + getClass() + &quot;) doesn't know how to&quot;</span>
+                    + &quot; execute the given query (&quot; + query + &quot;) because&quot;
+                    + &quot; WindowStores only supports WindowRangeQuery.withWindowStartRange.&quot;
+                    + &quot; Contact the store maintainer if you need support for a new query type.&quot;
+            );
+        }
+<span class="nc" id="L287">        return result;</span>
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, ValueTimestampHeaders&lt;V&gt;&gt; fetch(
+        final K keyFrom,
+        final K keyTo,
+        final long timeFrom,
+        final long timeTo
+    ) {
+<span class="nc" id="L297">        return new MeteredTimestampedWindowStoreWithHeadersKeyValueIterator(</span>
+<span class="nc" id="L298">            wrapped().fetch(</span>
+<span class="nc" id="L299">                serializeKey(keyFrom, internalContext.headers()),</span>
+<span class="nc" id="L300">                serializeKey(keyTo, internalContext.headers()),</span>
+                timeFrom,
+                timeTo)
+        );
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, ValueTimestampHeaders&lt;V&gt;&gt; backwardFetch(
+        final K keyFrom,
+        final K keyTo,
+        final long timeFrom,
+        final long timeTo
+    ) {
+<span class="nc" id="L313">        return new MeteredTimestampedWindowStoreWithHeadersKeyValueIterator(</span>
+<span class="nc" id="L314">            wrapped().backwardFetch(</span>
+<span class="nc" id="L315">                serializeKey(keyFrom, internalContext.headers()),</span>
+<span class="nc" id="L316">                serializeKey(keyTo, internalContext.headers()),</span>
+                timeFrom,
+                timeTo)
+        );
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, ValueTimestampHeaders&lt;V&gt;&gt; fetchAll(final long timeFrom, final long timeTo) {
+<span class="nc" id="L324">        return new MeteredTimestampedWindowStoreWithHeadersKeyValueIterator(</span>
+<span class="nc" id="L325">            wrapped().fetchAll(timeFrom, timeTo)</span>
+        );
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, ValueTimestampHeaders&lt;V&gt;&gt; backwardFetchAll(final long timeFrom, final long timeTo) {
+<span class="nc" id="L331">        return new MeteredTimestampedWindowStoreWithHeadersKeyValueIterator(</span>
+<span class="nc" id="L332">            wrapped().backwardFetchAll(timeFrom, timeTo)</span>
+        );
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, ValueTimestampHeaders&lt;V&gt;&gt; all() {
+<span class="nc" id="L338">        return new MeteredTimestampedWindowStoreWithHeadersKeyValueIterator(</span>
+<span class="nc" id="L339">            wrapped().all()</span>
+        );
+    }
+
+    @Override
+    public KeyValueIterator&lt;Windowed&lt;K&gt;, ValueTimestampHeaders&lt;V&gt;&gt; backwardAll() {
+<span class="nc" id="L345">        return new MeteredTimestampedWindowStoreWithHeadersKeyValueIterator(</span>
+<span class="nc" id="L346">            wrapped().backwardAll()</span>
+        );
+    }
+
+    private class MeteredTimestampedWindowStoreWithHeadersKeyValueIterator
+        implements KeyValueIterator&lt;Windowed&lt;K&gt;, ValueTimestampHeaders&lt;V&gt;&gt;, MeteredIterator {
+
+        private final KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; iter;
+        private final long startNs;
+        private final long startTimestampMs;
+        private KeyValue&lt;Windowed&lt;K&gt;, ValueTimestampHeaders&lt;V&gt;&gt; cachedNext;
+
+        private MeteredTimestampedWindowStoreWithHeadersKeyValueIterator(
+<span class="nc" id="L359">            final KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt; iter) {</span>
+<span class="nc" id="L360">            this.iter = iter;</span>
+<span class="nc" id="L361">            this.startNs = time.nanoseconds();</span>
+<span class="nc" id="L362">            this.startTimestampMs = time.milliseconds();</span>
+<span class="nc" id="L363">            numOpenIterators.increment();</span>
+<span class="nc" id="L364">            openIterators.add(this);</span>
+<span class="nc" id="L365">        }</span>
+
+        @Override
+        public long startTimestamp() {
+<span class="nc" id="L369">            return this.startTimestampMs;</span>
+        }
+
+        @Override
+        public boolean hasNext() {
+<span class="nc bnc" id="L374" title="All 4 branches missed.">            return cachedNext != null || iter.hasNext();</span>
+        }
+
+        @Override
+        public KeyValue&lt;Windowed&lt;K&gt;, ValueTimestampHeaders&lt;V&gt;&gt; next() {
+<span class="nc bnc" id="L379" title="All 2 branches missed.">            if (cachedNext != null) {</span>
+<span class="nc" id="L380">                final KeyValue&lt;Windowed&lt;K&gt;, ValueTimestampHeaders&lt;V&gt;&gt; result = cachedNext;</span>
+<span class="nc" id="L381">                cachedNext = null;</span>
+<span class="nc" id="L382">                return result;</span>
+            }
+
+<span class="nc" id="L385">            final KeyValue&lt;Windowed&lt;Bytes&gt;, byte[]&gt; next = iter.next();</span>
+<span class="nc" id="L386">            final ValueTimestampHeaders&lt;V&gt; valueTimestampHeaders = deserializeValue(next.value);</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">            final Headers headers = valueTimestampHeaders != null ? valueTimestampHeaders.headers() : new RecordHeaders();</span>
+<span class="nc" id="L388">            final K key = deserializeKey(next.key.key().get(), headers);</span>
+<span class="nc" id="L389">            final Windowed&lt;K&gt; windowedKey = new Windowed&lt;&gt;(key, next.key.window());</span>
+<span class="nc" id="L390">            return KeyValue.pair(windowedKey, valueTimestampHeaders);</span>
+        }
+
+        @Override
+        public void close() {
+            try {
+<span class="nc" id="L396">                iter.close();</span>
+            } finally {
+<span class="nc" id="L398">                final long duration = time.nanoseconds() - startNs;</span>
+<span class="nc" id="L399">                fetchSensor.record(duration);</span>
+<span class="nc" id="L400">                iteratorDurationSensor.record(duration);</span>
+<span class="nc" id="L401">                numOpenIterators.decrement();</span>
+<span class="nc" id="L402">                openIterators.remove(this);</span>
+            }
+<span class="nc" id="L404">        }</span>
+
+        @Override
+        public Windowed&lt;K&gt; peekNextKey() {
+<span class="nc bnc" id="L408" title="All 2 branches missed.">            if (cachedNext == null) {</span>
+<span class="nc" id="L409">                cachedNext = next();</span>
+            }
+<span class="nc" id="L411">            return cachedNext.key;</span>
+        }
+    }
+
+    private &lt;ValueType&gt; MeteredWindowedKeyValueIterator&lt;K, ValueType&gt; meteredWindowedIterator(
+        final QueryResult&lt;KeyValueIterator&lt;Windowed&lt;Bytes&gt;, byte[]&gt;&gt; rawResult,
+        final Function&lt;ValueTimestampHeaders&lt;V&gt;, ValueType&gt; valueConverter
+    ) {
+<span class="nc" id="L419">        return new MeteredWindowedKeyValueWithHeadersIterator&lt;&gt;(</span>
+<span class="nc" id="L420">            rawResult.getResult(),</span>
+            fetchSensor,
+            iteratorDurationSensor,
+            this::deserializeValue,
+            this::deserializeKey,
+            ValueTimestampHeaders::headers,
+            valueConverter,
+            time,
+            numOpenIterators,
+            openIterators
+        );
+    }
+
+    private boolean isUnderlyingStoreTimestamped() {
+<span class="nc" id="L434">        StateStore store = wrapped();</span>
+        do {
+            // Check adapters first before attempting to unwrap
+<span class="nc bnc" id="L437" title="All 2 branches missed.">            if (store instanceof TimestampedToHeadersWindowStoreAdapter) {</span>
+<span class="nc" id="L438">                return true;</span>
+            }
+<span class="nc bnc" id="L440" title="All 2 branches missed.">            if (store instanceof PlainToHeadersWindowStoreAdapter) {</span>
+<span class="nc" id="L441">                return false; // Plain store doesn't preserve timestamps</span>
+            }
+<span class="nc bnc" id="L443" title="All 2 branches missed.">            if (store instanceof TimestampedBytesStore) {</span>
+<span class="nc" id="L444">                return true;</span>
+            }
+            // Only unwrap if it's a WrappedStateStore
+<span class="nc bnc" id="L447" title="All 2 branches missed.">            if (store instanceof WrappedStateStore) {</span>
+<span class="nc" id="L448">                store = ((WrappedStateStore&lt;?, ?, ?&gt;) store).wrapped();</span>
+            } else {
+                break;
+            }
+        } while (true);
+
+<span class="nc" id="L454">        return false;</span>
+    }
+
+    private Bytes serializeKey(final K key, final Headers headers) {
+<span class="nc" id="L458">        return Bytes.wrap(serdes.rawKey(key, headers));</span>
+    }
+
+    private K deserializeKey(final byte[] rawKey, final Headers headers) {
+<span class="nc" id="L462">        return serdes.keyFrom(rawKey, headers);</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

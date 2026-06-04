@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CoordinatorPartitionWriter.scala</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">kafka.coordinator.group</a> &gt; <span class="el_source">CoordinatorPartitionWriter.scala</span></div><h1>CoordinatorPartitionWriter.scala</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package kafka.coordinator.group
+
+import kafka.server.ReplicaManager
+import org.apache.kafka.common.{TopicIdPartition, TopicPartition}
+import org.apache.kafka.common.protocol.Errors
+import org.apache.kafka.common.record.internal.{MemoryRecords, RecordBatch}
+import org.apache.kafka.coordinator.common.runtime.PartitionWriter
+import org.apache.kafka.server.ActionQueue
+import org.apache.kafka.server.common.RequestLocal
+import org.apache.kafka.server.partition.PartitionListener
+import org.apache.kafka.server.transaction.AddPartitionsToTxnManager
+import org.apache.kafka.storage.internals.log.{AppendOrigin, LogConfig, VerificationGuard}
+
+import java.util.concurrent.CompletableFuture
+import scala.collection.Map
+
+/**
+ * ListenerAdapter adapts the PartitionListener interface to the
+ * PartitionWriter.Listener interface.
+ */
+<span class="pc" id="L37">private[group] class ListenerAdapter(</span>
+<span class="fc" id="L38">  val listener: PartitionWriter.Listener</span>
+<span class="fc" id="L39">) extends PartitionListener {</span>
+  override def onHighWatermarkUpdated(
+    tp: TopicPartition,
+    offset: Long
+  ): Unit = {
+<span class="fc" id="L44">    listener.onHighWatermarkUpdated(tp, offset)</span>
+  }
+
+  override def equals(that: Any): Boolean = that match {
+<span class="pc bpc" id="L48" title="1 of 2 branches missed.">    case other: ListenerAdapter =&gt; listener.equals(other.listener)</span>
+<span class="nc" id="L49">    case _ =&gt; false</span>
+  }
+
+  override def hashCode(): Int = {
+<span class="nc" id="L53">    listener.hashCode()</span>
+  }
+
+  override def toString: String = {
+<span class="nc" id="L57">    s&quot;ListenerAdapter(listener=$listener)&quot;</span>
+  }
+}
+
+<span class="fc" id="L61">class CoordinatorPartitionWriter(</span>
+<span class="fc" id="L62">  replicaManager: ReplicaManager</span>
+<span class="fc" id="L63">) extends PartitionWriter {</span>
+  // We use an action queue which directly executes actions. This is possible
+  // here because we don't hold any conflicting locks.
+<span class="fc" id="L66">  private val directActionQueue = new ActionQueue {</span>
+    override def add(action: Runnable): Unit = {
+<span class="fc" id="L68">      action.run()</span>
+    }
+
+    override def tryCompleteActions(): Unit = {}
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  override def registerListener(
+    tp: TopicPartition,
+    listener: PartitionWriter.Listener
+  ): Unit = {
+<span class="fc" id="L81">    replicaManager.maybeAddListener(tp, new ListenerAdapter(listener))</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  override def deregisterListener(
+    tp: TopicPartition,
+    listener: PartitionWriter.Listener
+  ): Unit = {
+<span class="fc" id="L91">    replicaManager.removeListener(tp, new ListenerAdapter(listener))</span>
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  override def config(tp: TopicPartition): LogConfig = {
+<span class="fc" id="L98">    replicaManager.getLogConfig(tp).getOrElse {</span>
+<span class="pc" id="L99">      throw Errors.NOT_LEADER_OR_FOLLOWER.exception()</span>
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  override def maybeStartTransactionVerification(
+    tp: TopicPartition,
+    transactionalId: String,
+    producerId: Long,
+    producerEpoch: Short,
+    apiVersion: Int
+  ): CompletableFuture[VerificationGuard] = {
+<span class="nc" id="L113">    val transactionSupportedOperation = AddPartitionsToTxnManager.txnOffsetCommitRequestVersionToTransactionSupportedOperation(apiVersion)</span>
+<span class="nc" id="L114">    val future = new CompletableFuture[VerificationGuard]()</span>
+<span class="nc" id="L115">    replicaManager.maybeSendPartitionToTransactionCoordinator(</span>
+<span class="nc" id="L116">      topicPartition = tp,</span>
+<span class="nc" id="L117">      transactionalId = transactionalId,</span>
+<span class="nc" id="L118">      producerId = producerId,</span>
+<span class="nc" id="L119">      producerEpoch = producerEpoch,</span>
+<span class="nc" id="L120">      baseSequence = RecordBatch.NO_SEQUENCE,</span>
+<span class="nc" id="L121">      callback = errorAndGuard =&gt; {</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">        val (error, verificationGuard) = errorAndGuard</span>
+<span class="nc bnc" id="L123" title="All 6 branches missed.">        if (error != Errors.NONE) {</span>
+<span class="nc" id="L124">          future.completeExceptionally(error.exception)</span>
+        } else {
+<span class="nc" id="L126">          future.complete(verificationGuard)</span>
+        }
+      },
+<span class="nc" id="L129">      transactionSupportedOperation</span>
+    )
+<span class="nc" id="L131">    future</span>
+  }
+
+  /**
+   * {@inheritDoc }
+   */
+  override def append(
+    tp: TopicPartition,
+    verificationGuard: VerificationGuard,
+    records: MemoryRecords,
+    transactionVersion: Short
+  ): Long = {
+    // We write synchronously to the leader replica without waiting on replication.
+<span class="fc" id="L144">    val topicIdPartition: TopicIdPartition = replicaManager.topicIdPartition(tp)</span>
+<span class="fc" id="L145">    val appendResults = replicaManager.appendRecordsToLeader(</span>
+<span class="fc" id="L146">      requiredAcks = 1,</span>
+<span class="fc" id="L147">      internalTopicsAllowed = true,</span>
+<span class="fc" id="L148">      origin = AppendOrigin.COORDINATOR,</span>
+<span class="fc" id="L149">      entriesPerPartition = Map(topicIdPartition -&gt; records),</span>
+<span class="fc" id="L150">      requestLocal = RequestLocal.noCaching,</span>
+<span class="fc" id="L151">      verificationGuards = Map(tp -&gt; verificationGuard),</span>
+      // We can directly complete the purgatories here because we don't hold
+      // any conflicting locks.
+<span class="fc" id="L154">      actionQueue = directActionQueue,</span>
+<span class="fc" id="L155">      transactionVersion = transactionVersion</span>
+    )
+
+<span class="fc" id="L158">    val partitionResult = appendResults.getOrElse(topicIdPartition,</span>
+<span class="pc" id="L159">      throw new IllegalStateException(s&quot;Append status $appendResults should have partition $tp.&quot;))</span>
+
+<span class="pc bpc" id="L161" title="4 of 6 branches missed.">    if (partitionResult.error != Errors.NONE) {</span>
+<span class="nc" id="L162">      throw partitionResult.error.exception(partitionResult.errorMessage)</span>
+    }
+
+    // Required offset.
+<span class="fc" id="L166">    partitionResult.logAppendSummary.lastOffset + 1</span>
+  }
+
+  override def deleteRecords(tp: TopicPartition, deleteBeforeOffset: Long): CompletableFuture[Void] = {
+<span class="nc" id="L170">    val responseFuture: CompletableFuture[Void] = new CompletableFuture[Void]()</span>
+
+<span class="nc" id="L172">    replicaManager.deleteRecords(</span>
+<span class="nc" id="L173">      timeout = 30000L, // 30 seconds.</span>
+<span class="nc" id="L174">      offsetPerPartition = Map(tp -&gt; deleteBeforeOffset),</span>
+<span class="nc" id="L175">      responseCallback = results =&gt; {</span>
+<span class="nc" id="L176">        val result = results.get(tp)</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        if (result.isEmpty) {</span>
+<span class="nc" id="L178">          responseFuture.completeExceptionally(new IllegalStateException(s&quot;Delete status $result should have partition $tp.&quot;))</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        } else if (result.get.errorCode != Errors.NONE.code) {</span>
+<span class="nc" id="L180">          responseFuture.completeExceptionally(Errors.forCode(result.get.errorCode).exception)</span>
+        } else {
+<span class="nc" id="L182">          responseFuture.complete(null)</span>
+        }
+      },
+<span class="nc" id="L185">      allowInternalTopicDeletion = true</span>
+    )
+<span class="nc" id="L187">    responseFuture</span>
+  }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>

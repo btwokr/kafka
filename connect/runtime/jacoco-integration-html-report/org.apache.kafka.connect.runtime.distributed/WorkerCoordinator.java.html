@@ -1,0 +1,657 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>WorkerCoordinator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Connect Integration Tests (Kafka + runtimeClasspath libraries)</a> &gt; <a href="index.source.html" class="el_package">org.apache.kafka.connect.runtime.distributed</a> &gt; <span class="el_source">WorkerCoordinator.java</span></div><h1>WorkerCoordinator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.connect.runtime.distributed;
+
+import org.apache.kafka.clients.GroupRebalanceConfig;
+import org.apache.kafka.clients.consumer.CloseOptions;
+import org.apache.kafka.clients.consumer.internals.AbstractCoordinator;
+import org.apache.kafka.clients.consumer.internals.ConsumerNetworkClient;
+import org.apache.kafka.common.metrics.Measurable;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.requests.JoinGroupRequest;
+import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Timer;
+import org.apache.kafka.connect.storage.ClusterConfigState;
+import org.apache.kafka.connect.storage.ConfigBackingStore;
+import org.apache.kafka.connect.util.ConnectorTaskId;
+
+import org.slf4j.Logger;
+
+import java.io.Closeable;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.function.Supplier;
+
+import static org.apache.kafka.common.message.JoinGroupRequestData.JoinGroupRequestProtocolCollection;
+import static org.apache.kafka.common.message.JoinGroupResponseData.JoinGroupResponseMember;
+import static org.apache.kafka.common.utils.Utils.UncheckedCloseable;
+import static org.apache.kafka.connect.runtime.distributed.ConnectProtocolCompatibility.EAGER;
+
+
+/**
+ * This class manages the coordination process with the Kafka group coordinator on the broker for managing assignments
+ * to workers.
+ */
+public class WorkerCoordinator extends AbstractCoordinator implements Closeable {
+    private final Logger log;
+    private final String restUrl;
+    private final ConfigBackingStore configStorage;
+    private volatile ExtendedAssignment assignmentSnapshot;
+    private ClusterConfigState configSnapshot;
+    private final WorkerRebalanceListener listener;
+    private final ConnectProtocolCompatibility protocolCompatibility;
+    private LeaderState leaderState;
+
+    private boolean rejoinRequested;
+    private volatile ConnectProtocolCompatibility currentConnectProtocol;
+    private volatile int lastCompletedGenerationId;
+    private final ConnectAssignor eagerAssignor;
+    private final ConnectAssignor incrementalAssignor;
+    private final int coordinatorDiscoveryTimeoutMs;
+
+    /**
+     * Initialize the coordination manager.
+     */
+    public WorkerCoordinator(GroupRebalanceConfig config,
+                             LogContext logContext,
+                             ConsumerNetworkClient client,
+                             Metrics metrics,
+                             String metricGrpPrefix,
+                             Time time,
+                             String restUrl,
+                             ConfigBackingStore configStorage,
+                             WorkerRebalanceListener listener,
+                             ConnectProtocolCompatibility protocolCompatibility,
+                             int maxDelay) {
+<span class="fc" id="L89">        super(config,</span>
+              logContext,
+              client,
+              metrics,
+              metricGrpPrefix,
+              time);
+<span class="fc" id="L95">        this.log = logContext.logger(WorkerCoordinator.class);</span>
+<span class="fc" id="L96">        this.restUrl = restUrl;</span>
+<span class="fc" id="L97">        this.configStorage = configStorage;</span>
+<span class="fc" id="L98">        this.assignmentSnapshot = null;</span>
+<span class="fc" id="L99">        new WorkerCoordinatorMetrics(metrics, metricGrpPrefix);</span>
+<span class="fc" id="L100">        this.listener = listener;</span>
+<span class="fc" id="L101">        this.rejoinRequested = false;</span>
+<span class="fc" id="L102">        this.protocolCompatibility = protocolCompatibility;</span>
+<span class="fc" id="L103">        this.incrementalAssignor = new IncrementalCooperativeAssignor(logContext, time, maxDelay);</span>
+<span class="fc" id="L104">        this.eagerAssignor = new EagerAssignor(logContext);</span>
+<span class="fc" id="L105">        this.currentConnectProtocol = protocolCompatibility;</span>
+<span class="fc" id="L106">        this.coordinatorDiscoveryTimeoutMs = config.heartbeatIntervalMs;</span>
+<span class="fc" id="L107">        this.lastCompletedGenerationId = Generation.NO_GENERATION.generationId;</span>
+<span class="fc" id="L108">    }</span>
+
+    @Override
+    public void requestRejoin(final String reason) {
+<span class="fc" id="L112">        log.debug(&quot;Request joining group due to: {}&quot;, reason);</span>
+<span class="fc" id="L113">        rejoinRequested = true;</span>
+<span class="fc" id="L114">    }</span>
+
+    @Override
+    public String protocolType() {
+<span class="fc" id="L118">        return &quot;connect&quot;;</span>
+    }
+
+    // expose for tests
+    @Override
+    protected synchronized boolean ensureCoordinatorReady(final Timer timer) {
+<span class="fc" id="L124">        return super.ensureCoordinatorReady(timer);</span>
+    }
+
+    public void poll(long timeout, Supplier&lt;UncheckedCloseable&gt; onPoll) {
+        // poll for io until the timeout expires
+<span class="fc" id="L129">        final long start = time.milliseconds();</span>
+<span class="fc" id="L130">        long now = start;</span>
+        long remaining;
+
+        do {
+<span class="fc bfc" id="L134" title="All 2 branches covered.">            if (coordinatorUnknown()) {</span>
+<span class="fc" id="L135">                log.debug(&quot;Broker coordinator is marked unknown. Attempting discovery with a timeout of {}ms&quot;,</span>
+<span class="fc" id="L136">                        coordinatorDiscoveryTimeoutMs);</span>
+                boolean coordinatorReady;
+<span class="fc" id="L138">                try (UncheckedCloseable polling = onPoll.get()) {</span>
+<span class="fc" id="L139">                    coordinatorReady = ensureCoordinatorReady(time.timer(coordinatorDiscoveryTimeoutMs));</span>
+                }
+<span class="fc bfc" id="L141" title="All 2 branches covered.">                if (coordinatorReady) {</span>
+<span class="fc" id="L142">                    log.debug(&quot;Broker coordinator is ready&quot;);</span>
+                } else {
+<span class="fc" id="L144">                    log.debug(&quot;Can not connect to broker coordinator&quot;);</span>
+<span class="fc" id="L145">                    final ExtendedAssignment localAssignmentSnapshot = assignmentSnapshot;</span>
+<span class="pc bpc" id="L146" title="1 of 4 branches missed.">                    if (localAssignmentSnapshot != null &amp;&amp; !localAssignmentSnapshot.failed()) {</span>
+<span class="fc" id="L147">                        log.info(&quot;Broker coordinator was unreachable for {}ms. Revoking previous assignment {} to &quot; +</span>
+<span class="fc" id="L148">                                &quot;avoid running tasks while not being a member the group&quot;, coordinatorDiscoveryTimeoutMs, localAssignmentSnapshot);</span>
+<span class="fc" id="L149">                        listener.onRevoked(localAssignmentSnapshot.leader(), localAssignmentSnapshot.connectors(), localAssignmentSnapshot.tasks());</span>
+<span class="fc" id="L150">                        assignmentSnapshot = null;</span>
+                    }
+                }
+<span class="fc" id="L153">                now = time.milliseconds();</span>
+            }
+
+<span class="fc bfc" id="L156" title="All 2 branches covered.">            if (rejoinNeededOrPending()) {</span>
+<span class="fc" id="L157">                try (UncheckedCloseable polling = onPoll.get()) {</span>
+<span class="fc" id="L158">                    ensureActiveGroup();</span>
+                }
+<span class="fc" id="L160">                now = time.milliseconds();</span>
+            }
+
+<span class="fc" id="L163">            pollHeartbeat(now);</span>
+
+<span class="fc" id="L165">            long elapsed = now - start;</span>
+<span class="fc" id="L166">            remaining = timeout - elapsed;</span>
+
+            // Note that because the network client is shared with the background heartbeat thread,
+            // we do not want to block in poll longer than the time to the next heartbeat.
+<span class="fc" id="L170">            long pollTimeout = Math.min(Math.max(0, remaining), timeToNextHeartbeat(now));</span>
+<span class="fc" id="L171">            try (UncheckedCloseable polling = onPoll.get()) {</span>
+<span class="fc" id="L172">                client.poll(time.timer(pollTimeout));</span>
+            }
+
+<span class="fc" id="L175">            now = time.milliseconds();</span>
+<span class="fc" id="L176">            elapsed = now - start;</span>
+<span class="fc" id="L177">            remaining = timeout - elapsed;</span>
+<span class="fc bfc" id="L178" title="All 2 branches covered.">        } while (remaining &gt; 0);</span>
+<span class="fc" id="L179">    }</span>
+
+    @Override
+    public JoinGroupRequestProtocolCollection metadata() {
+<span class="fc" id="L183">        configSnapshot = configStorage.snapshot();</span>
+<span class="fc" id="L184">        final ExtendedAssignment localAssignmentSnapshot = assignmentSnapshot;</span>
+<span class="fc" id="L185">        ExtendedWorkerState workerState = new ExtendedWorkerState(restUrl, configSnapshot.offset(), localAssignmentSnapshot);</span>
+<span class="pc bpc" id="L186" title="2 of 3 branches missed.">        return switch (protocolCompatibility) {</span>
+<span class="nc" id="L187">            case EAGER -&gt; ConnectProtocol.metadataRequest(workerState);</span>
+<span class="nc" id="L188">            case COMPATIBLE -&gt; IncrementalCooperativeConnectProtocol.metadataRequest(workerState, false);</span>
+<span class="fc" id="L189">            case SESSIONED -&gt; IncrementalCooperativeConnectProtocol.metadataRequest(workerState, true);</span>
+        };
+    }
+
+    @Override
+    protected void onJoinComplete(int generation, String memberId, String protocol, ByteBuffer memberAssignment) {
+<span class="fc" id="L195">        ExtendedAssignment newAssignment = IncrementalCooperativeConnectProtocol.deserializeAssignment(memberAssignment);</span>
+<span class="fc" id="L196">        log.debug(&quot;Deserialized new assignment: {}&quot;, newAssignment);</span>
+<span class="fc" id="L197">        currentConnectProtocol = ConnectProtocolCompatibility.fromProtocol(protocol);</span>
+        // At this point we always consider ourselves to be a member of the cluster, even if there was an assignment
+        // error (the leader couldn't make the assignment) or we are behind the config and cannot yet work on our assigned
+        // tasks. It's the responsibility of the code driving this process to decide how to react (e.g. trying to get
+        // up to date, try to rejoin again, leaving the group and backing off, etc.).
+<span class="fc" id="L202">        rejoinRequested = false;</span>
+<span class="pc bpc" id="L203" title="1 of 2 branches missed.">        if (currentConnectProtocol != EAGER) {</span>
+<span class="fc bfc" id="L204" title="All 4 branches covered.">            if (!newAssignment.revokedConnectors().isEmpty() || !newAssignment.revokedTasks().isEmpty()) {</span>
+<span class="fc" id="L205">                listener.onRevoked(newAssignment.leader(), newAssignment.revokedConnectors(), newAssignment.revokedTasks());</span>
+            }
+
+<span class="fc" id="L208">            final ExtendedAssignment localAssignmentSnapshot = assignmentSnapshot;</span>
+<span class="fc bfc" id="L209" title="All 2 branches covered.">            if (localAssignmentSnapshot != null) {</span>
+<span class="fc" id="L210">                localAssignmentSnapshot.connectors().removeAll(newAssignment.revokedConnectors());</span>
+<span class="fc" id="L211">                localAssignmentSnapshot.tasks().removeAll(newAssignment.revokedTasks());</span>
+<span class="fc" id="L212">                log.debug(&quot;After revocations snapshot of assignment: {}&quot;, localAssignmentSnapshot);</span>
+<span class="fc" id="L213">                newAssignment.connectors().addAll(localAssignmentSnapshot.connectors());</span>
+<span class="fc" id="L214">                newAssignment.tasks().addAll(localAssignmentSnapshot.tasks());</span>
+            }
+<span class="fc" id="L216">            log.debug(&quot;Augmented new assignment: {}&quot;, newAssignment);</span>
+        }
+<span class="fc" id="L218">        assignmentSnapshot = newAssignment;</span>
+<span class="fc" id="L219">        lastCompletedGenerationId = generation;</span>
+<span class="fc" id="L220">        listener.onAssigned(newAssignment, generation);</span>
+<span class="fc" id="L221">    }</span>
+
+    @Override
+    protected Map&lt;String, ByteBuffer&gt; onLeaderElected(String leaderId,
+                                                      String protocol,
+                                                      List&lt;JoinGroupResponseMember&gt; allMemberMetadata,
+                                                      boolean skipAssignment) {
+<span class="pc bpc" id="L228" title="1 of 2 branches missed.">        if (skipAssignment)</span>
+<span class="nc" id="L229">            throw new IllegalStateException(&quot;Can't skip assignment because Connect does not support static membership.&quot;);</span>
+
+<span class="fc" id="L231">        ConnectProtocolCompatibility protocolCompatibility = ConnectProtocolCompatibility.fromProtocol(protocol);</span>
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">        return protocolCompatibility == EAGER</span>
+<span class="nc" id="L233">               ? eagerAssignor.performAssignment(leaderId, protocolCompatibility, allMemberMetadata, this)</span>
+<span class="fc" id="L234">               : incrementalAssignor.performAssignment(leaderId, protocolCompatibility, allMemberMetadata, this);</span>
+    }
+
+    @Override
+    protected boolean onJoinPrepare(Timer timer, int generation, String memberId) {
+<span class="fc" id="L239">        log.info(&quot;Rebalance started&quot;);</span>
+<span class="fc" id="L240">        leaderState(null);</span>
+<span class="fc" id="L241">        final ExtendedAssignment localAssignmentSnapshot = assignmentSnapshot;</span>
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">        if (currentConnectProtocol == EAGER) {</span>
+<span class="nc" id="L243">            log.debug(&quot;Revoking previous assignment {}&quot;, localAssignmentSnapshot);</span>
+<span class="nc bnc" id="L244" title="All 4 branches missed.">            if (localAssignmentSnapshot != null &amp;&amp; !localAssignmentSnapshot.failed())</span>
+<span class="nc" id="L245">                listener.onRevoked(localAssignmentSnapshot.leader(), localAssignmentSnapshot.connectors(), localAssignmentSnapshot.tasks());</span>
+        } else {
+<span class="fc" id="L247">            log.debug(&quot;Cooperative rebalance triggered. Keeping assignment {} until it's &quot;</span>
+                      + &quot;explicitly revoked.&quot;, localAssignmentSnapshot);
+        }
+<span class="fc" id="L250">        return true;</span>
+    }
+
+    @Override
+    protected boolean rejoinNeededOrPending() {
+<span class="fc" id="L255">        final ExtendedAssignment localAssignmentSnapshot = assignmentSnapshot;</span>
+<span class="pc bpc" id="L256" title="1 of 8 branches missed.">        return super.rejoinNeededOrPending() || (localAssignmentSnapshot == null || localAssignmentSnapshot.failed()) || rejoinRequested;</span>
+    }
+
+    @Override
+    public String memberId() {
+<span class="fc" id="L261">        Generation generation = generationIfStable();</span>
+<span class="fc bfc" id="L262" title="All 2 branches covered.">        if (generation != null)</span>
+<span class="fc" id="L263">            return generation.memberId;</span>
+<span class="fc" id="L264">        return JoinGroupRequest.UNKNOWN_MEMBER_ID;</span>
+    }
+
+    @Override
+    protected void handlePollTimeoutExpiry() {
+<span class="fc" id="L269">        listener.onPollTimeoutExpiry();</span>
+<span class="fc" id="L270">        maybeLeaveGroup(CloseOptions.GroupMembershipOperation.DEFAULT, &quot;worker poll timeout has expired.&quot;);</span>
+<span class="fc" id="L271">    }</span>
+
+    /**
+     * Return the current generation. The generation refers to this worker's knowledge with
+     * respect to which generation is the latest one and, therefore, this information is local.
+     *
+     * @return the generation ID or -1 if no generation is defined
+     */
+    public int generationId() {
+<span class="fc" id="L280">        return super.generation().generationId;</span>
+    }
+
+    /**
+     * Return id that corresponds to the group generation that was active when the last join was successful
+     *
+     * @return the generation ID of the last group that was joined successfully by this member or -1 if no generation
+     * was stable at that point
+     */
+    public int lastCompletedGenerationId() {
+<span class="fc" id="L290">        return lastCompletedGenerationId;</span>
+    }
+
+    public void revokeAssignment(ExtendedAssignment assignment) {
+<span class="nc" id="L294">        listener.onRevoked(assignment.leader(), assignment.connectors(), assignment.tasks());</span>
+<span class="nc" id="L295">    }</span>
+
+    private boolean isLeader() {
+<span class="fc" id="L298">        final ExtendedAssignment localAssignmentSnapshot = assignmentSnapshot;</span>
+<span class="pc bpc" id="L299" title="2 of 4 branches missed.">        return localAssignmentSnapshot != null &amp;&amp; memberId().equals(localAssignmentSnapshot.leader());</span>
+    }
+
+    public String ownerUrl(String connector) {
+<span class="nc bnc" id="L303" title="All 4 branches missed.">        if (rejoinNeededOrPending() || !isLeader())</span>
+<span class="nc" id="L304">            return null;</span>
+<span class="nc" id="L305">        return leaderState().ownerUrl(connector);</span>
+    }
+
+    public String ownerUrl(ConnectorTaskId task) {
+<span class="pc bpc" id="L309" title="2 of 4 branches missed.">        if (rejoinNeededOrPending() || !isLeader())</span>
+<span class="nc" id="L310">            return null;</span>
+<span class="fc" id="L311">        return leaderState().ownerUrl(task);</span>
+    }
+
+    /**
+     * Get an up-to-date snapshot of the cluster configuration.
+     *
+     * @return the state of the cluster configuration; the result is not locally cached
+     */
+    public ClusterConfigState configFreshSnapshot() {
+<span class="nc" id="L320">        return configStorage.snapshot();</span>
+    }
+
+    /**
+     * Get a snapshot of the cluster configuration.
+     *
+     * @return the state of the cluster configuration
+     */
+    public ClusterConfigState configSnapshot() {
+<span class="fc" id="L329">        return configSnapshot;</span>
+    }
+
+    /**
+     * Set the state of the cluster configuration to this worker coordinator.
+     *
+     * @param update the updated state of the cluster configuration
+     */
+    public void configSnapshot(ClusterConfigState update) {
+<span class="nc" id="L338">        configSnapshot = update;</span>
+<span class="nc" id="L339">    }</span>
+
+    /**
+     * Get the leader state stored in this worker coordinator.
+     *
+     * @return the leader state
+     */
+    private LeaderState leaderState() {
+<span class="fc" id="L347">        return leaderState;</span>
+    }
+
+    /**
+     * Store the leader state to this worker coordinator.
+     *
+     * @param update the updated leader state
+     */
+    public void leaderState(LeaderState update) {
+<span class="fc" id="L356">        leaderState = update;</span>
+<span class="fc" id="L357">    }</span>
+
+    /**
+     * Get the version of the connect protocol that is currently active in the group of workers.
+     *
+     * @return the current connect protocol version
+     */
+    public short currentProtocolVersion() {
+<span class="fc" id="L365">        return currentConnectProtocol.protocolVersion();</span>
+    }
+
+    private class WorkerCoordinatorMetrics {
+        public final String metricGrpName;
+
+<span class="fc" id="L371">        public WorkerCoordinatorMetrics(Metrics metrics, String metricGrpPrefix) {</span>
+<span class="fc" id="L372">            this.metricGrpName = metricGrpPrefix + &quot;-coordinator-metrics&quot;;</span>
+
+<span class="fc" id="L374">            Measurable numConnectors = (config, now) -&gt; {</span>
+<span class="nc" id="L375">                final ExtendedAssignment localAssignmentSnapshot = assignmentSnapshot;</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">                if (localAssignmentSnapshot == null) {</span>
+<span class="nc" id="L377">                    return 0.0;</span>
+                }
+<span class="nc" id="L379">                return localAssignmentSnapshot.connectors().size();</span>
+            };
+
+<span class="fc" id="L382">            Measurable numTasks = (config, now) -&gt; {</span>
+<span class="nc" id="L383">                final ExtendedAssignment localAssignmentSnapshot = assignmentSnapshot;</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">                if (localAssignmentSnapshot == null) {</span>
+<span class="nc" id="L385">                    return 0.0;</span>
+                }
+<span class="nc" id="L387">                return localAssignmentSnapshot.tasks().size();</span>
+            };
+
+<span class="fc" id="L390">            metrics.addMetric(metrics.metricName(&quot;assigned-connectors&quot;,</span>
+                              this.metricGrpName,
+                              &quot;The number of connector instances currently assigned to this worker&quot;), numConnectors);
+<span class="fc" id="L393">            metrics.addMetric(metrics.metricName(&quot;assigned-tasks&quot;,</span>
+                              this.metricGrpName,
+                              &quot;The number of tasks currently assigned to this worker&quot;), numTasks);
+<span class="fc" id="L396">        }</span>
+    }
+
+    public static &lt;K, V&gt; Map&lt;V, K&gt; invertAssignment(Map&lt;K, Collection&lt;V&gt;&gt; assignment) {
+<span class="fc" id="L400">        Map&lt;V, K&gt; inverted = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L401" title="All 2 branches covered.">        for (Map.Entry&lt;K, Collection&lt;V&gt;&gt; assignmentEntry : assignment.entrySet()) {</span>
+<span class="fc" id="L402">            K key = assignmentEntry.getKey();</span>
+<span class="fc bfc" id="L403" title="All 2 branches covered.">            for (V value : assignmentEntry.getValue())</span>
+<span class="fc" id="L404">                inverted.put(value, key);</span>
+<span class="fc" id="L405">        }</span>
+<span class="fc" id="L406">        return inverted;</span>
+    }
+
+    public static class LeaderState {
+        private final Map&lt;String, ExtendedWorkerState&gt; allMembers;
+        private final Map&lt;String, String&gt; connectorOwners;
+        private final Map&lt;ConnectorTaskId, String&gt; taskOwners;
+
+        public LeaderState(Map&lt;String, ExtendedWorkerState&gt; allMembers,
+                           Map&lt;String, Collection&lt;String&gt;&gt; connectorAssignment,
+<span class="fc" id="L416">                           Map&lt;String, Collection&lt;ConnectorTaskId&gt;&gt; taskAssignment) {</span>
+<span class="fc" id="L417">            this.allMembers = allMembers;</span>
+<span class="fc" id="L418">            this.connectorOwners = invertAssignment(connectorAssignment);</span>
+<span class="fc" id="L419">            this.taskOwners = invertAssignment(taskAssignment);</span>
+<span class="fc" id="L420">        }</span>
+
+        private String ownerUrl(ConnectorTaskId id) {
+<span class="fc" id="L423">            String ownerId = taskOwners.get(id);</span>
+<span class="pc bpc" id="L424" title="1 of 2 branches missed.">            if (ownerId == null)</span>
+<span class="nc" id="L425">                return null;</span>
+<span class="fc" id="L426">            return allMembers.get(ownerId).url();</span>
+        }
+
+        private String ownerUrl(String connector) {
+<span class="nc" id="L430">            String ownerId = connectorOwners.get(connector);</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">            if (ownerId == null)</span>
+<span class="nc" id="L432">                return null;</span>
+<span class="nc" id="L433">            return allMembers.get(ownerId).url();</span>
+        }
+
+        @Override
+        public boolean equals(Object o) {
+<span class="nc bnc" id="L438" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">            if (!(o instanceof LeaderState that)) return false;</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">            return Objects.equals(allMembers, that.allMembers)</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">                    &amp;&amp; Objects.equals(connectorOwners, that.connectorOwners)</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">                    &amp;&amp; Objects.equals(taskOwners, that.taskOwners);</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L447">            return Objects.hash(allMembers, connectorOwners, taskOwners);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L452">            return &quot;LeaderState{&quot;</span>
+                    + &quot;allMembers=&quot; + allMembers
+                    + &quot;, connectorOwners=&quot; + connectorOwners
+                    + &quot;, taskOwners=&quot; + taskOwners
+                    + '}';
+        }
+    }
+
+    public static class ConnectorsAndTasks {
+<span class="fc" id="L461">        public static final ConnectorsAndTasks EMPTY =</span>
+<span class="fc" id="L462">                new ConnectorsAndTasks(List.of(), List.of());</span>
+
+        private final Collection&lt;String&gt; connectors;
+        private final Collection&lt;ConnectorTaskId&gt; tasks;
+
+<span class="fc" id="L467">        private ConnectorsAndTasks(Collection&lt;String&gt; connectors, Collection&lt;ConnectorTaskId&gt; tasks) {</span>
+<span class="fc" id="L468">            this.connectors = connectors;</span>
+<span class="fc" id="L469">            this.tasks = tasks;</span>
+<span class="fc" id="L470">        }</span>
+
+        public static class Builder {
+<span class="fc" id="L473">            private Set&lt;String&gt; withConnectors = new LinkedHashSet&lt;&gt;();</span>
+<span class="fc" id="L474">            private Set&lt;ConnectorTaskId&gt; withTasks = new LinkedHashSet&lt;&gt;();</span>
+
+<span class="fc" id="L476">            public Builder() {</span>
+<span class="fc" id="L477">            }</span>
+
+            public ConnectorsAndTasks.Builder with(Collection&lt;String&gt; connectors,
+                                                   Collection&lt;ConnectorTaskId&gt; tasks) {
+<span class="fc" id="L481">                withConnectors = new LinkedHashSet&lt;&gt;(connectors);</span>
+<span class="fc" id="L482">                withTasks = new LinkedHashSet&lt;&gt;(tasks);</span>
+<span class="fc" id="L483">                return this;</span>
+            }
+
+            public ConnectorsAndTasks.Builder addConnectors(Collection&lt;String&gt; connectors) {
+<span class="fc" id="L487">                this.withConnectors.addAll(connectors);</span>
+<span class="fc" id="L488">                return this;</span>
+            }
+
+            public ConnectorsAndTasks.Builder addTasks(Collection&lt;ConnectorTaskId&gt; tasks) {
+<span class="fc" id="L492">                this.withTasks.addAll(tasks);</span>
+<span class="fc" id="L493">                return this;</span>
+            }
+
+            public ConnectorsAndTasks.Builder addAll(ConnectorsAndTasks connectorsAndTasks) {
+<span class="fc" id="L497">                return this</span>
+<span class="fc" id="L498">                        .addConnectors(connectorsAndTasks.connectors())</span>
+<span class="fc" id="L499">                        .addTasks(connectorsAndTasks.tasks());</span>
+            }
+
+            public ConnectorsAndTasks build() {
+<span class="fc" id="L503">                return new ConnectorsAndTasks(withConnectors, withTasks);</span>
+            }
+        }
+
+        public Collection&lt;String&gt; connectors() {
+<span class="fc" id="L508">            return connectors;</span>
+        }
+
+        public Collection&lt;ConnectorTaskId&gt; tasks() {
+<span class="fc" id="L512">            return tasks;</span>
+        }
+
+        public int size() {
+<span class="nc" id="L516">            return connectors.size() + tasks.size();</span>
+        }
+
+        public boolean isEmpty() {
+<span class="fc bfc" id="L520" title="All 4 branches covered.">            return connectors.isEmpty() &amp;&amp; tasks.isEmpty();</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="fc" id="L525">            return &quot;{ connectorIds=&quot; + connectors + &quot;, taskIds=&quot; + tasks + '}';</span>
+        }
+    }
+
+    public static class WorkerLoad {
+        private final String worker;
+        private final Collection&lt;String&gt; connectors;
+        private final Collection&lt;ConnectorTaskId&gt; tasks;
+
+        private WorkerLoad(
+                String worker,
+                Collection&lt;String&gt; connectors,
+                Collection&lt;ConnectorTaskId&gt; tasks
+<span class="fc" id="L538">        ) {</span>
+<span class="fc" id="L539">            this.worker = worker;</span>
+<span class="fc" id="L540">            this.connectors = connectors;</span>
+<span class="fc" id="L541">            this.tasks = tasks;</span>
+<span class="fc" id="L542">        }</span>
+
+        public static class Builder {
+            private final String withWorker;
+            private Collection&lt;String&gt; withConnectors;
+            private Collection&lt;ConnectorTaskId&gt; withTasks;
+
+<span class="fc" id="L549">            public Builder(String worker) {</span>
+<span class="fc" id="L550">                this.withWorker = Objects.requireNonNull(worker, &quot;worker cannot be null&quot;);</span>
+<span class="fc" id="L551">            }</span>
+
+            public WorkerLoad.Builder withCopies(Collection&lt;String&gt; connectors,
+                                                 Collection&lt;ConnectorTaskId&gt; tasks) {
+<span class="nc" id="L555">                withConnectors = new ArrayList&lt;&gt;(</span>
+<span class="nc" id="L556">                        Objects.requireNonNull(connectors, &quot;connectors may be empty but not null&quot;));</span>
+<span class="nc" id="L557">                withTasks = new ArrayList&lt;&gt;(</span>
+<span class="nc" id="L558">                        Objects.requireNonNull(tasks, &quot;tasks may be empty but not null&quot;));</span>
+<span class="nc" id="L559">                return this;</span>
+            }
+
+            public WorkerLoad.Builder with(Collection&lt;String&gt; connectors,
+                                           Collection&lt;ConnectorTaskId&gt; tasks) {
+<span class="fc" id="L564">                withConnectors = Objects.requireNonNull(connectors,</span>
+                        &quot;connectors may be empty but not null&quot;);
+<span class="fc" id="L566">                withTasks = Objects.requireNonNull(tasks, &quot;tasks may be empty but not null&quot;);</span>
+<span class="fc" id="L567">                return this;</span>
+            }
+
+            public WorkerLoad build() {
+<span class="fc" id="L571">                return new WorkerLoad(</span>
+                        withWorker,
+<span class="pc bpc" id="L573" title="1 of 2 branches missed.">                        withConnectors != null ? withConnectors : new ArrayList&lt;&gt;(),</span>
+<span class="pc bpc" id="L574" title="1 of 2 branches missed.">                        withTasks != null ? withTasks : new ArrayList&lt;&gt;());</span>
+            }
+        }
+
+        public String worker() {
+<span class="fc" id="L579">            return worker;</span>
+        }
+
+        public Collection&lt;String&gt; connectors() {
+<span class="fc" id="L583">            return connectors;</span>
+        }
+
+        public Collection&lt;ConnectorTaskId&gt; tasks() {
+<span class="fc" id="L587">            return tasks;</span>
+        }
+
+        public int connectorsSize() {
+<span class="fc" id="L591">            return connectors.size();</span>
+        }
+
+        public int tasksSize() {
+<span class="fc" id="L595">            return tasks.size();</span>
+        }
+
+        public void assign(String connector) {
+<span class="fc" id="L599">            connectors.add(connector);</span>
+<span class="fc" id="L600">        }</span>
+
+        public void assign(ConnectorTaskId task) {
+<span class="fc" id="L603">            tasks.add(task);</span>
+<span class="fc" id="L604">        }</span>
+
+        public int size() {
+<span class="nc" id="L607">            return connectors.size() + tasks.size();</span>
+        }
+
+        public boolean isEmpty() {
+<span class="fc bfc" id="L611" title="All 4 branches covered.">            return connectors.isEmpty() &amp;&amp; tasks.isEmpty();</span>
+        }
+
+        public static Comparator&lt;WorkerLoad&gt; connectorComparator() {
+<span class="fc" id="L615">            return (left, right) -&gt; {</span>
+<span class="fc" id="L616">                int res = left.connectors.size() - right.connectors.size();</span>
+<span class="pc bpc" id="L617" title="1 of 4 branches missed.">                return res != 0 ? res : left.worker == null</span>
+<span class="nc bnc" id="L618" title="All 2 branches missed.">                                        ? right.worker == null ? 0 : -1</span>
+<span class="fc" id="L619">                                        : left.worker.compareTo(right.worker);</span>
+            };
+        }
+
+        public static Comparator&lt;WorkerLoad&gt; taskComparator() {
+<span class="fc" id="L624">            return (left, right) -&gt; {</span>
+<span class="fc" id="L625">                int res = left.tasks.size() - right.tasks.size();</span>
+<span class="pc bpc" id="L626" title="1 of 4 branches missed.">                return res != 0 ? res : left.worker == null</span>
+<span class="nc bnc" id="L627" title="All 2 branches missed.">                                        ? right.worker == null ? 0 : -1</span>
+<span class="fc" id="L628">                                        : left.worker.compareTo(right.worker);</span>
+            };
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L634">            return &quot;{ worker=&quot; + worker + &quot;, connectorIds=&quot; + connectors + &quot;, taskIds=&quot; + tasks + '}';</span>
+        }
+
+        @Override
+        public boolean equals(Object o) {
+<span class="nc bnc" id="L639" title="All 2 branches missed.">            if (this == o) {</span>
+<span class="nc" id="L640">                return true;</span>
+            }
+<span class="nc bnc" id="L642" title="All 2 branches missed.">            if (!(o instanceof WorkerLoad that)) {</span>
+<span class="nc" id="L643">                return false;</span>
+            }
+<span class="nc bnc" id="L645" title="All 2 branches missed.">            return worker.equals(that.worker) &amp;&amp;</span>
+<span class="nc bnc" id="L646" title="All 2 branches missed.">                    connectors.equals(that.connectors) &amp;&amp;</span>
+<span class="nc bnc" id="L647" title="All 2 branches missed.">                    tasks.equals(that.tasks);</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L652">            return Objects.hash(worker, connectors, tasks);</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.14.202510111229</span></div></body></html>
